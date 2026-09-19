@@ -1073,3 +1073,23 @@ knn/FTS 全部正常 (最高 count-distinct 50ms、全表投影 86ms)。四个�
   kill -9 → 重开 WAL 重放零丢失 (5/11 倍数残留 0、全部变异可见)
 - UPDATE 语句语义变化: 校验/求值失败的行现在使整条语句写入前失败 (旧的
   "写一半再报错" 更接近原子, 但非事务内仍非原子 — 与 SQLite 相同)
+
+## Round 13e — 扫描#2: GROUP BY 表达式丢键修复 + 快路径 + 计算键 hash join
+
+DDL/大事务/恢复全部健康 (CREATE INDEX 22ms、ALTER 28ms、单事务 30K 插入
+107ms、回滚 95ms、大 WAL 重开 38ms)。挖出并修复:
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | `GROUP BY id%3, id%5` (双 canonical 表达式) 返回 **3 组而非 15 组** — 正确性 bug | apply_group_by 的无别名 SELECT 表达式匹配任何组项 (`alias.is_none() \|\| …` 短路了 canonical 相等) → 两个组键都解析到第一个表达式 | 无别名表达式必须 canonical 名相等; 别名按字面匹配 |
+| 2 | GROUP BY 表达式 20K 行 1.8s (有未合并写 35µs/行; 列 GROUP BY 0.26ms) | 表达式组键让位置化快路径 decline → SqlRow 物化路径 | 新 `try_expression_group_by` 快路径: 流式行 + eval_expr_on_row 求键 + 单遍累加 (COUNT/SUM/AVG/MIN/MAX, NULL 语义对齐, ≤2 键, 别名/输出 ORDER BY, LIMIT) |
+| 3 | 非等值 ON `a.id = b.id - 1` 2K×20K **23.5 min** | 无等值对 → O(N×M) 嵌套循环逐候选建 SqlRow eval | 新 `try_expr_key_hash_join` 计算键 hash: 单表表达式侧逐行求值建 hash、列侧探测 (`a.id*2=b.id` 表达式在左同样归一) → **40.8 ms (34,500×)** |
+
+已知限制 (记录待办): 双侧表达式 ON (`UPPER(a.dev)=UPPER(b.dev)`) 无法单侧
+建 hash → 仍嵌套循环 (正确但慢); 无 WHERE 全乘积 join 的 COUNT 折叠
+(20K×20K 9 亿结果行 144s — COUNT(*) 可不物化直接折叠); `INSERT … SELECT`、
+`FROM (SELECT …)` 子查询形态不支持。
+
+回归: round13 Rust 回归 17/17 (新增双表达式组键 + 计算键 join) + fuzz 8
+seed 全绿 + GROUP BY 表达式差分 10/10 + 非等值 ON 差分 5/5 + 全量 229 bin
+EXIT=0 + E2E 51/51。

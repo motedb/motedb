@@ -15313,6 +15313,7 @@ impl QueryExecutor {
                 if let Ok(schema) = self.db.get_table_schema(table_name) {
                     if let Some((column_names, projected_rows)) =
                         self.try_apply_group_by_positional(stmt, &schema, table_name)?
+                            .or(self.try_expression_group_by(stmt, &schema, table_name)?)
                     {
                         return Ok(QueryResult::Select {
                             columns: column_names,
@@ -18001,6 +18002,130 @@ impl QueryExecutor {
     /// INNER JOIN: only rows that match condition in both tables
     ///
     /// 🚀 Optimized with Hash Join for equi-joins
+
+    /// 🔑 计算键 hash join: `ON <col> = <单表表达式>` (如 a.id = b.id - 1)。
+    /// 无等值对时曾落 O(N×M) 嵌套循环逐候选建 SqlRow eval — 2K×20K 自 join
+    /// 23.5 分钟 (热点扫描)。表达式侧逐行求值建 hash, 列侧探测。
+    /// 仅处理单叶 Eq ON; 合取/其他形状由调用方既有路径负责。
+    fn try_expr_key_hash_join(
+        &self,
+        left_rows: &[(u64, SqlRow)],
+        right_rows: &[(u64, SqlRow)],
+        on_condition: &Expr,
+    ) -> Result<Option<Vec<(u64, SqlRow)>>> {
+        use crate::sql::ast::BinaryOperator;
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = on_condition
+        else {
+            return Ok(None);
+        };
+        // 形态: (Column, expr) 或 (expr, Column)
+        let (col_name, expr) = match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(c), e) if !matches!(e, Expr::Column(_)) => (c.clone(), e.clone()),
+            (e, Expr::Column(c)) if !matches!(e, Expr::Column(_)) => (c.clone(), e.clone()),
+            _ => return Ok(None),
+        };
+        // 表达式的列引用必须全部落在同一侧 (否则无法建单侧 hash)
+        let mut refs: Vec<String> = Vec::new();
+        if !Self::collect_column_names_strict(&expr, &mut refs) || refs.is_empty() {
+            return Ok(None);
+        }
+        let lk = left_rows.first().map(|(_, r)| r.clone());
+        let rk = right_rows.first().map(|(_, r)| r.clone());
+        let all_in = |keys: &Option<SqlRow>| {
+            keys.as_ref()
+                .map_or(false, |k| refs.iter().all(|c| k.contains_key(c)))
+        };
+        let (expr_left, col_side_right) = if all_in(&lk) && lk.as_ref().map_or(true, |k| !k.contains_key(&col_name) || rk.as_ref().map_or(true, |r| !r.contains_key(&col_name)) || true) {
+            // 表达式在左; 列须在右 (或列在左也行? 严格: 列在另一侧才省事)
+            let col_in_right = rk.as_ref().map_or(false, |k| k.contains_key(&col_name));
+            if col_in_right {
+                (true, true)
+            } else if rk.as_ref().map_or(false, |k| refs.iter().all(|c| k.contains_key(c))) {
+                (false, false) // 表达式在右, 列在左
+            } else {
+                return Ok(None);
+            }
+        } else if all_in(&rk) {
+            let col_in_left = lk.as_ref().map_or(false, |k| k.contains_key(&col_name));
+            if !col_in_left {
+                return Ok(None);
+            }
+            (false, false)
+        } else {
+            return Ok(None);
+        };
+        let _ = expr_left;
+        let _ = col_side_right;
+        // 统一: expr_rows 建 hash, col_rows 探测
+        let (expr_rows, col_rows, expr_is_left) = {
+            let e_in_l = all_in(&lk);
+            if e_in_l {
+                (left_rows, right_rows, true)
+            } else {
+                (right_rows, left_rows, false)
+            }
+        };
+        #[derive(Hash, PartialEq, Eq)]
+        enum HK {
+            Num(u64),
+            Text(String),
+            Bool(bool),
+        }
+        let to_hk = |v: &Value| -> Option<HK> {
+            match v {
+                Value::Integer(i) => {
+                    if *i >= -(1i64 << 53) && *i <= (1i64 << 53) {
+                        Some(HK::Num((*i as f64).to_bits()))
+                    } else {
+                        Some(HK::Num((*i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
+                Value::Float(f) => Some(HK::Num(f.to_bits())),
+                Value::Text(t) => Some(HK::Text(t.to_string())),
+                Value::Bool(b) => Some(HK::Bool(*b)),
+                _ => None,
+            }
+        };
+        use std::collections::HashMap;
+        let mut hash: HashMap<HK, Vec<usize>> = HashMap::with_capacity(expr_rows.len());
+        for (ri, (_, row)) in expr_rows.iter().enumerate() {
+            if let Ok(v) = self.evaluator.eval(&expr, row) {
+                if let Some(k) = to_hk(&v) {
+                    hash.entry(k).or_default().push(ri);
+                }
+            }
+        }
+        let mut out: Vec<(u64, SqlRow)> = Vec::new();
+        let mut next_id = 1u64;
+        for (_, crow) in col_rows {
+            let Some(cv) = crow.get(&col_name) else {
+                continue;
+            };
+            if matches!(cv, Value::Null) {
+                continue;
+            }
+            let Some(hits) = to_hk(cv).and_then(|k| hash.get(&k).cloned()) else {
+                continue;
+            };
+            for ri in hits {
+                let (erow_id, erow) = &expr_rows[ri];
+                let combined = if expr_is_left {
+                    self.combine_rows(erow, crow)
+                } else {
+                    self.combine_rows(crow, erow)
+                };
+                out.push((next_id, combined));
+                next_id += 1;
+                let _ = erow_id;
+            }
+        }
+        Ok(Some(out))
+    }
+
     fn inner_join(
         &self,
         left_rows: &[(u64, SqlRow)],
@@ -18069,6 +18194,13 @@ impl QueryExecutor {
             if let Some((left_col, right_col)) = self.extract_equi_join_columns(&on_equi) {
                 // 🚀 Use Hash Join (O(N + M))
                 return self.hash_join_inner(left_rows, right_rows, &left_col, &right_col);
+            }
+            // 🔑 计算键 hash: `col = 单表表达式` (a.id = b.id - 1) — 此前
+            // 嵌套循环 O(N×M) 逐候选建 SqlRow (2K×20K 自 join 23.5min)。
+            if let Some(joined) =
+                self.try_expr_key_hash_join(left_rows, right_rows, &on_equi)?
+            {
+                return Ok(joined);
             }
         }
 
@@ -19975,9 +20107,13 @@ impl QueryExecutor {
                         SelectColumn::Expr(e, Some(a)) if a == col_name => Some(e),
                         // `GROUP BY <full expression text>` must also find the
                         // expression when the SELECT item carries an alias.
+                        // 🔑 无别名表达式必须按 canonical 名匹配 — 旧的
+                        // `alias.is_none() || …` 让第一个无别名表达式匹配任何
+                        // 组项, 双表达式组键双双解析到它 (GROUP BY id%3, id%5
+                        // 返回 3 组而非 15 组, 差分对拍抓出)。
                         SelectColumn::Expr(e, alias)
-                            if alias.is_none()
-                                || alias.is_some() && &Self::expr_to_column_name(e) == col_name =>
+                            if &Self::expr_to_column_name(e) == col_name
+                                || alias.as_deref() == Some(col_name.as_str()) =>
                         {
                             Some(e)
                         }
@@ -21648,6 +21784,235 @@ impl QueryExecutor {
     /// Returns `None` if the query is too complex for this path (joins, subqueries,
     /// complex expressions, etc.), in which case the caller falls back to the
     /// materialized path.
+
+    /// 🔑 表达式 GROUP BY 快路径: `SELECT <expr>…, AGG(…)… GROUP BY <same exprs>`.
+    /// 此前表达式组键让 try_apply_group_by_positional decline → 物化 SqlRow
+    /// 路径 (干净表 0.7µs/行, 有未合并写时 35µs/行; 热点扫描: 20K 行 1.8s)。
+    /// 这里流式行 + eval_expr_on_row 求键 + 单遍累加, NULL 语义与
+    /// apply_group_by 一致 (COUNT(col)/SUM/AVG/MIN/MAX 跳过 NULL)。
+    fn try_expression_group_by(
+        &self,
+        stmt: &SelectStmt,
+        schema: &TableSchema,
+        table_name: &str,
+    ) -> Result<Option<(Vec<String>, Vec<Vec<Value>>)>> {
+        use std::collections::HashMap;
+        let group_items = match &stmt.group_by {
+            Some(g) if !g.is_empty() => g,
+            _ => return Ok(None),
+        };
+        if group_items.len() > 2 || stmt.having.is_some() || stmt.distinct {
+            return Ok(None);
+        }
+        #[derive(Clone)]
+        struct Acc {
+            count: u64,
+            nn: u64,
+            int_sum: i64,
+            fsum: f64,
+            has_f: bool,
+            has_v: bool,
+            min: Option<Value>,
+            max: Option<Value>,
+        }
+        impl Acc {
+            fn new() -> Self {
+                Self { count: 0, nn: 0, int_sum: 0, fsum: 0.0, has_f: false, has_v: false, min: None, max: None }
+            }
+            fn update(&mut self, v: Option<&Value>) {
+                self.count += 1;
+                let Some(v) = v else { return };
+                if matches!(v, Value::Null) {
+                    return;
+                }
+                self.nn += 1;
+                self.has_v = true;
+                match v {
+                    Value::Integer(i) => self.int_sum = self.int_sum.wrapping_add(*i),
+                    Value::Float(f) => {
+                        self.fsum += f;
+                        self.has_f = true;
+                    }
+                    _ => {}
+                }
+                if self.min.as_ref().is_none_or(|m| order_by_cmp(v, m) == std::cmp::Ordering::Less) {
+                    self.min = Some(v.clone());
+                }
+                if self.max.as_ref().is_none_or(|m| order_by_cmp(v, m) == std::cmp::Ordering::Greater) {
+                    self.max = Some(v.clone());
+                }
+            }
+            fn finalize(&self, func: &str, col_pos: Option<usize>) -> Value {
+                match func {
+                    "COUNT" => {
+                        if col_pos.is_none() {
+                            Value::Integer(self.count as i64)
+                        } else {
+                            Value::Integer(self.nn as i64)
+                        }
+                    }
+                    "SUM" => {
+                        if self.nn == 0 {
+                            Value::Null
+                        } else if self.has_f {
+                            Value::Float(self.fsum + self.int_sum as f64)
+                        } else {
+                            Value::Integer(self.int_sum)
+                        }
+                    }
+                    "AVG" => {
+                        if self.nn == 0 {
+                            Value::Null
+                        } else {
+                            let total = if self.has_f {
+                                self.fsum + self.int_sum as f64
+                            } else {
+                                self.int_sum as f64
+                            };
+                            Value::Float(total / self.nn as f64)
+                        }
+                    }
+                    "MIN" => self.min.clone().unwrap_or(Value::Null),
+                    "MAX" => self.max.clone().unwrap_or(Value::Null),
+                    _ => Value::Null,
+                }
+            }
+        }
+        // SELECT 解析: 输出序的 [Key(expr) | Agg] 序列
+        enum Out {
+            Key(usize),   // index into key_exprs
+            Agg(usize),   // index into agg_infos
+        }
+        let mut key_exprs: Vec<Expr> = Vec::new();
+        let mut out_names: Vec<String> = Vec::new();
+        let mut out_cols: Vec<Out> = Vec::new();
+        let mut agg_infos: Vec<AggregateInfo> = Vec::new();
+        for sc in &stmt.columns {
+            match sc {
+                SelectColumn::Star => return Ok(None),
+                SelectColumn::Column(_) | SelectColumn::ColumnWithAlias(_, _) => {
+                    return Ok(None);
+                }
+                SelectColumn::Expr(expr, alias) => {
+                    if let Some(agg) = self.try_parse_aggregate(expr, schema) {
+                        if agg.distinct
+                            || !matches!(agg.func.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                        {
+                            return Ok(None);
+                        }
+                        out_names.push(
+                            alias.clone().unwrap_or_else(|| Self::expr_to_column_name(expr)),
+                        );
+                        out_cols.push(Out::Agg(agg_infos.len()));
+                        agg_infos.push(agg);
+                    } else {
+                        let name =
+                            alias.clone().unwrap_or_else(|| Self::expr_to_column_name(expr));
+                        let canonical = Self::expr_to_column_name(expr);
+                        let matched = group_items
+                            .iter()
+                            .any(|g| g == &name || g == &canonical);
+                        if !matched || key_exprs.len() + 1 > group_items.len() {
+                            return Ok(None);
+                        }
+                        // (组项全被 SELECT 覆盖由函数末尾的长度相等检查保证)
+                        out_names.push(name);
+                        out_cols.push(Out::Key(key_exprs.len()));
+                        key_exprs.push((*expr).clone());
+                    }
+                }
+            }
+        }
+        if key_exprs.is_empty() || agg_infos.is_empty() || key_exprs.len() != group_items.len() {
+            return Ok(None);
+        }
+        // WHERE: 简单比较谓词可用编译过滤; 复杂形状逐行 eval (仍远快于物化)
+        let mut row_iter = self.db.scan_table_rows_streaming(table_name)?;
+        let mut groups: HashMap<Vec<Value>, Vec<Acc>> = HashMap::new();
+        let mut key_buf: Vec<Value> = Vec::with_capacity(key_exprs.len());
+        for result in row_iter.by_ref() {
+            let (_, row) = result?;
+            // WHERE 逐行求值 (Bool(true) 才收)
+            if let Some(ref wc) = stmt.where_clause {
+                let sql_row = row_to_sql_row(&row, schema)?;
+                let ok = matches!(
+                    self.evaluator.eval(wc, &sql_row),
+                    Ok(Value::Bool(true))
+                );
+                if !ok {
+                    continue;
+                }
+            }
+            key_buf.clear();
+            for e in &key_exprs {
+                key_buf.push(Self::eval_expr_on_row(e, &row, schema)?);
+            }
+            let accs = groups.entry(key_buf.clone()).or_insert_with(|| {
+                agg_infos.iter().map(|_| Acc::new()).collect::<Vec<_>>()
+            });
+            for (ai, acc) in accs.iter_mut().enumerate() {
+                let info = &agg_infos[ai];
+                let v = info.col_pos.and_then(|p| row.get(p));
+                acc.update(v);
+            }
+        }
+        drop(row_iter);
+        // 组装输出行 + ORDER BY (输出名/别名唯一命中) + LIMIT/OFFSET
+        let mut rows: Vec<Vec<Value>> = groups
+            .into_iter()
+            .map(|(keys, accs)| {
+                out_cols
+                    .iter()
+                    .map(|c| match c {
+                        Out::Key(i) => keys[*i].clone(),
+                        Out::Agg(i) => accs[*i].finalize(
+                            agg_infos[*i].func.as_str(),
+                            agg_infos[*i].col_pos,
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if let Some(ref ob) = stmt.order_by {
+            let mut specs: Vec<(usize, bool)> = Vec::new();
+            for oe in ob {
+                let Expr::Column(cn) = &oe.expr else { return Ok(None) };
+                let hits: Vec<usize> = out_names
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| {
+                        n.as_str() == cn.as_str()
+                            || n.rsplit('.').next().unwrap_or(n) == cn.as_str()
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if hits.len() != 1 {
+                    return Ok(None);
+                }
+                specs.push((hits[0], oe.asc));
+            }
+            if !specs.is_empty() {
+                rows.sort_by(|a, b| {
+                    for &(i, asc) in &specs {
+                        let c = order_by_cmp(&a[i], &b[i]);
+                        if c != std::cmp::Ordering::Equal {
+                            return if asc { c } else { c.reverse() };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+        }
+        let offset = stmt.offset.unwrap_or(0);
+        if offset > 0 {
+            rows.drain(..offset.min(rows.len()));
+        }
+        if let Some(l) = stmt.limit {
+            rows.truncate(l);
+        }
+        Ok(Some((out_names, rows)))
+    }
+
     fn try_apply_group_by_positional(
         &self,
         stmt: &SelectStmt,

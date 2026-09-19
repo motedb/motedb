@@ -497,3 +497,67 @@ fn join_on_conjunction_residual_evaluated() {
     let r = rows(&db, "SELECT COUNT(*) FROM items a JOIN tags b ON a.id = b.item_id AND b.tag = 'red'");
     assert_eq!(r[0][0], i(2));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Round 13e (扫描#2): GROUP BY 表达式双键丢键 + 计算键 hash join
+#[test]
+fn groupby_double_expression_keys_all_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("gb2.mote")).unwrap());
+    ex(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    for i in 0..20i64 {
+        ex(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
+    }
+    // 双 canonical 表达式组键: 曾双双解析到第一个 SELECT 表达式 → 3 组 (应 15)
+    let r = rows(&db, "SELECT id % 3, id % 5, COUNT(*) FROM t GROUP BY id % 3, id % 5");
+    assert_eq!(r.len(), 15, "double expression key groups: got {:?}", r.len());
+    // 快路径 (无 ORDER BY) 与物化路径 (ORDER BY 序号 decline) 一致
+    let r2 = rows(
+        &db,
+        "SELECT id % 3, id % 5, COUNT(*) FROM t GROUP BY id % 3, id % 5 ORDER BY 1, 2",
+    );
+    assert_eq!(r2.len(), 15);
+    let key = |row: &Vec<Value>| -> (i64, i64) {
+        match (&row[0], &row[1]) {
+            (Value::Integer(a), Value::Integer(b)) => (*a, *b),
+            _ => (i64::MIN, i64::MIN),
+        }
+    };
+    let mut a = r; a.sort_by_key(key); let mut b = r2; b.sort_by_key(key);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn non_equi_on_computed_key_join() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("nk.mote")).unwrap());
+    ex(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    for i in 1..=10i64 {
+        ex(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10));
+    }
+    // a.id = b.id - 1: 相邻对 (1,2),(2,3)…(9,10)
+    let r = rows(
+        &db,
+        "SELECT a.id, b.id FROM t a JOIN t b ON a.id = b.id - 1 ORDER BY a.id ASC",
+    );
+    let mut expect = Vec::new();
+    for k in 1..=9i64 {
+        expect.push(vec![i(k), i(k + 1)]);
+    }
+    assert_eq!(r, expect);
+    // 表达式在左: a.id * 2 = b.id → (1,2),(2,4),(3,6),(4,8),(5,10)
+    let r = rows(
+        &db,
+        "SELECT a.id, b.id FROM t a JOIN t b ON a.id * 2 = b.id ORDER BY a.id ASC",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![i(1), i(2)],
+            vec![i(2), i(4)],
+            vec![i(3), i(6)],
+            vec![i(4), i(8)],
+            vec![i(5), i(10)],
+        ]
+    );
+}
