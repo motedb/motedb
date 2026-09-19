@@ -229,6 +229,84 @@ impl Segment {
     /// Read a fixed-width column, using the cross-query col_cache.
     /// On cache miss, decodes and caches the column segment. On hit,
     /// returns the cached FixedSegment (zero allocation, zero decode).
+    /// 🔁 VEC M0: 段列整列读为 [`ColumnVector`]（零 `Value` 物化）。
+    ///
+    /// - Integer/Timestamp/Float: `FixedSegment` raw 切片直接拷贝（M1 起
+    ///   聚合/谓词可在切片上自动向量化）；
+    /// - Bool: 1 字节/行 → 位图；
+    /// - Text: `get_str` 批量切 `Arc<str>`（文本本质需要每串一次分配）；
+    /// - Tensor/Spatial: 逐行 `Value` fallback（knn 保持现有 `&[f32]` SIMD
+    ///   路径，不走本 API）。
+    ///
+    /// 类型不匹配/压缩损坏返回 `None`（调用方回退行式路径）。
+    pub fn read_column_batch(
+        &self,
+        col_idx: usize,
+        ct: &crate::types::ColumnType,
+    ) -> Option<crate::storage::colbatch::ColumnVector> {
+        use crate::storage::colbatch::{ColData, ColumnVector, ValidityBitmap};
+        use crate::types::ColumnType;
+        let n = self.row_count;
+        match ct {
+            ColumnType::Integer | ColumnType::Timestamp => {
+                let seg = self.sst.read_fixed_i64(col_idx).ok()?;
+                let valid = ValidityBitmap::from_null_bytes(seg.null_bitmap_bytes(), n);
+                Some(ColumnVector::from_i64_slice(seg.raw_i64_slice(), valid))
+            }
+            ColumnType::Float => {
+                let seg = self.sst.read_fixed_i64(col_idx).ok()?;
+                let valid = ValidityBitmap::from_null_bytes(seg.null_bitmap_bytes(), n);
+                Some(ColumnVector::from_f64_slice(seg.raw_f64_typed_slice(), valid))
+            }
+            ColumnType::Boolean => {
+                let seg = self.sst.read_fixed_i64(col_idx).ok()?;
+                let valid = ValidityBitmap::from_null_bytes(seg.null_bitmap_bytes(), n);
+                let bytes = seg.raw_f64_slice(); // 即 data 字节（Bool 1B/行）
+                let mut bits = vec![0u64; n.div_ceil(64)];
+                for (i, &b) in bytes.iter().take(n).enumerate() {
+                    if b != 0 {
+                        bits[i / 64] |= 1u64 << (i % 64);
+                    }
+                }
+                Some(ColumnVector {
+                    data: ColData::Bool(bits),
+                    valid,
+                })
+            }
+            ColumnType::Text => {
+                let ts = self.sst.read_text(col_idx).ok()?;
+                let mut valid = ValidityBitmap::with_capacity(n);
+                let mut buf: Vec<std::sync::Arc<str>> = Vec::with_capacity(n);
+                for i in 0..n {
+                    match ts.get_str(i) {
+                        Some(s) => {
+                            buf.push(std::sync::Arc::from(s));
+                            valid.push(true);
+                        }
+                        None => {
+                            buf.push(std::sync::Arc::from(""));
+                            valid.push(false);
+                        }
+                    }
+                }
+                Some(ColumnVector {
+                    data: ColData::Utf8(buf),
+                    valid,
+                })
+            }
+            ColumnType::Tensor(_) | ColumnType::Spatial => {
+                let mut cv = ColumnVector::with_type_capacity(ct, n);
+                for i in 0..n {
+                    let v = self.read_var_value_at(col_idx, i);
+                    if !cv.push_value(&v) {
+                        return None;
+                    }
+                }
+                Some(cv)
+            }
+        }
+    }
+
     pub fn read_fixed_cached(&self, col_idx: usize) -> Option<FixedSegment> {
         {
             let mut cache = self.col_cache.lock();

@@ -9,6 +9,7 @@ pub mod columnar;
 pub mod file_manager;
 pub mod lsm;
 pub mod manifest;
+pub mod colbatch;
 pub mod row_format;
 
 pub use checksum::{Checksum, ChecksumError, ChecksumType};

@@ -618,6 +618,9 @@ impl ColumnArray {
 pub struct ColumnarRowSet {
     pub columns: Vec<String>,
     pub data: Vec<ColumnArray>,
+    /// 🔑 每列 NULL 有效性（bit=1 有效）。此前 Null 值被 push_value_to_column
+    /// 直接丢弃 → 可空列数组错位（VEC M0 修复；decode_row_into_columns 维护）。
+    pub validity: Vec<crate::storage::colbatch::ValidityBitmap>,
     pub num_rows: usize,
 }
 
@@ -638,6 +641,10 @@ impl ColumnarRowSet {
         Self {
             columns,
             data,
+            validity: col_types
+                .iter()
+                .map(|_| crate::storage::colbatch::ValidityBitmap::with_capacity(0))
+                .collect(),
             num_rows: 0,
         }
     }
@@ -657,36 +664,43 @@ impl ColumnarRowSet {
             .map(|_| Vec::with_capacity(self.data.len()))
             .collect();
 
-        for col_array in &self.data {
+        for (col_idx, col_array) in self.data.iter().enumerate() {
+            let valid = self.validity.get(col_idx);
+            let is_null_at =
+                |row_idx: usize| valid.map_or(false, |b| b.is_null(row_idx));
+            let mut put = |row_idx: usize, v: Value| {
+                let n = if is_null_at(row_idx) { Value::Null } else { v };
+                rows[row_idx].push(n);
+            };
             match col_array {
                 ColumnArray::Integers(v) => {
                     for (row_idx, &val) in v.iter().enumerate() {
-                        rows[row_idx].push(Value::Integer(val));
+                        put(row_idx, Value::Integer(val));
                     }
                 }
                 ColumnArray::Floats(v) => {
                     for (row_idx, &val) in v.iter().enumerate() {
-                        rows[row_idx].push(Value::Float(val));
+                        put(row_idx, Value::Float(val));
                     }
                 }
                 ColumnArray::Texts(v) => {
                     for (row_idx, val) in v.iter().enumerate() {
-                        rows[row_idx].push(Value::Text(ArcString(Arc::clone(val))));
+                        put(row_idx, Value::Text(ArcString(Arc::clone(val))));
                     }
                 }
                 ColumnArray::Timestamps(v) => {
                     for (row_idx, &val) in v.iter().enumerate() {
-                        rows[row_idx].push(Value::Timestamp(Timestamp::from_micros(val)));
+                        put(row_idx, Value::Timestamp(Timestamp::from_micros(val)));
                     }
                 }
                 ColumnArray::Bools(v) => {
                     for (row_idx, &val) in v.iter().enumerate() {
-                        rows[row_idx].push(Value::Bool(val));
+                        put(row_idx, Value::Bool(val));
                     }
                 }
                 ColumnArray::Values(v) => {
                     for (row_idx, val) in v.iter().enumerate() {
-                        rows[row_idx].push(val.clone());
+                        put(row_idx, val.clone());
                     }
                 }
             }
@@ -712,6 +726,7 @@ pub fn decode_row_into_columns(
     ctx: &SchemaDecodeContext,
     data: &[u8],
     col_data: &mut [ColumnArray],
+    validity: &mut [crate::storage::colbatch::ValidityBitmap],
 ) -> Result<()> {
     // Fast path: skip magic check when data is from our own encode()
     if !ctx.skip_magic_check {
@@ -719,6 +734,9 @@ pub fn decode_row_into_columns(
             let row: Vec<Value> = bincode::deserialize(data)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             for (i, val) in row.into_iter().enumerate() {
+                if let Some(b) = validity.get_mut(i) {
+                    b.push(!matches!(val, Value::Null));
+                }
                 push_value_to_column(&mut col_data[i], val);
             }
             return Ok(());
@@ -770,9 +788,24 @@ pub fn decode_row_into_columns(
     let mut var_idx = 0usize;
 
     for (i, col_arr) in col_data.iter_mut().enumerate() {
-        // Null check
+        // 🔑 Null → 各列 push 类型占位 + validity=false（数组行号对齐 —
+        // VEC M0 修复：此前 continue 跳过导致可空列整体错位）。
         if null_bitmap & (1u64 << i) != 0 {
-            continue; // Skip nulls in columnar format
+            if let Some(b) = validity.get_mut(i) {
+                b.push(false);
+            }
+            match col_arr {
+                ColumnArray::Integers(v) => v.push(0),
+                ColumnArray::Floats(v) => v.push(0.0),
+                ColumnArray::Texts(v) => v.push(Arc::from("")),
+                ColumnArray::Timestamps(v) => v.push(0),
+                ColumnArray::Bools(v) => v.push(false),
+                ColumnArray::Values(v) => v.push(Value::Null),
+            }
+            continue;
+        }
+        if let Some(b) = validity.get_mut(i) {
+            b.push(true);
         }
 
         match ctx.col_decoders[i] {
@@ -860,6 +893,14 @@ fn push_value_to_column(col: &mut ColumnArray, val: Value) {
         (ColumnArray::Timestamps(v), Value::Timestamp(ts)) => v.push(ts.as_micros()),
         (ColumnArray::Bools(v), Value::Bool(b)) => v.push(b),
         (ColumnArray::Values(v), val) => v.push(val),
+        // 🔑 Null → 类型默认占位，保持数组行号对齐（validity 由调用方
+        // decode_row_into_columns 按 null_bitmap 记录；此前直接丢弃导致
+        // 可空列错位 — VEC M0 修复）。
+        (ColumnArray::Integers(v), Value::Null) => v.push(0),
+        (ColumnArray::Floats(v), Value::Null) => v.push(0.0),
+        (ColumnArray::Texts(v), Value::Null) => v.push(Arc::from("")),
+        (ColumnArray::Timestamps(v), Value::Null) => v.push(0),
+        (ColumnArray::Bools(v), Value::Null) => v.push(false),
         _ => {} // Type mismatch: skip (shouldn't happen with correct schema)
     }
 }

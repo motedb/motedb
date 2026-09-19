@@ -1949,6 +1949,11 @@ impl MoteDB {
             }
         }
 
+        let mut col_validity: Vec<crate::storage::colbatch::ValidityBitmap> = col_types
+            .iter()
+            .map(|_| crate::storage::colbatch::ValidityBitmap::with_capacity(size_hint))
+            .collect();
+
         let mut count = 0usize;
         loop {
             match lsm_iter.next() {
@@ -1964,6 +1969,7 @@ impl MoteDB {
                         &ctx,
                         data,
                         &mut col_data,
+                        &mut col_validity,
                     ) {
                         continue; // skip malformed rows
                     }
@@ -1975,6 +1981,7 @@ impl MoteDB {
         }
 
         result.data = col_data;
+        result.validity = col_validity;
         result.num_rows = count;
         Ok(result)
     }
