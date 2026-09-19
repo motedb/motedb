@@ -89,6 +89,12 @@ impl ValidityBitmap {
         self.len
     }
 
+    /// 内部 u64 word 数（缓存记账用）。
+    #[inline]
+    pub fn words_len(&self) -> usize {
+        self.words.len()
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -248,6 +254,22 @@ pub struct ColumnVector {
 }
 
 impl ColumnVector {
+    /// 缓存预算记账用的堆字节。
+    pub fn heap_bytes(&self) -> usize {
+        let data = match &self.data {
+            ColData::I64(v) => v.len() * 8,
+            ColData::F64(v) => v.len() * 8,
+            ColData::Bool(bits) => bits.len() * 8,
+            ColData::Utf8(v) => v
+                .iter()
+                .map(|s| s.as_ptr() as usize + s.len() * 1 - s.as_ptr() as usize + 16)
+                .sum::<usize>()
+                + v.len() * 8,
+            ColData::Values(v) => v.len() * 16,
+        };
+        data + self.valid.words_len() * 8
+    }
+
     pub fn with_type_capacity(ct: &ColumnType, cap: usize) -> Self {
         let data = match ct {
             ColumnType::Integer | ColumnType::Timestamp => ColData::I64(Vec::with_capacity(cap)),
@@ -364,15 +386,23 @@ impl ColumnVector {
     }
 }
 
-/// 列批：多列向量 + 全批共享 selection。
+/// 列批：多列向量（Arc 共享 — 段缓存复用）+ 全批共享 selection。
 #[derive(Debug, Clone, Default)]
 pub struct ColumnBatch {
-    pub cols: Vec<ColumnVector>,
+    pub cols: Vec<std::sync::Arc<ColumnVector>>,
     pub sel: Option<SelectionVec>,
 }
 
 impl ColumnBatch {
     pub fn new(cols: Vec<ColumnVector>) -> Self {
+        Self {
+            cols: cols.into_iter().map(std::sync::Arc::new).collect(),
+            sel: None,
+        }
+    }
+
+    /// 已持 Arc 列的构造（段缓存复用路径 — 零深拷贝）。
+    pub fn new_shared(cols: Vec<std::sync::Arc<ColumnVector>>) -> Self {
         Self { cols, sel: None }
     }
 
@@ -380,7 +410,7 @@ impl ColumnBatch {
         Self {
             cols: cts
                 .iter()
-                .map(|ct| ColumnVector::with_type_capacity(ct, cap))
+                .map(|ct| std::sync::Arc::new(ColumnVector::with_type_capacity(ct, cap)))
                 .collect(),
             sel: None,
         }
@@ -548,8 +578,9 @@ mod tests {
         let mut b = ColumnBatch::with_types(&cts, 8);
         for i in 0..6i64 {
             let row = vec![Value::Integer(i), Value::text(format!("t{}", i))];
-            for (c, v) in b.cols.iter_mut().zip(row.iter()) {
-                assert!(c.push_value(v));
+            for (ci, c) in b.cols.iter_mut().enumerate() {
+                let cv = std::sync::Arc::get_mut(c).expect("独占");
+                assert!(cv.push_value(&row[ci]));
             }
         }
         // 过滤: 保留偶数行 {0,2,4}

@@ -15,6 +15,9 @@ enum CachedCol {
     /// per segment. Point reads of a GEOMETRY column used to decode the
     /// whole column per row (0.5ms each on a 20K-row table).
     Spatial(Arc<Vec<(crate::types::RowId, crate::types::Geometry)>>),
+    /// 🔁 VEC: 段列的批形态（M1 起 scan/agg 稳态复用 — Text 列的 Arc
+    /// 构建只在首查发生）。
+    Batch(std::sync::Arc<crate::storage::colbatch::ColumnVector>),
 }
 
 /// Max columns cached per segment. Each entry is O(rows) decoded data, so we
@@ -157,6 +160,7 @@ fn cached_col_bytes(c: &CachedCol) -> usize {
         CachedCol::Text(t) => t.heap_bytes(),
         CachedCol::Vector(v) => v.heap_bytes(),
         CachedCol::Spatial(gs) => gs.len() * 32 + 16,
+        CachedCol::Batch(b) => b.heap_bytes(),
     }
 }
 
@@ -240,6 +244,63 @@ impl Segment {
     ///
     /// 类型不匹配/压缩损坏返回 `None`（调用方回退行式路径）。
     pub fn read_column_batch(
+        &self,
+        col_idx: usize,
+        ct: &crate::types::ColumnType,
+    ) -> Option<std::sync::Arc<crate::storage::colbatch::ColumnVector>> {
+        {
+            let mut cache = self.col_cache.lock();
+            if let Some(CachedCol::Batch(b)) = cache.get(col_idx) {
+                return Some(std::sync::Arc::clone(b));
+            }
+        }
+        let built = self.build_column_batch(col_idx, ct)?;
+        let arc = std::sync::Arc::new(built);
+        self.col_cache
+            .lock()
+            .insert(col_idx, CachedCol::Batch(std::sync::Arc::clone(&arc)));
+        Some(arc)
+    }
+
+    /// 🔁 VEC: 段内 row 顺序的 composite key 列表 (跨段 newest-wins 去重用)。
+    /// 🔑 先 load_full_keys — 未加载时 key() 回退 fence 估计 (全段同值,
+    /// dedup 曾把 100 行折叠成 1)。
+    pub fn keys(&self) -> Vec<u64> {
+        let _ = self.sst.load_full_keys();
+        (0..self.row_count)
+            .map(|i| self.sst.row_map.key_opt(i).unwrap_or(0))
+            .collect()
+    }
+
+    /// 🔁 VEC: 段内行是否被墓碑标记。
+    pub fn is_row_deleted(&self, i: usize) -> bool {
+        self.sst.row_map.is_deleted(i)
+    }
+
+    /// 🔁 VEC: 段内是否存在任何墓碑。
+    pub fn has_any_deleted(&self) -> bool {
+        self.sst.row_map.has_any_deleted()
+    }
+
+    /// 🔁 VEC: 批的**活行** selection — 剔除墓碑行（DELETE tombstone flush
+    /// 进段后 deleted 位图标记; read_column_batch 的列数据仍含占位 —
+    /// 调用方必须与本 selection 相交, 否则已删行被计入 (M1 差分:
+    /// DELETE 后 COUNT 多 1)。None = 全部行有效（无删除, 快路径）。
+    pub fn live_row_selection(&self) -> Option<crate::storage::colbatch::SelectionVec> {
+        if !self.sst.row_map.has_any_deleted() {
+            return None;
+        }
+        let n = self.row_count;
+        let mut sel = crate::storage::colbatch::SelectionVec::with_capacity(n);
+        for i in 0..n {
+            if !self.sst.row_map.is_deleted(i) {
+                sel.push(i as u32);
+            }
+        }
+        Some(sel)
+    }
+
+    fn build_column_batch(
         &self,
         col_idx: usize,
         ct: &crate::types::ColumnType,

@@ -68,7 +68,7 @@ fn segment_batch_roundtrip_matches_sql() {
             .map(|c| seg.read_column_batch(c, &cts[c]))
             .collect::<Option<Vec<_>>>()
             .expect("read_column_batch 全列成功");
-        let batch = motedb::storage::colbatch::ColumnBatch::new(cols);
+        let batch = motedb::storage::colbatch::ColumnBatch::new_shared(cols);
         for i in 0..batch.row_count() {
             let r = batch.get_row(i);
             if let Value::Integer(id) = r[0] {
@@ -186,4 +186,128 @@ fn columnar_row_set_null_alignment() {
             assert!(matches!(r[4], Value::Null), "行{} ts", i);
         }
     }
+}
+
+/// VEC M1: 批聚合差分回归（含 NULL/三值逻辑/BETWEEN/OR/NOT）。
+#[test]
+fn vec_no_group_aggregate_matches_expectations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("m1.mote")).unwrap());
+    ex(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP, dev TEXT, val REAL, qty INT)",
+    );
+    for i in 1..=400i64 {
+        let (v, q) = if i % 7 == 0 {
+            ("NULL".into(), "NULL".into())
+        } else {
+            (
+                format!("{:.3}", i as f64 * 1.5 - 300.0),
+                (i % 11 - 5).to_string(),
+            )
+        };
+        ex(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({}, {}, 'dev-{:03}', {}, {})",
+                i,
+                1700000000000000 + i * 1000,
+                i % 8,
+                v,
+                q
+            ),
+        );
+    }
+    db.checkpoint().unwrap();
+
+    // 手工期望
+    let mut cnt = 0i64;
+    let mut nn = 0i64;
+    let mut fsum = 0.0f64;
+    let mut mn = f64::INFINITY;
+    let mut mx = f64::NEG_INFINITY;
+    let mut qsum = 0i64;
+    for i in 1..=400i64 {
+        cnt += 1;
+        if i % 7 != 0 {
+            let v = i as f64 * 1.5 - 300.0;
+            nn += 1;
+            fsum += v;
+            mn = mn.min(v);
+            mx = mx.max(v);
+            qsum += i % 11 - 5;
+        }
+    }
+    let r = rows(&db, "SELECT COUNT(*), COUNT(val), SUM(val), MIN(val), MAX(val), SUM(qty) FROM t");
+    assert_eq!(
+        r[0],
+        vec![
+            Value::Integer(cnt),
+            Value::Integer(nn),
+            Value::Float((fsum * 1000.0).round() / 1000.0),
+            Value::Float(mn),
+            Value::Float(mx),
+            Value::Integer(qsum),
+        ]
+    );
+
+    // WHERE + BETWEEN + OR/NOT 三值
+    let r = rows(&db, "SELECT COUNT(*), AVG(val) FROM t WHERE id BETWEEN 50 AND 350 AND qty > 0");
+    let mut w = 0i64;
+    let mut wsum = 0.0;
+    let mut wnn = 0i64;
+    for i in 50..=400 {
+        if i <= 350 && i % 7 != 0 && (i % 11 - 5) > 0 {
+            w += 1;
+            wnn += 1;
+            wsum += i as f64 * 1.5 - 300.0;
+        }
+    }
+    assert_eq!(r[0][0], Value::Integer(w));
+    match &r[0][1] {
+        Value::Float(f) => assert!((f - wsum / wnn as f64).abs() < 1e-9),
+        o => panic!("{:?}", o),
+    }
+
+    let r = rows(&db, "SELECT COUNT(*) FROM t WHERE dev = 'dev-003' OR qty IS NULL");
+    let mut orc = 0i64;
+    for i in 1..=400i64 {
+        if i % 8 == 3 || i % 7 == 0 {
+            orc += 1;
+        }
+    }
+    assert_eq!(r[0][0], Value::Integer(orc));
+
+    // NOT(val > 0): NULL 行是 UNKNOWN 被排除 — 只有非 NULL 且 <= 0 计入
+    let r = rows(&db, "SELECT COUNT(*) FROM t WHERE NOT (val > 0)");
+    let mut nc = 0i64;
+    for i in 1..=400i64 {
+        if i % 7 != 0 && (i as f64 * 1.5 - 300.0) <= 0.0 {
+            nc += 1;
+        }
+    }
+    assert_eq!(r[0][0], Value::Integer(nc), "NOT+NULL 三值语义");
+}
+
+/// fuzz seed 14 挖出的 OFFSET 点查 bug 回归。
+#[test]
+fn pk_point_query_respects_offset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("off.mote")).unwrap());
+    ex(&db, "CREATE TABLE items (id INT PRIMARY KEY, cat TEXT, val REAL, qty INT)");
+    for i in 1..=20i64 {
+        ex(
+            &db,
+            &format!("INSERT INTO items VALUES ({}, 'c{}', {}, {})", i, i % 3, i, i),
+        );
+    }
+    let r = rows(
+        &db,
+        "SELECT qty FROM items WHERE id = 1 ORDER BY val DESC LIMIT 13 OFFSET 6",
+    );
+    assert!(r.is_empty(), "OFFSET 跳过唯一匹配行 → 0 行, got {:?}", r);
+    let r = rows(&db, "SELECT qty FROM items WHERE id = 1 LIMIT 5 OFFSET 3");
+    assert!(r.is_empty());
+    let r = rows(&db, "SELECT qty FROM items WHERE id = 1 LIMIT 5");
+    assert_eq!(r.len(), 1);
 }

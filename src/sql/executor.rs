@@ -2079,6 +2079,11 @@ impl QueryExecutor {
         CURRENT_TXN_ID.with(|c| c.get().is_some())
     }
 
+    /// TLS 事务态查询（无 executor 句柄的模块用 — vector_exec 的 decline 检查）。
+    pub fn is_in_transaction_tls() -> bool {
+        CURRENT_TXN_ID.with(|c| c.get().is_some())
+    }
+
     /// Mark a transaction as active so subsequent execute() calls route writes
     /// through the transaction coordinator (buffered in write_set until commit).
     /// Called by Database::begin_transaction() to keep the executor in sync
@@ -6245,6 +6250,30 @@ impl QueryExecutor {
                 if self.db.has_col_segment_store(table_name) {
                     if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
                         let _ = store.prepare_for_query();
+                        // 🚀 VEC M1: 批扫描+批过滤+批聚合（无 GROUP BY）。
+                        // 返回 None → 下方旧融合路径原样回退。
+                        if stmt.group_by.is_none() {
+                            if let Ok(schema) = self.db.get_table_schema(table_name) {
+                                if let Some(outcome) =
+                                    crate::sql::vector_exec::try_vec_no_group_aggregate(
+                                        &store, &schema, stmt,
+                                    )?
+                                {
+                                    store.release_pages_only();
+                                    let row = outc_rows(&outcome);
+                                    return Ok(StreamingQueryResult::SelectStreaming {
+                                        columns: outcome.columns.clone(),
+                                        rows: Box::new(row.into_iter().map(Ok)),
+                                        order_by: None,
+                                        limit: None,
+                                        offset: None,
+                                        distinct: false,
+                                        max_result_rows: None,
+                                        size_hint: Some(1),
+                                    });
+                                }
+                            }
+                        }
                         if let Some(result) =
                             self.col_segment_aggregate(stmt, table_name, &store)?
                         {
@@ -9549,10 +9578,15 @@ impl QueryExecutor {
                 .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
                 .collect()
         };
-        Ok(Some(StreamingQueryResult::SelectReady {
-            columns,
-            rows: vec![result_row],
-        }))
+        // 🔑 OFFSET 语义: 单行结果也可能被整体跳过 — `WHERE id = 1 …
+        // OFFSET 3` 应返回 0 行 (此前点查快路径忽略 OFFSET, fuzz seed 14
+        // 差分对拍 SQLite 抓出)。
+        let skip = stmt.offset.unwrap_or(0);
+        let mut rows: Vec<Vec<Value>> = if skip > 0 { Vec::new() } else { vec![result_row] };
+        if let Some(l) = stmt.limit {
+            rows.truncate(l);
+        }
+        Ok(Some(StreamingQueryResult::SelectReady { columns, rows }))
     }
 
     /// 🔥 全表扫描流式（现有实现）
@@ -29893,4 +29927,9 @@ mod tests {
         );
         assert!(checked >= 1000, "row-level checks too small: {checked}");
     }
+}
+
+/// VEC M1 接线辅助：单行结果包装。
+fn outc_rows(outcome: &crate::sql::vector_exec::VecScanAggOutcome) -> Vec<Vec<Value>> {
+    vec![outcome.values.clone()]
 }

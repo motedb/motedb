@@ -5,6 +5,7 @@ pub mod lexer;
 pub mod optimizer;
 pub mod parser;
 pub mod row_converter;
+pub mod vector_exec;
 /// MoteDB Lightweight SQL Engine
 ///
 /// A zero-dependency, high-performance SQL engine designed for embedded use.
