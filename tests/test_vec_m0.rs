@@ -395,3 +395,116 @@ fn vec_group_by_matches_expectations() {
     );
     assert_eq!(r.len(), 3);
 }
+
+/// VEC M3: 批 hash equi-JOIN + GROUP BY 差分回归。
+#[test]
+fn vec_equi_join_group_by_matches_expectations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("m3.mote")).unwrap());
+    ex(&db, "CREATE TABLE ev (id INT PRIMARY KEY, dev TEXT, val REAL, qty INT)");
+    ex(&db, "CREATE TABLE sen (dev TEXT PRIMARY KEY, zone INT)");
+    for i in 1..=300i64 {
+        let (v, q) = if i % 7 == 0 {
+            ("NULL".into(), "NULL".into())
+        } else {
+            (
+                format!("{:.3}", i as f64 * 0.5),
+                (i % 11 - 5).to_string(),
+            )
+        };
+        ex(
+            &db,
+            &format!(
+                "INSERT INTO ev VALUES ({}, 'dev-{:02}', {}, {})",
+                i,
+                i % 8,
+                v,
+                q
+            ),
+        );
+    }
+    for d in 0..8i64 {
+        ex(&db, &format!("INSERT INTO sen VALUES ('dev-{:02}', {})", d, d % 3));
+    }
+    db.checkpoint().unwrap();
+
+    // 手工期望: zone=1 的 sen 设备 (dev-01, dev-04, dev-07) 与 ev 连接计数
+    let r = rows(
+        &db,
+        "SELECT e.dev, COUNT(*) FROM ev e JOIN sen s ON e.dev = s.dev \
+         WHERE s.zone = 1 GROUP BY e.dev ORDER BY e.dev",
+    );
+    let mut want: Vec<(String, i64)> = Vec::new();
+    for d in [1i64, 4, 7] {
+        let mut c = 0;
+        for i in 1..=300i64 {
+            if i % 8 == d {
+                c += 1;
+            }
+        }
+        want.push((format!("dev-{:02}", d), c));
+    }
+    assert_eq!(r.len(), want.len());
+    for (row, w) in r.iter().zip(want.iter()) {
+        assert_eq!(row[0], Value::text(w.0.clone()));
+        assert_eq!(row[1], Value::Integer(w.1));
+    }
+
+    // 组键=join 键 + AVG (NULL 语义)
+    let r = rows(
+        &db,
+        "SELECT e.dev, COUNT(*), AVG(e.val) FROM ev e JOIN sen s ON e.dev = s.dev \
+         GROUP BY e.dev ORDER BY e.dev",
+    );
+    assert_eq!(r.len(), 8);
+    for (d, row) in r.iter().enumerate() {
+        let dd = d as i64;
+        let mut nn = 0;
+        let mut sum = 0.0;
+        for i in 1..=300i64 {
+            if i % 8 == dd && i % 7 != 0 {
+                nn += 1;
+                sum += i as f64 * 0.5;
+            }
+        }
+        assert_eq!(row[0], Value::text(format!("dev-{:02}", dd)));
+        match &row[2] {
+            Value::Float(f) => assert!((f - sum / nn as f64).abs() < 1e-9),
+            o => panic!("{:?}", o),
+        }
+    }
+
+    // 整型 join 键 + 表达式组键 + 双侧 WHERE
+    ex(&db, "CREATE TABLE ev2 (id INT PRIMARY KEY, dev_id INT, v REAL)");
+    ex(&db, "CREATE TABLE sen2 (dev_id INT PRIMARY KEY, zone INT)");
+    for i in 1..=200i64 {
+        ex(
+            &db,
+            &format!("INSERT INTO ev2 VALUES ({}, {}, {})", i, i % 8, i as f64),
+        );
+    }
+    for d in 0..8i64 {
+        ex(&db, &format!("INSERT INTO sen2 VALUES ({}, {})", d, d % 3));
+    }
+    db.checkpoint().unwrap();
+    let r = rows(
+        &db,
+        "SELECT e.id % 4, COUNT(*) FROM ev2 e JOIN sen2 s ON e.dev_id = s.dev_id \
+         WHERE s.zone < 2 AND e.id > 50 GROUP BY e.id % 4 ORDER BY 1",
+    );
+    let mut want2: Vec<(i64, i64)> = Vec::new();
+    for m in 0..4i64 {
+        let mut c = 0;
+        for i in 51..=200i64 {
+            if i % 4 == m && (i % 8) % 3 < 2 {
+                c += 1;
+            }
+        }
+        want2.push((m, c));
+    }
+    assert_eq!(r.len(), 4);
+    for (row, w) in r.iter().zip(want2.iter()) {
+        assert_eq!(row[0], Value::Integer(w.0));
+        assert_eq!(row[1], Value::Integer(w.1));
+    }
+}

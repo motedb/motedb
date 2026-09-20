@@ -6197,7 +6197,6 @@ impl QueryExecutor {
                             if let Some(outcome) =
                                 crate::sql::vector_exec::try_vec_group_by(&store, &schema, stmt)?
                             {
-                                store.release_pages_only();
                                 return Ok(StreamingQueryResult::SelectReady {
                                     columns: outcome.columns,
                                     rows: outcome.rows,
@@ -6272,7 +6271,6 @@ impl QueryExecutor {
                                         &store, &schema, stmt,
                                     )?
                                 {
-                                    store.release_pages_only();
                                     let row = outc_rows(&outcome);
                                     return Ok(StreamingQueryResult::SelectStreaming {
                                         columns: outcome.columns.clone(),
@@ -14957,6 +14955,14 @@ impl QueryExecutor {
             on_condition,
         } = from
         {
+            // 🚀 VEC M3: 批 hash equi-JOIN + GROUP BY (半连接聚合形态 —
+            // 探测行命中直接折叠, 不物化 joined 行)。None → 下方原路径。
+            if let Some(outcome) = self.try_vec_equi_join_gb(stmt, left, right, on_condition)? {
+                return Ok(QueryResult::Select {
+                    columns: outcome.columns,
+                    rows: outcome.rows,
+                });
+            }
             // 🚀 Multi-way first: 3+ table left-deep chains (and JOIN +
             // GROUP BY/aggregate shapes) run successive hash joins here;
             // the nested-loop general path took minutes for bounded
@@ -17240,6 +17246,85 @@ impl QueryExecutor {
                 Some((pidx, op.clone(), lit.clone()))
             })
             .collect()
+    }
+
+    /// VEC M3 接线: 2 表 INNER equi-join + GROUP BY 形状 → 批 hash join。
+    /// 解析 ON 的等值对、两侧 store/schema, 选小侧 build。
+    fn try_vec_equi_join_gb(
+        &self,
+        stmt: &SelectStmt,
+        left: &crate::sql::ast::TableRef,
+        right: &crate::sql::ast::TableRef,
+        on_condition: &Expr,
+    ) -> Result<Option<crate::sql::vector_exec::VecJoinGbOutcome>> {
+        use crate::sql::ast::TableRef;
+        if !crate::sql::vector_exec::vec_enabled() {
+            return Ok(None);
+        }
+        let (TableRef::Table { name: lt, alias: la, .. }, TableRef::Table { name: rt, alias: ra, .. }) =
+            (left, right)
+        else {
+            return Ok(None);
+        };
+        let (Some(lschema), Some(rschema)) = (
+            self.db.get_table_schema(lt).ok(),
+            self.db.get_table_schema(rt).ok(),
+        ) else {
+            return Ok(None);
+        };
+        if !self.db.has_col_segment_store(lt) || !self.db.has_col_segment_store(rt) {
+            return Ok(None);
+        }
+        let (Some(lstore), Some(rstore)) = (
+            self.db.get_or_create_col_segment_store(lt, &[]).ok(),
+            self.db.get_or_create_col_segment_store(rt, &[]).ok(),
+        ) else {
+            return Ok(None);
+        };
+        let _ = lstore.prepare_for_query();
+        let _ = rstore.prepare_for_query();
+        // ON: 单等值对 l.col = r.col
+        let Some((lc, rc)) = self.extract_equi_join_columns(on_condition) else {
+            return Ok(None);
+        };
+        // 解析到各自 schema 的位置 + 归属别名
+        let lalias = la.clone().unwrap_or_else(|| lt.clone());
+        let ralias = ra.clone().unwrap_or_else(|| rt.clone());
+        let resolve = |c: &str, schema: &crate::types::TableSchema| -> Option<usize> {
+            if let Some((p, bare)) = c.split_once('.') {
+                let _ = p;
+                schema.get_column_position(bare)
+            } else {
+                schema.get_column_position(c)
+            }
+        };
+        let (lpos, rpos) = match (resolve(&lc, &lschema), resolve(&rc, &rschema)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Ok(None),
+        };
+        // 小侧 build (段行数和)
+        let lrows: usize = lstore.segments_snapshot().iter().map(|s| s.row_count).sum();
+        let rrows: usize = rstore.segments_snapshot().iter().map(|s| s.row_count).sum();
+        let outcome = if lrows <= rrows {
+            crate::sql::vector_exec::try_vec_equi_join_gb(
+                (&lstore, &lschema, &lalias),
+                (&rstore, &rschema, &ralias),
+                lpos,
+                rpos,
+                stmt,
+            )?
+        } else {
+            crate::sql::vector_exec::try_vec_equi_join_gb(
+                (&rstore, &rschema, &ralias),
+                (&lstore, &lschema, &lalias),
+                rpos,
+                lpos,
+                stmt,
+            )?
+        };
+        // 🔑 不调 release_pages_only — 它清空批缓存, Utf8 列每次重建
+        // 100K Arc (曾使每查询 +7ms)。批缓存受 col_cache_budget 管控。
+        Ok(outcome)
     }
 
     fn try_multi_way_inner_join(&self, stmt: &SelectStmt) -> Result<Option<QueryResult>> {
@@ -20862,7 +20947,7 @@ impl QueryExecutor {
         false
     }
 
-    fn collect_column_names_strict(expr: &Expr, out: &mut Vec<String>) -> bool {
+    pub(crate) fn collect_column_names_strict(expr: &Expr, out: &mut Vec<String>) -> bool {
         match expr {
             Expr::Column(name) => {
                 out.push(name.clone());

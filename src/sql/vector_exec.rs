@@ -193,15 +193,21 @@ impl VecPred {
     /// Expr → 批谓词。仅收列-op-字面量 / IS [NOT] NULL / AND/OR/NOT /
     /// BETWEEN（折叠为两个闭区间比较；NOT BETWEEN 是 OR 语义 → 拒收）。
     fn compile(e: &Expr, schema: &TableSchema) -> Option<VecPred> {
+        Self::compile_with_alias(e, schema, None)
+    }
+
+    /// alias 感知编译: 限定名 `<alias>.<col>` 仅在 alias 匹配时剥前缀解析
+    /// (join 的 WHERE 按表侧拆分用)。
+    fn compile_with_alias(e: &Expr, schema: &TableSchema, alias: Option<&str>) -> Option<VecPred> {
         match e {
             Expr::BinaryOp { left, op, right } => match op {
                 BinaryOperator::And => Some(VecPred::And(
-                    Box::new(Self::compile(left, schema)?),
-                    Box::new(Self::compile(right, schema)?),
+                    Box::new(Self::compile_with_alias(left, schema, alias)?),
+                    Box::new(Self::compile_with_alias(right, schema, alias)?),
                 )),
                 BinaryOperator::Or => Some(VecPred::Or(
-                    Box::new(Self::compile(left, schema)?),
-                    Box::new(Self::compile(right, schema)?),
+                    Box::new(Self::compile_with_alias(left, schema, alias)?),
+                    Box::new(Self::compile_with_alias(right, schema, alias)?),
                 )),
                 _ => {
                     if !matches!(
@@ -216,7 +222,7 @@ impl VecPred {
                         return None;
                     }
                     // 列 op 字面量（含负数字面量 UnaryOp(Minus, Literal)）
-                    let (col, lit) = Self::col_lit(left, right, schema)?;
+                    let (col, lit) = Self::col_lit(left, right, schema, alias)?;
                     Some(VecPred::Leaf(VecPredLeaf::Cmp {
                         col,
                         op: op.clone(),
@@ -227,12 +233,13 @@ impl VecPred {
             Expr::UnaryOp {
                 op: crate::sql::ast::UnaryOperator::Not,
                 expr,
-            } => Self::compile(expr, schema).map(|p| VecPred::Not(Box::new(p))),
+            } => Self::compile_with_alias(expr, schema, alias)
+                .map(|p| VecPred::Not(Box::new(p))),
             Expr::IsNull { expr, negated } => {
                 let Expr::Column(c) = expr.as_ref() else {
                     return None;
                 };
-                let pos = schema.get_column_position(c)?;
+                let pos = resolve_col_alias(c, schema, alias)?;
                 Some(VecPred::Leaf(VecPredLeaf::IsNull {
                     col: pos,
                     negated: *negated,
@@ -247,7 +254,7 @@ impl VecPred {
                 let Expr::Column(c) = expr.as_ref() else {
                     return None;
                 };
-                let pos = schema.get_column_position(c)?;
+                let pos = resolve_col_alias(c, schema, alias)?;
                 let lv = literal_of(low)?;
                 let hv = literal_of(high)?;
                 Some(VecPred::And(
@@ -267,14 +274,15 @@ impl VecPred {
         }
     }
 
-    fn col_lit(left: &Expr, right: &Expr, schema: &TableSchema) -> Option<(usize, Value)> {
+    fn col_lit(
+        left: &Expr,
+        right: &Expr,
+        schema: &TableSchema,
+        alias: Option<&str>,
+    ) -> Option<(usize, Value)> {
         if let (Expr::Column(c), r) = (left, right) {
             let lit = literal_of(r)?;
-            // 允许限定名（表内单表查询时剥前缀）
-            let bare = c.rsplit('.').next().unwrap_or(c);
-            let pos = schema
-                .get_column_position(c)
-                .or_else(|| schema.get_column_position(bare))?;
+            let pos = resolve_col_alias(c, schema, alias)?;
             return Some((pos, lit));
         }
         None
@@ -349,6 +357,19 @@ impl VecPred {
                 TV::Unknown => TV::Unknown,
             },
         }
+    }
+}
+
+/// alias 感知列解析: 裸名直接查; 限定名 `alias.col` 在 alias 匹配时剥前缀,
+/// alias 不匹配 → None (该谓词不属于这个表)。
+fn resolve_col_alias(c: &str, schema: &TableSchema, alias: Option<&str>) -> Option<usize> {
+    if let Some((p, bare)) = c.split_once('.') {
+        match alias {
+            Some(a) if a == p => schema.get_column_position(bare),
+            _ => None,
+        }
+    } else {
+        schema.get_column_position(c)
     }
 }
 
@@ -1477,12 +1498,13 @@ pub fn try_vec_group_by(
                     Some((*n as usize).wrapping_sub(1)).filter(|&p| p < out_names.len())
                 }
                 Expr::Column(cn) => {
+                    let cn_bare = cn.rsplit('.').next().unwrap_or(cn);
                     let hits: Vec<usize> = out_names
                         .iter()
                         .enumerate()
                         .filter(|(_, nm)| {
                             nm.as_str() == cn.as_str()
-                                || nm.rsplit('.').next().unwrap_or(nm) == cn.as_str()
+                                || nm.rsplit('.').next().unwrap_or(nm) == cn_bare
                         })
                         .map(|(i, _)| i)
                         .collect();
@@ -1523,3 +1545,554 @@ pub fn try_vec_group_by(
         rows,
     }))
 }
+
+// ───────────────────────── M3: 批 hash equi-JOIN ─────────────────────────
+
+/// 类型化 join 键 (与既有 hash_join_inner 的 JoinKey 同归一规则:
+/// 小整数与浮点共享 Num 位形跨类型匹配, 大整数保全 64 位)。
+#[derive(Hash, PartialEq, Eq, Debug)]
+enum JKey {
+    Num(u64),
+    Int(u64),
+    Text(std::sync::Arc<str>),
+    Bool(bool),
+}
+
+fn col_jkey(cv: &ColumnVector, i: usize) -> Option<JKey> {
+    if cv.valid.is_null(i) {
+        return None; // NULL 键永不匹配
+    }
+    const EXACT_MAX: i64 = 1i64 << 53;
+    match &cv.data {
+        ColData::I64(v) => {
+            if v[i] >= -EXACT_MAX && v[i] <= EXACT_MAX {
+                Some(JKey::Num((v[i] as f64).to_bits()))
+            } else {
+                Some(JKey::Int((v[i] as u64).wrapping_add(i64::MIN as u64)))
+            }
+        }
+        ColData::F64(v) => Some(JKey::Num(v[i].to_bits())),
+        ColData::Bool(bits) => Some(JKey::Bool((bits[i / 64] >> (i % 64)) & 1 != 0)),
+        ColData::Utf8(v) => Some(JKey::Text(std::sync::Arc::clone(&v[i]))),
+        ColData::Values(v) => match &v[i] {
+            Value::Integer(x) => {
+                if *x >= -EXACT_MAX && *x <= EXACT_MAX {
+                    Some(JKey::Num((*x as f64).to_bits()))
+                } else {
+                    Some(JKey::Int((*x as u64).wrapping_add(i64::MIN as u64)))
+                }
+            }
+            Value::Float(f) => Some(JKey::Num(f.to_bits())),
+            Value::Text(t) => Some(JKey::Text(std::sync::Arc::clone(&t.0))),
+            Value::Bool(b) => Some(JKey::Bool(*b)),
+            _ => None,
+        },
+    }
+}
+
+pub struct VecJoinGbOutcome {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// 🚀 M3 批 hash equi-JOIN + GROUP BY（半连接聚合形态）:
+/// `SELECT <探测侧键/聚合> FROM a JOIN b ON a.k = b.k [WHERE 单表谓词]
+/// [GROUP BY 探测侧键]`。
+///
+/// 小侧 build (HashMap<JKey, 匹配数>)、大侧 probe — 探测行命中后**直接折叠
+/// 进组累加器**, 不物化 joined 行 (旧路径每 joined 行一次 Vec<Value> clone —
+/// JOIN+GROUP BY @100K 16.7ms 的主成本)。SELECT 引用 build 侧非键列 /
+/// HAVING / 非 INNER → decline。
+#[allow(clippy::too_many_lines)]
+pub fn try_vec_equi_join_gb(
+    build: (&Arc<ColSegmentStore>, &TableSchema, &str), // (store, schema, alias)
+    probe: (&Arc<ColSegmentStore>, &TableSchema, &str),
+    build_key_col: usize,
+    probe_key_col: usize,
+    stmt: &SelectStmt,
+) -> Result<Option<VecJoinGbOutcome>> {
+    use std::collections::{HashMap, HashSet};
+    if !vec_enabled() || crate::sql::executor::QueryExecutor::is_in_transaction_tls() {
+        return Ok(None);
+    }
+    if stmt.having.is_some() || stmt.distinct || stmt.latest_by.is_some() {
+        return Ok(None);
+    }
+    let (bstore, bschema, balias) = build;
+    let (pstore, pschema, palias) = probe;
+    let Some(group_items) = stmt.group_by.as_ref() else {
+        return Ok(None);
+    };
+    if group_items.is_empty() || group_items.len() > 2 {
+        return Ok(None);
+    }
+
+    // ── SELECT 解析: 键 (探测侧 KeyExpr) + 聚合 ──
+    enum Out {
+        Key(usize),
+        Agg(usize),
+    }
+    let mut key_exprs: Vec<KeyExpr> = Vec::new();
+    let mut out_names: Vec<String> = Vec::new();
+    let mut out_cols: Vec<Out> = Vec::new();
+    let mut agg_specs: Vec<VecAggSpec> = Vec::new();
+    for sc in &stmt.columns {
+        match sc {
+            SelectColumn::Star => return Ok(None),
+            SelectColumn::Column(c) | SelectColumn::ColumnWithAlias(c, _) => {
+                // 🔑 探测侧普通列作组键 (bench 形状: SELECT e.device, COUNT(*)) —
+                // 剥探测别名后在探测 schema 解析; 必须匹配某 GROUP BY 项。
+                let bare = c.rsplit('.').next().unwrap_or(c);
+                let matched = group_items
+                    .iter()
+                    .any(|g| g.rsplit('.').next().unwrap_or(g) == bare || g == c);
+                if !matched || key_exprs.len() + 1 > group_items.len() {
+                    return Ok(None);
+                }
+                match resolve_col_alias(c, pschema, Some(palias))
+                    .or_else(|| pschema.get_column_position(bare))
+                {
+                    Some(pos) => {
+                        out_names.push(bare.to_string());
+                        out_cols.push(Out::Key(key_exprs.len()));
+                        key_exprs.push(KeyExpr::Col(pos));
+                    }
+                    None => return Ok(None),
+                }
+            }
+            SelectColumn::Expr(expr, alias) => {
+                if let Some((func, arg)) = parse_simple_agg(expr) {
+                    // 聚合参数必须是探测侧列
+                    let col = match arg {
+                        Some(Expr::Column(c)) => {
+                            let bare = c.rsplit('.').next().unwrap_or(c);
+                            match resolve_col_alias(c, pschema, Some(palias))
+                                .or_else(|| pschema.get_column_position(bare))
+                            {
+                                Some(p) => Some(p),
+                                None => return Ok(None),
+                            }
+                        }
+                        Some(_) => return Ok(None),
+                        None => None,
+                    };
+                    out_names.push(alias.clone().unwrap_or_else(|| {
+                        crate::sql::executor::QueryExecutor::expr_to_column_name(expr)
+                    }));
+                    out_cols.push(Out::Agg(agg_specs.len()));
+                    agg_specs.push(VecAggSpec {
+                        func,
+                        col: col.filter(|_| !matches!(func, VecAggFunc::CountStar)),
+                    });
+                } else {
+                    let name = alias.clone().unwrap_or_else(|| {
+                        crate::sql::executor::QueryExecutor::expr_to_column_name(expr)
+                    });
+                    let canonical = crate::sql::executor::QueryExecutor::expr_to_column_name(expr);
+                    let matched = group_items.iter().any(|g| g == &name || g == &canonical);
+                    if !matched || key_exprs.len() + 1 > group_items.len() {
+                        return Ok(None);
+                    }
+                    // KeyExpr 按**探测侧 schema 位置**编译 (剥探测别名)
+                    let stripped = strip_alias(expr, palias);
+                    let Some(ke) = KeyExpr::compile(&stripped, pschema) else {
+                        return Ok(None);
+                    };
+                    out_names.push(name);
+                    out_cols.push(Out::Key(key_exprs.len()));
+                    key_exprs.push(ke);
+                }
+            }
+        }
+    }
+    if key_exprs.is_empty() || agg_specs.is_empty() || key_exprs.len() != group_items.len() {
+        return Ok(None);
+    }
+
+    // ── WHERE 按表侧拆分 (AND 链叶全部可按别名归类) ──
+    let mut bpred = None;
+    let mut ppred = None;
+    if let Some(w) = &stmt.where_clause {
+        match split_where_by_alias(w, balias, palias) {
+            Some((be, pe)) => {
+                if let Some(e) = be {
+                    bpred = VecPred::compile_with_alias(&e, bschema, Some(balias));
+                }
+                if let Some(e) = pe {
+                    ppred = VecPred::compile_with_alias(&e, pschema, Some(palias));
+                }
+            }
+            None => { return Ok(None) }
+        }
+    }
+
+    // ── 需要的列 ──
+    let bcts = bschema.col_types();
+    let pcts = pschema.col_types();
+    let mut bneeded: Vec<usize> = vec![build_key_col];
+    if let Some(p) = &bpred {
+        collect_pred_cols(p, &mut bneeded);
+    }
+    bneeded.sort_unstable();
+    bneeded.dedup();
+    let mut pneeded: Vec<usize> = vec![probe_key_col];
+    if let Some(p) = &ppred {
+        collect_pred_cols(p, &mut pneeded);
+    }
+    for ke in &key_exprs {
+        ke.collect_cols(&mut pneeded);
+    }
+    for sp in &agg_specs {
+        if let Some(c) = sp.col {
+            pneeded.push(c);
+        }
+    }
+    pneeded.sort_unstable();
+    pneeded.dedup();
+    if bneeded
+        .iter()
+        .chain(pneeded.iter())
+        .any(|&c| matches!(bcts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
+        || pneeded
+            .iter()
+            .any(|&c| matches!(pcts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
+    {
+        return Ok(None);
+    }
+    let mut bpred = bpred;
+    if let Some(p) = bpred.as_mut() {
+        remap_pred(p, &bneeded);
+    }
+    let mut ppred = ppred;
+    if let Some(p) = ppred.as_mut() {
+        remap_pred(p, &pneeded);
+    }
+    for sp in agg_specs.iter_mut() {
+        if let Some(c) = sp.col.as_mut() {
+            if let Some(i) = pneeded.iter().position(|&x| x == *c) {
+                *c = i;
+            }
+        }
+    }
+    let key_remap = |c: usize| -> usize {
+        pneeded.iter().position(|&x| x == c).unwrap_or(0)
+    };
+
+    // 段门 (与 M1/M2 相同): 墓碑/多段 decline
+    let _ = bstore.flush_buffer();
+    let bsegs = bstore.segments_snapshot();
+    if bsegs.iter().any(|s| s.has_any_deleted()) || bsegs.len() > 1 {
+        return Ok(None);
+    }
+    let _ = pstore.flush_buffer();
+    let psegs = pstore.segments_snapshot();
+    if psegs.iter().any(|s| s.has_any_deleted()) || psegs.len() > 1 {
+        return Ok(None);
+    }
+
+    // ── build 侧: 扫描 + 过滤 + HashMap<JKey, 匹配数> ──
+    let mut table: HashMap<JKey, u64> = HashMap::new();
+    for seg in &bsegs {
+        let n = seg.row_count;
+        if n == 0 {
+            continue;
+        }
+        let mut cols: Vec<std::sync::Arc<ColumnVector>> = Vec::with_capacity(bneeded.len());
+        for &c in &bneeded {
+            let Some(cv) = seg.read_column_batch(c, &bcts[c]) else {
+                return Ok(None);
+            };
+            cols.push(cv);
+        }
+        let batch = ColumnBatch::new_shared(cols);
+        let bkey_idx = bneeded.iter().position(|&x| x == build_key_col).unwrap_or(0);
+        let rows: Vec<u32> = match &bpred {
+            Some(p) => {
+                let mut chain: Vec<&VecPredLeaf> = Vec::new();
+                if p.as_and_chain(&mut chain) {
+                    let mut sel = Vec::with_capacity(n);
+                    for i in 0..n {
+                        if chain.iter().all(|l| leaf_tv_leaf(&batch.cols, l, i) == TV::True) {
+                            sel.push(i as u32);
+                        }
+                    }
+                    sel
+                } else {
+                    p.eval_sel(&batch).into_inner()
+                }
+            }
+            None => (0..n as u32).collect(),
+        };
+        for r in rows {
+            let i = r as usize;
+            if let Some(k) = col_jkey(&batch.cols[bkey_idx], i) {
+                *table.entry(k).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // ── probe 侧: 扫描 + 过滤 + 命中直接折叠 ──
+    let pkey_idx = pneeded.iter().position(|&x| x == probe_key_col).unwrap_or(0);
+    // 🔑 组键==join 键列 → JKey 组 (每行一次 hash); 单键 → Value 组;
+    // 多键 → Vec<Value> 组。
+    let group_is_join_key = key_exprs.len() == 1
+        && matches!(&key_exprs[0], KeyExpr::Col(c) if key_remap(*c) == pkey_idx);
+    let mut groups_j: HashMap<JKey, (Option<Value>, Vec<VecAcc>)> = HashMap::new();
+    let mut groups_1: std::collections::HashMap<Value, Vec<VecAcc>> = std::collections::HashMap::new();
+    let mut groups_v: HashMap<Vec<Value>, Vec<VecAcc>> = HashMap::new();
+    let single_key = key_exprs.len() == 1;
+    for seg in &psegs {
+        let n = seg.row_count;
+        if n == 0 {
+            continue;
+        }
+        let mut cols: Vec<std::sync::Arc<ColumnVector>> = Vec::with_capacity(pneeded.len());
+        for &c in &pneeded {
+            let Some(cv) = seg.read_column_batch(c, &pcts[c]) else {
+                return Ok(None);
+            };
+            cols.push(cv);
+        }
+        let batch = ColumnBatch::new_shared(cols);
+        let rows: Vec<u32> = match &ppred {
+            Some(p) => {
+                let mut chain: Vec<&VecPredLeaf> = Vec::new();
+                if p.as_and_chain(&mut chain) {
+                    let mut sel = Vec::with_capacity(n);
+                    for i in 0..n {
+                        if chain.iter().all(|l| leaf_tv_leaf(&batch.cols, l, i) == TV::True) {
+                            sel.push(i as u32);
+                        }
+                    }
+                    sel
+                } else {
+                    p.eval_sel(&batch).into_inner()
+                }
+            }
+            None => (0..n as u32).collect(),
+        };
+        for r in rows {
+            let i = r as usize;
+            let k = col_jkey(&batch.cols[pkey_idx], i);
+            let matches = match &k {
+                Some(k) => table.get(k).copied().unwrap_or(0),
+                None => 0,
+            };
+            if matches == 0 {
+                continue;
+            }
+            // 🔑 组键 == join 键列 (bench 形状: SELECT e.device … ON e.device):
+            // 直接以 JKey 为组标识 — 每行只做这一次字符串 hash
+            // (分别对 join 键和组键各 hash 一次曾比旧路径还慢)。
+            if group_is_join_key {
+                let e = groups_j
+                    .entry(k.unwrap())
+                    .or_insert_with(|| (key_exprs[0].eval(&batch, i, &key_remap), agg_specs.iter().map(|_| VecAcc::default()).collect::<Vec<_>>()));
+                for _ in 0..matches {
+                    fold_row(&mut (e.1)[..], &agg_specs, &batch.cols, i);
+                }
+                continue;
+            }
+            if single_key {
+                if let Some(kv) = key_exprs[0].eval_i64(&batch, i, &key_remap) {
+                    let accs = groups_1
+                        .entry(Value::Integer(kv))
+                        .or_insert_with(|| agg_specs.iter().map(|_| VecAcc::default()).collect());
+                    for _ in 0..matches {
+                        fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                    }
+                    continue;
+                }
+                if let Some(kv) = key_exprs[0].eval(&batch, i, &key_remap) {
+                    let accs = groups_1
+                        .entry(kv)
+                        .or_insert_with(|| agg_specs.iter().map(|_| VecAcc::default()).collect());
+                    for _ in 0..matches {
+                        fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                    }
+                    continue;
+                }
+                return Ok(None);
+            }
+            let mut key = Vec::with_capacity(key_exprs.len());
+            for ke in &key_exprs {
+                match ke.eval(&batch, i, &key_remap) {
+                    Some(v) => key.push(v),
+                    None => return Ok(None),
+                }
+            }
+            let accs = groups_v
+                .entry(key)
+                .or_insert_with(|| agg_specs.iter().map(|_| VecAcc::default()).collect());
+            for _ in 0..matches {
+                fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+            }
+        }
+    }
+
+    // ── 输出 (与 M2 相同: 双表合并 + ORDER BY + LIMIT) ──
+    let mut merged: Vec<(Vec<Value>, Vec<VecAcc>)> = groups_v.into_iter().collect();
+    for (k, accs) in groups_1 {
+        merged.push((vec![k], accs));
+    }
+    for (_k, (disp, accs)) in groups_j {
+        if let Some(d) = disp {
+            merged.push((vec![d], accs));
+        }
+    }
+    let mut rows: Vec<Vec<Value>> = merged
+        .into_iter()
+        .map(|(keys, accs)| {
+            out_cols
+                .iter()
+                .map(|c| match c {
+                    Out::Key(i) => keys[*i].clone(),
+                    Out::Agg(i) => accs[*i].finalize(agg_specs[*i].func),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if let Some(ref ob) = stmt.order_by {
+        let mut specs: Vec<(usize, bool)> = Vec::new();
+        for oe in ob {
+            let hit = match &oe.expr {
+                Expr::Literal(Value::Integer(nx)) if *nx >= 1 => {
+                    Some((*nx as usize).wrapping_sub(1)).filter(|&p| p < out_names.len())
+                }
+                Expr::Column(cn) => {
+                    let cn_bare = cn.rsplit('.').next().unwrap_or(cn);
+                    let hits: Vec<usize> = out_names
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, nm)| {
+                            nm.as_str() == cn.as_str()
+                                || nm.rsplit('.').next().unwrap_or(nm) == cn_bare
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if hits.len() == 1 {
+                        Some(hits[0])
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let Some(p) = hit else {
+                return Ok(None);
+            };
+            specs.push((p, oe.asc));
+        }
+        if !specs.is_empty() {
+            rows.sort_by(|a, b| {
+                for &(i, asc) in &specs {
+                    let c = crate::storage::colbatch::colbatch_order_cmp(&a[i], &b[i]);
+                    if c != std::cmp::Ordering::Equal {
+                        return if asc { c } else { c.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+    }
+    let offset = stmt.offset.unwrap_or(0);
+    if offset > 0 {
+        rows.drain(..offset.min(rows.len()));
+    }
+    if let Some(l) = stmt.limit {
+        rows.truncate(l);
+    }
+    Ok(Some(VecJoinGbOutcome {
+        columns: out_names,
+        rows,
+    }))
+}
+
+/// WHERE 按表侧拆分: AND 链叶按列前缀 (alias) 归类到两侧; 叶引用裸名
+/// (无前缀) 或跨侧 → None (整体 decline — 保守)。
+fn split_where_by_alias(
+    e: &Expr,
+    balias: &str,
+    palias: &str,
+) -> Option<(Option<Expr>, Option<Expr>)> {
+    fn leaves(e: &Expr, out: &mut Vec<Expr>) {
+        if let Expr::BinaryOp {
+            left,
+            op: crate::sql::ast::BinaryOperator::And,
+            right,
+        } = e
+        {
+            leaves(left, out);
+            leaves(right, out);
+        } else {
+            out.push(e.clone());
+        }
+    }
+    let mut ls: Vec<Expr> = Vec::new();
+    leaves(e, &mut ls);
+    let mut bside: Vec<Expr> = Vec::new();
+    let mut pside: Vec<Expr> = Vec::new();
+    for leaf in ls {
+        let mut cols: Vec<String> = Vec::new();
+        if !crate::sql::executor::QueryExecutor::collect_column_names_strict(&leaf, &mut cols) {
+            return None;
+        }
+        if cols.is_empty() {
+            return None; // 纯常量叶 — 保守 decline
+        }
+        let all_b = cols.iter().all(|c| {
+            c.split_once('.').map(|(p, _)| p == balias).unwrap_or(false)
+        });
+        let all_p = cols.iter().all(|c| {
+            c.split_once('.').map(|(p, _)| p == palias).unwrap_or(false)
+        });
+        if all_b {
+            bside.push(leaf);
+        } else if all_p {
+            pside.push(leaf);
+        } else {
+            return None; // 裸名/跨侧
+        }
+    }
+    let join = |mut v: Vec<Expr>| -> Option<Expr> {
+        if v.is_empty() {
+            return None;
+        }
+        while v.len() > 1 {
+            let r = v.pop().unwrap();
+            let l = v.pop().unwrap();
+            v.push(Expr::BinaryOp {
+                left: Box::new(l),
+                op: crate::sql::ast::BinaryOperator::And,
+                right: Box::new(r),
+            });
+        }
+        Some(v.pop().unwrap())
+    };
+    Some((join(bside), join(pside)))
+}
+
+/// 剥表达式中的 `<alias>.` 前缀 (KeyExpr 在探测侧 schema 上编译用)。
+fn strip_alias(e: &Expr, alias: &str) -> Expr {
+    match e {
+        Expr::Column(c) => {
+            if let Some((p, bare)) = c.split_once('.') {
+                if p == alias {
+                    return Expr::Column(bare.to_string());
+                }
+            }
+            e.clone()
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(strip_alias(left, alias)),
+            op: op.clone(),
+            right: Box::new(strip_alias(right, alias)),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(strip_alias(expr, alias)),
+        },
+        _ => e.clone(),
+    }
+}
+
