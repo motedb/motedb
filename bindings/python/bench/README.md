@@ -1093,3 +1093,33 @@ DDL/大事务/恢复全部健康 (CREATE INDEX 22ms、ALTER 28ms、单事务 30K
 回归: round13 Rust 回归 17/17 (新增双表达式组键 + 计算键 join) + fuzz 8
 seed 全绿 + GROUP BY 表达式差分 10/10 + 非等值 ON 差分 5/5 + 全量 229 bin
 EXIT=0 + E2E 51/51。
+
+## VEC M4 — 排序/输出边界: top-k 缺口五连修 (100K×384 ev 表)
+
+`sample` 采样定位三条验收线的热点后发现: 全表投影 46.5ms 中 **Python 边界
+(dict 构造+释放) 占 ~60-80%、存储扫描仅 ~19%**; `ORDER BY ts LIMIT k` 慢 22×
+不是扫描慢, 是快路径的 `is_numeric` 白名单漏了 Timestamp; 深分页慢是整序后
+丢弃。修复:
+
+| # | 形状 (@100K) | 前 | 后 | 修复 |
+|---|---|---|---|---|
+| 1 | `ORDER BY ts DESC LIMIT 10` | 11.7ms | **0.49ms** (24×) | top-k 快路径 is_numeric 补 Timestamp (i64 micros 本就是定宽) |
+| 2 | `ORDER BY id LIMIT 100 OFFSET 99800` | 21.7ms | **4.5ms** (4.8×, 目标"减半") | top-k 支持 OFFSET: k=offset+limit 有界选择, 只解码最终页 |
+| 3 | `WHERE ts>=? ORDER BY ts LIMIT 100` | 22.5ms | **0.69ms** (33×) | `try_vec_filter_topk` (MOTE_VEC=on): 批谓词 + typed 键 select_nth, 只解码 K 行 |
+| 4 | `SELECT 5 列` 全表 (execute dicts) | 46.5ms | **27ms** (1.7×) | `try_vec_projection` 批投影 (Rust 扫描 ~10→4ms) + Python 边界重写 |
+| 5 | top-k val (基准线) | 0.52ms | 0.53ms | 持平 ✓ |
+
+Python 边界重写 (bindings, 不受 MOTE_VEC 门控, 所有 execute()/query() 受益):
+- 列名 PyString **每查询创建一次**并复用 — 旧行为每 (行,列) 一次
+  PyUnicode_New + str hash, 100K×5 结果 = 500K 次冗余构造 (CPython 把 hash
+  缓存在对象内, 复用 key 对象即免重复 hash)
+- TEXT 值驻留缓存 (FxHash, 上限 8192 项): 低基数列 (device/enum) 千行映射
+  到 handful 个 PyString; 唯一值列只付一次 hash 查找
+
+`SELECT 5 列` 27ms 已近 dict-per-row API 地板 (纯 CPython 构造 100K×5 键
+dict = 11.6ms + 400K 个值对象创建 ~15ms); `db.query()` 元组路径同 26.6ms —
+差异已被值转换成本吞没。大结果如需更低延迟需列式返回 API (后续另议)。
+
+验证: A/B 16 形状 (vec on/off) 行集+顺序全等 + test_vec_m4 4/4 (投影/top-k
+对拍 SQL、Timestamp 类型、墓碑 decline) + fuzz 4 seed × (on/off) + bigtable
+重开 reopen_diverge=0 (on) + E2E 51/51 + CLI 17/17 + ACID 22/22。

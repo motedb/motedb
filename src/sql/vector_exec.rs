@@ -2096,3 +2096,488 @@ fn strip_alias(e: &Expr, alias: &str) -> Expr {
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
+// M4a: 批投影 — SELECT 纯列 [WHERE] [LIMIT/OFFSET] 的批输出边界
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 批投影：列批直读（段缓存复用）→ 可见性/谓词 selection → 边界一次行拼装，
+/// LIMIT/OFFSET 在拼装前生效（budget = offset+limit，跨段提前终止）。
+/// 返回 None → 旧 scan_projected_filtered 路径原样回退。
+///
+/// 🔑 行序精确复刻 `scan_projected_filtered`（分页依赖顺序一致）：
+/// 段 new→old（`.rev()`）；段内 need_dedup（多段 ∨ 可能重复键）时 index
+/// 降序 + newest-wins 去重（seen 先于墓碑检查 — 墓碑压制旧版本），
+/// 否则升序 0..n。单段无 dedup 时跳过 load_full_keys（旧路径每查询必做）。
+pub fn try_vec_projection(
+    store: &ColSegmentStore,
+    schema: &TableSchema,
+    select_cols: &[SelectColumn],
+    where_clause: Option<&Expr>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    if !vec_enabled() {
+        return Ok(None);
+    }
+    // 🔑 事务 read-your-writes：段批看不到 write_set 未提交行 → decline。
+    if crate::sql::executor::QueryExecutor::is_in_transaction_tls() {
+        return Ok(None);
+    }
+    let cts = schema.col_types();
+
+    let mut pred = match where_clause {
+        Some(w) => match VecPred::compile(w, schema) {
+            Some(p) => Some(p),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+
+    // 投影解析：仅纯列（含限定名 `t.col`）；单 Star → 全列；表达式列 decline。
+    let mut proj: Vec<usize> = Vec::new();
+    for sc in select_cols {
+        match sc {
+            SelectColumn::Star => proj.extend(0..schema.columns.len()),
+            SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => {
+                let bare = if n.contains('.') {
+                    n.rsplit('.').next().unwrap_or(n)
+                } else {
+                    n
+                };
+                match schema.get_column_position(bare) {
+                    Some(p) => proj.push(p),
+                    None => return Ok(None),
+                }
+            }
+            SelectColumn::Expr(_, _) => return Ok(None),
+        }
+    }
+    if proj.is_empty() {
+        return Ok(None);
+    }
+
+    // needed = 谓词列 ∪ 投影列（批只装载这些）；Tensor/Spatial decline。
+    let mut needed: Vec<usize> = Vec::new();
+    if let Some(p) = &pred {
+        collect_pred_cols(p, &mut needed);
+    }
+    needed.extend_from_slice(&proj);
+    needed.sort_unstable();
+    needed.dedup();
+    if needed
+        .iter()
+        .any(|&c| matches!(cts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
+    {
+        return Ok(None);
+    }
+    // 谓词叶列位 → 批内相对位（M1 教训：按 schema 位索引批列会越界）。
+    if let Some(p) = pred.as_mut() {
+        remap_pred(p, &needed);
+    }
+    // 投影列的批内位 + Timestamp 语义标记（I64 批需包装回 Value::Timestamp）。
+    let proj_meta: Vec<(usize, bool)> = proj
+        .iter()
+        .map(|&p| {
+            let bi = needed.iter().position(|&x| x == p).expect("proj in needed");
+            (bi, matches!(cts.get(p), Some(ColumnType::Timestamp)))
+        })
+        .collect();
+
+    let limit_v = limit.unwrap_or(usize::MAX);
+    let budget = offset.saturating_add(limit_v);
+    let mut rows_out: Vec<Vec<Value>> = Vec::new();
+
+    let _ = store.flush_buffer();
+    let segments = store.segments_snapshot();
+    // 🔑 与 M1 相同的保守门：任一段含墓碑 → decline（事务回滚 undo 双写
+    // 可能使段发散；DELETE 场景走旧路径）。
+    if segments.iter().any(|s| s.has_any_deleted()) {
+        return Ok(None);
+    }
+    let need_dedup = segments.len() > 1 || store.may_have_duplicate_keys();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    'outer: for seg in segments.iter().rev() {
+        let n = seg.row_count;
+        if n == 0 {
+            continue;
+        }
+        let mut cols: Vec<std::sync::Arc<ColumnVector>> = Vec::with_capacity(needed.len());
+        for &c in &needed {
+            let Some(cv) = seg.read_column_batch(c, &cts[c]) else {
+                return Ok(None); // 读取失败（压缩等）→ 回退
+            };
+            cols.push(cv);
+        }
+        let batch = ColumnBatch::new_shared(cols);
+
+        // 可见性 selection（行序语义见函数注释）。
+        let vis: Vec<u32> = if !need_dedup {
+            (0..n)
+                .filter(|&i| !seg.is_row_deleted(i))
+                .map(|i| i as u32)
+                .collect()
+        } else {
+            let keys = seg.keys();
+            let mut v: Vec<u32> = Vec::with_capacity(n);
+            for i in (0..n).rev() {
+                if !seen.insert(keys[i]) {
+                    continue;
+                }
+                if seg.is_row_deleted(i) {
+                    continue;
+                }
+                v.push(i as u32);
+            }
+            v
+        };
+        // 谓词过滤（AND 链单遍短路；混合形状 selection∩vis）。
+        let filtered: Vec<u32> = match &pred {
+            None => vis,
+            Some(p) => {
+                let mut chain: Vec<&VecPredLeaf> = Vec::new();
+                if p.as_and_chain(&mut chain) {
+                    vis.into_iter()
+                        .filter(|&r| {
+                            chain
+                                .iter()
+                                .all(|l| leaf_tv_leaf(&batch.cols, l, r as usize) == TV::True)
+                        })
+                        .collect()
+                } else {
+                    let set: std::collections::HashSet<u32> =
+                        p.eval_sel(&batch).iter().collect();
+                    vis.into_iter().filter(|r| set.contains(r)).collect()
+                }
+            }
+        };
+        // 边界行拼装（budget 内）。
+        for r in filtered {
+            if rows_out.len() >= budget {
+                break 'outer;
+            }
+            let i = r as usize;
+            let row: Vec<Value> = proj_meta
+                .iter()
+                .map(|&(bi, is_ts)| {
+                    let cv = &batch.cols[bi];
+                    if is_ts {
+                        crate::storage::colbatch::i64_vec_as_timestamp(cv, i)
+                    } else {
+                        cv.get(i)
+                    }
+                })
+                .collect();
+            rows_out.push(row);
+        }
+    }
+    // LIMIT/OFFSET：拼装后的最后一跳（budget 已限总量）。
+    if offset > 0 {
+        rows_out.drain(..offset.min(rows_out.len()));
+    }
+    if rows_out.len() > limit_v {
+        rows_out.truncate(limit_v);
+    }
+    Ok(Some(rows_out))
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// M4b: 过滤 top-k — WHERE + ORDER BY 单数值键 + LIMIT/OFFSET
+// ═══════════════════════════════════════════════════════════════════════
+
+/// f64 → 全序 u64 键（NaN 安全；与 top_k_row_indices_typed 同编码）。
+#[inline]
+fn f64_ord_key(v: f64) -> u64 {
+    let bits = v.to_bits();
+    if bits & (1u64 << 63) != 0 {
+        !bits
+    } else {
+        bits ^ (1u64 << 63)
+    }
+}
+
+/// 批过滤 top-k：谓词批求值 → 命中行的排序键 typed 提取 → select_nth
+/// 取前 k → 只对 K 行做边界行拼装（ORDER BY + LIMIT 的 dashboard 形状：
+/// WHERE ts >= ? ORDER BY ts LIMIT 100 — 旧路径解码全部命中行的全部投影列
+/// 再全排序）。k = offset+limit 支持深分页，拼装时跳过 offset。
+///
+/// 语义对齐 `top_k_row_indices_typed`：NULL 排最前(ASC)/最后(DESC)；
+/// DESC 用 `u64::MAX - key` 翻转；i64 用符号位翻转直接比。
+pub fn try_vec_filter_topk(
+    store: &ColSegmentStore,
+    schema: &TableSchema,
+    stmt: &SelectStmt,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    if !vec_enabled() {
+        return Ok(None);
+    }
+    if crate::sql::executor::QueryExecutor::is_in_transaction_tls() {
+        return Ok(None);
+    }
+    if stmt.distinct || stmt.group_by.is_some() || stmt.having.is_some() || stmt.latest_by.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(w) = &stmt.where_clause else {
+        return Ok(None); // 无 WHERE 走既有 top_k_row_indices_typed 快路径
+    };
+    // 单一 ORDER BY 键、纯列（含限定名）、数值/Timestamp。
+    let Some(ob) = stmt.order_by.as_ref() else {
+        return Ok(None);
+    };
+    if ob.len() != 1 {
+        return Ok(None);
+    }
+    let obe = &ob[0];
+    let Expr::Column(cn) = &obe.expr else {
+        return Ok(None);
+    };
+    let bare = cn.rsplit('.').next().unwrap_or(cn);
+    let Some(order_col) = schema.get_column_position(bare) else {
+        return Ok(None);
+    };
+    let desc = !obe.asc;
+    let cts = schema.col_types();
+    let key_float = matches!(cts.get(order_col), Some(ColumnType::Float));
+    let key_ok = matches!(
+        cts.get(order_col),
+        Some(
+            ColumnType::Integer
+                | ColumnType::Float
+                | ColumnType::Boolean
+                | ColumnType::Timestamp
+        )
+    );
+    if !key_ok {
+        return Ok(None);
+    }
+    let Some(page) = stmt.limit else {
+        return Ok(None);
+    };
+    let offset = stmt.offset.unwrap_or(0);
+    if page == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let k = page.saturating_add(offset);
+    if k > 1_000_000 {
+        return Ok(None);
+    }
+
+    let Some(mut pred) = VecPred::compile(w, schema) else {
+        return Ok(None);
+    };
+
+    // 投影解析（同 try_vec_projection）。
+    let mut proj: Vec<usize> = Vec::new();
+    for sc in &stmt.columns {
+        match sc {
+            SelectColumn::Star => proj.extend(0..schema.columns.len()),
+            SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => {
+                let bare = if n.contains('.') {
+                    n.rsplit('.').next().unwrap_or(n)
+                } else {
+                    n
+                };
+                let Some(p) = schema.get_column_position(bare) else {
+                    return Ok(None);
+                };
+                proj.push(p);
+            }
+            SelectColumn::Expr(_, _) => return Ok(None),
+        }
+    }
+    if proj.is_empty() {
+        return Ok(None);
+    }
+
+    let mut needed: Vec<usize> = Vec::new();
+    collect_pred_cols(&pred, &mut needed);
+    needed.push(order_col);
+    needed.extend_from_slice(&proj);
+    needed.sort_unstable();
+    needed.dedup();
+    if needed
+        .iter()
+        .any(|&c| matches!(cts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
+    {
+        return Ok(None);
+    }
+    remap_pred(&mut pred, &needed);
+    let Some(order_bi) = needed.iter().position(|&x| x == order_col) else {
+        return Ok(None);
+    };
+    let mut proj_meta: Vec<(usize, bool)> = Vec::with_capacity(proj.len());
+    for &p in &proj {
+        let Some(bi) = needed.iter().position(|&x| x == p) else {
+            return Ok(None);
+        };
+        proj_meta.push((bi, matches!(cts.get(p), Some(ColumnType::Timestamp))));
+    }
+
+    let _ = store.flush_buffer();
+    let segments = store.segments_snapshot();
+    if segments.iter().any(|s| s.has_any_deleted()) {
+        return Ok(None);
+    }
+    let need_dedup = segments.len() > 1 || store.may_have_duplicate_keys();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    // (ord_key, seg_idx, row) — 全命中行入表，select_nth 取前 k。
+    let mut entries: Vec<(u64, u32, u32)> = Vec::new();
+    for (sidx, seg) in segments.iter().enumerate() {
+        let n = seg.row_count;
+        if n == 0 {
+            continue;
+        }
+        let mut cols: Vec<std::sync::Arc<ColumnVector>> = Vec::with_capacity(needed.len());
+        for &c in &needed {
+            let Some(cv) = seg.read_column_batch(c, &cts[c]) else {
+                return Ok(None);
+            };
+            cols.push(cv);
+        }
+        let batch = ColumnBatch::new_shared(cols);
+        let vis: Vec<u32> = if !need_dedup {
+            (0..n)
+                .filter(|&i| !seg.is_row_deleted(i))
+                .map(|i| i as u32)
+                .collect()
+        } else {
+            let keys = seg.keys();
+            let mut v: Vec<u32> = Vec::with_capacity(n);
+            for i in (0..n).rev() {
+                if !seen.insert(keys[i]) {
+                    continue;
+                }
+                if seg.is_row_deleted(i) {
+                    continue;
+                }
+                v.push(i as u32);
+            }
+            v
+        };
+        let filtered: Vec<u32> = {
+            let mut chain: Vec<&VecPredLeaf> = Vec::new();
+            if pred.as_and_chain(&mut chain) {
+                vis.into_iter()
+                    .filter(|&r| {
+                        chain
+                            .iter()
+                            .all(|l| leaf_tv_leaf(&batch.cols, l, r as usize) == TV::True)
+                    })
+                    .collect()
+            } else {
+                let set: std::collections::HashSet<u32> = pred.eval_sel(&batch).iter().collect();
+                vis.into_iter().filter(|r| set.contains(r)).collect()
+            }
+        };
+        let kc = &batch.cols[order_bi];
+        for r in filtered {
+            let i = r as usize;
+            let ord_key: u64 = match &kc.data {
+                crate::storage::colbatch::ColData::F64(vs) => {
+                    match (kc.valid.is_valid(i)).then(|| vs[i]) {
+                        Some(v) => {
+                            if desc {
+                                u64::MAX - f64_ord_key(v)
+                            } else {
+                                f64_ord_key(v)
+                            }
+                        }
+                        // 🔑 NULL 排最前(ASC)/最后(DESC) — 同引擎级语义。
+                        None => {
+                            if desc {
+                                u64::MAX
+                            } else {
+                                u64::MIN
+                            }
+                        }
+                    }
+                }
+                crate::storage::colbatch::ColData::I64(vs) => {
+                    match (kc.valid.is_valid(i)).then(|| vs[i]) {
+                        Some(v) => {
+                            if desc {
+                                !(v as u64 ^ (1u64 << 63))
+                            } else {
+                                v as u64 ^ (1u64 << 63)
+                            }
+                        }
+                        None => {
+                            if desc {
+                                u64::MAX
+                            } else {
+                                u64::MIN
+                            }
+                        }
+                    }
+                }
+                // Bool 位图列按布尔序（false<true）折算 i64 键。
+                crate::storage::colbatch::ColData::Bool(_) => {
+                    let b = kc.get(i);
+                    let v = match b {
+                        Value::Bool(x) => x as i64,
+                        _ => 0,
+                    };
+                    if desc {
+                        !(v as u64 ^ (1u64 << 63))
+                    } else {
+                        v as u64 ^ (1u64 << 63)
+                    }
+                }
+                _ => {
+                    if desc {
+                        u64::MAX
+                    } else {
+                        u64::MIN
+                    }
+                }
+            };
+            entries.push((ord_key, sidx as u32, r));
+        }
+    }
+    if entries.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let k_actual = k.min(entries.len());
+    if k_actual < entries.len() {
+        entries.select_nth_unstable_by(k_actual - 1, |a, b| a.0.cmp(&b.0));
+    }
+    entries.truncate(k_actual);
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    // 只对 K 行拼装（read_column_batch 已入段缓存，二次读取零解压）。
+    let mut rows_out: Vec<Vec<Value>> = Vec::with_capacity(page.min(k_actual));
+    let mut batches: Vec<Option<ColumnBatch>> = vec![None; segments.len()];
+    for idx in offset..k_actual {
+        let (_, sidx, r) = entries[idx];
+        let si = sidx as usize;
+        if batches[si].is_none() {
+            let seg = &segments[si];
+            let mut cols: Vec<std::sync::Arc<ColumnVector>> = Vec::with_capacity(needed.len());
+            for &c in &needed {
+                let Some(cv) = seg.read_column_batch(c, &cts[c]) else {
+                    return Ok(None);
+                };
+                cols.push(cv);
+            }
+            batches[si] = Some(ColumnBatch::new_shared(cols));
+        }
+        let batch = batches[si].as_ref().expect("just set");
+        let i = r as usize;
+        let row: Vec<Value> = proj_meta
+            .iter()
+            .map(|&(bi, is_ts)| {
+                let cv = &batch.cols[bi];
+                if is_ts {
+                    crate::storage::colbatch::i64_vec_as_timestamp(cv, i)
+                } else {
+                    cv.get(i)
+                }
+            })
+            .collect();
+        rows_out.push(row);
+    }
+    Ok(Some(rows_out))
+}

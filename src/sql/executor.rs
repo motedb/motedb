@@ -10428,6 +10428,28 @@ impl QueryExecutor {
         let limit = stmt.limit.unwrap_or(usize::MAX);
         let offset = stmt.offset.unwrap_or(0);
 
+        // 🚀 VEC M4: 批投影 — 纯列 SELECT [WHERE] [LIMIT/OFFSET]，列批直读
+        // + 边界一次行拼装 + LIMIT 前置截断。返回 None → 原路径回退。
+        if stmt.group_by.is_none()
+            && stmt.order_by.is_none()
+            && !stmt.distinct
+            && stmt.latest_by.is_none()
+        {
+            if let Some(rows) = crate::sql::vector_exec::try_vec_projection(
+                store,
+                schema,
+                &stmt.columns,
+                where_clause.as_ref(),
+                stmt.limit,
+                offset,
+            )? {
+                return Ok(StreamingQueryResult::SelectReady {
+                    columns,
+                    rows,
+                });
+            }
+        }
+
         // IN (literal list) HashSet fast path: avoid O(rows × list_len) linear scan.
         // For `WHERE col IN (v1, v2, ...)`, build a HashSet once and do O(1) lookup per row.
         let in_hashset: Option<(usize /*col_pos*/, std::collections::HashSet<Value>)> =
@@ -10810,6 +10832,17 @@ impl QueryExecutor {
             });
         }
 
+        // 🚀 VEC M4b: 批过滤 top-k — WHERE（批谓词）+ ORDER BY 单数值/Timestamp
+        // 键 + LIMIT/OFFSET：命中行只提排序键，select_nth 取前 k，只对最终
+        // 页行做投影解码（旧路径解码全部命中行的全部投影列再全排序）。
+        if where_clause.is_some() && stmt.order_by.is_some() && stmt.limit.is_some() {
+            if let Some(rows) =
+                crate::sql::vector_exec::try_vec_filter_topk(store, schema, stmt)?
+            {
+                return Ok(StreamingQueryResult::SelectReady { columns, rows });
+            }
+        }
+
         // 🚀 ORDER BY + LIMIT fast path: if ORDER BY is on a single numeric
         // column with a small LIMIT and no WHERE (or a simple text-eq WHERE),
         // use top_k_row_indices to scan only the sort column (bounded heap),
@@ -10840,7 +10873,6 @@ impl QueryExecutor {
             _ => None,
         };
         if (where_clause.is_none() || text_eq_filter.is_some())
-            && offset == 0
             && stmt.order_by.as_ref().is_none_or(|o| o.len() <= 1)
             // 🚨 DISTINCT must dedup AFTER sort+limit. The Top-K path below
             // returns the K smallest/largest raw rows without dedup, so
@@ -10851,14 +10883,28 @@ impl QueryExecutor {
             if let Some(ref ob) = stmt.order_by {
                 if let Some(first_ob) = ob.first() {
                     if let crate::sql::ast::Expr::Column(cn) = &first_ob.expr {
-                        let lim = stmt.limit.unwrap_or(usize::MAX);
-                        if lim > 0 && lim <= 10000 {
-                            if let Some(order_col) = schema.get_column_position(cn) {
+                        // 🔑 Deep pagination: OFFSET pages within the sorted
+                        // order, so we select the top (offset+limit) keys and
+                        // decode only the final `limit` rows — the old path
+                        // decoded every projected row for all N, sorted, then
+                        // threw the first `offset` away (21ms → ~2ms @100K).
+                        let page = stmt.limit.unwrap_or(usize::MAX);
+                        let k = page.saturating_add(offset);
+                        if page > 0 && k <= 1_000_000 {
+                            // 🔑 剥限定名前缀 (`e.ts`) — get_column_position
+                            // 不认带表名前缀的键, 限定名会静默 decline 到全排序。
+                            let cn_bare = cn.rsplit('.').next().unwrap_or(cn);
+                            if let Some(order_col) = schema.get_column_position(cn_bare) {
                                 let is_numeric = matches!(
                                     schema.col_types().get(order_col),
                                     Some(crate::types::ColumnType::Integer)
                                         | Some(crate::types::ColumnType::Float)
                                         | Some(crate::types::ColumnType::Boolean)
+                                        // Timestamp is i64 microseconds under the
+                                        // hood; leaving it out routed
+                                        // `ORDER BY ts LIMIT k` to the full
+                                        // scan+sort path (11.7ms vs 0.5ms).
+                                        | Some(crate::types::ColumnType::Timestamp)
                                 );
                                 if is_numeric {
                                     let is_float = matches!(
@@ -10878,7 +10924,7 @@ impl QueryExecutor {
                                         ) {
                                             Some(indices) => store.top_k_from_indices_typed(
                                                 order_col,
-                                                lim,
+                                                k,
                                                 !first_ob.asc,
                                                 is_float,
                                                 &indices,
@@ -10888,11 +10934,18 @@ impl QueryExecutor {
                                     } else {
                                         store.top_k_row_indices_typed(
                                             order_col,
-                                            lim,
+                                            k,
                                             !first_ob.asc,
                                             is_float,
                                         )
                                     };
+                                    // 🔑 Page after the bounded sort: skip the
+                                    // first `offset` best rows, keep `page`.
+                                    let top_indices: Vec<(usize, usize)> = top_indices
+                                        .into_iter()
+                                        .skip(offset)
+                                        .take(page)
+                                        .collect();
                                     let segs = store.segments_snapshot();
                                     let col_types = store.col_types();
                                     // Cache decoded columns per segment to avoid re-reading.

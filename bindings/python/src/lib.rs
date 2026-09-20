@@ -15,6 +15,55 @@ use pyo3::prelude::*;
 
 // ── Value conversion ──────────────────────────────────────────────────
 
+/// FxHash-style multiplicative hasher for the per-query TEXT intern map.
+/// std's SipHash costs ~1.3ms per 100K-row projection (unique strings are
+/// still hashed for the lookup); the keys are untrusted-free column data,
+/// not attacker-controlled table keys, so a fast non-crypto hash suffices.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.hash = (self.hash.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(0x517cc1b727220a95);
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.hash = (self.hash.rotate_left(5) ^ i as u64).wrapping_mul(0x517cc1b727220a95);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.hash = (self.hash.rotate_left(5) ^ i as u64).wrapping_mul(0x517cc1b727220a95);
+    }
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
+type InternMap = std::collections::HashMap<std::sync::Arc<str>, PyObject, FxBuild>;
+
+/// `mote_to_py` with a per-query intern cache for TEXT values.
+/// Low-cardinality columns (device ids, enums, statuses) map thousands of
+/// rows onto a handful of distinct strings: every hit saves a PyUnicode_New
+/// + copy. Uniquely-valued columns stop growing the cache at 8192 entries,
+/// so their only overhead is one hash lookup per value.
+fn mote_to_py_cached(v: &MValue, text_cache: &mut InternMap) -> PyObject {
+    if let MValue::Text(t) = v {
+        if let Some(hit) = text_cache.get(t.as_str()) {
+            return Python::with_gil(|py| hit.clone_ref(py));
+        }
+        let obj: PyObject = Python::with_gil(|py| t.as_str().into_py(py));
+        if text_cache.len() < 8192 {
+            let cloned = Python::with_gil(|py| obj.clone_ref(py));
+            text_cache.insert(t.0.clone(), cloned);
+        }
+        return obj;
+    }
+    mote_to_py(v)
+}
+
 fn mote_to_py(v: &MValue) -> PyObject {
     Python::with_gil(|py| -> PyObject {
         match v {
@@ -259,11 +308,21 @@ impl PyDatabase {
             use pyo3::types::PyAnyMethods as _;
             match result {
                 motedb_core::QueryResult::Select { columns, rows } => {
+                    // 🚀 Create (and hash) each column-name PyString ONCE per
+                    // query. The old per-row `set_item(&String, ..)` built a
+                    // fresh PyUnicode key for every (row, column) pair — for
+                    // a 100K×5 result that's 500K PyUnicode_New + 500K str
+                    // hashes before any value conversion runs; CPython caches
+                    // the hash inside the object, so reusing the key objects
+                    // makes every later SetItem hash-free.
+                    let keys: Vec<PyObject> =
+                        columns.iter().map(|c| c.as_str().into_py(py)).collect();
                     let list = pyo3::types::PyList::empty_bound(py);
+                    let mut text_cache: InternMap = std::collections::HashMap::default();
                     for row in rows {
                         let dict = pyo3::types::PyDict::new_bound(py);
-                        for (col, val) in columns.iter().zip(row.iter()) {
-                            dict.set_item(col, mote_to_py(val))?;
+                        for (key, val) in keys.iter().zip(row.iter()) {
+                            dict.set_item(key.clone(), mote_to_py_cached(val, &mut text_cache))?;
                         }
                         list.append(dict)?;
                     }
@@ -288,10 +347,13 @@ impl PyDatabase {
                 motedb_core::QueryResult::Select { columns, rows } => {
                     let cols: Vec<String> = columns;
                     let list = pyo3::types::PyList::empty_bound(py);
+                    let mut text_cache: InternMap = std::collections::HashMap::default();
                     for row in rows {
                         let tuple = pyo3::types::PyTuple::new_bound(
                             py,
-                            row.iter().map(mote_to_py).collect::<Vec<_>>(),
+                            row.iter()
+                                .map(|v| mote_to_py_cached(v, &mut text_cache))
+                                .collect::<Vec<_>>(),
                         );
                         list.append(tuple)?;
                     }
