@@ -610,3 +610,15 @@ mod tests {
         assert_eq!(cv.len(), 4);
     }
 }
+
+/// 输出排序比较（NULL 最小 — 与 executor 的 order_by_cmp 语义一致）。
+pub fn colbatch_order_cmp(a: &crate::types::Value, b: &crate::types::Value) -> std::cmp::Ordering {
+    use crate::types::Value;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+    }
+}

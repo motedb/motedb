@@ -311,3 +311,87 @@ fn pk_point_query_respects_offset() {
     let r = rows(&db, "SELECT qty FROM items WHERE id = 1 LIMIT 5");
     assert_eq!(r.len(), 1);
 }
+
+/// VEC M2: 批 GROUP BY 差分回归（表达式键/别名/双键/WHERE/序号 ORDER BY/LIMIT）。
+#[test]
+fn vec_group_by_matches_expectations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("m2.mote")).unwrap());
+    ex(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, val REAL, qty INT, note TEXT)",
+    );
+    for i in 1..=400i64 {
+        let (v, q) = if i % 7 == 0 {
+            ("NULL".into(), "NULL".into())
+        } else {
+            (
+                format!("{:.3}", i as f64 * 1.5 - 300.0),
+                (i % 11 - 5).to_string(),
+            )
+        };
+        ex(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, {}, {}, 'n{}')", i, v, q, i % 13),
+        );
+    }
+    db.checkpoint().unwrap();
+
+    // 手工期望: id % 5 分组 COUNT(*) / SUM(qty) (qty 跳 NULL)
+    let r = rows(&db, "SELECT id % 5, COUNT(*), SUM(qty) FROM t GROUP BY id % 5 ORDER BY 1");
+    let mut want: Vec<(i64, i64, i64)> = Vec::new();
+    for m in 0..5i64 {
+        let mut c = 0;
+        let mut s = 0;
+        for i in 1..=400i64 {
+            if i % 5 == m {
+                c += 1;
+                if i % 7 != 0 {
+                    s += i % 11 - 5;
+                }
+            }
+        }
+        want.push((m, c, s));
+    }
+    for (row, w) in r.iter().zip(want.iter()) {
+        assert_eq!(row[0], Value::Integer(w.0));
+        assert_eq!(row[1], Value::Integer(w.1));
+        assert_eq!(row[2], Value::Integer(w.2));
+    }
+    assert_eq!(r.len(), 5);
+
+    // 别名键 + WHERE + AVG
+    let r = rows(
+        &db,
+        "SELECT id % 4 AS k, COUNT(*), AVG(val) FROM t WHERE qty > 0 GROUP BY k ORDER BY k",
+    );
+    let mut want2: Vec<(i64, i64, f64)> = Vec::new();
+    for m in 0..4i64 {
+        let (mut c, mut sum, mut nn) = (0i64, 0.0f64, 0i64);
+        for i in 1..=400i64 {
+            if i % 4 == m && i % 7 != 0 && (i % 11 - 5) > 0 {
+                c += 1;
+                nn += 1;
+                sum += i as f64 * 1.5 - 300.0;
+            }
+        }
+        want2.push((m, c, if nn > 0 { sum / nn as f64 } else { f64::NAN }));
+    }
+    assert_eq!(r.len(), 4);
+    for (row, w) in r.iter().zip(want2.iter()) {
+        assert_eq!(row[0], Value::Integer(w.0));
+        assert_eq!(row[1], Value::Integer(w.1));
+        if let Value::Float(f) = &row[2] {
+            assert!((f - w.2).abs() < 1e-9);
+        } else {
+            panic!("{:?}", row);
+        }
+    }
+
+    // LIMIT + ORDER BY 聚合值
+    let r = rows(
+        &db,
+        "SELECT id % 9, COUNT(*) FROM t GROUP BY id % 9 ORDER BY 2 DESC, 1 ASC LIMIT 3",
+    );
+    assert_eq!(r.len(), 3);
+}

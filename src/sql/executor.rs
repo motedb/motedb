@@ -6184,7 +6184,8 @@ impl QueryExecutor {
                     }
                 }
             }
-            // Try the columnar GROUP BY pushdown first (much faster).
+            // 🚀 VEC M2: 批 GROUP BY (表达式键形状 — 旧行式路径 14-35ms
+            // 的痛点)。None → 下方列存下推原样回退。
             if let Some(TableRef::Table {
                 name: table_name, ..
             }) = stmt.from.as_ref()
@@ -6192,6 +6193,18 @@ impl QueryExecutor {
                 if self.db.has_col_segment_store(table_name) {
                     if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
                         let _ = store.prepare_for_query();
+                        if let Ok(schema) = self.db.get_table_schema(table_name) {
+                            if let Some(outcome) =
+                                crate::sql::vector_exec::try_vec_group_by(&store, &schema, stmt)?
+                            {
+                                store.release_pages_only();
+                                return Ok(StreamingQueryResult::SelectReady {
+                                    columns: outcome.columns,
+                                    rows: outcome.rows,
+                                });
+                            }
+                        }
+                        // Try the columnar GROUP BY pushdown (much faster).
                         let schema = self.db.get_table_schema(table_name)?;
                         if let Some(result) =
                             self.col_segment_group_by(stmt, table_name, &store, &schema)?
