@@ -1165,3 +1165,36 @@ morsel 并行 (M2/M3, MOTE_VEC=on, ≥200K 行):
 验证: A/B 12 形状 250K 行 (并行参与) 全等 (ORDER 精确序 / 无 ORDER 多重集)
 + 竞态压测 2/2 + fuzz 4 seed × (on/off) + bigtable 重开 diverge=0 + E2E
 51/51 + CLI 17/17 + edge (no-rayon) profile 编译通过。
+
+## VEC M6 — 收编清理: 默认开启 + 六语义 bug + executor 拆模块
+
+**MOTE_VEC 默认开启** (MOTE_VEC=off 一键回全旧路径)。M1-M5 默认关闭的唯一
+阻塞 (事务回滚 undo 双写段发散) 已被三重保守门完整掩蔽, 转默认开后 232 bin
+全量成为 vec 审计面, 暴露并修复 6 个语义 bug:
+
+| # | bug | 抓出者 |
+|---|---|---|
+| 1 | SUM 整数溢出静默回绕 (wrapping_add) → checked_add 提升 Float | v27 |
+| 2 | `WHERE ts = 'ISO串'` 恒 false (I64 vs Text 类型化比较无强转) → 编译期预解析 | v53 |
+| 3 | MIN(ts)/MAX(ts) 返回 Integer → ts 标志还原 Timestamp | v62 |
+| 4 | SUM(BOOLEAN) = 0 → true→1 数值累加 | v86 |
+| 5 | 🔴 点查缓存解码对 CachedCol::Batch 全返 NULL → UPDATE 旧行全 NULL | no_bloat |
+| 6 | 🔴 `GROUP BY departments.name` 错解析到探测表 employees.name (带前缀禁止 bare 回退) | sql_joins |
+
+executor.rs (30,086 行) 拆模块 (纯代码移动, pub(super) + 子模块可见父私有项,
+零可见性风暴, 一次编译通过):
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| executor/mod.rs | 22,327 | 核心分发 + DML/DDL/表达式/流式结果 |
+| executor/scan.rs | 2,701 | 全表扫描/col-segment 扫描/事务合并/投影扫描 |
+| executor/agg.rs | 2,378 | 聚合下推/多聚合/GROUP BY 下推 + WHERE 解析 |
+| executor/join.rs | 2,696 | multi-way/positional/hash/expr-key join + 左右全外 |
+
+fast path 收编说明: 静态扫描零死代码 (全部私有 fn 有引用); 旧 fast path
+保留为 MOTE_VEC=off 灭火开关的回退路径, 不做破坏性删除 — 默认开后它们
+仅在 decline 形状 (事务/墓碑/多段/复杂类型) 上服务。
+
+验证: 拆分前后 232 bin 全绿 EXIT=0 + fuzz 4 seed × (默认开/off) + bigtable
+重开 0 发散 + E2E 51/51 + CLI 17/17 + compete_bench 无回退 (join 1.70ms,
+groupby 1.65ms)。
