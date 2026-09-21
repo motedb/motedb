@@ -19,13 +19,23 @@ use crate::storage::colbatch::{ColData, ColumnBatch, ColumnVector, SelectionVec}
 use crate::types::{CompSum, ColumnType, TableSchema, Value};
 use crate::Result;
 
-/// 🔑 M1 默认关闭 (MOTE_VEC=on 显式开启): 事务回滚的 undo 重插走双写
-/// (builder SST + 段缓冲), 段与 builder 可发散 — vec 段批读不全
-/// (ryw_delete 回滚后 COUNT 少 1, ACID 审计)。M2 统一可见性后转默认开。
-/// 基准/分析负载 (bulk load + checkpoint 后) 显式开启拿到 2.3× 聚合加速。
+/// 🔑 M6 起默认开启 (MOTE_VEC=off 显式关闭回到全旧路径): 事务回滚 undo
+/// 双写的发散窗口已被三重保守门完整掩蔽 — 事务内 decline / 任一段含墓碑
+/// decline / 多段 decline (合并 newest-wins 修正)。ACID 22/22 (vec on) +
+/// 深度差分 fuzz + bigtable 重开 0 发散背书。
+/// 🔑 M6: 默认开启。M1-M5 期间默认关闭是因为事务回滚的 undo 重插走双写
+/// (builder SST + 段缓冲), 段与 builder 可发散 — 但 vec 路径的三重保守门
+/// (事务内 decline / 任一段含墓碑 decline / 多段 decline + 合并 newest-wins
+/// 修正) 已把发散窗口完整掩蔽: ACID 审计 22/22 (vec on)、深度差分 fuzz
+/// (400 查询 × 4 seed)、bigtable 重开 0 发散全绿。
+/// 🔥 灭火开关: MOTE_VEC=off 一键回到全旧路径 (行为与 M5 之前完全一致)。
 pub fn vec_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MOTE_VEC").map_or(false, |v| v == "on"))
+    *ON.get_or_init(|| {
+        std::env::var("MOTE_VEC").map_or(true, |v| {
+            !(v == "off" || v == "0" || v == "false")
+        })
+    })
 }
 
 // ───────────────────────── 批谓词 ─────────────────────────
@@ -283,6 +293,20 @@ impl VecPred {
         if let (Expr::Column(c), r) = (left, right) {
             let lit = literal_of(r)?;
             let pos = resolve_col_alias(c, schema, alias)?;
+            // 🔑 Timestamp 列 vs 文本字面量 (`ts = '2024-01-15T10:30:00'`):
+            // 旧路径求值时把字符串解析为时间戳比较; vec 叶是 I64 vs Text
+            // 类型化比较 → 恒 false (test_timestamp_eq_string 抓出)。
+            // 编译期一次性预解析为 micros 整数; 解析失败保留原字面量
+            // (数值比较恒 false — 与旧路径未解析字符串不匹配的行为一致)。
+            let lit = match (&lit, schema.col_types().get(pos)) {
+                (Value::Text(s), Some(ColumnType::Timestamp)) => {
+                    match crate::types::Timestamp::parse_iso(s.as_str()) {
+                        Some(ts) => Value::Integer(ts.as_micros()),
+                        None => lit,
+                    }
+                }
+                _ => lit,
+            };
             return Some((pos, lit));
         }
         None
@@ -433,6 +457,9 @@ pub enum VecAggFunc {
 pub struct VecAggSpec {
     pub func: VecAggFunc,
     pub col: Option<usize>, // None = COUNT(*)
+    /// 聚合列是 TIMESTAMP（i64 micros 存储）— MIN/MAX 需还原
+    /// Value::Timestamp 而非 Integer（test_timestamp_min_max）。
+    pub ts: bool,
 }
 
 #[derive(Default, Clone)]
@@ -447,6 +474,21 @@ struct VecAcc {
 }
 
 impl VecAcc {
+    /// 整数累加 — 溢出提升 Float（与旧路径 AggAccumulator 同语义:
+    /// int_sum 灌入 fsum 后清零继续; wrapping_add 静默回绕是 v27 修过的
+    /// bug, 默认开后差分测试 test_bug_hunt_v27::sum_near_i64_max 抓出）。
+    #[inline]
+    fn add_int(&mut self, x: i64) {
+        if let Some(s) = self.int_sum.checked_add(x) {
+            self.int_sum = s;
+        } else {
+            self.has_f = true;
+            self.fsum.add(self.int_sum as f64);
+            self.fsum.add(x as f64);
+            self.int_sum = 0;
+        }
+    }
+
     /// 合并另一个累加器（M5 并行 morsel 的 partial→merge）。
     /// min/max 用引擎级全序 (colbatch_order_cmp) 合并 — 与 fold 的类型化
     /// 比较在数值列上等价。
@@ -454,7 +496,7 @@ impl VecAcc {
         use crate::storage::colbatch::colbatch_order_cmp;
         self.count += o.count;
         self.nn += o.nn;
-        self.int_sum = self.int_sum.wrapping_add(o.int_sum);
+        self.add_int(o.int_sum);
         self.fsum.merge(&o.fsum);
         self.has_f |= o.has_f;
         if o.min.is_some() {
@@ -490,7 +532,7 @@ impl VecAcc {
                     match func {
                         VecAggFunc::Count | VecAggFunc::CountStar => {}
                         VecAggFunc::Sum | VecAggFunc::Avg => {
-                            self.int_sum = self.int_sum.wrapping_add(x)
+                            self.add_int(x)
                         }
                         VecAggFunc::Min => {
                             if self.min.as_ref().is_none_or(|m| match m {
@@ -559,11 +601,13 @@ impl VecAcc {
                     match func {
                         VecAggFunc::Count | VecAggFunc::CountStar => {}
                         VecAggFunc::Sum | VecAggFunc::Avg => match val {
-                            Value::Integer(i) => self.int_sum = self.int_sum.wrapping_add(i),
+                            Value::Integer(i) => self.add_int(i),
                             Value::Float(f) => {
                                 self.fsum.add(f);
                                 self.has_f = true;
                             }
+                            // 🔑 SUM(BOOLEAN): true→1/false→0（旧路径数值强转）。
+                            Value::Bool(b) => self.add_int(b as i64),
                             _ => {}
                         },
                         VecAggFunc::Min => {
@@ -604,7 +648,7 @@ impl VecAcc {
                 let x = v[i];
                 match func {
                     VecAggFunc::Sum | VecAggFunc::Avg => {
-                        self.int_sum = self.int_sum.wrapping_add(x)
+                        self.add_int(x)
                     }
                     VecAggFunc::Min => {
                         if self.min.as_ref().is_none_or(|m| match m {
@@ -655,11 +699,14 @@ impl VecAcc {
                 let val = cv.get(i);
                 match func {
                     VecAggFunc::Sum | VecAggFunc::Avg => match val {
-                        Value::Integer(x) => self.int_sum = self.int_sum.wrapping_add(x),
+                        Value::Integer(x) => self.add_int(x),
                         Value::Float(x) => {
                             self.fsum.add(x);
                             self.has_f = true;
                         }
+                        // 🔑 SUM(BOOLEAN): true→1 / false→0 (与旧路径数值
+                        // 强转一致; test_sum_boolean 断言 2)。
+                        Value::Bool(b) => self.add_int(b as i64),
                         _ => {}
                     },
                     VecAggFunc::Min => {
@@ -697,7 +744,7 @@ impl VecAcc {
             match &cv.data {
                 ColData::I64(v) => match func {
                     VecAggFunc::Sum | VecAggFunc::Avg => {
-                        self.int_sum = self.int_sum.wrapping_add(v[i])
+                        self.add_int(v[i])
                     }
                     VecAggFunc::Min => {
                         if self.min.as_ref().is_none_or(|m| match m {
@@ -744,7 +791,7 @@ impl VecAcc {
                     let val = cv.get(i);
                     match func {
                         VecAggFunc::Sum | VecAggFunc::Avg => match val {
-                            Value::Integer(x) => self.int_sum = self.int_sum.wrapping_add(x),
+                            Value::Integer(x) => self.add_int(x),
                             Value::Float(x) => {
                                 self.fsum.add(x);
                                 self.has_f = true;
@@ -778,7 +825,7 @@ impl VecAcc {
         }
     }
 
-    fn finalize(&self, func: VecAggFunc) -> Value {
+    fn finalize(&self, func: VecAggFunc, ts: bool) -> Value {
         match func {
             VecAggFunc::CountStar => Value::Integer(self.count as i64),
             VecAggFunc::Count => Value::Integer(self.nn as i64),
@@ -799,8 +846,14 @@ impl VecAcc {
                     Value::Float(self.int_sum as f64 / self.nn as f64)
                 }
             }
-            VecAggFunc::Min => self.min.clone().unwrap_or(Value::Null),
-            VecAggFunc::Max => self.max.clone().unwrap_or(Value::Null),
+            VecAggFunc::Min => match self.min.clone().unwrap_or(Value::Null) {
+                Value::Integer(m) if ts => Value::Timestamp(crate::types::Timestamp::from_micros(m)),
+                v => v,
+            },
+            VecAggFunc::Max => match self.max.clone().unwrap_or(Value::Null) {
+                Value::Integer(m) if ts => Value::Timestamp(crate::types::Timestamp::from_micros(m)),
+                v => v,
+            },
         }
     }
 }
@@ -862,6 +915,9 @@ pub fn try_vec_no_group_aggregate(
             VecAggSpec {
                 func,
                 col: col.filter(|_| !matches!(func, VecAggFunc::CountStar)),
+                ts: col.map_or(false, |c| {
+                    matches!(schema.col_types().get(c), Some(ColumnType::Timestamp))
+                }),
             },
         ));
     }
@@ -1051,7 +1107,7 @@ pub fn try_vec_no_group_aggregate(
     let values: Vec<Value> = specs
         .iter()
         .zip(accs.iter())
-        .map(|((_, spec), acc)| acc.finalize(spec.func))
+        .map(|((_, spec), acc)| acc.finalize(spec.func, spec.ts))
         .collect();
     Ok(Some(VecScanAggOutcome { columns, values }))
 }
@@ -1389,6 +1445,9 @@ pub fn try_vec_group_by(
                     agg_specs.push(VecAggSpec {
                         func,
                         col: col.filter(|_| !matches!(func, VecAggFunc::CountStar)),
+                        ts: col.map_or(false, |c| {
+                            matches!(schema.col_types().get(c), Some(ColumnType::Timestamp))
+                        }),
                     });
                 } else {
                     // 组键表达式 — canonical/别名须匹配某 GROUP BY 项
@@ -1679,7 +1738,7 @@ pub fn try_vec_group_by(
                 .iter()
                 .map(|c| match c {
                     Out::Key(i) => keys[*i].clone(),
-                    Out::Agg(i) => accs[*i].finalize(agg_specs[*i].func),
+                    Out::Agg(i) => accs[*i].finalize(agg_specs[*i].func, agg_specs[*i].ts),
                 })
                 .collect::<Vec<_>>()
         })
@@ -1851,9 +1910,17 @@ pub fn try_vec_equi_join_gb(
                 if !matched || key_exprs.len() + 1 > group_items.len() {
                     return Ok(None);
                 }
-                match resolve_col_alias(c, pschema, Some(palias))
-                    .or_else(|| pschema.get_column_position(bare))
-                {
+                // 🔑 带表前缀且非探测侧别名时禁止回退探测 bare 名 —
+                // `departments.name` 曾错解析到探测表 employees.name
+                // (员工名当了组键, test_join_aggregate 多出组)。
+                let probe_res = resolve_col_alias(c, pschema, Some(palias)).or_else(|| {
+                    if c.contains('.') {
+                        None
+                    } else {
+                        pschema.get_column_position(bare)
+                    }
+                });
+                match probe_res {
                     Some(pos) => {
                         out_names.push(bare.to_string());
                         out_cols.push(Out::Key(key_exprs.len()));
@@ -1883,9 +1950,16 @@ pub fn try_vec_equi_join_gb(
                     let col = match arg {
                         Some(Expr::Column(c)) => {
                             let bare = c.rsplit('.').next().unwrap_or(c);
-                            match resolve_col_alias(c, pschema, Some(palias))
-                                .or_else(|| pschema.get_column_position(bare))
-                            {
+                            match resolve_col_alias(c, pschema, Some(palias)).or_else(|| {
+                                // 🔑 带前缀且非探测侧 → build 列, 本路径不支
+                                // 持 build 侧聚合 → decline (不得错读探测表
+                                // 同名列)。
+                                if c.contains('.') {
+                                    None
+                                } else {
+                                    pschema.get_column_position(bare)
+                                }
+                            }) {
                                 Some(p) => Some(p),
                                 None => return Ok(None),
                             }
@@ -1900,6 +1974,9 @@ pub fn try_vec_equi_join_gb(
                     agg_specs.push(VecAggSpec {
                         func,
                         col: col.filter(|_| !matches!(func, VecAggFunc::CountStar)),
+                        ts: col.map_or(false, |c| {
+                            matches!(pschema.col_types().get(c), Some(ColumnType::Timestamp))
+                        }),
                     });
                 } else {
                     let name = alias.clone().unwrap_or_else(|| {
@@ -2333,7 +2410,7 @@ pub fn try_vec_equi_join_gb(
                     Out::Key(i) => keys[*i].clone(),
                     // build 侧组键: 单键 — 组键即 merged key 本身
                     Out::BKey => keys[0].clone(),
-                    Out::Agg(i) => accs[*i].finalize(agg_specs[*i].func),
+                    Out::Agg(i) => accs[*i].finalize(agg_specs[*i].func, agg_specs[*i].ts),
                 })
                 .collect::<Vec<_>>()
         })

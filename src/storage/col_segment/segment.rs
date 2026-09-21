@@ -863,6 +863,16 @@ fn decode_cached_value(
 ) -> crate::types::Value {
     use crate::types::{ColumnType, Value};
     match (cached, ct) {
+        // 🔑 VEC 批缓存变体: 点查的缓存解码路径曾只认 Fixed/Text —
+        // vec SELECT 后 col_cache 里是 Batch, 点查 (WHERE id=?) 对每个
+        // 列落到 catch-all Value::Null (UPDATE 旧行全 NULL → "id cannot
+        // be null", 默认开后 test_no_bloat 抓出)。
+        (CachedCol::Batch(b), _) => match b.get(idx) {
+            Value::Integer(m) if matches!(ct, ColumnType::Timestamp) => {
+                Value::Timestamp(crate::types::Timestamp::from_micros(m))
+            }
+            v => v,
+        },
         (CachedCol::Fixed(f), ColumnType::Integer) => {
             f.get_i64(idx).map(Value::Integer).unwrap_or(Value::Null)
         }
