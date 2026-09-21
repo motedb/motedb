@@ -22,6 +22,15 @@ impl CompSum {
         self.sum = t;
     }
 
+    /// 合并另一个补偿和（M5 并行聚合 partial→merge 用）：先把对方的补偿项
+    /// 并入自身补偿，再用 Neumaier 加其主和 — 与串行逐项累加同阶精度
+    /// （误差 O(eps²)），差分对拍在浮点容差内。
+    #[inline]
+    pub fn merge(&mut self, other: &CompSum) {
+        self.comp += other.comp;
+        self.add(other.sum);
+    }
+
     /// Seeded constructor (e.g. promoting an integer running sum).
     #[inline]
     pub fn from_value(v: f64) -> Self {

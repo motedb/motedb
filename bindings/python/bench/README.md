@@ -1123,3 +1123,45 @@ dict = 11.6ms + 400K 个值对象创建 ~15ms); `db.query()` 元组路径同 26.
 验证: A/B 16 形状 (vec on/off) 行集+顺序全等 + test_vec_m4 4/4 (投影/top-k
 对拍 SQL、Timestamp 类型、墓碑 decline) + fuzz 4 seed × (on/off) + bigtable
 重开 reopen_diverge=0 (on) + E2E 51/51 + CLI 17/17 + ACID 22/22。
+
+## VEC M5 — 并行里程碑: 三雷拆除 + morsel 并行聚合/join
+
+1M 行 (10 核 M 系列) 的三个 decline 黑洞先修 (并行一条会 decline 的路径
+毫无意义), 再并行:
+
+| 形状 @1M | 旧路径 | M5 串行 | M5 并行 | 总加速 |
+|---|---|---|---|---|
+| GROUP BY 文本键 + ORDER BY | 146.8ms | 42ms (M2 接管普通列键+ORDER) | **4.8ms** | **30×** |
+| GROUP BY + AVG + ORDER BY | 164.6ms | 43ms | **5.6ms** | 29× |
+| JOIN + GROUP BY build 侧键 (s.zone) | 187ms | 42ms (BKey 扩展) | **8.3ms** | **22×** |
+| JOIN + AVG + GROUP BY | 199ms | 78ms | **8.9ms** | 22× |
+| bench 形状 JOIN (e.device 键) | 17.6ms | 17.6ms | **3.6ms** | 4.8× (验收 2-3×) |
+
+三处修复:
+1. **M2 接管普通列键 + ORDER BY/LIMIT 形状**: col_segment_group_by 一见
+   ORDER BY/LIMIT 就整体 decline → 全物化+全排序 (排序 64 个组竟要 147ms)。
+   M2 的组输出 ORDER BY 尾部只排组数行。无 ORDER 的纯列键仍走 &str 零分配
+   路径 (不截胡)。
+2. **M3 build 侧组键 (GROUP BY s.zone)**: build 表 HashMap 值扩为
+   (匹配数, 组值), probe 命中折叠进组值分组; 同 join 键跨组值 → decline
+   (PK 维度表不触发)。NULL 组值归 NULL 组 (SQL 语义)。AVG 乘法折叠本就
+   正确 (for _ in 0..matches 折 sum+count)。
+3. **雷#1 params 竞态拆除**: 绑定参数从 executor 共享 RwLock 改 thread-local
+   (与 CURRENT_TXN_ID 同模型) — 多线程共用 Database 时 bind→execute→clear
+   窗口互相踩踏 (A 拿到 B 的参数=静默错行, 或参数被清空报错)。竞态压测
+   (8 线程 × 500 参数化点查) 修复前 FAIL / 修复后 PASS。
+
+morsel 并行 (M2/M3, MOTE_VEC=on, ≥200K 行):
+- 行按 chunk 分 rayon 线程 (chunk 数 = 线程数封顶 16), 各建 partial 组表,
+  主线程 VecAcc::merge 合并 (CompSum::merge 保 Neumaier 精度)
+- 🔑 教训 ×2: (a) `par_chunk_count` 曾把下界写成上界 → nchunks=n, 每 chunk
+  1 行, rayon 被百万微型任务淹没 (并行比串行慢 25×, 全线程卡 join 调度 —
+  sample 的 self-time 全在 rayon plumbing); (b) M2 通用路径每行一次
+  Vec<Value> 键分配, 并行时 16 线程在分配器锁上踩踏 → 单键一律 Value 键
+  (克隆 = Arc 计数/POD, 零堆分配)
+- 雷#2/#3 (CURRENT_TXN_ID / memo TLS): vec 批路径不读 TLS 状态 + 事务内
+  decline + 谓词纯字面量 — 工作线程不触碰雷区, 并发读压测无错果
+
+验证: A/B 12 形状 250K 行 (并行参与) 全等 (ORDER 精确序 / 无 ORDER 多重集)
++ 竞态压测 2/2 + fuzz 4 seed × (on/off) + bigtable 重开 diverge=0 + E2E
+51/51 + CLI 17/17 + edge (no-rayon) profile 编译通过。

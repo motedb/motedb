@@ -435,7 +435,7 @@ pub struct VecAggSpec {
     pub col: Option<usize>, // None = COUNT(*)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct VecAcc {
     count: u64, // 选中行数（COUNT(*)）
     nn: u64,    // 非 NULL 计数（COUNT(col)/SUM/AVG 分母）
@@ -447,6 +447,34 @@ struct VecAcc {
 }
 
 impl VecAcc {
+    /// 合并另一个累加器（M5 并行 morsel 的 partial→merge）。
+    /// min/max 用引擎级全序 (colbatch_order_cmp) 合并 — 与 fold 的类型化
+    /// 比较在数值列上等价。
+    fn merge(&mut self, o: &VecAcc) {
+        use crate::storage::colbatch::colbatch_order_cmp;
+        self.count += o.count;
+        self.nn += o.nn;
+        self.int_sum = self.int_sum.wrapping_add(o.int_sum);
+        self.fsum.merge(&o.fsum);
+        self.has_f |= o.has_f;
+        if o.min.is_some() {
+            let take = self.min.as_ref().is_none_or(|m| {
+                colbatch_order_cmp(o.min.as_ref().unwrap(), m) == std::cmp::Ordering::Less
+            });
+            if take {
+                self.min = o.min.clone();
+            }
+        }
+        if o.max.is_some() {
+            let take = self.max.as_ref().is_none_or(|m| {
+                colbatch_order_cmp(o.max.as_ref().unwrap(), m) == std::cmp::Ordering::Greater
+            });
+            if take {
+                self.max = o.max.clone();
+            }
+        }
+    }
+
     /// 批内折叠：定长列直接在类型化切片上按 selection 走（无 Value 物化），
     /// Bool/Utf8/Values 走批边界 get。
     fn fold_batch(&mut self, cv: &ColumnVector, sel: &SelectionVec, func: VecAggFunc) {
@@ -1256,6 +1284,20 @@ pub struct VecGroupByOutcome {
 /// 稳态零重建)、键在类型化切片上求值、聚合批内折叠 — 无 SqlRow/全行
 /// 物化。收集 M1 同样的保守门 (事务/墓碑 decline)。
 #[allow(clippy::too_many_lines)]
+/// M5 morsel 并行门槛: 行数 ≥ 此值才并行 (rayon 调度 + merge 开销
+/// ~几十 µs 级, 小数据串行更快; 阈值按 1M 行基线校准留出充足余量)。
+#[cfg(feature = "rayon")]
+const PARALLEL_MIN_ROWS: usize = 200_000;
+
+/// chunk 数: rayon 线程数 (封顶 16 — 更细的 morsel 只增加 merge 成本)。
+#[cfg(feature = "rayon")]
+fn par_chunk_count(n: usize) -> usize {
+    // 线程数封顶 16, 且不超过行数 (n=0 由调用方门槛挡掉)。
+    // 🔑 曾把下界写成上界 (.max(n)) → nchunks=n → 每 chunk 1 行,
+    // rayon 被百万微型任务淹没 (并行比串行慢 25×, 全线程卡在 join 调度)。
+    rayon::current_num_threads().clamp(1, 16).min(n.max(1))
+}
+
 pub fn try_vec_group_by(
     store: &Arc<ColSegmentStore>,
     schema: &TableSchema,
@@ -1291,10 +1333,36 @@ pub fn try_vec_group_by(
     for sc in &stmt.columns {
         match sc {
             SelectColumn::Star => return Ok(None),
-            SelectColumn::Column(_) | SelectColumn::ColumnWithAlias(_, _) => {
-                // 普通列组键: 交给 col_segment_group_by (已 1.5ms 级);
-                // 这里只收表达式键形状 (旧路径 14-35ms 的痛点)。
-                return Ok(None);
+            SelectColumn::Column(c) | SelectColumn::ColumnWithAlias(c, _) => {
+                // 🔑 普通列组键也接管 — 但仅限 col_segment_group_by 会整体
+                // decline 的形状 (ORDER BY/LIMIT/OFFSET): 它一见这些就落全
+                // 物化+排序 (1M 行 GROUP BY+ORDER BY 147ms vs 无 ORDER 15ms)。
+                // M2 的组输出 ORDER BY/LIMIT 尾部只排组数行 (≤基数)。
+                // 无 ORDER BY 的纯列键仍由 col_segment_group_by 的 &str
+                // 零分配路径接管 (更快), 不在此截胡。
+                if stmt.order_by.is_none()
+                    && stmt.limit.is_none()
+                    && stmt.offset.is_none()
+                {
+                    return Ok(None);
+                }
+                let bare = c.rsplit('.').next().unwrap_or(c);
+                let matched = group_items
+                    .iter()
+                    .any(|g| g.rsplit('.').next().unwrap_or(g) == bare || g == c);
+                if !matched || key_exprs.len() + 1 > group_items.len() {
+                    return Ok(None);
+                }
+                let pos = match schema
+                    .get_column_position(c)
+                    .or_else(|| schema.get_column_position(bare))
+                {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                out_names.push(bare.to_string());
+                out_cols.push(Out::Key(key_exprs.len()));
+                key_exprs.push(KeyExpr::Col(pos));
             }
             SelectColumn::Expr(expr, alias) => {
                 if let Some((func, arg)) = parse_simple_agg(expr) {
@@ -1398,12 +1466,18 @@ pub fn try_vec_group_by(
 
     // 🔑 单整型键快路径: HashMap<i64> + 零 Value 构造; 键含 NULL/文本/浮点
     // 或多键 → 通用 Vec<Value> 路径。
+    let single_key = key_exprs.len() == 1;
     let single_int_key = key_exprs.len() == 1 && agg_specs.iter().all(|s| {
         s.col.map_or(true, |c| {
             matches!(batchless_type(&cts, needed[c]), ColumnType::Integer | ColumnType::Timestamp)
         })
     });
     let mut groups_i: HashMap<i64, Vec<VecAcc>> = HashMap::new();
+    // 🔑 单键 Value 组 (文本/浮点/混合): Value 克隆是 Arc 计数或 POD —
+    // 零堆分配。此前单键也走 Vec<Value> 通用路径, 每行一次 Vec 分配
+    // (1M 行 GROUP BY 42 vs 15ms 的差距来源; 并行时 16 线程在分配器
+    // 锁上互相踩踏 → 25× 回退)。
+    let mut groups_1: HashMap<Value, Vec<VecAcc>> = HashMap::new();
     let mut groups_v: HashMap<Vec<Value>, Vec<VecAcc>> = HashMap::new();
     for seg in &segments {
         let n = seg.row_count;
@@ -1443,6 +1517,109 @@ pub fn try_vec_group_by(
             }
             None => (0..n as u32).collect(),
         };
+        #[cfg(feature = "rayon")]
+        if rows.len() >= PARALLEL_MIN_ROWS {
+            use rayon::prelude::*;
+            // 🔑 M5 morsel 并行: 行按 chunk 分给 rayon 线程, 各自建 partial
+            // 组表, 主线程按组合并。列批 Arc 共享零拷贝; 谓词/键/聚合都是
+            // 纯字面量 (雷#1/#2/#3 的 TLS 状态不被工作线程触碰)。
+            // 🔑 单键 Value 组零堆分配 (Value 克隆 = Arc 计数/POD) — 并行
+            // 线程不在分配器锁上踩踏; 多键才用 Vec<Value>。
+            let nchunks = par_chunk_count(rows.len());
+            let chunk_len = rows.len().div_ceil(nchunks).max(1);
+            let partials: Vec<(
+                HashMap<i64, Vec<VecAcc>>,
+                HashMap<Value, Vec<VecAcc>>,
+                HashMap<Vec<Value>, Vec<VecAcc>>,
+                bool, // 键求值失败 (串行路径同位 decline)
+            )> = rows
+                .par_chunks(chunk_len)
+                .map(|chunk| {
+                    let mut li: HashMap<i64, Vec<VecAcc>> = HashMap::new();
+                    let mut l1: HashMap<Value, Vec<VecAcc>> = HashMap::new();
+                    let mut lv: HashMap<Vec<Value>, Vec<VecAcc>> = HashMap::new();
+                    let mut ok = true;
+                    for &r in chunk {
+                        let i = r as usize;
+                        if single_int_key {
+                            if let Some(k) = key_exprs[0].eval_i64(&batch, i, &key_remap) {
+                                let accs = li.entry(k).or_insert_with(|| {
+                                    agg_specs.iter().map(|_| VecAcc::default()).collect()
+                                });
+                                fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                                continue;
+                            }
+                        }
+                        if single_key {
+                            if let Some(kv) = key_exprs[0].eval_i64(&batch, i, &key_remap) {
+                                let accs = l1.entry(Value::Integer(kv)).or_insert_with(|| {
+                                    agg_specs.iter().map(|_| VecAcc::default()).collect()
+                                });
+                                fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                                continue;
+                            }
+                            if let Some(kv) = key_exprs[0].eval(&batch, i, &key_remap) {
+                                let accs = l1.entry(kv).or_insert_with(|| {
+                                    agg_specs.iter().map(|_| VecAcc::default()).collect()
+                                });
+                                fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                                continue;
+                            }
+                            ok = false;
+                            break;
+                        }
+                        let mut key = Vec::with_capacity(key_exprs.len());
+                        for ke in &key_exprs {
+                            match ke.eval(&batch, i, &key_remap) {
+                                Some(v) => key.push(v),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !ok {
+                            break;
+                        }
+                        let accs = lv.entry(key).or_insert_with(|| {
+                            agg_specs.iter().map(|_| VecAcc::default()).collect()
+                        });
+                        fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                    }
+                    (li, l1, lv, ok)
+                })
+                .collect();
+            if partials.iter().any(|(_, _, _, ok)| !ok) {
+                return Ok(None);
+            }
+            for (li, l1, lv, _) in partials {
+                for (k, src) in li {
+                    let e = groups_i
+                        .entry(k)
+                        .or_insert_with(|| vec![VecAcc::default(); src.len()]);
+                    for (d, s) in e.iter_mut().zip(src.iter()) {
+                        d.merge(s);
+                    }
+                }
+                for (k, src) in l1 {
+                    let e = groups_1
+                        .entry(k)
+                        .or_insert_with(|| vec![VecAcc::default(); src.len()]);
+                    for (d, s) in e.iter_mut().zip(src.iter()) {
+                        d.merge(s);
+                    }
+                }
+                for (k, src) in lv {
+                    let e = groups_v
+                        .entry(k)
+                        .or_insert_with(|| vec![VecAcc::default(); src.len()]);
+                    for (d, s) in e.iter_mut().zip(src.iter()) {
+                        d.merge(s);
+                    }
+                }
+            }
+            continue;
+        }
         for r in rows {
             let i = r as usize;
             if single_int_key {
@@ -1454,6 +1631,23 @@ pub fn try_vec_group_by(
                     fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
                     continue;
                 }
+            }
+            if single_key {
+                if let Some(kv) = key_exprs[0].eval_i64(&batch, i, &key_remap) {
+                    let accs = groups_1
+                        .entry(Value::Integer(kv))
+                        .or_insert_with(|| agg_specs.iter().map(|_| VecAcc::default()).collect());
+                    fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                    continue;
+                }
+                if let Some(kv) = key_exprs[0].eval(&batch, i, &key_remap) {
+                    let accs = groups_1
+                        .entry(kv)
+                        .or_insert_with(|| agg_specs.iter().map(|_| VecAcc::default()).collect());
+                    fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                    continue;
+                }
+                return Ok(None);
             }
             let mut key = Vec::with_capacity(key_exprs.len());
             for ke in &key_exprs {
@@ -1469,10 +1663,13 @@ pub fn try_vec_group_by(
         }
     }
 
-    // 组装输出行: 键 + 聚合值 (输出序)。i64 快表并入通用表。
+    // 组装输出行: 键 + 聚合值 (输出序)。i64 快表与单键 Value 表并入通用表。
     let mut merged: Vec<(Vec<Value>, Vec<VecAcc>)> = groups_v.into_iter().collect();
     for (k, accs) in groups_i {
         merged.push((vec![Value::Integer(k)], accs));
+    }
+    for (k, accs) in groups_1 {
+        merged.push((vec![k], accs));
     }
     let rows_from = merged;
     let mut rows: Vec<Vec<Value>> = rows_from
@@ -1611,7 +1808,7 @@ pub fn try_vec_equi_join_gb(
     probe_key_col: usize,
     stmt: &SelectStmt,
 ) -> Result<Option<VecJoinGbOutcome>> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     if !vec_enabled() || crate::sql::executor::QueryExecutor::is_in_transaction_tls() {
         return Ok(None);
     }
@@ -1630,9 +1827,14 @@ pub fn try_vec_equi_join_gb(
     // ── SELECT 解析: 键 (探测侧 KeyExpr) + 聚合 ──
     enum Out {
         Key(usize),
+        /// build 侧组键 (维度表列, 如 GROUP BY s.zone) — 值来自 build 表,
+        /// 输出时即组键本身 (单键)。
+        BKey,
         Agg(usize),
     }
     let mut key_exprs: Vec<KeyExpr> = Vec::new();
+    // build 侧组键列 (schema 位); 仅支持单 build 键、且不能与探测键混用。
+    let mut bgroup_col: Option<usize> = None;
     let mut out_names: Vec<String> = Vec::new();
     let mut out_cols: Vec<Out> = Vec::new();
     let mut agg_specs: Vec<VecAggSpec> = Vec::new();
@@ -1657,7 +1859,22 @@ pub fn try_vec_equi_join_gb(
                         out_cols.push(Out::Key(key_exprs.len()));
                         key_exprs.push(KeyExpr::Col(pos));
                     }
-                    None => return Ok(None),
+                    None => {
+                        // 🔑 build 侧组键 (维度表列): GROUP BY s.zone 形状。
+                        // 解析到 build schema; 仅单键且无探测键混用时支持
+                        // (混用键需要物化 joined 行, 超出半连接折叠模型)。
+                        let Some(bpos) = resolve_col_alias(c, bschema, Some(balias))
+                            .or_else(|| bschema.get_column_position(bare))
+                        else {
+                            return Ok(None);
+                        };
+                        if bgroup_col.is_some() || !key_exprs.is_empty() {
+                            return Ok(None);
+                        }
+                        bgroup_col = Some(bpos);
+                        out_names.push(bare.to_string());
+                        out_cols.push(Out::BKey);
+                    }
                 }
             }
             SelectColumn::Expr(expr, alias) => {
@@ -1705,7 +1922,8 @@ pub fn try_vec_equi_join_gb(
             }
         }
     }
-    if key_exprs.is_empty() || agg_specs.is_empty() || key_exprs.len() != group_items.len() {
+    let n_keys = key_exprs.len() + usize::from(bgroup_col.is_some());
+    if n_keys == 0 || agg_specs.is_empty() || n_keys != group_items.len() {
         return Ok(None);
     }
 
@@ -1732,6 +1950,9 @@ pub fn try_vec_equi_join_gb(
     let mut bneeded: Vec<usize> = vec![build_key_col];
     if let Some(p) = &bpred {
         collect_pred_cols(p, &mut bneeded);
+    }
+    if let Some(gc) = bgroup_col {
+        bneeded.push(gc);
     }
     bneeded.sort_unstable();
     bneeded.dedup();
@@ -1790,8 +2011,12 @@ pub fn try_vec_equi_join_gb(
         return Ok(None);
     }
 
-    // ── build 侧: 扫描 + 过滤 + HashMap<JKey, 匹配数> ──
-    let mut table: HashMap<JKey, u64> = HashMap::new();
+    // ── build 侧: 扫描 + 过滤 + HashMap<JKey, (匹配数, 组值)> ──
+    // 组值: build 侧组键列的值 (维度表属性)。同 join 键的多行必须同组值,
+    // 否则半连接折叠无法把 probe 行归到唯一组 → decline (PK 维度表不会触发)。
+    let mut table: HashMap<JKey, (u64, Option<Value>)> = HashMap::new();
+    let bg_idx: Option<usize> = bgroup_col
+        .and_then(|gc| bneeded.iter().position(|&x| x == gc));
     for seg in &bsegs {
         let n = seg.row_count;
         if n == 0 {
@@ -1826,7 +2051,16 @@ pub fn try_vec_equi_join_gb(
         for r in rows {
             let i = r as usize;
             if let Some(k) = col_jkey(&batch.cols[bkey_idx], i) {
-                *table.entry(k).or_insert(0) += 1;
+                let gval: Option<Value> = match bg_idx {
+                    Some(gi) => Some(batch.cols[gi].get(i)),
+                    None => None,
+                };
+                let e = table.entry(k).or_insert((0, gval.clone()));
+                e.0 += 1;
+                if e.1 != gval {
+                    // 同 join 键跨组值 — 折叠模型不成立
+                    return Ok(None);
+                }
             }
         }
     }
@@ -1871,14 +2105,164 @@ pub fn try_vec_equi_join_gb(
             }
             None => (0..n as u32).collect(),
         };
+        #[cfg(feature = "rayon")]
+        if rows.len() >= PARALLEL_MIN_ROWS {
+            use rayon::prelude::*;
+            // 🔑 M5 morsel 并行: probe 行按 chunk 分线程, 各自 partial 组表,
+            // 主线程合并。build 表 (table) 共享只读; 列批 Arc 零拷贝。
+            let nchunks = par_chunk_count(rows.len());
+            let chunk_len = rows.len().div_ceil(nchunks).max(1);
+            let partials: Vec<(
+                HashMap<JKey, (Option<Value>, Vec<VecAcc>)>,
+                std::collections::HashMap<Value, Vec<VecAcc>>,
+                HashMap<Vec<Value>, Vec<VecAcc>>,
+                bool,
+            )> = rows
+                .par_chunks(chunk_len)
+                .map(|chunk| {
+                    let mut gj: HashMap<JKey, (Option<Value>, Vec<VecAcc>)> = HashMap::new();
+                    let mut g1: std::collections::HashMap<Value, Vec<VecAcc>> =
+                        std::collections::HashMap::new();
+                    let mut gv: HashMap<Vec<Value>, Vec<VecAcc>> = HashMap::new();
+                    let mut ok = true;
+                    for &r in chunk {
+                        let i = r as usize;
+                        let k = col_jkey(&batch.cols[pkey_idx], i);
+                        let (matches, bgrp) = match &k {
+                            Some(k) => match table.get(k) {
+                                Some((m, g)) => (*m, g.clone()),
+                                None => (0, None),
+                            },
+                            None => (0, None),
+                        };
+                        if matches == 0 {
+                            continue;
+                        }
+                        if bgroup_col.is_some() {
+                            let gval = bgrp.unwrap_or(Value::Null);
+                            let accs = g1
+                                .entry(gval)
+                                .or_insert_with(|| {
+                                    agg_specs.iter().map(|_| VecAcc::default()).collect()
+                                });
+                            for _ in 0..matches {
+                                fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                            }
+                            continue;
+                        }
+                        if group_is_join_key {
+                            let e = gj.entry(k.unwrap()).or_insert_with(|| {
+                                (
+                                    key_exprs[0].eval(&batch, i, &key_remap),
+                                    agg_specs.iter().map(|_| VecAcc::default()).collect::<Vec<_>>(),
+                                )
+                            });
+                            for _ in 0..matches {
+                                fold_row(&mut (e.1)[..], &agg_specs, &batch.cols, i);
+                            }
+                            continue;
+                        }
+                        if single_key {
+                            if let Some(kv) = key_exprs[0].eval_i64(&batch, i, &key_remap) {
+                                let accs = g1.entry(Value::Integer(kv)).or_insert_with(|| {
+                                    agg_specs.iter().map(|_| VecAcc::default()).collect()
+                                });
+                                for _ in 0..matches {
+                                    fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                                }
+                                continue;
+                            }
+                            if let Some(kv) = key_exprs[0].eval(&batch, i, &key_remap) {
+                                let accs = g1.entry(kv).or_insert_with(|| {
+                                    agg_specs.iter().map(|_| VecAcc::default()).collect()
+                                });
+                                for _ in 0..matches {
+                                    fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                                }
+                                continue;
+                            }
+                            ok = false;
+                            break;
+                        }
+                        let mut key = Vec::with_capacity(key_exprs.len());
+                        let mut key_ok = true;
+                        for ke in &key_exprs {
+                            match ke.eval(&batch, i, &key_remap) {
+                                Some(v) => key.push(v),
+                                None => {
+                                    key_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !key_ok {
+                            ok = false;
+                            break;
+                        }
+                        let accs = gv.entry(key).or_insert_with(|| {
+                            agg_specs.iter().map(|_| VecAcc::default()).collect()
+                        });
+                        for _ in 0..matches {
+                            fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                        }
+                    }
+                    (gj, g1, gv, ok)
+                })
+                .collect();
+            if partials.iter().any(|(_, _, _, ok)| !ok) {
+                return Ok(None);
+            }
+            for (gj, g1, gv, _) in partials {
+                for (k, (disp, src)) in gj {
+                    let e = groups_j
+                        .entry(k)
+                        .or_insert_with(|| (disp, vec![VecAcc::default(); src.len()]));
+                    for (d, s) in (e.1).iter_mut().zip(src.iter()) {
+                        d.merge(s);
+                    }
+                }
+                for (k, src) in g1 {
+                    let e = groups_1
+                        .entry(k)
+                        .or_insert_with(|| vec![VecAcc::default(); src.len()]);
+                    for (d, s) in e.iter_mut().zip(src.iter()) {
+                        d.merge(s);
+                    }
+                }
+                for (k, src) in gv {
+                    let e = groups_v
+                        .entry(k)
+                        .or_insert_with(|| vec![VecAcc::default(); src.len()]);
+                    for (d, s) in e.iter_mut().zip(src.iter()) {
+                        d.merge(s);
+                    }
+                }
+            }
+            continue;
+        }
         for r in rows {
             let i = r as usize;
             let k = col_jkey(&batch.cols[pkey_idx], i);
-            let matches = match &k {
-                Some(k) => table.get(k).copied().unwrap_or(0),
-                None => 0,
+            let (matches, bgrp) = match &k {
+                Some(k) => match table.get(k) {
+                    Some((m, g)) => (*m, g.clone()),
+                    None => (0, None),
+                },
+                None => (0, None),
             };
             if matches == 0 {
+                continue;
+            }
+            // 🔑 build 侧组键: 组 = 命中 build 行的组值 (单键 Value 组)。
+            // build 行组值为 NULL → 归入 NULL 组 (SQL GROUP BY 语义, 不丢弃)。
+            if bgroup_col.is_some() {
+                let gv = bgrp.unwrap_or(Value::Null);
+                let accs = groups_1
+                    .entry(gv)
+                    .or_insert_with(|| agg_specs.iter().map(|_| VecAcc::default()).collect());
+                for _ in 0..matches {
+                    fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
+                }
                 continue;
             }
             // 🔑 组键 == join 键列 (bench 形状: SELECT e.device … ON e.device):
@@ -1947,6 +2331,8 @@ pub fn try_vec_equi_join_gb(
                 .iter()
                 .map(|c| match c {
                     Out::Key(i) => keys[*i].clone(),
+                    // build 侧组键: 单键 — 组键即 merged key 本身
+                    Out::BKey => keys[0].clone(),
                     Out::Agg(i) => accs[*i].finalize(agg_specs[*i].func),
                 })
                 .collect::<Vec<_>>()

@@ -7,7 +7,6 @@ use parking_lot::RwLock as PlRwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 /// ⚡ Compiled LIKE pattern for fast matching
 #[derive(Debug, Clone)]
@@ -168,8 +167,18 @@ pub struct ExprEvaluator {
     pattern_cache: Arc<PlRwLock<HashMap<String, CompiledPattern>>>,
     /// Store the last AUTO_INCREMENT value inserted (AtomicI64, i64::MIN = None)
     pub(crate) last_insert_id: AtomicI64,
-    /// Bind parameters for parameterized queries (?1, ?2, ...)
-    params: RwLock<Vec<Value>>,
+}
+
+// 🔑 M5 雷#1: 绑定参数改为 thread-local。原实现是 executor 上的共享
+// RwLock<Vec<Value>> — 多线程共用一个 Database 时, bind→execute→clear
+// 窗口互相踩踏: 线程 A 的查询拿到线程 B 的参数 (静默错行), 或执行时参数
+// 已被 B 清空 ("Parameter ?1 not bound")。文档化并发模型与 CURRENT_TXN_ID
+// 相同: bind 与 execute 在同一线程 (execute_prepared 同步串起两者),
+// TLS 让并发线程天然隔离; rayon 工作线程看不到主线程参数 → 安全失败
+// 而非错数据。
+thread_local! {
+    static TLS_PARAMS: std::cell::RefCell<Vec<Value>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl ExprEvaluator {
@@ -177,7 +186,6 @@ impl ExprEvaluator {
         Self {
             pattern_cache: Arc::new(PlRwLock::new(HashMap::new())),
             last_insert_id: AtomicI64::new(i64::MIN),
-            params: RwLock::new(Vec::new()),
         }
     }
 
@@ -219,13 +227,13 @@ impl ExprEvaluator {
         Self {
             pattern_cache: Arc::new(PlRwLock::new(HashMap::new())),
             last_insert_id: AtomicI64::new(i64::MIN),
-            params: RwLock::new(Vec::new()),
         }
     }
 
-    /// Set bind parameters for a parameterized query.
+    /// Set bind parameters for a parameterized query (thread-local —
+    /// 见 TLS_PARAMS 注释: 共享槽在并发 bind→execute→clear 下互相踩踏)。
     pub fn set_params(&self, params: Vec<Value>) {
-        *self.params.write().unwrap() = params;
+        TLS_PARAMS.with(|p| *p.borrow_mut() = params);
     }
 
     /// 🔑 Generate a column name for an expression, matching the executor's
@@ -262,12 +270,12 @@ impl ExprEvaluator {
     }
 
     pub fn get_params(&self) -> Vec<Value> {
-        self.params.read().unwrap().clone()
+        TLS_PARAMS.with(|p| p.borrow().clone())
     }
 
     /// Clear bind parameters after execution.
     pub fn clear_params(&self) {
-        self.params.write().unwrap().clear();
+        TLS_PARAMS.with(|p| p.borrow_mut().clear());
     }
 
     /// Evaluate an expression against a row.
@@ -358,7 +366,7 @@ impl ExprEvaluator {
             Expr::Literal(val) => Ok(val.clone()),
 
             Expr::Parameter(idx) => {
-                let params = self.params.read().unwrap();
+                let params = TLS_PARAMS.with(|p| p.borrow().clone());
                 if *idx == 0 {
                     return Err(MoteDBError::InvalidArgument(
                         "Unnamed ? parameter not resolved (internal error)".to_string(),
