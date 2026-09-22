@@ -1845,6 +1845,13 @@ impl QueryExecutor {
                 if group_pos >= seg.sst.column_tags.len() {
                     continue;
                 }
+                // 🔑 慢路径 dedup 用 row_map.key(i) — keys 未加载时它回退到
+                // 栅栏键 (每 fence_interval≈2048 行一个), 每 2048 行被当成同
+                // key, seen 集合把首行之外的行全部"去重"掉: 100K 行 GROUP BY
+                // 只剩 50 行 32 组 (静默错果, 对拍抓出)。必须先 load_full_keys。
+                if need_dedup {
+                    let _ = seg.sst.load_full_keys();
+                }
                 let ftext = match seg.read_text_cached(group_pos) {
                     Some(t) => t,
                     None => continue,
@@ -1859,7 +1866,8 @@ impl QueryExecutor {
                     // Phase 2: for each agg column, vectorized raw slice fold.
                     let off_bytes = ftext.offsets_bytes();
                     let str_bytes = ftext.strings_bytes();
-                    let mut row_groups: Vec<u16> = Vec::with_capacity(n);
+                    // 🔑 u32: 组索引曾用 u16 — 超 65535 个不同组时静默截断错组。
+                        let mut row_groups: Vec<u32> = Vec::with_capacity(n);
                     const LINEAR_THRESHOLD: usize = 16;
                     let mut use_hash = group_keys.len() >= LINEAR_THRESHOLD;
                     for i in 0..n {
@@ -1935,7 +1943,7 @@ impl QueryExecutor {
                             }
                         };
                         group_counts[idx] += 1;
-                        row_groups.push(idx as u16);
+                        row_groups.push(idx as u32);
                     }
                     // Phase 2: vectorized agg fold per column.
                     for (ai, agg) in gb_aggs.iter().enumerate() {

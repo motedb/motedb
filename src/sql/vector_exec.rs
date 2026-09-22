@@ -520,9 +520,15 @@ impl VecAcc {
     /// 批内折叠：定长列直接在类型化切片上按 selection 走（无 Value 物化），
     /// Bool/Utf8/Values 走批边界 get。
     fn fold_batch(&mut self, cv: &ColumnVector, sel: &SelectionVec, func: VecAggFunc) {
+        self.fold_rows(cv, sel.as_slice(), func)
+    }
+
+    /// 同 fold_batch，但直接吃原始行号切片 — M1 并行时 rayon par_chunks 的
+    /// chunk 就是 &[u32]，免建 SelectionVec。
+    fn fold_rows(&mut self, cv: &ColumnVector, rows: &[u32], func: VecAggFunc) {
         match &cv.data {
             ColData::I64(v) => {
-                for s in sel.iter() {
+                for s in rows.iter().copied() {
                     let s = s as usize;
                     if cv.valid.is_null(s) {
                         continue;
@@ -554,7 +560,7 @@ impl VecAcc {
                 }
             }
             ColData::F64(v) => {
-                for s in sel.iter() {
+                for s in rows.iter().copied() {
                     let s = s as usize;
                     if cv.valid.is_null(s) {
                         continue;
@@ -591,7 +597,7 @@ impl VecAcc {
             _ => {
                 // Bool 位图 / Utf8 / Values：批边界 get（含 Timestamp 列在
                 // I64 之外不会到这；Text MIN/MAX 走 Value 比较）
-                for s in sel.iter() {
+                for s in rows.iter().copied() {
                     let s = s as usize;
                     let val = cv.get(s);
                     if matches!(val, Value::Null) {
@@ -971,8 +977,11 @@ pub fn try_vec_no_group_aggregate(
     // — 只查墓碑会双计 (fuzz seed 18: GROUP BY id%5 多 6 行 = 恰好 6 个
     // 被 UPDATE 的行)。纯插入多段 (row_id 唯一) 也走去重 — 正确性优先,
     // 单段无墓碑 (checkpoint 合并后) 才走快路径。
-    let needs_dedup =
-        segments.iter().any(|s| s.has_any_deleted()) || segments.len() > 1;
+    // 🔑 去重条件精确化: 墓碑段在下方整体 decline; 多段纯插入 (row_id 唯一
+    // ⇒ key 唯一) 不再强制去重 — overlap_possible (UPDATE/DELETE 置位,
+    // 重开 2+ 段保守置位, 全量合并清除) 才是跨段重复键的判据。省掉
+    // keys 加载 + HashSet (~3ms/100K 行)。
+    let needs_dedup = store.may_have_duplicate_keys();
     let mut seen_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // 🔑 M1 保守门: 任一段含墓碑 → decline。已提交 DELETE 的段状态一致
     // (本路径可正确处理), 但 事务回滚 的 undo 重插走 insert_row_to_table
@@ -999,12 +1008,8 @@ pub fn try_vec_no_group_aggregate(
         // 🔑 快路径: 全段无墓碑 (纯插入 — row_id 唯一 ⇒ key 唯一) 时跳过
         // key 去重 (100K keys 加载 + HashSet 曾给每查询加 ~3ms)。
         // 有墓碑: 逆序 newest-wins (同 key 重复时新版本在下标大端)。
-        let vis_sel = if !needs_dedup {
-            let mut s0 = crate::storage::colbatch::SelectionVec::with_capacity(n);
-            for i in 0..n {
-                s0.push(i as u32);
-            }
-            s0
+        let vis: Vec<u32> = if !needs_dedup {
+            (0..n as u32).collect()
         } else {
             let keys = seg.keys();
             let mut vis: Vec<u32> = Vec::with_capacity(n);
@@ -1020,11 +1025,118 @@ pub fn try_vec_no_group_aggregate(
                 }
             }
             vis.reverse();
-            crate::storage::colbatch::SelectionVec::from_vec(vis)
+            vis
         };
-        if vis_sel.is_empty() {
+        if vis.is_empty() {
             continue;
         }
+        // 🔑 M1 morsel 并行 (大段): 去重/可见集已顺序算好, 行折叠按 chunk 分
+        // rayon 线程, partial VecAcc 主线程 merge (MIN/MAX 比较可交换, 和走
+        // CompSum::merge 保 Neumaier)。三种谓词形状 (无/AND 链/混合) 都在
+        // chunk 内闭式求值 — 工作线程不触碰任何 TLS 状态 (雷#1/#2/#3)。
+        #[cfg(feature = "rayon")]
+        if vis.len() >= PARALLEL_MIN_ROWS {
+            use rayon::prelude::*;
+            // 混合形状 (OR/NOT) 的谓词集整段先算一次 (chunk 内只做 contains)
+            let mixed_set: Option<std::collections::HashSet<u32>> = match &pred {
+                Some(p) => {
+                    let mut chain: Vec<&VecPredLeaf> = Vec::new();
+                    if !p.as_and_chain(&mut chain) {
+                        Some(p.eval_sel(&batch).iter().collect())
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            let chain: Vec<&VecPredLeaf> = match &pred {
+                Some(p) => {
+                    let mut c = Vec::new();
+                    let _ = p.as_and_chain(&mut c);
+                    c
+                }
+                None => Vec::new(),
+            };
+            let fold_specs: Vec<(usize, VecAggFunc, usize)> = specs
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, sp))| sp.func != VecAggFunc::CountStar)
+                .map(|(ai, (_, sp))| (ai, sp.func, sp.col.expect("non-CountStar has col")))
+                .collect();
+            let nchunks = par_chunk_count(vis.len());
+            let chunk_len = vis.len().div_ceil(nchunks).max(1);
+            let partials: Vec<Vec<VecAcc>> = vis
+                .par_chunks(chunk_len)
+                .map(|chunk| {
+                    let mut pa: Vec<VecAcc> = specs.iter().map(|_| VecAcc::default()).collect();
+                    match &pred {
+                        None => {
+                            for (ai, (_, sp)) in specs.iter().enumerate() {
+                                match sp.func {
+                                    VecAggFunc::CountStar => pa[ai].count += chunk.len() as u64,
+                                    _ => pa[ai].fold_rows(
+                                        &batch.cols[sp.col.expect("non-CountStar has col")],
+                                        chunk,
+                                        sp.func,
+                                    ),
+                                }
+                            }
+                        }
+                        Some(_) if !chain.is_empty() => {
+                            let mut hits: u64 = 0;
+                            for &r in chunk {
+                                let i = r as usize;
+                                let mut pass = true;
+                                for l in &chain {
+                                    if leaf_tv_leaf(&batch.cols, l, i) != TV::True {
+                                        pass = false;
+                                        break;
+                                    }
+                                }
+                                if !pass {
+                                    continue;
+                                }
+                                hits += 1;
+                                for &(ai, f, c) in &fold_specs {
+                                    pa[ai].fold_one(&batch.cols[c], i, f);
+                                }
+                            }
+                            for (ai, (_, sp)) in specs.iter().enumerate() {
+                                if sp.func == VecAggFunc::CountStar {
+                                    pa[ai].count += hits;
+                                }
+                            }
+                        }
+                        Some(_) => {
+                            let set = mixed_set.as_ref().expect("mixed pred set precomputed");
+                            let mut hits: u64 = 0;
+                            for &r in chunk {
+                                if !set.contains(&r) {
+                                    continue;
+                                }
+                                hits += 1;
+                                for &(ai, f, c) in &fold_specs {
+                                    pa[ai].fold_one(&batch.cols[c], r as usize, f);
+                                }
+                            }
+                            for (ai, (_, sp)) in specs.iter().enumerate() {
+                                if sp.func == VecAggFunc::CountStar {
+                                    pa[ai].count += hits;
+                                }
+                            }
+                        }
+                    }
+                    pa
+                })
+                .collect();
+            for pa in partials {
+                for (d, s) in accs.iter_mut().zip(pa.into_iter()) {
+                    d.merge(&s);
+                }
+            }
+            continue;
+        }
+        let vis_sel = crate::storage::colbatch::SelectionVec::from_vec(vis);
         match &pred {
             None => {
                 for (ai, (_, spec)) in specs.iter().enumerate() {
@@ -1394,13 +1506,29 @@ pub fn try_vec_group_by(
                 // decline 的形状 (ORDER BY/LIMIT/OFFSET): 它一见这些就落全
                 // 物化+排序 (1M 行 GROUP BY+ORDER BY 147ms vs 无 ORDER 15ms)。
                 // M2 的组输出 ORDER BY/LIMIT 尾部只排组数行 (≤基数)。
-                // 无 ORDER BY 的纯列键仍由 col_segment_group_by 的 &str
-                // 零分配路径接管 (更快), 不在此截胡。
+                // 无 ORDER BY 的纯列键: 小表仍让位 col_segment_group_by 的
+                // &str 零分配路径; 大表 (≥PARALLEL_MIN_ROWS) 走 M2 morsel
+                // 并行 — 1M 行实测 &str 串行 14.3ms vs M2 并行 4.8ms,
+                // "不截胡"在大表上是负优化。
                 if stmt.order_by.is_none()
                     && stmt.limit.is_none()
                     && stmt.offset.is_none()
                 {
-                    return Ok(None);
+                    #[cfg(not(feature = "rayon"))]
+                    {
+                        return Ok(None);
+                    }
+                    #[cfg(feature = "rayon")]
+                    {
+                        let total_rows: u64 = store
+                            .segments_snapshot()
+                            .iter()
+                            .map(|s| s.row_count as u64)
+                            .sum();
+                        if total_rows < PARALLEL_MIN_ROWS as u64 {
+                            return Ok(None);
+                        }
+                    }
                 }
                 let bare = c.rsplit('.').next().unwrap_or(c);
                 let matched = group_items
@@ -1519,7 +1647,7 @@ pub fn try_vec_group_by(
     // 🔑 与 M1 相同的多段/墓碑保守门 (UPDATE 合并后墓碑消失但跨段同 key
     // 残留 → 双计)。M2 直接 decline (M1 有去重机械, 这里表达式键场景
     // post-checkpoint 单段是常态)。
-    if segments.iter().any(|s| s.has_any_deleted()) || segments.len() > 1 {
+    if segments.iter().any(|s| s.has_any_deleted()) || store.may_have_duplicate_keys() {
         return Ok(None);
     }
 
@@ -2658,7 +2786,8 @@ pub fn try_vec_projection(
     if segments.iter().any(|s| s.has_any_deleted()) {
         return Ok(None);
     }
-    let need_dedup = segments.len() > 1 || store.may_have_duplicate_keys();
+    // 🔑 同 M1: 纯插入多段 (无 overlap) 不去重 — key 唯一。
+    let need_dedup = store.may_have_duplicate_keys();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     'outer: for seg in segments.iter().rev() {
@@ -2767,6 +2896,70 @@ fn f64_ord_key(v: f64) -> u64 {
 ///
 /// 语义对齐 `top_k_row_indices_typed`：NULL 排最前(ASC)/最后(DESC)；
 /// DESC 用 `u64::MAX - key` 翻转；i64 用符号位翻转直接比。
+
+/// top-k 有序键: 数值列折算 u64 保序键 (NULL 排最前 ASC/最后 DESC, 同引擎级
+/// 语义; Bool 按布尔序折 i64 键)。M4 串行/并行 chunk 共用。
+#[inline]
+fn topk_ord_key(kc: &ColumnVector, i: usize, desc: bool) -> u64 {
+    match &kc.data {
+        crate::storage::colbatch::ColData::F64(vs) => {
+            match (kc.valid.is_valid(i)).then(|| vs[i]) {
+                Some(v) => {
+                    if desc {
+                        u64::MAX - f64_ord_key(v)
+                    } else {
+                        f64_ord_key(v)
+                    }
+                }
+                None => {
+                    if desc {
+                        u64::MAX
+                    } else {
+                        u64::MIN
+                    }
+                }
+            }
+        }
+        crate::storage::colbatch::ColData::I64(vs) => {
+            match (kc.valid.is_valid(i)).then(|| vs[i]) {
+                Some(v) => {
+                    if desc {
+                        !(v as u64 ^ (1u64 << 63))
+                    } else {
+                        v as u64 ^ (1u64 << 63)
+                    }
+                }
+                None => {
+                    if desc {
+                        u64::MAX
+                    } else {
+                        u64::MIN
+                    }
+                }
+            }
+        }
+        // Bool 位图列按布尔序（false<true）折算 i64 键。
+        crate::storage::colbatch::ColData::Bool(_) => {
+            let v = match kc.get(i) {
+                Value::Bool(x) => x as i64,
+                _ => 0,
+            };
+            if desc {
+                !(v as u64 ^ (1u64 << 63))
+            } else {
+                v as u64 ^ (1u64 << 63)
+            }
+        }
+        _ => {
+            if desc {
+                u64::MAX
+            } else {
+                u64::MIN
+            }
+        }
+    }
+}
+
 pub fn try_vec_filter_topk(
     store: &ColSegmentStore,
     schema: &TableSchema,
@@ -2883,7 +3076,8 @@ pub fn try_vec_filter_topk(
     if segments.iter().any(|s| s.has_any_deleted()) {
         return Ok(None);
     }
-    let need_dedup = segments.len() > 1 || store.may_have_duplicate_keys();
+    // 🔑 同 M1: 纯插入多段 (无 overlap) 不去重 — key 唯一。
+    let need_dedup = store.may_have_duplicate_keys();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     // (ord_key, seg_idx, row) — 全命中行入表，select_nth 取前 k。
@@ -2920,6 +3114,49 @@ pub fn try_vec_filter_topk(
             }
             v
         };
+        // 🔑 M4 morsel 并行 (大段): 谓词过滤 + 有序键提取按 chunk 分 rayon
+        // 线程, partial entries 主线程拼接; select_nth/物化仍顺序 (k 有界)。
+        // 去重/可见集已顺序算好; 谓词是纯字面量 (雷#1/#2/#3 不触碰)。
+        #[cfg(feature = "rayon")]
+        if vis.len() >= PARALLEL_MIN_ROWS {
+            use rayon::prelude::*;
+            let mut chain: Vec<&VecPredLeaf> = Vec::new();
+            let is_chain = pred.as_and_chain(&mut chain);
+            let mixed_set: Option<std::collections::HashSet<u32>> = if !is_chain {
+                Some(pred.eval_sel(&batch).iter().collect())
+            } else {
+                None
+            };
+            let kc = &batch.cols[order_bi];
+            let nchunks = par_chunk_count(vis.len());
+            let chunk_len = vis.len().div_ceil(nchunks).max(1);
+            let parts: Vec<Vec<(u64, u32, u32)>> = vis
+                .par_chunks(chunk_len)
+                .map(|chunk| {
+                    let mut out: Vec<(u64, u32, u32)> = Vec::new();
+                    for &r in chunk {
+                        let pass = if is_chain {
+                            chain
+                                .iter()
+                                .all(|l| leaf_tv_leaf(&batch.cols, l, r as usize) == TV::True)
+                        } else {
+                            mixed_set.as_ref().map_or(false, |s| s.contains(&r))
+                        };
+                        if !pass {
+                            continue;
+                        }
+                        out.push((topk_ord_key(kc, r as usize, desc), sidx as u32, r));
+                    }
+                    out
+                })
+                .collect();
+            let total: usize = parts.iter().map(|p| p.len()).sum();
+            entries.reserve(total);
+            for p in parts {
+                entries.extend(p);
+            }
+            continue;
+        }
         let filtered: Vec<u32> = {
             let mut chain: Vec<&VecPredLeaf> = Vec::new();
             if pred.as_and_chain(&mut chain) {
@@ -2938,65 +3175,7 @@ pub fn try_vec_filter_topk(
         let kc = &batch.cols[order_bi];
         for r in filtered {
             let i = r as usize;
-            let ord_key: u64 = match &kc.data {
-                crate::storage::colbatch::ColData::F64(vs) => {
-                    match (kc.valid.is_valid(i)).then(|| vs[i]) {
-                        Some(v) => {
-                            if desc {
-                                u64::MAX - f64_ord_key(v)
-                            } else {
-                                f64_ord_key(v)
-                            }
-                        }
-                        // 🔑 NULL 排最前(ASC)/最后(DESC) — 同引擎级语义。
-                        None => {
-                            if desc {
-                                u64::MAX
-                            } else {
-                                u64::MIN
-                            }
-                        }
-                    }
-                }
-                crate::storage::colbatch::ColData::I64(vs) => {
-                    match (kc.valid.is_valid(i)).then(|| vs[i]) {
-                        Some(v) => {
-                            if desc {
-                                !(v as u64 ^ (1u64 << 63))
-                            } else {
-                                v as u64 ^ (1u64 << 63)
-                            }
-                        }
-                        None => {
-                            if desc {
-                                u64::MAX
-                            } else {
-                                u64::MIN
-                            }
-                        }
-                    }
-                }
-                // Bool 位图列按布尔序（false<true）折算 i64 键。
-                crate::storage::colbatch::ColData::Bool(_) => {
-                    let b = kc.get(i);
-                    let v = match b {
-                        Value::Bool(x) => x as i64,
-                        _ => 0,
-                    };
-                    if desc {
-                        !(v as u64 ^ (1u64 << 63))
-                    } else {
-                        v as u64 ^ (1u64 << 63)
-                    }
-                }
-                _ => {
-                    if desc {
-                        u64::MAX
-                    } else {
-                        u64::MIN
-                    }
-                }
-            };
+            let ord_key: u64 = topk_ord_key(kc, i, desc);
             entries.push((ord_key, sidx as u32, r));
         }
     }

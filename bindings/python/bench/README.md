@@ -1259,3 +1259,49 @@ rows/s** (原 43-54K, 计划验收线 ≥200K 超 1.8 倍); executemany 119-132K
 快慢两路径/省略非 PK 列 NULL/未知列报错/显式 PK 大批保留) +
 tests/test_insert_engine.rs 3/3 (Rust 侧对拍) + fuzz 3 seed × (on/off) +
 bigtable reopen_diverge=0 ×3 + E2E 51/51 + CLI 17/17。
+
+## M1/M4 路径并行 + GROUP BY 首查询错果修复 (vec-parallel 收尾)
+
+M5 只并行了 M2/M3; 本轮补 M1 (无组聚合) / M4 (过滤 top-k), 并在采样中
+挖出一个**主分支现行静默错果 bug**:
+
+1. **M1 morsel 并行** (`try_vec_no_group_aggregate`): 可见集/去重顺序算好
+   后, 行折叠按 chunk 分 rayon 线程 (三种谓词形状: 无/AND 链/混合 OR —
+   混合形状整段先算一次谓词集, chunk 内只做 contains), partial VecAcc
+   主线程 merge (MIN/MAX 可交换, 和走 CompSum::merge 保 Neumaier)。
+2. **M4 morsel 并行** (`try_vec_filter_topk`): 谓词过滤 + 有序键提取
+   (提取为公共 `topk_ord_key`) 按 chunk 并行, entries 拼接后 select_nth
+   仍顺序 (k 有界)。
+3. **M2 大表截胡修正**: 无 ORDER 纯列键 GROUP BY 曾无条件让位 &str 零分
+   配路径 — 1M 行实测 &str 串行 14.3ms vs M2 并行 4.8ms, "不截胡"在大表
+   上是负优化。现在 ≥PARALLEL_MIN_ROWS(200K) 走 M2, 小表仍 &str。
+4. **去重条件精确化** (M1/M4/M2): `segments.len() > 1` →
+   `may_have_duplicate_keys()` — 纯插入多段 (row_id 唯一 ⇒ key 唯一)
+   不再强制 keys 加载 + HashSet 去重 (~3ms/100K 行); overlap_possible
+   (UPDATE/DELETE 置位, 重开 2+ 段保守置位, 全量合并清除) 才去重。
+5. **🚨 col_segment_group_by 慢路径错果 (主分支现行 bug)**: 多段表上
+   GROUP BY 是首个需要 keys 的查询时, dedup 的 `row_map.key(i)` 在 keys
+   未加载时回退到**栅栏键** (每 fence_interval≈2048 行一个) — 每 2048 行
+   被当成同 key, seen 集合只留首行: **100K 行 GROUP BY 只剩 50 行/32 组,
+   静默错果**。全量套件没抓到是因为测试流程里总有前置查询先把 keys 载入
+   缓存。修复: need_dedup 时先 `load_full_keys()`; 回归测试
+   `test_groupby_first_query` (GROUP BY 作为首查询)。顺手修掉两阶段快路径
+   `row_groups: Vec<u16>` 的 65535 组截断。
+
+吞吐 @1M (基准 `bench/prof_vec_parallel.py`, p50):
+
+| 形状 | 前 | 后 | 加速 |
+|---|---|---|---|
+| A range COUNT+AVG (M1) | 7.72ms | **1.66ms** | 4.7× |
+| B filter top-k (M4) | 5.81ms | **2.12ms** | 2.7× |
+| C 深分页 top-k (M4) | 3.85ms | **1.81ms** | 2.1× |
+| D GROUP BY 无 ORDER | 14.34ms | **4.85ms** | 3.0× (M2 接管) |
+| E GROUP BY+ORDER (对照) | 4.85ms | 4.81ms | 持平 |
+
+@100K (低于并行门槛, 受益于去重精确化): A 3.39→**0.78** / B 3.37→**0.63**
+/ C 3.20→**0.42ms**。D &str 路径 2.4-2.5ms (计划 <0.8ms 目标仍开放 — 需
+并行门槛下调或 &str 路径并行化, 记录待办)。
+
+验证: A/B 对拍 11/11 (250K 行, MOTE_VEC on/off 全等, 含墓碑+多段) +
+test_groupby_first_query + fuzz 3 seed × (on/off) + bigtable
+reopen_diverge=0 + E2E 51/51 + CLI 17/17 + insert_arrays 15/15 + 全量套件。

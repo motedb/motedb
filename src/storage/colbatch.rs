@@ -210,6 +210,11 @@ impl SelectionVec {
         self.rows.iter().copied()
     }
 
+    /// 原始行号切片 — 并行 chunk 折叠 (par_chunks) 直接切这个。
+    pub fn as_slice(&self) -> &[u32] {
+        &self.rows
+    }
+
     pub fn into_inner(self) -> Vec<u32> {
         self.rows
     }
