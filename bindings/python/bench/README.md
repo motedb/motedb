@@ -1198,3 +1198,32 @@ fast path 收编说明: 静态扫描零死代码 (全部私有 fn 有引用); �
 验证: 拆分前后 232 bin 全绿 EXIT=0 + fuzz 4 seed × (默认开/off) + bigtable
 重开 0 发散 + E2E 51/51 + CLI 17/17 + compete_bench 无回退 (join 1.70ms,
 groupby 1.65ms)。
+
+## 导入吞吐战役 — WAL 微压缩黑洞 + insert_arrays 列式 API
+
+计划验收表的 ≥200K 行/s 目标: 采样定位到三层问题, 修掉两层, 第三层
+(核心插入引擎) 是另一场战役, 如实记录:
+
+1. **WAL 微压缩黑洞**: WAL_COMPRESS_THRESHOLD 曾是 128B — 1.6KB 的行级
+   WAL 记录全部走压缩检查, 100K 行导入 = 20 万次微型 zstd (每次都建
+   Huffman/FSE 表) ≈ 0.6s 纯开销。→ 阈值 4KB + 32KB×2 前缀采样预检 +
+   值得压缩门槛 10%→25% (WAL 短命, 边际压缩比不配热写路径吃 CPU)。
+   注: 行交错序列化让采样无法分辨 (文本恒可压), 门槛提高才是主效。
+2. **`db.insert_arrays(table, {列: numpy 数组/列表})`** 列式批量插入:
+   numpy (i64/f64/f32/2D-f32 → 向量列/<U unicode) 经 tobytes 一次 memcpy
+   解码, str/int/float 列表走同构批量 C-API 提取; 跳过 SQL 解析与逐行
+   Python 对象。executemany 的 Python 侧天花板实测 124K 行/s (每行
+   .tolist() 建 384 个 float 对象 = 0.8s), 此 API 是列式数据正解。
+3. **TIMESTAMP 强转 bug** (insert_arrays 对拍抓出): 直通批量路径的裸
+   Integer micros 未包成 Value::Timestamp → 编码落 0 (读回全 0)。
+   batch_insert 层补 Integer→Timestamp 强转 (SQL 路径在求值层已有)。
+
+吞吐 (100K×384, 同机噪声 ±20%): executemany 33-42K; insert_arrays
+numpy 列式 43-54K。**未达标**: 核心插入引擎天花板实测 ~250K 行/s
+(0.4s/100K = WAL 序列化+行编码+段构建), 提取侧零成本也压不进 200K 墙内
+—— 需 WAL 序列化/行编码/段构建的专项优化 (记录待办)。单发大调用反而更
+慢 (35.8K vs 分块 53.9K), 非每批 fsync 瓶颈。
+
+正确性: test_insert_arrays.py 10/10 (标量/NULL/向量/unicode 往返/
+executemany 聚合对拍/重开一致) + fuzz 4 seed × (on/off) + E2E 51/51 +
+全量 232 bin EXIT=0。

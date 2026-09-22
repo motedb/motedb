@@ -734,6 +734,13 @@ impl Database {
     /// of magnitude faster than N separate `execute_prepared` calls.
     ///
     /// Returns the total number of affected rows.
+    /// 🔥 列式批量插入 (numpy 数组直通): 跳过 SQL 解析与逐行 Python 对象,
+    /// 一次 WAL 批 + 单次锁获取。绑定层把 numpy 缓冲区组装成行后走这里。
+    pub fn insert_rows(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
+        let ids = self.inner.batch_insert_rows_to_table(table, rows)?;
+        Ok(ids.len() as u64)
+    }
+
     pub fn execute_prepared_many(&self, sql: &str, batch: Vec<Vec<Value>>) -> Result<u64> {
         if self
             .inner

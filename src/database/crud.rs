@@ -2829,6 +2829,22 @@ impl MoteDB {
             })?;
         }
 
+        // 2.4b 🔑 TIMESTAMP 列的 Integer 强转: SQL 插入路径在求值层已把
+        // 整数 micros 包成 Value::Timestamp, 直通批量路径 (insert_arrays)
+        // 传的是裸 Integer — 不转的话按 Timestamp 变体编码落 0
+        // (读回全 0, insert_arrays ts 对拍抓出)。
+        for row in rows.iter_mut() {
+            for (i, ct) in schema.col_types().iter().enumerate() {
+                if matches!(ct, crate::types::ColumnType::Timestamp) {
+                    if let Some(crate::types::Value::Integer(m)) = row.get(i) {
+                        row[i] = crate::types::Value::Timestamp(
+                            crate::types::Timestamp::from_micros(*m),
+                        );
+                    }
+                }
+            }
+        }
+
         // 2.5 Check primary key uniqueness for non-AUTO_INCREMENT tables.
         // 🔑 Track reserved PKs so we can roll them back if validation (step 3)
         // fails — otherwise a failed batch leaves phantom PK entries in the

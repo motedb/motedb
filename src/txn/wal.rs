@@ -146,8 +146,11 @@ const TAG_ROLLBACK: u8 = 0x06;
 const TAG_CHECKPOINT: u8 = 0x07;
 /// Compression marker tag (0x00 never used by record types, backward compatible)
 const TAG_COMPRESSED: u8 = 0x00;
-/// Minimum payload size (bytes) to consider compression. Small records aren't worth it.
-const WAL_COMPRESS_THRESHOLD: usize = 128;
+/// Minimum payload size (bytes) to consider compression. Small records aren't
+/// worth it — 曾是 128B: 1.6KB 的行级 WAL 记录全走压缩检查 (含采样器的
+/// zstd 调用, 每次都要建 Huffman/FSE 表), 100K 行导入 = 20 万次微型 zstd
+/// ≈ 0.6s 纯开销。4KB 以下直接跳过。
+const WAL_COMPRESS_THRESHOLD: usize = 4096;
 
 impl WALRecord {
     /// Encode WAL record to native binary format.
@@ -942,10 +945,20 @@ impl PartitionWAL {
             // 🚀 零分配：不压缩时返回借用（省 to_vec 的堆分配 + 拷贝）
             return std::borrow::Cow::Borrowed(data);
         }
+        // 🚀 前缀采样预检: 随机浮点/向量为主的批 payload 压不动 (ratio<10%),
+        // 但旧逻辑为发现这一点先付全量 level-1 编码 — 导入 70% 时间在给
+        // 随机数做无用压缩。先压 2×32KB 样本 (首部+中部), 任一节省 <10%
+        // 都倾向跳过全量; 样本可压才做完整编码。跳过压缩永远合法
+        // (WAL 帧格式有 TAG_COMPRESSED 标记), 只影响空间。
+        if !Self::sample_compression_promising(data) {
+            return std::borrow::Cow::Borrowed(data);
+        }
         // Try Zstd level 1 compression
         if let Ok(compressed) = zstd::encode_all(data, 1) {
-            // Only use compressed if we save meaningful space (>10%)
-            if compressed.len() + 5 < data.len() * 9 / 10 {
+            // Only use compressed if we save meaningful space (>25% —
+            // WAL 是短命数据 (checkpoint 截断), 边际压缩比不值得热写路径
+            // 的 zstd CPU; 10% 门槛曾让 85% 随机浮点的批也全量压缩)
+            if compressed.len() + 5 < data.len() * 3 / 4 {
                 // Format: [0x00][u32 original_len][zstd_data]
                 let mut out = Vec::with_capacity(5 + compressed.len());
                 out.push(TAG_COMPRESSED);
@@ -955,6 +968,25 @@ impl PartitionWAL {
             }
         }
         std::borrow::Cow::Borrowed(data)
+    }
+
+    /// 32KB×2 (首部+中部) 样本的 level-1 压缩是否值得做全量编码。
+    fn sample_compression_promising(data: &[u8]) -> bool {
+        const SAMPLE: usize = 32 * 1024;
+        let half = data.len() / 2;
+        let head_len = SAMPLE.min(half);
+        let head = &data[..head_len];
+        let mid = data.len() / 2;
+        let tail_len = SAMPLE.min(data.len() - mid);
+        let tail = &data[mid..mid + tail_len];
+        for s in [head, tail] {
+            if let Ok(c) = zstd::encode_all(s, 1) {
+                if c.len() + 5 < s.len() * 3 / 4 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Write a pre-serialized record with framing (single buffer).
