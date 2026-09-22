@@ -139,8 +139,16 @@ fn extract_column_values(obj: &Bound<'_, pyo3::types::PyAny>) -> PyResult<Vec<mo
             .getattr("str")?
             .extract()?;
         let shape: Vec<usize> = obj.getattr("shape")?.extract()?;
-        let bytes: Vec<u8> = obj.call_method0("tobytes")?.extract()?;
-        return decode_array_bytes(&dtype, &shape, &bytes);
+        // 🔑 bytes 对象必须 downcast 成 PyBytes 用 as_bytes() 借切片 —
+        // extract::<Vec<u8>> 走通用序列提取, 每字节建一个 PyLong (100K×384
+        // 的导入 95% 时间在这, sample 剖析实锤), 慢两个数量级。
+        let bytes_obj = obj.call_method0("tobytes")?;
+        let bytes_bound = bytes_obj
+            .downcast::<pyo3::types::PyBytes>()
+            .map_err(|_| {
+                PyValueError::new_err("tobytes() did not return a bytes object")
+            })?;
+        return decode_array_bytes(&dtype, &shape, bytes_bound.as_bytes());
     }
     // 2) 同构列表快路径: 单次批量 C-API 提取 — 逐对象 py_to_mote (每次
     //    先试 bool/i64/f64 再 String) 曾占导入的 2/3。
@@ -513,48 +521,70 @@ impl PyDatabase {
         use pyo3::types::PyAnyMethods as _;
         use motedb_core::types::Value as MValue;
 
-        // 收集 (列名, 值生成器): 先按 schema 无关地提取 — 列序由表 schema 决定。
-        let schema_cols: Vec<String> = {
-            // 通过一次 0 行探测拿不到 schema — 直接要求调用方字典键即列名,
-            // 行数取第一个键的长度。列缺失/多余由 validate_row 报错。
-            columns.keys().into_iter().map(|k| k.extract::<String>().unwrap_or_default()).collect()
-        };
-        if schema_cols.is_empty() {
-            return Err(PyValueError::new_err("columns dict is empty"));
-        }
-        // 每列 → 逐行 Value 数组
-        let mut col_values: Vec<Vec<MValue>> = Vec::with_capacity(schema_cols.len());
-        let mut nrows: Option<usize> = None;
+        // 🔑 按 schema 位置放置列值。旧实现按字典序转置 — 字典序 ≠ schema
+        // 序时值静默落错列 (TEXT 列收到 Float 被清成空串), 省略前导自增 PK
+        // 时 row[0] 被 auto id 覆盖, 100 行数据全毁且无报错。
+        let schema_cols = self
+            .db
+            .table_columns(table)
+            .map_err(py_err)?;
+        let mut by_pos: Vec<Option<Vec<MValue>>> = vec![None; schema_cols.len()];
         for key in columns.keys() {
-            let name = key.extract::<String>().map_err(|_| PyValueError::new_err("column keys must be strings"))?;
+            let name = key
+                .extract::<String>()
+                .map_err(|_| PyValueError::new_err("column keys must be strings"))?;
+            let pos = schema_cols
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown column '{}' for table '{}'",
+                        name, table
+                    ))
+                })?;
+            if by_pos[pos].is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "column '{}' given twice",
+                    name
+                )));
+            }
             let obj = columns
                 .get_item(&name)
                 .map_err(|_| PyValueError::new_err(format!("column '{}' missing", name)))?
                 .unwrap_or_else(|| py.None().into_bound(py));
-            let vals = extract_column_values(&obj)?;
-            let n = vals.len();
-            if let Some(prev) = nrows {
-                if prev != n {
+            by_pos[pos] = Some(extract_column_values(&obj)?);
+        }
+        if by_pos.iter().all(|c| c.is_none()) {
+            return Err(PyValueError::new_err("columns dict is empty"));
+        }
+        let nrows = by_pos
+            .iter()
+            .find_map(|c| c.as_ref().map(|v| v.len()))
+            .unwrap_or(0);
+        for (i, c) in by_pos.iter().enumerate() {
+            if let Some(vals) = c {
+                if vals.len() != nrows {
                     return Err(PyValueError::new_err(format!(
-                        "column '{}' has {} rows, expected {}", name, n, prev
+                        "column '{}' has {} rows, expected {}",
+                        schema_cols[i], vals.len(), nrows
                     )));
                 }
-            } else {
-                nrows = Some(n);
             }
-            col_values.push(vals);
         }
-        let nrows = nrows.unwrap_or(0);
         if nrows == 0 {
             return Ok(0);
         }
-        // 转置成行
-        let ncols = col_values.len();
+        // 转置成 schema 全宽行: 缺失列 = NULL (自增 PK 的 NULL 在批量路径
+        // 由引擎填 auto id; 逐列消费避免整列 clone)。
+        let ncols = by_pos.len();
         let mut rows: Vec<Vec<MValue>> = Vec::with_capacity(nrows);
         for r in 0..nrows {
             let mut row = Vec::with_capacity(ncols);
-            for c in col_values.iter_mut() {
-                row.push(std::mem::replace(&mut c[r], MValue::Null));
+            for c in by_pos.iter_mut() {
+                row.push(match c {
+                    Some(vals) => std::mem::replace(&mut vals[r], MValue::Null),
+                    None => MValue::Null,
+                });
             }
             rows.push(row);
         }

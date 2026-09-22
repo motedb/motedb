@@ -65,5 +65,40 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+# ── 按位放置回归 (2026-09 修复: 旧实现按字典序转置 → 错位损毁) ──
+dbp = motedb.Database(os.path.join(tmp, "pos.mote"))
+dbp.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, c TEXT, v FLOAT)")
+# 1) 字典序 != schema 序
+dbp.insert_arrays("t", {"v": [9.5, 8.5], "c": ["zz", "yy"]})
+check("dict order != schema order", dbp.execute("SELECT c, v FROM t ORDER BY c"),
+      [{"c": "yy", "v": 8.5}, {"c": "zz", "v": 9.5}])
+# 2) 省略自增 PK: 小批 (慢路径) 与大批 (快路径) 数据均完整
+dbp.insert_arrays("t", {"c": ["small"], "v": [0.5]})
+dbp.insert_arrays("t", {"c": [f"L{i}" for i in range(150)], "v": [1.0] * 150})
+got = dbp.execute("SELECT c, v FROM t WHERE c = 'small'")
+check("omitted PK small batch", got, [{"c": "small", "v": 0.5}])
+got = dbp.execute("SELECT c, v FROM t WHERE c = 'L149'")
+check("omitted PK large batch", got, [{"c": "L149", "v": 1.0}])
+check("auto id sequence", [r["id"] for r in dbp.execute("SELECT id FROM t ORDER BY id LIMIT 4")],
+      [1, 2, 3, 4])
+# 3) 省略非 PK 列 → NULL
+dbp.execute("CREATE TABLE u (id INTEGER PRIMARY KEY AUTO_INCREMENT, a TEXT, b FLOAT)")
+dbp.insert_arrays("u", {"a": ["only_a"]})
+check("omitted non-PK col is NULL", dbp.execute("SELECT * FROM u"),
+      [{"id": 1, "a": "only_a", "b": None}])
+# 4) 未知列报错
+try:
+    dbp.insert_arrays("u", {"nope": [1]})
+    check("unknown column errors", "no error", "error")
+except (RuntimeError, ValueError):
+    check("unknown column errors", "error", "error")
+# 5) 显式 PK 大批不被改写 (Rust 门修复的对拍)
+dbp.execute("CREATE TABLE w (id INTEGER PRIMARY KEY AUTO_INCREMENT, x TEXT)")
+dbp.insert_arrays("w", {"x": ["a", "b"]})  # 先 2 行 auto id
+dbp.insert_arrays("w", {"id": list(range(1000, 1150)), "x": [f"e{i}" for i in range(150)]})
+check("explicit PK honored in large batch",
+      dbp.execute("SELECT x FROM w WHERE id = 1000"), [{"x": "e0"}])
+dbp.close()
+
 print("ALL OK" if FAIL == 0 else f"{FAIL} FAILURES")
 sys.exit(1 if FAIL else 0)

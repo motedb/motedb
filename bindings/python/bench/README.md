@@ -1227,3 +1227,35 @@ numpy 列式 43-54K。**未达标**: 核心插入引擎天花板实测 ~250K 行
 正确性: test_insert_arrays.py 10/10 (标量/NULL/向量/unicode 往返/
 executemany 聚合对拍/重开一致) + fuzz 4 seed × (on/off) + E2E 51/51 +
 全量 232 bin EXIT=0。
+
+## 插入引擎专项 — 天花板解剖: 根因不在引擎, 在 pyo3 提取层 (3 bug)
+
+上节记录的 "核心插入引擎 ~250K 行/s 天花板" 解剖后推翻: 纯 Rust 基准
+(`examples/bench_insert_engine.rs`, 100K×384) 实测 **2.1-2.5M rows/s**
+(含向量数据, 默认 group-commit 配置), close 落盘 0.13s。所谓引擎天花板
+是 Python 侧测量的误归因。sample 剖析 Python 进程: insert_arrays 窗口
+95% 时间在 Python→Rust 边界提取, 真正的 DB 写入只占 ~2%。
+
+1. **tobytes→Vec<u8> 逐字节 PyLong (20× 黑洞)**: `extract::<Vec<u8>>()`
+   把 bytes 对象当通用 Python 序列 — 每字节建一个 PyLong 再转回 u8,
+   100K×384 = 1.5 亿次。修复: downcast `PyBytes` + `as_bytes()` 借切片
+   (零拷贝零对象)。insert 窗口 1300ms → 70ms。
+2. **insert_arrays 字典序转置 = 静默数据损毁**: 旧实现按字典键序转置成
+   行, 与 schema 列序无关 — 字典序 ≠ schema 序时值落错列 (TEXT 列收到
+   Float 被清成空串); 省略前导自增 PK 时 `row[pk_pos]=auto_id` 覆盖首列
+   真实值, 100 行全毁且无报错。修复: 绑定层先取 `db.table_columns()`
+   (新增 api), 值按 schema 位置放置, 缺失列 = NULL (自增 PK 的 NULL 由
+   引擎填 auto id, 两条路径一致); 未知列显式报错。
+3. **fast_batch_insert 静默丢弃显式自增 PK**: SQL 层与慢路径都保留
+   `INSERT INTO t (id,…) VALUES (100,…)` 的显式 id (值即 row id + 唯一性
+   检查), 唯独 ≥100 行快路径用 counter id 覆盖。修复: 批内任一行带非
+   NULL PK → 走全路径 (SQL 批量导入省略 id → 仍走快路径, 无性能回归)。
+
+吞吐 (100K×384, 数据预生成, 同机噪声 ±20%): **insert_arrays 311-385K
+rows/s** (原 43-54K, 计划验收线 ≥200K 超 1.8 倍); executemany 119-132K
+(.tolist() Python 侧天花板)。400K 行持续 296K rows/s。
+
+正确性: test_insert_arrays.py 15/15 (原 10 + 按位放置/字典序/省略 PK
+快慢两路径/省略非 PK 列 NULL/未知列报错/显式 PK 大批保留) +
+tests/test_insert_engine.rs 3/3 (Rust 侧对拍) + fuzz 3 seed × (on/off) +
+bigtable reopen_diverge=0 ×3 + E2E 51/51 + CLI 17/17。

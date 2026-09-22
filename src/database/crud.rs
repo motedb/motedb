@@ -2813,9 +2813,22 @@ impl MoteDB {
         // validation, WAL clone overhead, and mmap page release. This is the
         // hot path for bulk INSERT benchmarks — ~3x faster than the full path.
         let auto_inc = schema.is_primary_key_auto_increment();
+        // 🔑 Only when NO row carries an explicit PK value. The full path
+        // honors explicit AUTO_INCREMENT PKs (value becomes the row id, counter
+        // bumps past it, uniqueness enforced); the fast path assigns counter
+        // ids — taking it with explicit PKs silently discarded them (a
+        // divergence between the two paths, data-affecting).
+        let has_explicit_pk = schema
+            .primary_key()
+            .and_then(|pk| schema.get_column(pk))
+            .map(|c| c.position)
+            .map_or(false, |p| {
+                rows.iter()
+                    .any(|r| !matches!(r.get(p), None | Some(Value::Null)))
+            });
         // Only use fast_batch_insert for large batches with ColSegmentStore.
         // Single-row inserts go through the normal path (WAL + index updates).
-        if auto_inc && rows.len() >= 100 {
+        if auto_inc && !has_explicit_pk && rows.len() >= 100 {
             return self.fast_batch_insert(table_name, rows, &schema);
         }
 

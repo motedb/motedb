@@ -741,6 +741,17 @@ impl Database {
         Ok(ids.len() as u64)
     }
 
+    /// 表的列名列表（schema 序）。绑定层 insert_arrays 按位放置列值用 —
+    /// 字典序 ≠ schema 序曾导致错位损毁 (值静默落错列)。
+    pub fn table_columns(&self, table: &str) -> Result<Vec<String>> {
+        let schema = self.inner.table_registry.get_table(table)?;
+        Ok(schema
+            .column_names_cache
+            .as_ref()
+            .map(|c| (**c).clone())
+            .unwrap_or_else(|| schema.columns.iter().map(|c| c.name.clone()).collect()))
+    }
+
     pub fn execute_prepared_many(&self, sql: &str, batch: Vec<Vec<Value>>) -> Result<u64> {
         if self
             .inner
