@@ -1305,3 +1305,34 @@ M5 只并行了 M2/M3; 本轮补 M1 (无组聚合) / M4 (过滤 top-k), 并在�
 验证: A/B 对拍 11/11 (250K 行, MOTE_VEC on/off 全等, 含墓碑+多段) +
 test_groupby_first_query + fuzz 3 seed × (on/off) + bigtable
 reopen_diverge=0 + E2E 51/51 + CLI 17/17 + insert_arrays 15/15 + 全量套件。
+
+## 并行门槛拆分 — VEC 计划查询目标全部收口
+
+上节的 100K 表 (批量导入后 2×50K 段, checkpoint 不合并小段) 暴露门槛
+粒度问题: 并行判据是**每段**行数, 100K 门槛对多段小段永不触发。拆两级:
+
+- `PARALLEL_MIN_ROWS = 100K` (路由级): 无 ORDER 纯列键 GROUP BY 让位 &str
+  还是走 M2 的分界 (跨段累计行数)。
+- `PARALLEL_MORSEL_MIN_ROWS = 20K` (段内折叠级): M1/M2/M3/M4 的 par_chunks
+  判据。校准: 单次 par_chunks (≤16 chunk) 调度+merge ~0.1ms, 20K 行折叠
+  工作 ≥0.5ms 仍有净收益; 更小查询不进并行分支零开销。实测 @20K 表
+  GROUP BY 0.33ms / @50K 0.79ms — 全尺寸赢无反伤。
+
+compete_bench (官方 100K×384 口径, p50):
+
+| 指标 | 计划目标 | R13 基线 | 现在 | 状态 |
+|---|---|---|---|---|
+| GROUP BY device | <0.8ms | 1.57ms | **0.713ms** | ✅ |
+| range COUNT+AVG | <0.4ms | 0.76ms | **0.185ms** | ✅ |
+| equi-JOIN + GROUP BY | <4ms | 16.7ms | **0.441ms** | ✅ (超 37×) |
+| top-k ORDER LIMIT | 持平 | 0.457ms | 0.452ms | ✅ |
+| PK 点查 | — | 18µs | 17µs | ✅ |
+| 批量导入 (insert_arrays, 384 维口径) | ≥200K/s | 62K | 311-385K/s | ✅ |
+
+VEC 计划 (M0-M6 + 后续并行收尾) 的全部量化目标至此收口。注: 本表导入
+行为 insert_arrays 列式口径; compete_bench 的 load_rows_per_s 仍走
+executemany (Python 侧 .tolist() 天花板 ~124K), 口径不同未列入。
+
+验证: A/B 对拍 11/11 + fuzz 3 seed × (on/off) + bigtable diverge=0 +
+E2E 51/51 + CLI 17/17 + insert_arrays 15/15 + test_groupby_first_query
++ 全量套件 + edge (no-rayon) 编译。

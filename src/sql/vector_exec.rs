@@ -1035,7 +1035,7 @@ pub fn try_vec_no_group_aggregate(
         // CompSum::merge 保 Neumaier)。三种谓词形状 (无/AND 链/混合) 都在
         // chunk 内闭式求值 — 工作线程不触碰任何 TLS 状态 (雷#1/#2/#3)。
         #[cfg(feature = "rayon")]
-        if vis.len() >= PARALLEL_MIN_ROWS {
+        if vis.len() >= PARALLEL_MORSEL_MIN_ROWS {
             use rayon::prelude::*;
             // 混合形状 (OR/NOT) 的谓词集整段先算一次 (chunk 内只做 contains)
             let mixed_set: Option<std::collections::HashSet<u32>> = match &pred {
@@ -1452,10 +1452,18 @@ pub struct VecGroupByOutcome {
 /// 稳态零重建)、键在类型化切片上求值、聚合批内折叠 — 无 SqlRow/全行
 /// 物化。收集 M1 同样的保守门 (事务/墓碑 decline)。
 #[allow(clippy::too_many_lines)]
-/// M5 morsel 并行门槛: 行数 ≥ 此值才并行 (rayon 调度 + merge 开销
-/// ~几十 µs 级, 小数据串行更快; 阈值按 1M 行基线校准留出充足余量)。
+/// 路由级门槛: 无 ORDER 纯列键 GROUP BY 让位 &str 还是走 M2 的分界
+/// (total rows, 跨段累计)。小表 &str 零分配更快; 大表 M2 morsel 并行更快。
 #[cfg(feature = "rayon")]
-const PARALLEL_MIN_ROWS: usize = 200_000;
+const PARALLEL_MIN_ROWS: usize = 100_000;
+
+/// 段内折叠门槛: 单段可见行数 ≥ 此值才 par_chunks (per-segment)。批量导入
+/// 后的常态是多段 (checkpoint 不合并小段, e.g. 100K 表 = 2×50K), 门槛按段
+/// 判时 100K 门槛永远不触发 — 拆独立常量校准到 20K: 单次 par_chunks
+/// (≤16 chunk) 调度+merge 开销 ~0.1ms, 20K 行的折叠工作 ≥0.5ms 仍有净收益;
+/// 更小的查询不进并行分支零开销。
+#[cfg(feature = "rayon")]
+const PARALLEL_MORSEL_MIN_ROWS: usize = 20_000;
 
 /// chunk 数: rayon 线程数 (封顶 16 — 更细的 morsel 只增加 merge 成本)。
 #[cfg(feature = "rayon")]
@@ -1705,7 +1713,7 @@ pub fn try_vec_group_by(
             None => (0..n as u32).collect(),
         };
         #[cfg(feature = "rayon")]
-        if rows.len() >= PARALLEL_MIN_ROWS {
+        if rows.len() >= PARALLEL_MORSEL_MIN_ROWS {
             use rayon::prelude::*;
             // 🔑 M5 morsel 并行: 行按 chunk 分给 rayon 线程, 各自建 partial
             // 组表, 主线程按组合并。列批 Arc 共享零拷贝; 谓词/键/聚合都是
@@ -2311,7 +2319,7 @@ pub fn try_vec_equi_join_gb(
             None => (0..n as u32).collect(),
         };
         #[cfg(feature = "rayon")]
-        if rows.len() >= PARALLEL_MIN_ROWS {
+        if rows.len() >= PARALLEL_MORSEL_MIN_ROWS {
             use rayon::prelude::*;
             // 🔑 M5 morsel 并行: probe 行按 chunk 分线程, 各自 partial 组表,
             // 主线程合并。build 表 (table) 共享只读; 列批 Arc 零拷贝。
@@ -3118,7 +3126,7 @@ pub fn try_vec_filter_topk(
         // 线程, partial entries 主线程拼接; select_nth/物化仍顺序 (k 有界)。
         // 去重/可见集已顺序算好; 谓词是纯字面量 (雷#1/#2/#3 不触碰)。
         #[cfg(feature = "rayon")]
-        if vis.len() >= PARALLEL_MIN_ROWS {
+        if vis.len() >= PARALLEL_MORSEL_MIN_ROWS {
             use rayon::prelude::*;
             let mut chain: Vec<&VecPredLeaf> = Vec::new();
             let is_chain = pred.as_and_chain(&mut chain);
