@@ -143,6 +143,9 @@ pub struct InsertStmt {
     pub table: String,
     pub columns: Option<Vec<String>>, // None means all columns
     pub values: Vec<Vec<Expr>>,       // Multiple rows
+    /// `INSERT INTO t ... SELECT ...`: 数据源为子查询 (与 values 互斥)。
+    /// 执行时先物化 SELECT 行, 再按 columns (或 schema 序) 走同一插入管线。
+    pub select: Option<Box<SelectStmt>>,
     /// Upsert clause: `ON CONFLICT ...` / `INSERT OR IGNORE` / `INSERT OR REPLACE`
     pub on_conflict: Option<OnConflict>,
 }

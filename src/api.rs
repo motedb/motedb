@@ -831,6 +831,7 @@ impl Database {
             table: insert.table.clone(),
             columns: insert.columns.clone(),
             values: rows,
+            select: None,
             on_conflict: insert.on_conflict.clone(),
         };
         self.query_executor.reset_last_insert_id();

@@ -8365,9 +8365,24 @@ impl QueryExecutor {
                             _ => 0,
                         })
                     })),
-                Statement::Insert(i) => i.values.iter().fold(0, |acc, row| {
-                    acc.max(row.iter().fold(0, |a, e| a.max(walk_expr(e))))
-                }),
+                Statement::Insert(i) => i
+                    .values
+                    .iter()
+                    .fold(0, |acc, row| {
+                        acc.max(row.iter().fold(0, |a, e| a.max(walk_expr(e))))
+                    })
+                    .max(i.select.as_ref().map(|s| {
+                        s.where_clause
+                            .as_ref()
+                            .map(walk_expr)
+                            .unwrap_or(0)
+                            .max(s.columns.iter().fold(0, |acc, c| {
+                                acc.max(match c {
+                                    SelectColumn::Expr(e, _) => walk_expr(e),
+                                    _ => 0,
+                                })
+                            }))
+                    }).unwrap_or(0)),
                 Statement::Update(u) => {
                     let where_max = u.where_clause.as_ref().map(walk_expr).unwrap_or(0);
                     let set_max = u
@@ -16033,6 +16048,30 @@ impl QueryExecutor {
             schema.columns.iter().map(|c| c.name.clone()).collect()
         };
 
+        // 🆕 INSERT ... SELECT: 先物化 SELECT 行 (execute_select_internal 是
+        // 内部路径, 不受 max_result_rows 截断 — 子查询同款), 后续走同一插入
+        // 管线 (batch/WAL/事务/索引)。自插 (INSERT INTO t SELECT ... FROM t)
+        // 因先物化后插入而无无限循环。
+        let select_rows: Option<Vec<Vec<Value>>> = match &stmt.select {
+            Some(sel) => {
+                if stmt.on_conflict.is_some() {
+                    return Err(MoteDBError::InvalidArgument(
+                        "INSERT ... SELECT does not support ON CONFLICT / OR IGNORE / OR REPLACE yet"
+                            .into(),
+                    ));
+                }
+                match self.execute_select_internal(sel)? {
+                    QueryResult::Select { rows, .. } => Some(rows),
+                    _ => {
+                        return Err(MoteDBError::InvalidArgument(
+                            "INSERT ... SELECT source must be a SELECT query".into(),
+                        ))
+                    }
+                }
+            }
+            None => None,
+        };
+
         // 🆕 Upsert (ON CONFLICT / OR IGNORE / OR REPLACE): dedicated
         // row-at-a-time path with a per-row existence check.
         if stmt.on_conflict.is_some() {
@@ -16041,11 +16080,27 @@ impl QueryExecutor {
 
         // Route TimeSeries INSERT to columnar store
         if schema.table_type == crate::types::TableType::TimeSeries {
-            return self.execute_columnar_insert(stmt, &schema, &columns);
+            return self.execute_columnar_insert(stmt, &schema, &columns, select_rows.as_deref());
         }
 
         // Prepare all rows — resolve expressions to Values, build Row directly
         let mut prepared_rows = Vec::new();
+
+        // SELECT 源: 行已是求值好的 Values — 直接按 columns 映射建行。
+        if let Some(sel_rows) = &select_rows {
+            for value_row in sel_rows {
+                if value_row.len() != columns.len() {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Column count mismatch: expected {}, got {}",
+                        columns.len(),
+                        value_row.len()
+                    )));
+                }
+                let row =
+                    crate::sql::row_converter::values_to_row_by_columns(value_row, &columns, &schema)?;
+                prepared_rows.push(row);
+            }
+        }
 
         for value_row in &stmt.values {
             if value_row.len() != columns.len() {
@@ -21632,8 +21687,25 @@ impl QueryExecutor {
         stmt: &InsertStmt,
         schema: &crate::types::TableSchema,
         columns: &[String],
+        select_rows: Option<&[Vec<Value>]>,
     ) -> Result<QueryResult> {
         let mut rows: Vec<Vec<crate::types::Value>> = Vec::new();
+
+        // INSERT ... SELECT 源: 行已求值, 直接按 columns 映射建行。
+        if let Some(sel_rows) = select_rows {
+            for value_row in sel_rows {
+                if value_row.len() != columns.len() {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Column count mismatch: expected {}, got {}",
+                        columns.len(),
+                        value_row.len()
+                    )));
+                }
+                let row =
+                    crate::sql::row_converter::values_to_row_by_columns(value_row, columns, schema)?;
+                rows.push(row);
+            }
+        }
 
         for value_row in &stmt.values {
             if value_row.len() != columns.len() {

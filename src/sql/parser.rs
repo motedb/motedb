@@ -816,18 +816,26 @@ impl Parser {
             None
         };
 
-        self.expect(TokenType::Values)?;
+        // 🆕 INSERT ... SELECT: 数据源为子查询 (与 VALUES 互斥)。
+        let select = if matches!(self.current().token_type, TokenType::Select) {
+            Some(Box::new(self.parse_select()?))
+        } else {
+            None
+        };
 
-        // Parse value rows
         let mut values = Vec::new();
-        loop {
-            self.expect(TokenType::LParen)?;
-            let row = self.parse_expr_list()?;
-            self.expect(TokenType::RParen)?;
-            values.push(row);
+        if select.is_none() {
+            self.expect(TokenType::Values)?;
+            // Parse value rows
+            loop {
+                self.expect(TokenType::LParen)?;
+                let row = self.parse_expr_list()?;
+                self.expect(TokenType::RParen)?;
+                values.push(row);
 
-            if !self.match_token(TokenType::Comma) {
-                break;
+                if !self.match_token(TokenType::Comma) {
+                    break;
+                }
             }
         }
 
@@ -871,6 +879,7 @@ impl Parser {
             table,
             columns,
             values,
+            select,
             on_conflict,
         })
     }

@@ -1366,3 +1366,28 @@ SqlRow + 每对 combine_rows 建 HashMap + eval, 20K×30K (6 亿对) 物化 144s
 WHERE×ON 叠加、三表链、空表、DELETE 墓碑、跨表 decline 手工对拍) +
 fuzz 3 seed × (on/off) + bigtable diverge=0 + E2E 51 + CLI 17 +
 insert_arrays 15 + parallel_ab 11 + 全量套件。
+
+## INSERT ... SELECT — SQL 缺口补齐 (500K 行 1.59M rows/s)
+
+Round 13e 记录的待办: `INSERT INTO t ... SELECT ...` 解析层就不支持
+("Expected Values")。补齐全链路:
+
+- **AST**: InsertStmt 增 `select: Option<Box<SelectStmt>>` (与 values 互斥)。
+- **解析器**: 列清单后接受 SELECT 源 (ON CONFLICT 后缀语法照旧解析,
+  但与 SELECT 组合在执行层显式报错 — 阶段一不支持)。
+- **执行器** (execute_insert_ref 顶部): `execute_select_internal` 物化
+  SELECT 行 (**内部路径不受 max_result_rows 截断** — 子查询同款; 避免
+  大 INSERT..SELECT 被静默截断), 行已是求值好的 Values, 按 columns
+  (或无列清单时的 schema 全宽 — 数量不符显式报错, 不静默 NULL 填充)
+  经 values_to_row_by_columns 建行后走**同一插入管线** (batch WAL/事务
+  缓冲/索引/last_insert_id)。TimeSeries 目标表同样支持 (columnar ingest);
+  自插因先物化后插入无无限循环; 事务内 ROLLBACK 干净。
+- max_parameter_index walker 补 SELECT 源参数扫描。
+
+吞吐: 500K 行 (4 列) INSERT..SELECT 315ms = **1.59M rows/s**, 校验和
+对拍一致 — 与原生 batch 插入同量级 (物化 + 批量写两趟)。
+
+验证: test_insert_select 11/11 (基本形状/表达式投影/无列序全宽与报错/
+自插翻倍对拍/ORDER LIMIT 源/JOIN 源/ON CONFLICT 显式错误/事务回滚与
+提交/参数化/TS 表/重开一致/500K 批量) + fuzz 2seed×(on/off) + bigtable
+diverge=0 + E2E 51 + CLI 17 + insert_arrays 15 + parallel_ab 11 + 全量套件。
