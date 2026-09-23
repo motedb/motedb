@@ -1391,3 +1391,28 @@ Round 13e 记录的待办: `INSERT INTO t ... SELECT ...` 解析层就不支持
 自插翻倍对拍/ORDER LIMIT 源/JOIN 源/ON CONFLICT 显式错误/事务回滚与
 提交/参数化/TS 表/重开一致/500K 批量) + fuzz 2seed×(on/off) + bigtable
 diverge=0 + E2E 51 + CLI 17 + insert_arrays 15 + parallel_ab 11 + 全量套件。
+
+## fetch_arrays — 列式 Python 返回 API (numpy 零拷贝)
+
+VEC 计划表外的最后一项记录候选: 查询结果列式直接返回 numpy, 免逐行
+dict 拼装。新 `db.fetch_arrays(sql, params=None)` → `(columns, {列名:
+numpy 数组 | Python 列表})`:
+
+- 同质无 NULL 列单遍分类后直接 `np.frombuffer` 零拷贝 (Rust 侧 lazy
+  `import numpy` — sys.modules 命中 ~µs; 缺 numpy / 调用失败回退 bytes
+  对象, 用户可自行 frombuffer):
+  INTEGER / TIMESTAMP → `<i8` (Timestamp 为 micros, 同 execute() 语义)
+  FLOAT → `<f8`; BOOLEAN → `bool`
+- TEXT 列 → str 列表 (复用驻留缓存); 含 NULL / 混合类型 / VECTOR /
+  SPATIAL 列 → 逐值 Python 对象列表 (None 表示 NULL) — 不做 NaN 假 NULL。
+- 只读数组 (frombuffer 语义); 需要 writable 用户侧 `.copy()`。
+
+吞吐 (100K×5 列, WHERE 过滤后 ~90K 行): execute() 逐行 dict 20.4ms /
+query() 元组 17.6ms / **fetch_arrays 8.7ms** (2.3×)。分析负载
+(df = pd.DataFrame(dict(arrays)) / 直接送 numpy kernel) 的正解。
+
+验证: test_fetch_arrays 16/16 (五列类型映射/dtype、与 execute() 全行
+对拍、Text/Vector 列表、NULL 回退、参数化、空结果、非 SELECT 报错、
+LIMIT OFFSET、重开一致) + E2E 51 + CLI 17 + insert_arrays 15 +
+parallel_ab 11 + fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件
+(Rust 侧无改动, 套件确认)。

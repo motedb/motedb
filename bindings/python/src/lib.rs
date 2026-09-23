@@ -248,6 +248,32 @@ fn decode_array_bytes(
     }
 }
 
+/// 运行时 lazy import numpy (sys.modules 命中后 ~µs 级, 无进程缓存 —
+/// pyo3 0.22 的 Py<PyAny> 无 GIL 不能 Clone)。缺 numpy → None (回退 bytes)。
+fn numpy_module(py: Python<'_>) -> Option<pyo3::Bound<'_, pyo3::types::PyModule>> {
+    py.import_bound("numpy").ok()
+}
+
+/// np.frombuffer(bytes, dtype) 零拷贝包装; 无 numpy / 调用失败 → bytes 对象
+/// (用户可自行 np.frombuffer)。
+fn frombuffer_or_bytes(
+    py: Python<'_>,
+    np: Option<&pyo3::Bound<'_, pyo3::types::PyModule>>,
+    buf: &[u8],
+    dtype: &str,
+) -> PyObject {
+    use pyo3::types::PyAnyMethods as _;
+    if let Some(np) = np {
+        let bytes = pyo3::types::PyBytes::new_bound(py, buf);
+        if let Ok(arr) = np.call_method1("frombuffer", (bytes, dtype)) {
+            return arr.into_any().unbind();
+        }
+    }
+    pyo3::types::PyBytes::new_bound(py, buf)
+        .into_any()
+        .unbind()
+}
+
 fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
     use pyo3::types::PyAnyMethods as _;
     if v.is_none() {
@@ -490,6 +516,118 @@ impl PyDatabase {
                 _ => Err(PyValueError::new_err("query() expects a SELECT statement")),
             }
         })
+    }
+
+    /// 🚀 列式取回: `(columns, {列名: numpy 数组 | Python 列表})`。
+    ///
+    /// 同质无 NULL 的列直接走 np.frombuffer 零拷贝 (运行时 lazy import
+    /// numpy; 缺 numpy 回退返回 bytes 对象):
+    /// - INTEGER / TIMESTAMP → dtype '<i8' (Timestamp 为 micros, 同 execute())
+    /// - FLOAT → '<f8'
+    /// - BOOLEAN → 'bool'
+    /// TEXT 列 → str 列表 (驻留缓存); 含 NULL / 混合类型 / VECTOR /
+    /// SPATIAL 列 → 逐值 Python 对象列表 (None 表示 NULL)。
+    /// 大结果集比 execute() 的逐行 dict 拼装快一个数量级。
+    #[pyo3(signature = (sql, params=None))]
+    fn fetch_arrays(&self, py: Python<'_>, sql: &str, params: Option<Bound<'_, pyo3::types::PyAny>>) -> PyResult<PyObject> {
+        let result = self.run(py, sql, params)?;
+        match result {
+            motedb_core::QueryResult::Select { columns, rows } => {
+                use pyo3::types::PyAnyMethods as _;
+                let np = numpy_module(py);
+                let dict = pyo3::types::PyDict::new_bound(py);
+                let mut text_cache: InternMap = std::collections::HashMap::default();
+                let ncols = columns.len();
+                for (ci, name) in columns.iter().enumerate() {
+                    // 单遍分类: 每列判定同质种类 (任一 NULL/异类 → Obj)。
+                    #[derive(PartialEq, Clone, Copy)]
+                    enum K {
+                        Unknown,
+                        I64,
+                        F64,
+                        Bool,
+                        Text,
+                        Obj,
+                    }
+                    let mut kind = K::Unknown;
+                    for row in rows.iter() {
+                        let k = match row.get(ci) {
+                            Some(MValue::Integer(_)) | Some(MValue::Timestamp(_)) => K::I64,
+                            Some(MValue::Float(_)) => K::F64,
+                            Some(MValue::Bool(_)) => K::Bool,
+                            Some(MValue::Text(_)) => K::Text,
+                            _ => K::Obj,
+                        };
+                        kind = match (kind, k) {
+                            (K::Unknown, k) => k,
+                            (a, b) if a == b => a,
+                            _ => {
+                                kind = K::Obj;
+                                break;
+                            }
+                        };
+                    }
+                    let n = rows.len();
+                    let payload: PyObject = match kind {
+                        K::I64 => {
+                            let mut buf: Vec<u8> = Vec::with_capacity(n * 8);
+                            for row in rows.iter() {
+                                let v = match row.get(ci) {
+                                    Some(MValue::Integer(i)) => *i,
+                                    Some(MValue::Timestamp(t)) => t.as_micros(),
+                                    _ => 0,
+                                };
+                                buf.extend_from_slice(&v.to_le_bytes());
+                            }
+                            frombuffer_or_bytes(py, np.as_ref(), &buf, "<i8")
+                        }
+                        K::F64 => {
+                            let mut buf: Vec<u8> = Vec::with_capacity(n * 8);
+                            for row in rows.iter() {
+                                if let Some(MValue::Float(f)) = row.get(ci) {
+                                    buf.extend_from_slice(&f.to_le_bytes());
+                                }
+                            }
+                            frombuffer_or_bytes(py, np.as_ref(), &buf, "<f8")
+                        }
+                        K::Bool => {
+                            let mut buf: Vec<u8> = Vec::with_capacity(n);
+                            for row in rows.iter() {
+                                buf.push(u8::from(matches!(row.get(ci), Some(MValue::Bool(true)))));
+                            }
+                            frombuffer_or_bytes(py, np.as_ref(), &buf, "bool")
+                        }
+                        K::Text => {
+                            let list = pyo3::types::PyList::empty_bound(py);
+                            for row in rows.iter() {
+                                let v: motedb_core::types::ArcString = match row.get(ci) {
+                                    Some(MValue::Text(t)) => t.clone(),
+                                    _ => "".into(), // 分类已保证 Text
+                                };
+                                list.append(mote_to_py_cached(&MValue::Text(v), &mut text_cache))?;
+                            }
+                            list.into_any().unbind()
+                        }
+                        _ => {
+                            let list = pyo3::types::PyList::empty_bound(py);
+                            for row in rows.iter() {
+                                let v = row.get(ci).cloned().unwrap_or(MValue::Null);
+                                list.append(mote_to_py_cached(&v, &mut text_cache))?;
+                            }
+                            list.into_any().unbind()
+                        }
+                    };
+                    dict.set_item(name.as_str(), payload)?;
+                }
+                let _ = ncols;
+                let cols_list: PyObject = columns.into_py(py);
+                let t = pyo3::types::PyTuple::new_bound(py, vec![cols_list, dict.into_any().unbind()]);
+                Ok(t.into_any().unbind())
+            }
+            _ => Err(PyValueError::new_err(
+                "fetch_arrays() expects a SELECT statement",
+            )),
+        }
     }
 
     /// Per-table budget (bytes) for decoded VECTOR columns — edge presets cap
