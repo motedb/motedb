@@ -1447,3 +1447,18 @@ parallel_ab 11 + fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件
 对拍 + UPDATE 500 行 newest-wins + DELETE 700 行无幽灵不缺行 + NULL
 向量不参与) + E2E 51 + CLI 17 + insert_arrays 15 + parallel_ab 11 +
 fetch_arrays 16 + fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件。
+
+## compete_bench 加载口径切换 insert_arrays — 官方口径 62K → 152K rows/s
+
+官方基准的加载路径从 executemany (SQL 参数绑定, Python 侧逐行对象构造 +
+.tolist() 每 384 浮点建列表) 切到 `db.insert_arrays` 列式批量 API:
+
+- **load_rows_per_s: ~62K → 151,674** (2.5×); load_peak_rss 830 → 710MB。
+- id 语义不变 (0..N-1 显式 PK 走 full path 校验+唯一性, q_point 依赖)。
+- 全部查询形状与切换前一致 (knn 4.77 / point 17µs / groupby 0.87 /
+  join 0.47 / topk 0.50 / fts 0.14ms) — 数据正确性由基准自身查询隐式
+  验证。
+- 口径说明: 各引擎用各自的批量导入正解 (sqlite executemany / duckdb
+  原生 / mote insert_arrays)。executemany 口径的历史数字 (48-62K) 留在
+  本文件历史章节 — 那是 SQL 绑定路径的 Python 侧天花板, 不是引擎上限;
+  无显式 PK 的自增表 (fast path) 为 311-385K rows/s (fb593a2 章节)。
