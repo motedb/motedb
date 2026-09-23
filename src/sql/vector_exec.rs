@@ -1455,7 +1455,7 @@ pub struct VecGroupByOutcome {
 /// 路由级门槛: 无 ORDER 纯列键 GROUP BY 让位 &str 还是走 M2 的分界
 /// (total rows, 跨段累计)。小表 &str 零分配更快; 大表 M2 morsel 并行更快。
 #[cfg(feature = "rayon")]
-const PARALLEL_MIN_ROWS: usize = 100_000;
+pub(crate) const PARALLEL_MIN_ROWS: usize = 100_000;
 
 /// 段内折叠门槛: 单段可见行数 ≥ 此值才 par_chunks (per-segment)。批量导入
 /// 后的常态是多段 (checkpoint 不合并小段, e.g. 100K 表 = 2×50K), 门槛按段
@@ -1463,11 +1463,11 @@ const PARALLEL_MIN_ROWS: usize = 100_000;
 /// (≤16 chunk) 调度+merge 开销 ~0.1ms, 20K 行的折叠工作 ≥0.5ms 仍有净收益;
 /// 更小的查询不进并行分支零开销。
 #[cfg(feature = "rayon")]
-const PARALLEL_MORSEL_MIN_ROWS: usize = 20_000;
+pub(crate) const PARALLEL_MORSEL_MIN_ROWS: usize = 20_000;
 
 /// chunk 数: rayon 线程数 (封顶 16 — 更细的 morsel 只增加 merge 成本)。
 #[cfg(feature = "rayon")]
-fn par_chunk_count(n: usize) -> usize {
+pub(crate) fn par_chunk_count(n: usize) -> usize {
     // 线程数封顶 16, 且不超过行数 (n=0 由调用方门槛挡掉)。
     // 🔑 曾把下界写成上界 (.max(n)) → nchunks=n → 每 chunk 1 行,
     // rayon 被百万微型任务淹没 (并行比串行慢 25×, 全线程卡在 join 调度)。

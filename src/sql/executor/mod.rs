@@ -20339,7 +20339,213 @@ impl QueryExecutor {
             for key in store.buffered_tombstone_keys() {
                 seen.insert(key);
             }
-            for seg in segs.iter().rev() {
+            // 🚀 跨段 morsel 并行: ≥2 段且无跨段重复键可能 (纯插入多段 —
+            // 4MB flush 产生的小段阵是批量导入后的常态, 段内 20K 门槛对
+            // ~2.7K 的小段永不触发) 时段间相互独立, 每段一个 rayon 任务
+            // 评分进本地 top-k 堆, 主线程合并。缓存/预算决策与缓存填充
+            // 保持串行 (RSS 语义不变)。有 overlap 可能 (UPDATE/DELETE 置
+            // 位 / 重开保守置位) 走下方顺序 newest-wins 路径。
+            // 🔑 跨段无重复键判据: 段键各自升序存储, 各段 [首键, 尾键] 区间
+            // 两两不相交 ⇒ 段间无同 key 行 (UPDATE 重写同 key 的新版本必然
+            // 落进与旧段重叠的区间 → 判据失败 → 走顺序 newest-wins)。首键 =
+            // row_map.key(0) (fence 边界精确), 尾键 = last_key_hint, 均 O(1)。
+            // 重开时保守置位的 overlap_possible 不再误伤纯插入段阵。
+            let segs_disjoint: bool = {
+                let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(segs.len());
+                let mut ok = true;
+                for seg in segs.iter() {
+                    let n = seg.sst.num_rows;
+                    if n == 0 {
+                        continue;
+                    }
+                    let first = seg.sst.row_map.key(0);
+                    match seg.sst.last_key_hint() {
+                        Some(last) if last >= first => ranges.push((first, last)),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                ok && {
+                    ranges.sort_unstable();
+                    ranges.windows(2).all(|w| w[0].1 < w[1].0)
+                }
+            };
+            #[cfg(feature = "rayon")]
+            let did_cross_parallel: bool = if segs.len() >= 2 && segs_disjoint {
+                use rayon::prelude::*;
+                enum Plan {
+                    Cached(crate::storage::lsm::columnar::VectorSegment),
+                    Stream,
+                    SkipTombstones,
+                }
+                // phase 1: 决策 + 缓存填充 (串行, 预算记账 — 同顺序路径)。
+                let mut cached_total_p: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
+                let plans: Vec<(std::sync::Arc<crate::storage::col_segment::Segment>, Plan)> =
+                    segs.iter()
+                        .map(|seg| {
+                        let n = seg.sst.num_rows;
+                        if col_pos >= seg.sst.column_tags.len() {
+                            return (std::sync::Arc::clone(seg), Plan::SkipTombstones);
+                        }
+                        let seg_bytes = n * qdim * 4;
+                        let cached = match seg.cached_vectors(col_pos) {
+                            Some(vs) => Some(vs),
+                            None if cached_total_p + seg_bytes <= budget => {
+                                let vs = seg.read_vectors_cached(col_pos);
+                                if vs.is_some() {
+                                    cached_total_p += seg_bytes;
+                                }
+                                vs
+                            }
+                            None => None,
+                        };
+                        match cached {
+                            Some(vs) if vs.dim == qdim => {
+                                (std::sync::Arc::clone(seg), Plan::Cached(vs))
+                            }
+                            Some(_) => (std::sync::Arc::clone(seg), Plan::SkipTombstones),
+                            None => (std::sync::Arc::clone(seg), Plan::Stream),
+                        }
+                        })
+                        .collect();
+                // phase 2: 段间并行评分 (段内串行 — 段数即并行度; 无
+                // overlap ⇒ 无需 seen 过滤)。
+                let offer_local = |lh: &mut std::collections::BinaryHeap<(OrderedF32, u64)>,
+                                   key: u64,
+                                   rv: &[f32]| {
+                    let dist = if cosine {
+                        crate::distance::cosine::cosine_distance(query, rv)
+                    } else {
+                        crate::distance::euclidean::euclidean_distance_squared(query, rv)
+                    };
+                    let cand = (OrderedF32(dist), key);
+                    if lh.len() < k {
+                        lh.push(cand);
+                    } else if lh.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
+                        lh.pop();
+                        lh.push(cand);
+                    }
+                };
+                let parts: Vec<(
+                    std::collections::BinaryHeap<(OrderedF32, u64)>,
+                    Vec<u64>,
+                )> = plans
+                    .into_par_iter()
+                    .map(|(seg, plan)| {
+                        let mut lh: std::collections::BinaryHeap<(OrderedF32, u64)> =
+                            std::collections::BinaryHeap::with_capacity(k + 1);
+                        let mut tombstoned: Vec<u64> = Vec::new();
+                        let n = seg.sst.num_rows;
+                        let seed_tombstoned = |tombstoned: &mut Vec<u64>| {
+                            for i in 0..n {
+                                if seg.sst.row_map.is_deleted(i) {
+                                    tombstoned.push(seg.sst.row_map.key(i));
+                                }
+                            }
+                        };
+                        match plan {
+                            Plan::SkipTombstones => {
+                                seed_tombstoned(&mut tombstoned);
+                            }
+                            Plan::Cached(vs) => {
+                                for i in 0..n {
+                                    if seg.sst.row_map.is_deleted(i) {
+                                        tombstoned.push(seg.sst.row_map.key(i));
+                                        continue;
+                                    }
+                                    if let Some(rv) = vs.row(i) {
+                                        offer_local(&mut lh, seg.sst.row_map.key(i), rv);
+                                    }
+                                }
+                            }
+                            Plan::Stream => {
+                                let entry = &seg.sst.column_index[col_pos];
+                                let col_start = entry.offset as usize;
+                                let null_bytes = n.div_ceil(8);
+                                let mut head = vec![0u8; null_bytes + 2];
+                                if seg
+                                    .sst
+                                    .read_bytes_at(col_start + 1, null_bytes + 2)
+                                    .map(|h| head.copy_from_slice(&h))
+                                    .is_err()
+                                {
+                                    seed_tombstoned(&mut tombstoned);
+                                    return (lh, tombstoned);
+                                }
+                                let dim =
+                                    u16::from_le_bytes([head[null_bytes], head[null_bytes + 1]])
+                                        as usize;
+                                if dim != qdim {
+                                    seed_tombstoned(&mut tombstoned);
+                                    return (lh, tombstoned);
+                                }
+                                let stride = dim * 4;
+                                let data_base = col_start + 1 + null_bytes + 2;
+                                const CHUNK: usize = 8 * 1024 * 1024;
+                                let rows_per_chunk = (CHUNK / stride.max(1)).max(1);
+                                let mut buf: Vec<u8> = Vec::new();
+                                let mut scr: Vec<f32> = vec![0.0; qdim];
+                                'outer: for cstart in (0..n).step_by(rows_per_chunk) {
+                                    let cend = (cstart + rows_per_chunk).min(n);
+                                    let need = (cend - cstart) * stride;
+                                    if buf.len() < need {
+                                        buf.resize(need, 0);
+                                    }
+                                    if seg
+                                        .sst
+                                        .read_bytes_at(data_base + cstart * stride, need)
+                                        .map(|b| buf[..need].copy_from_slice(&b))
+                                        .is_err()
+                                    {
+                                        break 'outer;
+                                    }
+                                    for i in cstart..cend {
+                                        if seg.sst.row_map.is_deleted(i) {
+                                            tombstoned.push(seg.sst.row_map.key(i));
+                                            continue;
+                                        }
+                                        if (head[i / 8] >> (i % 8)) & 1 != 0 {
+                                            continue;
+                                        }
+                                        let base = (i - cstart) * stride;
+                                        crate::storage::lsm::columnar::copy_le_f32(
+                                            &mut scr,
+                                            &buf[base..base + stride],
+                                        );
+                                        offer_local(&mut lh, seg.sst.row_map.key(i), &scr);
+                                    }
+                                }
+                            }
+                        }
+                        (lh, tombstoned)
+                    })
+                    .collect();
+                for (lh, tombstoned) in parts {
+                    for cand in lh {
+                        if heap.len() < k {
+                            heap.push(cand);
+                        } else if heap.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
+                            heap.pop();
+                            heap.push(cand);
+                        }
+                    }
+                    seen.extend(tombstoned);
+                }
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "rayon"))]
+            let did_cross_parallel: bool = false;
+            for seg in (if did_cross_parallel {
+                &segs[..0] // 并行分支已完成 — 空迭代跳过顺序路径
+            } else {
+                &segs[..]
+            })
+            .iter()
+            .rev() {
                 let n = seg.sst.num_rows;
                 // 🔑 Seed tombstones even when this segment's VECTOR column is
                 // unusable for scoring. A tombstone-only segment stores NULL
@@ -20374,6 +20580,73 @@ impl QueryExecutor {
                 if let Some(vs) = cached {
                     if vs.dim != qdim {
                         seed_tombstones(&mut seen);
+                        continue;
+                    }
+                    // 🚀 段内 morsel 并行 (大段): 段内键唯一 (flush 时
+                    // newest-wins 去重) ⇒ 段内无需去重; prior-seen (更新
+                    // 来源已声明的键) 作只读快照, 段后统一合并本段新声明键
+                    // + 墓碑键 — 跨段 newest-wins 序逐位保持。
+                    #[cfg(feature = "rayon")]
+                    if n >= crate::sql::vector_exec::PARALLEL_MORSEL_MIN_ROWS {
+                        use rayon::prelude::*;
+                        let nchunks = crate::sql::vector_exec::par_chunk_count(n);
+                        let chunk_len = n.div_ceil(nchunks).max(1);
+                        let prior = &seen;
+                        let parts: Vec<(
+                            std::collections::BinaryHeap<(OrderedF32, u64)>,
+                            Vec<u64>,
+                            Vec<u64>,
+                        )> = (0..n)
+                            .into_par_iter()
+                            .chunks(chunk_len)
+                            .map(|rows| {
+                                let mut lh: std::collections::BinaryHeap<(OrderedF32, u64)> =
+                                    std::collections::BinaryHeap::with_capacity(k + 1);
+                                let (mut claimed, mut tombstoned): (Vec<u64>, Vec<u64>) =
+                                    (Vec::new(), Vec::new());
+                                for i in rows {
+                                    let key = seg.sst.row_map.key(i);
+                                    if seg.sst.row_map.is_deleted(i) {
+                                        tombstoned.push(key);
+                                        continue;
+                                    }
+                                    let Some(row_vec) = vs.row(i) else {
+                                        continue;
+                                    };
+                                    if prior.contains(&key) {
+                                        continue;
+                                    }
+                                    let dist = if cosine {
+                                        crate::distance::cosine::cosine_distance(query, row_vec)
+                                    } else {
+                                        crate::distance::euclidean::euclidean_distance_squared(
+                                            query, row_vec,
+                                        )
+                                    };
+                                    let cand = (OrderedF32(dist), key);
+                                    if lh.len() < k {
+                                        lh.push(cand);
+                                    } else if lh.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
+                                        lh.pop();
+                                        lh.push(cand);
+                                    }
+                                    claimed.push(key);
+                                }
+                                (lh, claimed, tombstoned)
+                            })
+                            .collect();
+                        for (lh, claimed, tombstoned) in parts {
+                            for cand in lh {
+                                if heap.len() < k {
+                                    heap.push(cand);
+                                } else if heap.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
+                                    heap.pop();
+                                    heap.push(cand);
+                                }
+                            }
+                            seen.extend(claimed);
+                            seen.extend(tombstoned);
+                        }
                         continue;
                     }
                     for i in 0..n {
@@ -20426,6 +20699,90 @@ impl QueryExecutor {
                 }
                 let stride = dim * 4;
                 let data_base = col_start + 1 + null_bytes + 2;
+                // 🚀 段内 morsel 并行 (大段): 每个 rayon chunk 自读自的列
+                // 切片 (mmap 页错误并行化) + 本地 top-k 堆; 键声明序同缓存
+                // 分支 (段后合并)。小段保持顺序 8MB 流式。
+                #[cfg(feature = "rayon")]
+                if n >= crate::sql::vector_exec::PARALLEL_MORSEL_MIN_ROWS {
+                    use rayon::prelude::*;
+                    let nchunks = crate::sql::vector_exec::par_chunk_count(n);
+                    let chunk_len = n.div_ceil(nchunks).max(1);
+                    let prior = &seen;
+                    let parts: Vec<(
+                        std::collections::BinaryHeap<(OrderedF32, u64)>,
+                        Vec<u64>,
+                        Vec<u64>,
+                    )> = (0..n)
+                        .into_par_iter()
+                        .chunks(chunk_len)
+                        .map(|rows| {
+                            let mut lh: std::collections::BinaryHeap<(OrderedF32, u64)> =
+                                std::collections::BinaryHeap::with_capacity(k + 1);
+                            let (mut claimed, mut tombstoned): (Vec<u64>, Vec<u64>) =
+                                (Vec::new(), Vec::new());
+                            let row0 = rows[0];
+                            let need = rows.len() * stride;
+                            let mut buf: Vec<u8> = vec![0u8; need];
+                            let base_off = data_base + row0 * stride;
+                            if seg
+                                .sst
+                                .read_bytes_at(base_off, need)
+                                .map(|b| buf.copy_from_slice(&b))
+                                .is_err()
+                            {
+                                return (lh, claimed, tombstoned);
+                            }
+                            let mut scr: Vec<f32> = vec![0.0; qdim];
+                            for i in rows {
+                                let key = seg.sst.row_map.key(i);
+                                if seg.sst.row_map.is_deleted(i) {
+                                    tombstoned.push(key);
+                                    continue;
+                                }
+                                if (head[i / 8] >> (i % 8)) & 1 != 0 {
+                                    continue;
+                                }
+                                let base = (i - row0) * stride;
+                                crate::storage::lsm::columnar::copy_le_f32(
+                                    &mut scr,
+                                    &buf[base..base + stride],
+                                );
+                                if prior.contains(&key) {
+                                    continue;
+                                }
+                                let dist = if cosine {
+                                    crate::distance::cosine::cosine_distance(query, &scr)
+                                } else {
+                                    crate::distance::euclidean::euclidean_distance_squared(
+                                        query, &scr,
+                                    )
+                                };
+                                let cand = (OrderedF32(dist), key);
+                                if lh.len() < k {
+                                    lh.push(cand);
+                                } else if lh.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
+                                    lh.pop();
+                                    lh.push(cand);
+                                }
+                                claimed.push(key);
+                            }
+                            (lh, claimed, tombstoned)
+                        })
+                        .collect();
+                    for (lh, claimed, tombstoned) in parts {
+                        for cand in lh {
+                            if heap.len() < k {
+                                heap.push(cand);
+                            } else if heap.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
+                                heap.pop();
+                                heap.push(cand);
+                            }
+                        }
+                        seen.extend(claimed);
+                        seen.extend(tombstoned);
+                    }
+                    continue;
+                }
                 const KNN_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024;
                 let rows_per_chunk = (KNN_STREAM_CHUNK_BYTES / stride.max(1)).max(1);
                 for cstart in (0..n).step_by(rows_per_chunk) {

@@ -1416,3 +1416,34 @@ query() 元组 17.6ms / **fetch_arrays 8.7ms** (2.3×)。分析负载
 LIMIT OFFSET、重开一致) + E2E 51 + CLI 17 + insert_arrays 15 +
 parallel_ab 11 + fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件
 (Rust 侧无改动, 套件确认)。
+
+## knn 精确扫描并行 — 官方 bench 最慢查询 6.05 → 4.66ms (带宽地板)
+
+瓶颈扫描定位: compete_bench 最慢查询是无索引 `ORDER BY emb <-> ? LIMIT 10`
+精确扫描 (100K×384 = 153.6MB/查, 串行 SIMD)。两层并行化:
+
+1. **段内 morsel 并行** (≥20K 行大段, checkpoint 合并后的单段形态):
+   行 chunk 分 rayon 线程, 各建本地 top-k 堆 (MAX-heap peek=最差, 严格
+   更近才替换 — 同串行语义), prior-seen 只读快照 + 段后合并键声明 —
+   跨段 newest-wins 去重序逐位保持。缓存/流式两条读取路径都覆盖。
+2. **跨段并行** (≥2 段的段阵 — 批量导入后 4MB flush 的常态, 段内 20K
+   门槛对 ~5K 小段永不触发): 每段一个 rayon 任务。**跨段无重复键判据**
+   用段键区间两两不相交 (段键升序存储, row_map.key(0) fence 边界精确 +
+   last_key_hint 均 O(1)) — UPDATE 重写同 key 的新版本必然落进与旧段
+   重叠的区间 → 判据失败 → 保守走顺序 newest-wins 路径。重开时保守置位
+   的 overlap_possible 不再误伤纯插入段阵。缓存/预算决策与缓存填充保持
+   串行 (RSS 语义不变), 流式段的 8MB 分块读取在各段任务内并行。
+
+吞吐: knn10 p50 **6.05 → 4.66ms** (1.3×)。到此是**内存带宽地板**:
+153.6MB 精确扫描 @ ~33GB/s — 再快需要近似索引 (CREATE VECTOR INDEX
+已有 DiskANN/HNSW 路径) 而非更快的精确扫描。其余形状全部持平
+(point 17µs / range 0.20 / groupby 0.80 / join 0.45 / topk 0.48 / fts 0.14ms)。
+
+教训 (测试侧): 差分数据生成器用 fract((i*K+d*C)*φ) 线性型在 8 维下产生
+大量 f32 余弦恰为 0.0 的近平行向量 (平局任意序, 双方都是合法答案) —
+换 splitmix64 (24-bit 均匀分量) 才能做确定性差分。
+
+验证: test_knn_parallel (60K×8 两段, L2+cosine 三查询点与测试内暴力
+对拍 + UPDATE 500 行 newest-wins + DELETE 700 行无幽灵不缺行 + NULL
+向量不参与) + E2E 51 + CLI 17 + insert_arrays 15 + parallel_ab 11 +
+fetch_arrays 16 + fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件。
