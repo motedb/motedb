@@ -548,6 +548,238 @@ impl QueryExecutor {
         }
     }
 
+
+    /// 🚀 全乘积/链式 INNER JOIN 的 COUNT(*) 折叠。
+    ///
+    /// `SELECT COUNT(*) FROM a JOIN b ON 1=1` (无跨表约束) 曾走通用路径:
+    /// 双侧物化 SqlRow + 每对 combine_rows 建 HashMap + eval — 20K×30K
+    /// (6 亿对) 物化数分钟。当每步 ON 都是 (a) 常量表达式 或 (b) 只引用
+    /// 单表列的 `col op literal` 谓词, 且 WHERE 亦全分解为单表谓词时,
+    /// INNER join 的计数因式分解: 结果 = Π 各表 (过滤后) 行数 — 零物化,
+    /// 复杂度 O(Σ N_i)。等值/跨表 ON decline (hash 路径已够快)。
+    pub(super) fn try_join_count_fold(
+        &self,
+        stmt: &SelectStmt,
+    ) -> Result<Option<(Vec<String>, Vec<Vec<Value>>)>> {
+        use crate::sql::ast::{BinaryOperator, SelectColumn};
+        if Self::is_in_transaction_tls() {
+            return Ok(None); // 事务内 read-your-writes 语义留给通用路径
+        }
+        if stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || stmt.latest_by.is_some()
+        {
+            return Ok(None);
+        }
+        // 恰好一个 COUNT(*)(无参或 *), 无其它输出列。
+        if stmt.columns.len() != 1 {
+            return Ok(None);
+        }
+        let agg_expr = match stmt.columns.first() {
+            Some(SelectColumn::Expr(e, _)) => e,
+            _ => return Ok(None),
+        };
+        let Expr::FunctionCall {
+            name,
+            args,
+            distinct: false,
+            ..
+        } = agg_expr
+        else {
+            return Ok(None);
+        };
+        if !name.eq_ignore_ascii_case("COUNT") {
+            return Ok(None);
+        }
+        let ok_arg = args.is_empty()
+            || (args.len() == 1 && matches!(args.first(), Some(Expr::Column(c)) if c == "*"));
+        if !ok_arg {
+            return Ok(None);
+        }
+        let Some(from) = stmt.from.as_ref() else {
+            return Ok(None);
+        };
+        let Some(((btable, balias), steps)) = Self::flatten_left_deep_inner(from) else {
+            return Ok(None);
+        };
+        if steps.is_empty() {
+            return Ok(None); // 单表 COUNT 走既有快路径
+        }
+
+        // 表清单: (表名, 前缀, 限定谓词[(schema 位, op, 字面量)])
+        type Pred = (usize, BinaryOperator, Value);
+        let mut tables: Vec<(String, String, Vec<Pred>, Arc<TableSchema>)> = Vec::new();
+        {
+            let bprefix = balias.unwrap_or_else(|| btable.clone());
+            let Ok(bschema) = self.db.get_table_schema(&btable) else {
+                return Ok(None);
+            };
+            tables.push((btable.clone(), bprefix, Vec::new(), bschema));
+            for (jt, ja, _) in &steps {
+                let Ok(js) = self.db.get_table_schema(jt) else {
+                    return Ok(None);
+                };
+                let jp = ja.clone().unwrap_or_else(|| jt.clone());
+                tables.push((jt.clone(), jp, Vec::new(), js));
+            }
+        }
+        let assign_pred = |tables: &mut Vec<(String, String, Vec<Pred>, Arc<TableSchema>)>,
+                           prefix: &str,
+                           bare: &str,
+                           op: BinaryOperator,
+                           lit: &Value|
+         -> bool {
+            for t in tables.iter_mut() {
+                if t.1 == prefix {
+                    return match t.3.get_column_position(bare) {
+                        Some(p) => {
+                            t.2.push((p, op, lit.clone()));
+                            true
+                        }
+                        None => false,
+                    };
+                }
+            }
+            false
+        };
+
+        // WHERE: 严格全分解 — 每个 AND 叶都必须是 `prefix.col op literal`
+        // (extract_pushdown_preds 会静默丢弃不匹配的叶, 不能直接用)。
+        if let Some(wc) = &stmt.where_clause {
+            let preds = Self::extract_pushdown_preds(wc);
+            let mut leaves = 0usize;
+            fn count_and_leaves(e: &Expr, n: &mut usize) {
+                if let Expr::BinaryOp {
+                    op: BinaryOperator::And,
+                    left,
+                    right,
+                } = e
+                {
+                    count_and_leaves(left, n);
+                    count_and_leaves(right, n);
+                } else {
+                    *n += 1;
+                }
+            }
+            count_and_leaves(wc, &mut leaves);
+            if preds.len() != leaves {
+                return Ok(None); // 有推不下去的 WHERE → 通用路径 (join 后过滤)
+            }
+            for (p, bare, op, lit) in preds {
+                if !assign_pred(&mut tables, &p, &bare, op, &lit) {
+                    return Ok(None);
+                }
+            }
+        }
+
+        // 每步 ON: 常量 (true 继续 / falsy → 计数 0) 或单表谓词; 跨表 → decline。
+        let zero = |col: String| {
+            Some((
+                vec![col],
+                vec![vec![Value::Integer(0)]],
+            ))
+        };
+        for (_, _, on) in &steps {
+            let mut leaves: Vec<&Expr> = Vec::new();
+            fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+                if let Expr::BinaryOp {
+                    op: BinaryOperator::And,
+                    left,
+                    right,
+                } = e
+                {
+                    flatten(left, out);
+                    flatten(right, out);
+                } else {
+                    out.push(e);
+                }
+            }
+            flatten(on, &mut leaves);
+            for leaf in leaves {
+                if Self::is_constant_expr(leaf) {
+                    // 与通用路径同语义: eval → to_bool → falsy 即不匹配。
+                    let v = self
+                        .evaluator
+                        .eval(leaf, &crate::types::SqlRow::new())
+                        .ok()
+                        .and_then(|v| self.to_bool(&v).ok())
+                        .unwrap_or(false);
+                    if !v {
+                        return Ok(zero(Self::expr_to_column_name(agg_expr)));
+                    }
+                    continue;
+                }
+                // 单表谓词: `prefix.col op literal`
+                if let Expr::BinaryOp { left, op, right } = leaf {
+                    let ok_op = matches!(
+                        op,
+                        BinaryOperator::Eq
+                            | BinaryOperator::Ne
+                            | BinaryOperator::Lt
+                            | BinaryOperator::Gt
+                            | BinaryOperator::Le
+                            | BinaryOperator::Ge
+                    );
+                    if let (Expr::Column(c), Expr::Literal(v), true) =
+                        (left.as_ref(), right.as_ref(), ok_op)
+                    {
+                        if let Some((p, bare)) = c.split_once('.') {
+                            if !assign_pred(&mut tables, p, bare, op.clone(), v) {
+                                return Ok(None);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                return Ok(None); // 跨表/复杂 ON → 等值有 hash, 其余走通用路径
+            }
+        }
+
+        // 计数: 无谓词 O(1) 原子计数器 (缺则投影空扫), 有谓词投影扫描过滤。
+        let mut product: u128 = 1;
+        for (table, _, preds, schema) in &tables {
+            let n: u64 = if preds.is_empty() {
+                match self.db.fast_row_count(table) {
+                    Some(n) => n,
+                    None => {
+                        let proj: Vec<usize> = Vec::new();
+                        self.scan_table_rows_fast_projected(table, schema, Some(&proj))?
+                            .len() as u64
+                    }
+                }
+            } else {
+                let mut positions: Vec<usize> = preds.iter().map(|(p, _, _)| *p).collect();
+                positions.sort_unstable();
+                positions.dedup();
+                let pos_to_slot: Vec<Option<usize>> = (0..schema.columns.len())
+                    .map(|i| positions.iter().position(|&p| p == i))
+                    .collect();
+                let rows = self.scan_table_rows_fast_projected(table, schema, Some(&positions))?;
+                rows.iter()
+                    .filter(|(_, row)| {
+                        preds.iter().all(|(p, op, lit)| {
+                            let slot = pos_to_slot[*p].unwrap();
+                            apply_op_value(op, row.get(slot), lit)
+                        })
+                    })
+                    .count() as u64
+            };
+            if n == 0 {
+                return Ok(zero(Self::expr_to_column_name(agg_expr)));
+            }
+            product *= n as u128;
+            if product > i64::MAX as u128 {
+                product = i64::MAX as u128; // 饱和 (旧路径 u64 计数同样溢出语义)
+                break;
+            }
+        }
+        Ok(Some((
+            vec![Self::expr_to_column_name(agg_expr)],
+            vec![vec![Value::Integer(product as i64)]],
+        )))
+    }
+
     /// 🚀 Multi-way INNER equi-join (3+ tables). Flattens a left-deep FROM
     /// chain into successive hash joins over concatenated positional rows.
     /// The general path nested-loop evaluated every candidate row pair — a

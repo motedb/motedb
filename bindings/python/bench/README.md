@@ -1336,3 +1336,33 @@ executemany (Python 侧 .tolist() 天花板 ~124K), 口径不同未列入。
 验证: A/B 对拍 11/11 + fuzz 3 seed × (on/off) + bigtable diverge=0 +
 E2E 51/51 + CLI 17/17 + insert_arrays 15/15 + test_groupby_first_query
 + 全量套件 + edge (no-rayon) 编译。
+
+## 全乘积 COUNT 折叠 — 6 亿对 144s → 0.5ms
+
+Round 13e 记录的待办: 无跨表约束 join 的 `COUNT(*)` 走通用路径 — 双侧物化
+SqlRow + 每对 combine_rows 建 HashMap + eval, 20K×30K (6 亿对) 物化 144s。
+新 `try_join_count_fold` (挂在聚合分发块顶部): 当每步 ON 都是 (a) 常量表
+达式 (true 继续 / falsy → 0, 含 NULL 比较 UNKNOWN→false 同通用路径) 或
+(b) 只引用单表的 `prefix.col op literal` 谓词, 且 WHERE 严格全分解为单表
+谓词 (extract_pushdown_preds 会静默丢弃不匹配叶 — 折叠路径自数 AND 叶,
+叶数不符即 decline) 时, INNER join 计数因式分解:
+
+    COUNT(*) = Π 各表 (谓词过滤后) 行数
+
+无谓词表走 O(1) 原子计数器 (INSERT++/DELETE--), 有谓词表投影扫描过滤。
+跨表/等值 ON decline — 等值已有 hash 路径 (对拍无回退); 事务内 decline
+(read-your-writes 留给通用路径)。
+
+| 形状 (20K×30K) | 前 | 后 |
+|---|---|---|
+| `JOIN b ON 1=1` COUNT(*) | 144s 级 | **0.5ms** (O(1)) |
+| `JOIN b ON a.x >= 0` (单表谓词) | 分钟级 | **8.5ms** (O(N)) |
+| `ON 1=1 WHERE a.x < 5` | 分钟级 | **1.9ms** |
+| `ON a.x = b.y` (等值, decline 对照) | — | 21.8ms 持平 |
+
+溢出语义: 乘积超 i64::MAX 饱和 (旧路径 u64 计数同界)。
+
+验证: test_join_count_fold 8/8 (常量真/假、NULL、单表谓词双表侧、
+WHERE×ON 叠加、三表链、空表、DELETE 墓碑、跨表 decline 手工对拍) +
+fuzz 3 seed × (on/off) + bigtable diverge=0 + E2E 51 + CLI 17 +
+insert_arrays 15 + parallel_ab 11 + 全量套件。

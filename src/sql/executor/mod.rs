@@ -3849,6 +3849,11 @@ impl QueryExecutor {
 
         // Aggregate queries (COUNT, SUM, etc.) — try fast paths
         if self.has_aggregates(&stmt.columns) {
+            // 🚀 全乘积/链式 INNER JOIN 的 COUNT(*) 折叠 (每步 ON 常量或
+            // 单表谓词 → Π 各表过滤行数, 零物化)。通用路径 6M 对物化 4.1s。
+            if let Some((columns, rows)) = self.try_join_count_fold(stmt)? {
+                return Ok(StreamingQueryResult::SelectReady { columns, rows });
+            }
             // 🚀 `SELECT COUNT(*) WHERE MATCH(...)` — count the index
             // postings directly (the pipeline below materializes every
             // matching row just to count it).
