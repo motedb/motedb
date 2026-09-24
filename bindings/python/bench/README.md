@@ -1462,3 +1462,40 @@ fetch_arrays 16 + fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件。
   原生 / mote insert_arrays)。executemany 口径的历史数字 (48-62K) 留在
   本文件历史章节 — 那是 SQL 绑定路径的 Python 侧天花板, 不是引擎上限;
   无显式 PK 的自增表 (fast path) 为 311-385K rows/s (fb593a2 章节)。
+
+## 查询内存画像收口 — 默认向量缓存预算 256→64MB (首查 knn RSS +2MB)
+
+用户约束: 查询期 RSS 峰值 ≤100MB (嵌入式定位)。knn 并行后官方 bench 的
+query_peak_rss 升到 74-116MB, 20ms 采样器实测首查真实峰值 **+288~307MB**:
+
+组成 = 向量缓存解码堆副本 (预算 256MB 时 100K×384 表全量缓存 ≈154MB
+保留) + 并行流式任务的整段缓冲 (16 并发 × 7.7MB ≈ 120MB 瞬时)。
+
+三处修复:
+
+1. **并行流式缓冲有界化**: 跨段/段内并行任务的列读取从整段一次性分配
+   改为 ≤1MB 子分块循环 (并发 × 1MB 有界)。
+2. **流式路径 f32 对齐直读**: 三处流式循环的 bytes 块 + 每行
+   copy_le_f32 两趟拷贝改为 pread 直接落位 f32 对齐缓冲, 行切片即
+   &[f32] (LE 主机盘上字节序即主机序; aarch64/x86_64 均如此)。
+3. **默认预算 256→64MB** (`DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES`):
+   超限段走 pread 流式 — 零 RSS 增量 (页缓存不计入进程 RSS); ≤64MB 的
+   表仍全量缓存 (暖查最快)。需要大表暖查延迟的场景按表调回:
+   `db.set_vector_cache_budget("ev", 256*1024*1024)` (edge/robotics
+   preset 本就 32MB)。
+
+取舍实测 (100K×384, 重开后首查 knn):
+
+| 配置 | 首查 RSS 峰值增量 | 暖查 p50 |
+|---|---|---|
+| 默认 64MB (流式) | **+2MB** | 27.4ms |
+| 调回 256MB (缓存) | +251~295MB | 5.4ms |
+
+官方 bench (默认档): query_peak_rss **0.1MB**, knn10 27.1ms — 与
+sqlite (18.4ms) 同量级; 调回 256MB 后 4.8ms (5.6×)。这是**画像优先
+的默认**: 内存换延迟的旋钮留给部署方。其余形状持平 (load 144K /
+point 18µs / range 0.24 / groupby 0.92 / join 0.55ms)。
+
+验证: test_knn_parallel (L2+cosine 对拍 + UPDATE/DELETE/NULL) + E2E
+51 + CLI 17 + insert_arrays 15 + parallel_ab 11 + fetch_arrays 16 +
+fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件。

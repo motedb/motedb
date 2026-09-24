@@ -299,7 +299,11 @@ pub const DEFAULT_COL_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// the engine's headline number. Text/fixed decodes stream cheaply (µs-level
 /// per column chunk) and stay under the 64MB general budget, so only this
 /// cache legitimately wants data-scale headroom.
-pub const DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// 🔑 资源画像优先 (2026-09): 256MB 时 100K×384 表首查 knn 缓存解码副本
+/// 峰值 +183~295MB RSS (超过嵌入式 ≤100MB 档位)。64MB 下超限段走 pread
+/// 流式 (零 RSS 增量); 暖查代价见 README (4.4→21.5ms @154MB 表, 可用
+/// set_vector_cache_budget / preset 按场景调回)。
+pub const DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Clear col_cache after this many point queries to bound memory. At 2M rows,
 /// one col_cache fill is ~88MB (5 columns). Clearing every 4096 queries keeps

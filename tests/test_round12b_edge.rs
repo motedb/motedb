@@ -150,8 +150,11 @@ fn reopen_allocates_fresh_row_ids_multi_segment() {
     assert_eq!(distinct, 700, "no row_id collisions after reopen");
 }
 
-/// The vector cache budget must be preset-wired (embodied = 64MB), not stuck
-/// at the 256MB default.
+/// The vector cache budget must be preset-wired (embodied = 64MB, robotics
+/// = 32MB). 🔑 默认 256→64MB (2026-09 资源画像收口): 256MB 时 100K×384 表
+/// 首查 knn 缓存解码副本峰值 +183~295MB RSS, 超出查询期 ≤100MB 档位;
+/// 超限段走 pread 流式 (零 RSS 增量)。需要大表暖查延迟的场景按表调回
+/// set_vector_cache_budget (基准取舍见 bench/README)。
 #[test]
 fn vector_cache_budget_honors_config() {
     let (_d, db) = db_with(DBConfig::for_embodied());
@@ -164,7 +167,7 @@ fn vector_cache_budget_honors_config() {
     seed_vectors(&db3, 10, 8);
     assert_eq!(
         db3.vector_cache_budget_bytes("v").unwrap(),
-        256 * 1024 * 1024,
-        "default stays 256MB"
+        64 * 1024 * 1024,
+        "default stays 64MB (resource-profile first; see bench/README)"
     );
 }

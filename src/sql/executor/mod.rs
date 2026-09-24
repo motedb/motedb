@@ -20483,22 +20483,33 @@ impl QueryExecutor {
                                 }
                                 let stride = dim * 4;
                                 let data_base = col_start + 1 + null_bytes + 2;
-                                const CHUNK: usize = 8 * 1024 * 1024;
+                                // 🔑 并行任务各自缓冲 — 上限 1MB/任务 (并发 ×
+                                // 1MB 有界; 此前整段一次性读, 16 并发任务
+                                // ×7.7MB = ~120MB 瞬时, 首查 RSS 峰值爆表)。
+                                // f32 对齐直读 (行切片零二次拷贝, 同顺序路径)。
+                                const CHUNK: usize = 1024 * 1024;
                                 let rows_per_chunk = (CHUNK / stride.max(1)).max(1);
-                                let mut buf: Vec<u8> = Vec::new();
-                                let mut scr: Vec<f32> = vec![0.0; qdim];
+                                let mut fbuf: Vec<f32> = Vec::new();
                                 'outer: for cstart in (0..n).step_by(rows_per_chunk) {
                                     let cend = (cstart + rows_per_chunk).min(n);
                                     let need = (cend - cstart) * stride;
-                                    if buf.len() < need {
-                                        buf.resize(need, 0);
+                                    let floats = need / 4;
+                                    if fbuf.len() < floats {
+                                        fbuf.resize(floats, 0.0);
                                     }
-                                    if seg
-                                        .sst
-                                        .read_bytes_at(data_base + cstart * stride, need)
-                                        .map(|b| buf[..need].copy_from_slice(&b))
-                                        .is_err()
-                                    {
+                                    let ok = {
+                                        let raw = unsafe {
+                                            std::slice::from_raw_parts_mut(
+                                                fbuf.as_mut_ptr() as *mut u8,
+                                                floats * 4,
+                                            )
+                                        };
+                                        seg.sst
+                                            .read_bytes_at(data_base + cstart * stride, need)
+                                            .map(|b| raw.copy_from_slice(b.as_ref()))
+                                            .is_ok()
+                                    };
+                                    if !ok {
                                         break 'outer;
                                     }
                                     for i in cstart..cend {
@@ -20509,12 +20520,8 @@ impl QueryExecutor {
                                         if (head[i / 8] >> (i % 8)) & 1 != 0 {
                                             continue;
                                         }
-                                        let base = (i - cstart) * stride;
-                                        crate::storage::lsm::columnar::copy_le_f32(
-                                            &mut scr,
-                                            &buf[base..base + stride],
-                                        );
-                                        offer_local(&mut lh, seg.sst.row_map.key(i), &scr);
+                                        let base = (i - cstart) * dim;
+                                        offer_local(&mut lh, seg.sst.row_map.key(i), &fbuf[base..base + dim]);
                                     }
                                 }
                             }
@@ -20721,50 +20728,67 @@ impl QueryExecutor {
                             let (mut claimed, mut tombstoned): (Vec<u64>, Vec<u64>) =
                                 (Vec::new(), Vec::new());
                             let row0 = rows[0];
-                            let need = rows.len() * stride;
-                            let mut buf: Vec<u8> = vec![0u8; need];
-                            let base_off = data_base + row0 * stride;
-                            if seg
-                                .sst
-                                .read_bytes_at(base_off, need)
-                                .map(|b| buf.copy_from_slice(&b))
-                                .is_err()
-                            {
-                                return (lh, claimed, tombstoned);
-                            }
-                            let mut scr: Vec<f32> = vec![0.0; qdim];
-                            for i in rows {
-                                let key = seg.sst.row_map.key(i);
-                                if seg.sst.row_map.is_deleted(i) {
-                                    tombstoned.push(key);
-                                    continue;
+                            // 🔑 子分块 ≤1MB (此前整 chunk 一次性分配 ~15MB/
+                            // 任务 ×并发 = 首查 RSS 峰值爆表; 有界缓冲语义)。
+                            // f32 对齐直读 (行切片零二次拷贝)。
+                            const SUB_CHUNK: usize = 1024 * 1024;
+                            let sub_rows = (SUB_CHUNK / stride.max(1)).max(1);
+                            let mut fbuf: Vec<f32> = Vec::new();
+                            'sub: for cstart in (row0..row0 + rows.len()).step_by(sub_rows) {
+                                let cend = (cstart + sub_rows).min(row0 + rows.len());
+                                let need = (cend - cstart) * stride;
+                                let floats = need / 4;
+                                if fbuf.len() < floats {
+                                    fbuf.resize(floats, 0.0);
                                 }
-                                if (head[i / 8] >> (i % 8)) & 1 != 0 {
-                                    continue;
-                                }
-                                let base = (i - row0) * stride;
-                                crate::storage::lsm::columnar::copy_le_f32(
-                                    &mut scr,
-                                    &buf[base..base + stride],
-                                );
-                                if prior.contains(&key) {
-                                    continue;
-                                }
-                                let dist = if cosine {
-                                    crate::distance::cosine::cosine_distance(query, &scr)
-                                } else {
-                                    crate::distance::euclidean::euclidean_distance_squared(
-                                        query, &scr,
-                                    )
+                                let ok = {
+                                    let raw = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            fbuf.as_mut_ptr() as *mut u8,
+                                            floats * 4,
+                                        )
+                                    };
+                                    seg.sst
+                                        .read_bytes_at(data_base + cstart * stride, need)
+                                        .map(|b| raw.copy_from_slice(b.as_ref()))
+                                        .is_ok()
                                 };
-                                let cand = (OrderedF32(dist), key);
-                                if lh.len() < k {
-                                    lh.push(cand);
-                                } else if lh.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
-                                    lh.pop();
-                                    lh.push(cand);
+                                if !ok {
+                                    break 'sub;
                                 }
-                                claimed.push(key);
+                                for i in cstart..cend {
+                                    let key = seg.sst.row_map.key(i);
+                                    if seg.sst.row_map.is_deleted(i) {
+                                        tombstoned.push(key);
+                                        continue;
+                                    }
+                                    if (head[i / 8] >> (i % 8)) & 1 != 0 {
+                                        continue;
+                                    }
+                                    let base = (i - cstart) * dim;
+                                    if prior.contains(&key) {
+                                        continue;
+                                    }
+                                    let dist = if cosine {
+                                        crate::distance::cosine::cosine_distance(
+                                            query,
+                                            &fbuf[base..base + dim],
+                                        )
+                                    } else {
+                                        crate::distance::euclidean::euclidean_distance_squared(
+                                            query,
+                                            &fbuf[base..base + dim],
+                                        )
+                                    };
+                                    let cand = (OrderedF32(dist), key);
+                                    if lh.len() < k {
+                                        lh.push(cand);
+                                    } else if lh.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
+                                        lh.pop();
+                                        lh.push(cand);
+                                    }
+                                    claimed.push(key);
+                                }
                             }
                             (lh, claimed, tombstoned)
                         })
@@ -20785,17 +20809,29 @@ impl QueryExecutor {
                 }
                 const KNN_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024;
                 let rows_per_chunk = (KNN_STREAM_CHUNK_BYTES / stride.max(1)).max(1);
+                // 🔑 f32 对齐块缓冲: pread 直接落位, 行切片即 &[f32] — 此前
+                // bytes 块 + 每行 copy_le_f32 两趟拷贝 (154MB 表暖查翻倍的
+                // 主因)。LE 主机上盘上 f32 字节序即主机序 (aarch64/x86_64)。
+                let mut fbuf: Vec<f32> = Vec::new();
                 for cstart in (0..n).step_by(rows_per_chunk) {
                     let cend = (cstart + rows_per_chunk).min(n);
                     let need = (cend - cstart) * stride;
-                    if chunk_buf.len() < need {
-                        chunk_buf.resize(need, 0);
+                    let floats = need / 4;
+                    if fbuf.len() < floats {
+                        fbuf.resize(floats, 0.0);
                     }
-                    let ok = seg
-                        .sst
-                        .read_bytes_at(data_base + cstart * stride, need)
-                        .map(|b| chunk_buf[..need].copy_from_slice(&b))
-                        .is_ok();
+                    let ok = {
+                        let raw = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                fbuf.as_mut_ptr() as *mut u8,
+                                floats * 4,
+                            )
+                        };
+                        seg.sst
+                            .read_bytes_at(data_base + cstart * stride, need)
+                            .map(|b| raw.copy_from_slice(b.as_ref()))
+                            .is_ok()
+                    };
                     if !ok {
                         break;
                     }
@@ -20811,15 +20847,11 @@ impl QueryExecutor {
                         if (head[i / 8] >> (i % 8)) & 1 != 0 {
                             continue;
                         }
-                        let base = (i - cstart) * stride;
-                        crate::storage::lsm::columnar::copy_le_f32(
-                            &mut scratch,
-                            &chunk_buf[base..base + stride],
-                        );
+                        let base = (i - cstart) * dim;
                         if !seen.insert(key) {
                             continue;
                         }
-                        offer(&mut heap, key, &scratch);
+                        offer(&mut heap, key, &fbuf[base..base + dim]);
                     }
                 }
             }

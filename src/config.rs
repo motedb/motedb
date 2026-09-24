@@ -519,7 +519,7 @@ impl Default for DBConfig {
             auto_checkpoint: Some(AutoCheckpointConfig::default()), // ✅ 默认启用自动 checkpoint
             columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
             col_cache_budget_mb: None, // 64MB default (store: DEFAULT_COL_CACHE_BUDGET_BYTES)
-            vector_cache_budget_mb: None, // 256MB default (DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES)
+            vector_cache_budget_mb: None, // 64MB default (DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES)
         }
     }
 }
