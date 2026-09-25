@@ -2831,6 +2831,24 @@ impl MoteDB {
         if auto_inc && !has_explicit_pk && rows.len() >= 100 {
             return self.fast_batch_insert(table_name, rows, &schema);
         }
+        // 🚀 显式整型 PK 大批快路径: row_id = PK 值 (慢路径同语义), 批内+
+        // 存量唯一性经 pk_lookup, 免整行 clone 进 WAL 与逐行 validate —
+        // auto-inc 快路径的全部节省。PK 负值/超 2^31 → 慢路径 (row_id 映射
+        // 复杂); TEXT PK → 慢路径。
+        let explicit_pk_fast = schema
+            .primary_key()
+            .and_then(|pk| schema.get_column(pk))
+            .map(|c| c.position)
+            .is_some_and(|p| {
+                rows.len() >= 100
+                    && self.pk_lookup.get(table_name).is_some()
+                    && rows.iter().all(|r| {
+                        matches!(r.get(p), Some(Value::Integer(v)) if (0..0x8000_0000i64).contains(v))
+                    })
+            });
+        if explicit_pk_fast {
+            return self.fast_batch_insert_explicit(table_name, rows, &schema);
+        }
 
         // 2. Validate all rows
         for (idx, row) in rows.iter().enumerate() {
@@ -3318,12 +3336,10 @@ impl MoteDB {
     fn fast_batch_insert(
         &self,
         table_name: &str,
-        mut rows: Vec<Row>,
+        rows: Vec<Row>,
         schema: &crate::types::TableSchema,
     ) -> Result<Vec<RowId>> {
         let n = rows.len();
-        let col_types = schema.col_types();
-
         // Allocate AUTO_INCREMENT IDs atomically (batch).
         let pk_pos = schema
             .primary_key()
@@ -3342,7 +3358,7 @@ impl MoteDB {
         };
         let start_id = counter.fetch_add(n as i64, std::sync::atomic::Ordering::Relaxed);
         let row_ids: Vec<u64> = (0..n).map(|i| (start_id + i as i64) as u64).collect();
-
+        let mut rows = rows;
         // Fill PK column values in-place (no clone).
         if let Some(pk_pos) = pk_pos {
             for (i, row) in rows.iter_mut().enumerate() {
@@ -3352,10 +3368,82 @@ impl MoteDB {
                 row[pk_pos] = Value::Integer(row_ids[i] as i64);
             }
         }
+        self.fast_batch_insert_with_ids(table_name, rows, schema, row_ids)
+    }
+
+    /// 🚀 显式整型 PK 大批快路径 (门在 batch_insert_rows_to_table):
+    /// row_id = PK 值, 批内+存量唯一性经 pk_lookup (存真实 row_id — 慢路径
+    /// 留 0 占位, 这里直接精确), auto-inc 表 counter 越过最大显式 PK
+    /// (慢路径 fetch_max 同语义)。
+    fn fast_batch_insert_explicit(
+        &self,
+        table_name: &str,
+        rows: Vec<Row>,
+        schema: &crate::types::TableSchema,
+    ) -> Result<Vec<RowId>> {
+        let pk_pos = schema
+            .primary_key()
+            .and_then(|pk| schema.get_column(pk))
+            .map(|c| c.position)
+            .expect("gate checked pk presence");
+        let row_ids: Vec<u64> = rows
+            .iter()
+            .map(|r| match r.get(pk_pos) {
+                Some(Value::Integer(v)) => *v as u64,
+                _ => unreachable!("gate checked integer pks"),
+            })
+            .collect();
+        let lookup = self.pk_lookup.get(table_name).expect("gate checked");
+        let mut reserved: Vec<(crate::database::pk_cache::PkKey, u64)> =
+            Vec::with_capacity(rows.len());
+        for (row, &rid) in rows.iter().zip(row_ids.iter()) {
+            let key = crate::database::pk_cache::PkKey::from_value(&row[pk_pos]);
+            match lookup.insert_if_absent(key.clone(), rid) {
+                Ok(()) => reserved.push((key, rid)),
+                Err(_) => {
+                    // 精确回滚: 只移除我们存入的 (key → rid) — rid 是本批
+                    // 的 PK 值, 不可能与并发插入者的占位混淆。
+                    for (pk, r) in &reserved {
+                        if lookup.get_pk(pk) == Some(*r) {
+                            lookup.remove_pk(pk);
+                        }
+                    }
+                    return Err(StorageError::InvalidData(format!(
+                        "Batch duplicate primary key {:?} for table '{}'",
+                        &row[pk_pos], table_name
+                    )));
+                }
+            }
+        }
+        drop(lookup);
+        // auto-inc 表带显式 PK: counter 越过最大值 (慢路径 fetch_max 语义)。
+        if schema.is_primary_key_auto_increment() {
+            let max_id = row_ids.iter().copied().max().unwrap_or(0) as i64;
+            if let Some(counter) = self.table_auto_increment.get(table_name) {
+                counter
+                    .value()
+                    .fetch_max(max_id.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.fast_batch_insert_with_ids(table_name, rows, schema, row_ids)
+    }
+
+    fn fast_batch_insert_with_ids(
+        &self,
+        table_name: &str,
+        mut rows: Vec<Row>,
+        schema: &crate::types::TableSchema,
+        row_ids: Vec<u64>,
+    ) -> Result<Vec<RowId>> {
+        let n = rows.len();
+        let col_types = schema.col_types();
 
         // 🚨 Critical: coerce whole-number Floats into Integer/Timestamp columns.
         // fast_batch_insert skips validate_row, so without this a Float(3.0)
         // written to an Integer column corrupts data (f64 bits read back as i64).
+        // 🔑 TIMESTAMP 列还需 Integer→Timestamp 强转 (insert_arrays 直通路径
+        // 传裸 micros — Timestamp 变体编码, Integer 落 0 读回全 0; fb593a2 在
+        // 慢路径修过, 显式 PK 快路径分流转发了同一形状 — 既有 ts 用例抓出)。
         for row in rows.iter_mut() {
             for (i, ct) in col_types.iter().enumerate() {
                 if matches!(
@@ -3370,6 +3458,13 @@ impl MoteDB {
                         {
                             row[i] = crate::types::Value::Integer(*f as i64);
                         }
+                    }
+                }
+                if matches!(ct, crate::types::ColumnType::Timestamp) {
+                    if let Some(crate::types::Value::Integer(m)) = row.get(i) {
+                        row[i] = crate::types::Value::Timestamp(
+                            crate::types::Timestamp::from_micros(*m),
+                        );
                     }
                 }
             }
@@ -3392,6 +3487,11 @@ impl MoteDB {
                 (key, base_ts + i as u64, row)
             })
             .collect();
+        // 🔑 pending_updates 信号: checkpoint_impl 在 pending==0 且 WAL 空
+        // 时整体早退 (什么都不做) — fast path 不写 WAL, 不置位则段永远不
+        // 合并 (WAL-less 加载的 auto-checkpoint 同样从不触发)。慢路径在
+        // WAL append 前置位; 这里批末置位。
+        self.increment_pending_updates();
         let __ta = std::time::Instant::now();
         store.append_rows(&store_rows)?;
 

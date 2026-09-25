@@ -279,6 +279,44 @@ fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
     if v.is_none() {
         return Ok(MValue::Null);
     }
+    // 🚀 numpy 1D 数组参数 → 向量: tobytes 一次 memcpy 解码 (f4/f8/i8),
+    // 免逐元素 C-API 提取 — executemany 向量列用户可直传 emb[i] 行视图,
+    // 不再需要每行 .tolist() (124K rows/s 的 Python 侧天花板)。
+    if v.hasattr("tobytes")? && v.hasattr("dtype")? {
+        let dtype: String = v.getattr("dtype")?.getattr("str")?.extract()?;
+        let shape: Vec<usize> = v.getattr("shape")?.extract()?;
+        if shape.len() == 1 {
+            let n = shape[0];
+            let code = dtype
+                .replace(['<', '=', '|', '>'], "")
+                .to_ascii_lowercase();
+            let bytes_obj = v.call_method0("tobytes")?;
+            if let Ok(b) = bytes_obj.downcast::<pyo3::types::PyBytes>() {
+                let raw = b.as_bytes();
+                let floats: Option<Vec<f32>> = match code.as_str() {
+                    "f4" | "f" if raw.len() == n * 4 => Some(
+                        raw.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                            .collect(),
+                    ),
+                    "f8" | "d" if raw.len() == n * 8 => Some(
+                        raw.chunks_exact(8)
+                            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+                            .collect(),
+                    ),
+                    "i8" | "l" if raw.len() == n * 8 => Some(
+                        raw.chunks_exact(8)
+                            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                if let Some(fs) = floats {
+                    return Ok(MValue::Vector(motedb_core::types::ArcVec::new(fs)));
+                }
+            }
+        }
+    }
     if let Ok(b) = v.extract::<bool>() {
         return Ok(MValue::Bool(b));
     }

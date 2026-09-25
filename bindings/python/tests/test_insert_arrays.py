@@ -100,5 +100,24 @@ check("explicit PK honored in large batch",
       dbp.execute("SELECT x FROM w WHERE id = 1000"), [{"x": "e0"}])
 dbp.close()
 
+# ── executemany numpy 行视图参数 (免 .tolist, tobytes 解码) ──
+dbn = motedb.Database(os.path.join(tmp, "npv.mote"))
+dbn.execute("CREATE TABLE v (id INT PRIMARY KEY, emb VECTOR(4))")
+try:
+    import numpy as _np
+    arr = _np.array([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=_np.float32)
+    dbn.executemany("INSERT INTO v VALUES (?, ?)", [(1, arr[0]), (2, arr[1])])
+    got = dbn.execute("SELECT emb FROM v ORDER BY id")
+    check("executemany np-row params", [list(r["emb"]) for r in got],
+          [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+    # f64 数组同样支持
+    arr64 = _np.array([[0.5, 1.5, 2.5, 3.5]], dtype=_np.float64)
+    dbn.executemany("INSERT INTO v VALUES (?, ?)", [(3, arr64[0])])
+    got = dbn.execute("SELECT emb FROM v WHERE id = 3")
+    check("executemany np-f64 params", [list(r["emb"]) for r in got], [[0.5, 1.5, 2.5, 3.5]])
+except ImportError:
+    pass
+dbn.close()
+
 print("ALL OK" if FAIL == 0 else f"{FAIL} FAILURES")
 sys.exit(1 if FAIL else 0)

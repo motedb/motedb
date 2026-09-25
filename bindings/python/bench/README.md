@@ -1571,3 +1571,34 @@ steady 18.8MB); 唯一延迟回退是 knn 流式 (上节记录的画像优先取
 核与主核等价性) + vamana 27/27 + E2E 51 + CLI 17 + insert_arrays 15 +
 parallel_ab 11 + fetch_arrays 16 + fuzz 2seed×(on/off) + bigtable
 diverge=0 + 全量套件。
+
+## 加载路径双优化 — 显式 PK fast path + executemany numpy 参数 (官方 152K→254K)
+
+两项加载优化 + 一个被暴露的先存 checkpoint 漏洞:
+
+1. **显式整型 PK 大批快路径** (`fast_batch_insert_explicit`, 门: ≥100 行 +
+   全整数非负 <2^31 PK + pk_lookup 在): row_id = PK 值 (慢路径同语义),
+   批内+存量唯一性经 pk_lookup **存真实 row_id** (慢路径留 0 占位),
+   auto-inc 表 counter 越过最大显式 PK; 复用 auto-inc 快路径的免 WAL/免
+   逐行 validate 全部节省。负值/超界/TEXT PK → 慢路径。过程中抓到并修复
+   快路径继承的 Integer→Timestamp 强转缺失 (insert_arrays ts 列读回 0 —
+   fb593a2 在慢路径修过, 分流把同一形状转发了过来; 既有 ts 用例抓住)。
+2. **executemany numpy 行视图参数**: py_to_mote 检测 numpy 1D 数组
+   (f4/f8/i8) 经 tobytes 一次 memcpy 解码为向量 — 用户免每行 .tolist()
+   (124K rows/s 的 Python 侧天花板), executemany 65K → **174K rows/s**。
+3. **🚨 先存 checkpoint 漏洞 (被 1 暴露)**: checkpoint_impl 在
+   pending_updates==0 且 WAL 空 → 整体早退 — fast path 不写 WAL 不置位,
+   段永远不合并 (reopen 才补), auto-checkpoint 对 WAL-less 加载从不触发。
+   e2e "disk single segment" 用例抓住。修复: fast path 批末
+   increment_pending_updates (慢路径在 WAL append 前的同款信号)。
+
+吞吐 (100K×5 列含 384 维向量, 同机): executemany .tolist() 65K (基线) /
+executemany numpy 视图 **174K** (2.7×) / insert_arrays 显式 PK
+**286-289K** (1.9×, 原 153K 慢路径) / 官方 compete_bench load
+**253,938 rows/s** (原 152K)。其余形状持平 (knn 19.0 / rss −0.0)。
+
+验证: test_insert_explicit_fastpath 5/5 (row_id=PK 点查/范围/ORDER、批内
+重复报错+精确回滚+重插、auto-inc 表显式 id+counter 越位、负值 PK 慢路径
+回退、重开+后续 UPDATE/DELETE 的 pk_cache 精确性) + insert_arrays 17/17
+(新增 numpy 行参数 f32/f64 往返) + E2E 51 + CLI 17 + parallel_ab 11 +
+fetch_arrays 16 + fuzz 3seed×(on/off) + bigtable diverge=0 + 全量套件。
