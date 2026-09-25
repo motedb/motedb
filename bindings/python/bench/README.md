@@ -1499,3 +1499,32 @@ point 18µs / range 0.24 / groupby 0.92 / join 0.55ms)。
 验证: test_knn_parallel (L2+cosine 对拍 + UPDATE/DELETE/NULL) + E2E
 51 + CLI 17 + insert_arrays 15 + parallel_ab 11 + fetch_arrays 16 +
 fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件。
+
+## DiskANN churn 稳定性专项 — 孤立 2-环根因 + 周期性领养 (flake 归零)
+
+全量套件唯一的残留时序 flake (`churn_rebuild_covers_all_nodes`, 五轮全量
+出现三次, 隔离复跑却过) 实为**进程级概率 bug**: `batch_build_graph` 用
+`thread_rng()` 洗牌插入序 → 每进程拓扑不同, ~5-20% 概率挂 (循环复现
+19/20 → 8/40 → 9/40)。
+
+**根因** (库内诊断测试转储搁浅节点出入边): 两个节点**互指成孤立 2-环**
+且无第三者指向 — 入度守卫 (`evictable`: 入度 >1 才可驱逐) 防的是"零入
+边", 防不了"幸存入边来自同样孤立的环"。rebuild 窗口内的行级插入没有
+全局可达性检查, 搁浅要等下一次 rebuild 的领养才恢复 — 测试断言的正是
+这个窗口。
+
+修复 (三件套):
+1. **set_neighbors 连通性守卫截断**: 盲截断丢最高 id 改为尾部丢弃时跳过
+   不可驱逐者, 不够丢则临时超限 (宽度自愈, 搁浅无法自愈)。
+2. **强制回链无 victim 时不驱逐**: 此前兜底驱逐任意最远边 (可能是受害
+   者唯一入边) 改为溢出追加 (set_neighbors_overflow_ok)。
+3. **周期性增量领养**: 把 rebuild 内的孤点领养提取为 `adopt_orphans`,
+   单行插入路径每 max(50, len/50) 次 churn 跑一次 flood-fill+领养 —
+   O(V+E)/len/50 摊销 ≈ 每次插入 ~64 次边读; rebuild 窗口内搁浅最多
+   积压 len/50 次插入。
+
+验证: churn 测试循环 **40/40** + 诊断测试 60 trial 零失败 (修复前
+5-20% 挂); vamana 模块 27/27; vector recall 220K×384 持平 (recall@1/10/
+100 = 0.99/0.99/0.98, 增量 +5000 行 0.995/0.99/0.98); E2E 51 + CLI 17 +
+insert_arrays 15 + fuzz + bigtable diverge=0 + 全量套件。诊断测试
+(`churn_connectivity_diagnostic`, 默认 ignore) 留作工具。

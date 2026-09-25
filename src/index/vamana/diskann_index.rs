@@ -461,6 +461,16 @@ impl DiskANNIndex {
             if len >= 1000 && churn >= len / 2 {
                 self.rebuild_graph()?;
                 *self.total_inserts_since_reorder.write() = 0;
+            } else if len >= 1000 && churn >= 50.max(len / 50) {
+                // 🔑 周期性增量领养: 入度守卫防"零入边", 防不了"幸存入边来自
+                // 同样孤立的环" (churn 诊断: ~5% 概率 2 节点互指成孤立 2-环,
+                // rebuild 窗口内的行级插入无全局可达性检查)。每 ~len/50 (≥50)
+                // 次插入 flood-fill+领养一次: O(V+E)/len/50 摊销后每次插入
+                // ~64 次边读; rebuild 窗口内最多积压 len/50 次插入的搁浅。
+                if let Some(medoid_id) = *self.medoid.read() {
+                    self.adopt_orphans(medoid_id)?;
+                }
+                *self.total_inserts_since_reorder.write() = 0;
             }
         }
 
@@ -706,14 +716,24 @@ impl DiskANNIndex {
         self.graph.clear();
         self.batch_build_graph(&ids)?;
 
-        // 🔑 Orphan adoption: incremental linking trims can evict a node's
-        // only inbound edge, leaving it unreachable from the medoid (1848/
-        // 2100 reachable after a full rebuild before this pass). Flood-fill
-        // once, then re-link every unreachable node to its nearest REACHABLE
-        // neighbor — one inbound edge restores it (its forward edges are
-        // already set). Repeat until the reachable set stops growing.
+        self.adopt_orphans(medoid_id)?;
+
+        // 🔑 Flush the graph sidecar so every rebuilt node stays findable
+        // across the offset-map boundary (batch_insert() also flushes).
+        self.graph.flush()?;
+        Ok(())
+    }
+
+    /// 🔑 孤点领养: flood-fill 一次, 把每个不可达节点重链到最近的**可达**
+    /// 邻居 (一条入边即恢复; 前向边已就位)。rebuild 后与周期性增量维护都
+    /// 调用 — 入度守卫防"零入边", 防不了"幸存入边来自同样孤立的环" (churn
+    /// 测试 ~5% 概率 2 节点互指成孤立 2-环的根因), 只有全局可达性检查能防。
+    /// 返回领养节点数。`all_ids` 为全量 id (领养扫描用)。
+    fn adopt_orphans(&self, medoid_id: RowId) -> Result<usize> {
+        let ids = self.vectors.ids();
         {
             let mut reachable = self.flood_fill_from(medoid_id);
+            let mut adopted = 0usize;
             loop {
                 let stranded: Vec<RowId> = ids
                     .iter()
@@ -721,7 +741,7 @@ impl DiskANNIndex {
                     .filter(|id| !reachable.contains(id))
                     .collect();
                 if stranded.is_empty() {
-                    break;
+                    return Ok(adopted);
                 }
                 for node in stranded {
                     // Nearest reachable node via the vector store (exact
@@ -743,6 +763,7 @@ impl DiskANNIndex {
                         }
                     }
                     if let Some((anchor, _)) = best {
+                        adopted += 1;
                         let edges_arc = self.graph.neighbors(anchor);
                         let mut edges = (*edges_arc).clone();
                         if !edges.contains(&node) {
@@ -771,21 +792,16 @@ impl DiskANNIndex {
                         }
                         reachable.insert(node);
                     } else {
-                        break; // no reachable anchor (shouldn't happen)
+                        return Ok(adopted); // no reachable anchor (shouldn't happen)
                     }
                 }
                 let again = self.flood_fill_from(medoid_id);
                 if again.len() <= reachable.len() {
-                    break;
+                    return Ok(adopted);
                 }
                 reachable = again;
             }
         }
-
-        // 🔑 Flush the graph sidecar so every rebuilt node stays findable
-        // across the offset-map boundary (batch_insert() also flushes).
-        self.graph.flush()?;
-        Ok(())
     }
 
     /// Flood fill the edge graph from `start`, returning all reachable ids.
@@ -1265,46 +1281,45 @@ impl DiskANNIndex {
             self.graph.with_node_lock(target, || {
                 let edges_arc = self.graph.neighbors(target);
                 let mut edges = (*edges_arc).clone();
+                let mut overflow_ok = false;
                 if edges.is_empty() {
                     edges = vec![new_id];
                 } else if !edges.contains(&new_id) {
+                    // Evict the entry farthest from `target` among EVICTABLE
+                    // candidates (inbound elsewhere). 🔑 无可驱逐者时不再兜底
+                    // 驱逐任意最远边 — 那条边可能是受害者的唯一入边, 驱逐即
+                    // 搁浅 (churn 测试 ~5% 概率 2 节点不可达的根因); 改为
+                    // 溢出追加, 宽度由下一次 rebuild/soft-limit 修剪自愈。
                     if let Some(target_vec) = self.vectors.get(target) {
-                        // Evict the entry farthest from `target` among EVICTABLE
-                        // candidates (inbound elsewhere); fall back to the
-                        // plain farthest if none qualify (rare, bounded).
-                        let mut far_idx = usize::MAX;
-                        let mut far_dist = -1.0f32;
                         let mut safe_idx = usize::MAX;
                         let mut safe_dist = -1.0f32;
                         for (i, &eid) in edges.iter().enumerate() {
                             if let Some(ev) = self.vectors.get(eid) {
                                 let d = self.metric.distance(&target_vec, &ev);
-                                if d > far_dist {
-                                    far_dist = d;
-                                    far_idx = i;
-                                }
-                                if d > safe_dist && self.graph.evictable(eid) {
+                                if self.graph.evictable(eid) && d > safe_dist {
                                     safe_dist = d;
                                     safe_idx = i;
                                 }
                             }
                         }
-                        let victim = if safe_idx != usize::MAX {
-                            safe_idx
+                        if safe_idx != usize::MAX {
+                            edges[safe_idx] = new_id;
                         } else {
-                            far_idx
-                        };
-                        if victim != usize::MAX {
-                            edges[victim] = new_id;
-                            edges.sort_unstable();
-                            edges.dedup();
+                            edges.push(new_id);
+                            overflow_ok = true;
                         }
+                        edges.sort_unstable();
+                        edges.dedup();
                     } else {
                         edges.pop();
                         edges.push(new_id);
                     }
                 }
-                self.graph.set_neighbors(target, edges)
+                if overflow_ok {
+                    self.graph.set_neighbors_overflow_ok(target, edges)
+                } else {
+                    self.graph.set_neighbors(target, edges)
+                }
             })?;
         }
 
@@ -1859,6 +1874,58 @@ mod tests {
             assert!(results[0].1 < 1.0); // Should be close to query
         }
     }
+    /// 连通性诊断 (默认 ignore, --ignored --nocapture 运行): 进程内循环
+    /// churn 场景, 失败时转储搁浅节点的出入边与入度记账 — 定位搁浅机理。
+    #[test]
+    #[ignore]
+    fn churn_connectivity_diagnostic() {
+        for t in 0..60 {
+            let temp_dir = TempDir::new().unwrap();
+            let dim = 8usize;
+            let index =
+                DiskANNIndex::create(temp_dir.path(), dim, VamanaConfig::embedded(dim)).unwrap();
+            let mut rng = Lcg(0xD00D);
+            let n = 2100u64;
+            for i in 1..=n {
+                let v: Vec<f32> = (0..dim).map(|_| rng.next_f32()).collect();
+                index.insert(i, v).unwrap();
+            }
+            let medoid = (*index.medoid.read()).expect("medoid set");
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![medoid];
+            seen.insert(medoid);
+            while let Some(node) = stack.pop() {
+                for nb in index.graph.neighbors(node).iter() {
+                    if seen.insert(*nb) {
+                        stack.push(*nb);
+                    }
+                }
+            }
+            if seen.len() != n as usize {
+                let stranded: Vec<u64> = (1..=n).filter(|i| !seen.contains(i)).collect();
+                println!("trial {}: {} stranded: {:?}", t, stranded.len(), stranded);
+                for id in &stranded {
+                    let out = index.graph.neighbors(*id);
+                    let mut inbound_from: Vec<u64> = Vec::new();
+                    for i in 1..=n {
+                        if index.graph.neighbors(i).contains(id) {
+                            inbound_from.push(i);
+                        }
+                    }
+                    println!(
+                        "  node {}: out={:?} inbound_from={:?} evictable={}",
+                        id,
+                        out.iter().take(10).collect::<Vec<_>>(),
+                        inbound_from,
+                        index.graph.evictable(*id)
+                    );
+                }
+                return;
+            }
+        }
+        println!("no failure in 60 trials");
+    }
+
     /// Churn-rebuild must cover ALL nodes. Before the authoritative-map
     /// refactor, lookups depended on a cache-capped offset LRU: builds and
     /// rebuilds stranded every non-resident node (flood-fill reached

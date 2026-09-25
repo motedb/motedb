@@ -558,7 +558,24 @@ impl DiskGraph {
     }
 
     /// Set neighbors (replaces existing)
-    pub fn set_neighbors(&self, node_id: RowId, mut neighbors: Vec<RowId>) -> Result<()> {
+    pub fn set_neighbors(&self, node_id: RowId, neighbors: Vec<RowId>) -> Result<()> {
+        self.set_neighbors_impl(node_id, neighbors, true)
+    }
+
+    /// 连通性关键的溢出变体: 跳过 max_degree 截断。强制回链在目标节点
+    /// 所有边都不可安全驱逐 (每条都是某节点的唯一入边) 时使用 — 截断
+    /// 或驱逐都会搁浅节点 (churn 测试 ~5% 概率挂 2 节点的根因)。宽度
+    /// 超限由下一次 rebuild/soft-limit 修剪自愈。
+    pub fn set_neighbors_overflow_ok(&self, node_id: RowId, neighbors: Vec<RowId>) -> Result<()> {
+        self.set_neighbors_impl(node_id, neighbors, false)
+    }
+
+    fn set_neighbors_impl(
+        &self,
+        node_id: RowId,
+        mut neighbors: Vec<RowId>,
+        enforce_max: bool,
+    ) -> Result<()> {
         // Block during flush to prevent sidecar from being built with stale node_count
         let _flush_guard = self.flush_lock.lock();
         // 🔑 Inbound delta bookkeeping: a node's edge list swap changes the
@@ -569,8 +586,24 @@ impl DiskGraph {
         neighbors.retain(|&id| id != node_id);
         neighbors.sort_unstable();
         neighbors.dedup();
-        if neighbors.len() > self.max_degree {
-            neighbors.truncate(self.max_degree);
+        if enforce_max && neighbors.len() > self.max_degree {
+            // 🔑 连通性守卫截断: 从尾部丢弃, 但跳过不可驱逐者 (其唯一入边
+            // 在本表 — 丢弃即搁浅, churn 测试 ~5% 概率 2 节点不可达的根因:
+            // 盲截断丢最高 id, 而最高 id 恰是新节点/唯一入边持有者)。可
+            // 驱逐者不够时允许临时超限 — 宽度由下一次 rebuild/soft-limit
+            // 修剪自愈, 搁浅无法自愈。
+            // (evictable 读 inbound 在 delta 记账之前 — 反映当前状态, 正确)
+            let mut to_drop = neighbors.len() - self.max_degree;
+            let mut kept: Vec<RowId> = Vec::with_capacity(neighbors.len());
+            for &id in neighbors.iter().rev() {
+                if to_drop > 0 && self.evictable(id) {
+                    to_drop -= 1;
+                } else {
+                    kept.push(id);
+                }
+            }
+            kept.reverse();
+            neighbors = kept;
         }
         {
             let mut inbound = self.inbound.write();
