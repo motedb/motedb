@@ -1694,3 +1694,32 @@ executemany 持平 128K (瓶颈在 Python 侧行构造, 非引擎写路径)。cr
 验证: crash 重放 1300/1300 + test_insert_explicit_fastpath 5/5 + E2E
 51 + CLI 17 + insert_arrays 17 + parallel_ab 11 + fetch_arrays 16 +
 fuzz 3seed×(on/off) + bigtable diverge=0 + 全量套件。
+
+## 四引擎同日对照 — v0.11.0 新鲜基线 (2026-09-26, load≈3.5)
+
+替代上方 Round 11/12 时代的对照表 (彼时 MoteDB join 138ms)。同脚本同
+数据 (100K×384), 负载 ~3.5 同日连跑, p50:
+
+| workload | MoteDB 0.11.0 | SQLite 3.51 | DuckDB 1.4.5 | FAISS Flat |
+|---|---|---|---|---|
+| bulk load rows/s (w/ vec) | **194,829** | 54,243 | 6,997* | n/a |
+| PK point | 17µs | **5µs** | 69µs | n/a |
+| range COUNT+AVG | **0.197ms** | 0.33ms | 0.279ms | n/a |
+| GROUP BY device | 0.79ms | 46.4ms | **0.558ms** | n/a |
+| top-k ORDER LIMIT | **0.457ms** | 35.0ms | 0.71ms | n/a |
+| equi-JOIN+GROUP BY | **0.472ms** | 10.5ms | 1.098ms | n/a |
+| exact vector knn@10 | 18.4ms | n/a | 65.8ms | **3.6ms** |
+| text two-term search | 0.141ms | **0.013ms** (FTS5) | n/a | n/a |
+| query RSS delta | **0.0MB** | 0.0MB | 0.1MB | 669.8MB (in-RAM) |
+| db size | **186.5MB** | 212.6MB | 489.7MB | 153.6MB (无持久化) |
+
+口径注: *DuckDB 1000-row multi-VALUES 路径 (Appender/read_parquet 更快
+但不在本脚本); MoteDB load 为 GroupCommit 耐久档 insert_arrays; knn 为
+无索引精确扫描 (64MB 默认缓存档; 256MB 档 4.4ms 与 FAISS 同内存量级);
+FAISS 无 SQL/持久化/FTS — 列不可直接比, 列出仅供 knn 参照。
+
+解读 (差距定位): 分析形状 (range/topk/join) 在 100K-1M 嵌入式档位与
+DuckDB 互有胜负 (join 快 2.3×, groupby 慢 1.4× — 均在双方固定开销量
+级); 加载/存储/内存画像领先。落后项: 点查 vs SQLite 3.4×, FTS vs
+FTS5 10×, ANN 索引路径 vs FAISS IVF 类 ~10×, >内存规模的 spill/外存
+路径未建, SQL 广度 (窗口函数/递归 CTE/代价优化器) vs DuckDB 一代。
