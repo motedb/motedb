@@ -1068,59 +1068,6 @@ impl PartitionWAL {
         Ok(lsns)
     }
 
-    /// 🔑 借用式批量 Insert: 直接从 &Row 序列化 (bincode::serialize 本就
-    /// 借用), 免 WALRecord::Insert 的整行 materialize+clone — fast path
-    /// 耐久性门的热路径 (384 维向量行 clone 是 GroupCommit 档加载吞吐的
-    /// 主要差额)。字节格式与 Insert/InsertRaw 臂逐位一致 (TAG_INSERT_RAW
-    /// framing), 重放走既有解码器。
-    pub(crate) fn batch_append_rows_borrowed(
-        &mut self,
-        table_name: &str,
-        rows: &[(RowId, PartitionId, &Row)],
-        txn_id: TransactionId,
-    ) -> Result<Vec<LogSequenceNumber>> {
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut lsns = Vec::with_capacity(rows.len());
-        let mut buffer = Vec::with_capacity(rows.len().max(1) * 256);
-        for &(row_id, partition, data) in rows {
-            let lsn = self.next_lsn;
-            self.next_lsn += 1;
-            lsns.push(lsn);
-
-            let mut record_data = Vec::with_capacity(64);
-            record_data.push(TAG_INSERT_RAW);
-            record_data.extend_from_slice(&txn_id.to_le_bytes());
-            encode_str(&mut record_data, table_name);
-            record_data.extend_from_slice(&row_id.to_le_bytes());
-            record_data.extend_from_slice(&(partition as u16).to_le_bytes());
-            let bytes = bincode::serialize(data)?;
-            record_data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            record_data.extend_from_slice(&bytes);
-
-            let payload = Self::compress_if_worthwhile(&record_data);
-            let checksum = Checksum::compute(ChecksumType::CRC32C, &payload);
-
-            let header_size = 4 + 8 + 4 + 4;
-            let total_len = (header_size + payload.len()) as u32;
-            buffer.extend_from_slice(&total_len.to_le_bytes());
-            buffer.extend_from_slice(&lsn.to_le_bytes());
-            buffer.extend_from_slice(&checksum.to_le_bytes());
-            buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            buffer.extend_from_slice(&payload);
-        }
-        self.file.write_all(&buffer)?;
-        match self.config.durability_level {
-            DurabilityLevel::Synchronous | DurabilityLevel::GroupCommit { .. } => {
-                self.sync_flush()?;
-            }
-            DurabilityLevel::Periodic { .. } => {}
-            DurabilityLevel::NoSync => {}
-        }
-        Ok(lsns)
-    }
-
     /// Create a checkpoint
     ///
     /// Uses atomic write-new-rename pattern for crash safety:
@@ -2095,25 +2042,6 @@ impl WALManager {
     /// This method is used during transaction commit to write all transaction
     /// operations (Begin, Insert/Update/Delete, Commit) in a single batch,
     /// reducing fsync overhead from O(n) to O(1).
-    /// 🔑 借用式批量 Insert (fast path 耐久性门): 免 WALRecord 整行 clone。
-    pub fn batch_append_rows(
-        &self,
-        partition: PartitionId,
-        table_name: &str,
-        rows: &[(RowId, PartitionId, &Row)],
-        txn_id: TransactionId,
-    ) -> Result<Vec<LogSequenceNumber>> {
-        if !rows.is_empty() {
-            self.periodic_new_writes.store(true, Ordering::Relaxed);
-        }
-        let entry = self
-            .partitions
-            .get(&partition)
-            .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        let mut wal = entry.value().lock();
-        wal.batch_append_rows_borrowed(table_name, rows, txn_id)
-    }
-
     pub fn batch_append(
         &self,
         partition: PartitionId,

@@ -1668,3 +1668,29 @@ GroupCommit 档的加载吞吐地板因此定格 ~170K (战役前 62K 的 2.7×)
 需要 286K 的批量导入场景用 NoSync/Periodic preset (尾部丢失是契约)。
 更进一步的路径是 WAL 消除 (段文件直写 + manifest/段双 fsync 替代 WAL
 重放), 属另线战役。
+
+## WAL 消除 — fast path 段直写耐久, GroupCommit 档 171→232K
+
+耐久性门修好 crash 契约后, GroupCommit 档的加载地板 ~170K (差额 = WAL
+bincode 序列化 + 写盘, 100K×384 = 160MB 额外编码与 IO)。零 clone 假设
+证伪后, 正解是**数据只写一遍**:
+
+- 核实 flush 链路发现段文件写入**本就耐久** (temp 文件 + fsync + rename
+  原子发布); manifest 追加不 fsync 但设计上由孤儿领养兜底 (段文件完整,
+  manifest 尾丢失 → recovery 领养), 且有现成的 `manifest.sync()`。
+- 新 `ColSegmentStore::flush_buffer_durable()`: flush (段原子发布) +
+  manifest fsync — 返回成功后 kill -9 (页缓存可见) 与掉电 (段已 fsync,
+  manifest 尾丢失走领养) 都恢复, **无需 WAL 重放**。
+- fast path 耐久分支从借用式 WAL 切换为每批 durable flush (数据只写一遍);
+  每批一段, 段阵由 auto-checkpoint 段计数触发合并 (与上节协同)。借用式
+  WAL API (a1d7bb9) 被超越, 已移除。
+
+吞吐 (GroupCommit 默认档, 100K×5 列含 384 维): insert_arrays 显式 PK
+171→**232K** (向 NoSync 286K 收复 81%); 官方 load 174→**197K**;
+executemany 持平 128K (瓶颈在 Python 侧行构造, 非引擎写路径)。crash
+契约复验 **1300/1300** ✓。knn 18-21ms 波动 (每批一段 → 段数增加, 跨段
+并行路径消化)。
+
+验证: crash 重放 1300/1300 + test_insert_explicit_fastpath 5/5 + E2E
+51 + CLI 17 + insert_arrays 17 + parallel_ab 11 + fetch_arrays 16 +
+fuzz 3seed×(on/off) + bigtable diverge=0 + 全量套件。

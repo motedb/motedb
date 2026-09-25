@@ -3501,30 +3501,19 @@ impl MoteDB {
             crate::config::DurabilityLevel::NoSync
                 | crate::config::DurabilityLevel::Periodic { .. }
         );
-        if durable {
-            // 🔑 借用式 WAL: 直接从 store_rows 的 &Row 序列化 — 免整行
-            // clone (384 维向量行 clone 是 GroupCommit 档加载吞吐的主要
-            // 差额; 原型 clone 版实测 174K, 借用版见 README)。
-            let wal_rows: Vec<(RowId, PartitionId, &Row)> = store_rows
-                .iter()
-                .map(|(key, _, row)| {
-                    let rid = key & 0xFFFFFFFF;
-                    (
-                        rid,
-                        (self.make_composite_key(table_name, rid)
-                            % self.num_partitions as u64) as PartitionId,
-                        row,
-                    )
-                })
-                .collect();
-            self.wal
-                .batch_append_rows(0, table_name, &wal_rows, 0)?;
-        }
         let __ta = std::time::Instant::now();
         store.append_rows(&store_rows)?;
 
-        // Flush periodically to bound memory (same threshold as full path).
-        if store.buffered_bytes() >= 4 * 1024 * 1024 {
+        if durable {
+            // 🔑 WAL 消除: 段直写 + manifest fsync 替代 WAL 重放 — 数据只
+            // 写一遍 (段文件 temp+fsync+rename 原子发布 + manifest fsync),
+            // kill -9 (页缓存可见) 与掉电 (孤儿领养) 都恢复。此前 WAL
+            // bincode 序列化+写盘 (100K×384 = 160MB 额外编码与 IO) 是
+            // GroupCommit 档加载吞吐的主要差额。每批一段, 段阵由
+            // auto-checkpoint 的段计数触发合并 (max_segment_count)。
+            store.flush_buffer_durable()?;
+        } else if store.buffered_bytes() >= 4 * 1024 * 1024 {
+            // Flush periodically to bound memory (same threshold as full path).
             store.flush_buffer()?;
         }
         let __tb = std::time::Instant::now();

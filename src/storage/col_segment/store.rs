@@ -576,6 +576,17 @@ impl ColSegmentStore {
         Ok(())
     }
 
+    /// 🔑 WAL 消除路径的耐久 flush: flush_buffer_locked 的段文件写入本身
+    /// 已是 temp+fsync+rename 原子发布; 这里补 manifest fsync — 返回成功后
+    /// kill -9 (页缓存) 与掉电 (段文件已 fsync, manifest 尾丢失则孤儿领养)
+    /// 都能恢复, 无需 WAL 重放。fast path 的 GroupCommit/Synchronous 耐久
+    /// 契约经此满足, 数据只写一遍 (段), 不再走 WAL bincode 序列化+写盘。
+    pub fn flush_buffer_durable(&self) -> Result<()> {
+        let _guard = self.flush_merge_lock.lock();
+        self.flush_buffer_locked()?;
+        self.manifest.lock().sync()
+    }
+
     /// Flush the write buffer ONLY if it contains pending rows/tombstones.
     /// Called at the start of query paths to ensure buffered writes are
     /// visible to segment-based scans. Cheap no-op when buffer is empty.
