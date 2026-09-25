@@ -2722,6 +2722,7 @@ impl MoteDB {
 
                     // 🚀 Lazy WAL size check - only when needed
                     let wal_dir = db.path.join("wal");
+                    let mut triggered = false;
                     match super::helpers::dir_size(&wal_dir) {
                         Ok(wal_size) if wal_size >= config.max_wal_size_bytes => {
                             debug_log!(
@@ -2729,20 +2730,39 @@ impl MoteDB {
                                 wal_size / 1024 / 1024,
                                 config.max_wal_size_bytes / 1024 / 1024
                             );
-
-                            // Trigger checkpoint
-                            if let Err(e) = db.checkpoint() {
-                                debug_log!("[AutoCheckpoint] ⚠️  Checkpoint failed: {:?}", e);
-                            } else {
-                                debug_log!("[AutoCheckpoint] ✅ Checkpoint complete");
-                                last_checkpoint = Instant::now();
-                            }
+                            triggered = true;
                         }
                         Ok(_) => {
                             // WAL size below threshold, skip checkpoint
                         }
                         Err(_e) => {
                             debug_log!("[AutoCheckpoint] ⚠️  Failed to check WAL size: {:?}", _e);
+                        }
+                    }
+                    // 🔑 WAL-less 段阵触发: fast path / insert_arrays 加载
+                    // 不写 WAL (WAL 大小触发对它们盲), 段阵直接度量被泄漏的
+                    // 资源 — 总段数过阈值即 checkpoint 合并。
+                    if !triggered {
+                        let total_segs: usize = db
+                            .col_segment_stores
+                            .iter()
+                            .map(|e| e.value().segment_count())
+                            .sum();
+                        if total_segs >= config.max_segment_count {
+                            debug_log!(
+                                "[AutoCheckpoint] 🔔 Trigger: segments {} >= {}",
+                                total_segs, config.max_segment_count
+                            );
+                            triggered = true;
+                        }
+                    }
+                    if triggered {
+                        // Trigger checkpoint
+                        if let Err(e) = db.checkpoint() {
+                            debug_log!("[AutoCheckpoint] ⚠️  Checkpoint failed: {:?}", e);
+                        } else {
+                            debug_log!("[AutoCheckpoint] ✅ Checkpoint complete");
+                            last_checkpoint = Instant::now();
                         }
                     }
                 }

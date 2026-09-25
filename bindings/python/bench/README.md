@@ -1602,3 +1602,26 @@ executemany numpy 视图 **174K** (2.7×) / insert_arrays 显式 PK
 回退、重开+后续 UPDATE/DELETE 的 pk_cache 精确性) + insert_arrays 17/17
 (新增 numpy 行参数 f32/f64 往返) + E2E 51 + CLI 17 + parallel_ab 11 +
 fetch_arrays 16 + fuzz 3seed×(on/off) + bigtable diverge=0 + 全量套件。
+
+## WAL-less 段阵的 auto-checkpoint — 段计数触发 (验证收口)
+
+上节修复的 `pending_updates` 信号只救了**手动** checkpoint; 完整验证暴露
+更深一层: **auto-checkpoint 线程只按 WAL 目录大小触发** — fast path /
+insert_arrays 加载 (推荐的批量导入方式) 不写 WAL, WAL 恒 0 → 自动触发
+永远不发生, 持续加载下段阵无界增长 (10GB ≈ 2500 段), 只等 reopen 或
+手动 checkpoint 收口。
+
+修复: AutoCheckpointConfig 新增 `max_segment_count` (默认 32; edge/
+embodied/robotics preset 16), 后台线程在 WAL 大小检查之外加**所有
+ColSegmentStore 表的段总计数**触发 — 段计数直接度量被泄漏的资源, 与
+写粒度无关 (WAL 大小是间接代理)。
+
+验证: test_auto_checkpoint_segments — 10 批 × 12MB WAL-less 加载
+(WAL 触发恒不命中), 阈值 8: 后台线程 (~10s 检查周期) 自动合并段阵到
+≤8, 行数与内容完好; 手动 checkpoint 对照。全量门槛 + E2E 51 + CLI 17 +
+fuzz 2seed×(on/off) + bigtable diverge=0。
+
+测试侧教训: 验证测试曾给 2 列表塞 3 值行 — fast path 跳过 validate_row,
+builder 的越界保护**静默丢弃整列** (120KB 载荷列消失 → 缓冲 <4MB 永不
+flush → 段数为 0), 掩盖了真实行为。宽行进快路径是既知语义 (SQL 层保证
+行宽), 但值得记录: 测试数据形状必须与 schema 严格一致。

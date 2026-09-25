@@ -476,6 +476,12 @@ pub struct AutoCheckpointConfig {
     /// Minimum time interval between checkpoints (seconds)
     /// Default: 60 seconds (prevents too-frequent checkpoints)
     pub min_interval_secs: u64,
+
+    /// 🔑 WAL-less 段阵触发: 所有 ColSegmentStore 表的段总数达到此值时
+    /// auto-checkpoint (合并段阵)。WAL 大小触发对 insert_arrays / fast
+    /// path 加载盲 (WAL 恒 0) — 段计数直接度量被泄漏的资源, 与写粒度无关。
+    /// Default: 32
+    pub max_segment_count: usize,
 }
 
 impl Default for AutoCheckpointConfig {
@@ -483,6 +489,7 @@ impl Default for AutoCheckpointConfig {
         Self {
             max_wal_size_bytes: 16 * 1024 * 1024, // 16MB
             min_interval_secs: 60,                // 1 minute
+            max_segment_count: 32,
         }
     }
 }
@@ -499,6 +506,7 @@ impl AutoCheckpointConfig {
         Self {
             max_wal_size_bytes: 2 * 1024 * 1024, // 2MB (tight limit)
             min_interval_secs: 120,              // 2 minutes (fewer wakeups)
+            max_segment_count: 16,
         }
     }
 }
@@ -583,6 +591,7 @@ impl DBConfig {
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 2 * 1024 * 1024, // 2MB trigger (was 8MB via embedded())
                 min_interval_secs: 30,
+                max_segment_count: 16,
             }),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             column_index_buffer_size: 4 * 1024 * 1024, // was 8MB — halve buffer
@@ -635,6 +644,7 @@ impl DBConfig {
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 8 * 1024 * 1024, // 8MB
                 min_interval_secs: 60,
+                max_segment_count: 32,
             }),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             columnar_config: crate::storage::columnar::config::ColumnarConfig::for_robotics(),
@@ -684,6 +694,7 @@ impl DBConfig {
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 4 * 1024 * 1024, // 4MB
                 min_interval_secs: 30,
+                max_segment_count: 16,
             }),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             columnar_config: crate::storage::columnar::config::ColumnarConfig::for_edge(),
