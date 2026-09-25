@@ -1548,3 +1548,26 @@ insert_arrays 15 + fuzz + bigtable diverge=0 + 全量套件。诊断测试
 结论: 查询期与 steady-state 内存全部落在 ≤100MB 档位内 (实测最大
 steady 18.8MB); 唯一延迟回退是 knn 流式 (上节记录的画像优先取舍, 部署
 方可按表调回预算)。加载/查询吞吐、join 内存、edge preset 全面改善。
+
+## 流式 knn 零拷贝 — 字节距离核, 24.6 → 18.0ms (页缓存带宽地板)
+
+64MB 默认档的流式 knn 此前是三趟扫描: read_bytes_at (mmap 借出) → fbuf
+对齐落位复制 → 距离核。新 `*_distance_bytes` 核 (euclidean/cosine) 直接
+消费**任意对齐的 LE 字节切片** — read_bytes_at 借出的 mmap 切片直接喂,
+零分配零复制, 三处流式循环 (顺序/跨段/段内并行) 全部切换:
+
+- NEON vld1q / AVX2 loadu 非对齐加载原生支持 (裸指针);
+- 标量回退 from_le_bytes (可移植, BE 主机正确);
+- 与主核同语义 (cosine clamp / 零范数)。
+
+实测 (100K×384, 64MB 默认档): 暖查 p50 **24.6 → 18.25ms** (−26%), RSS
+仍 +0MB; 官方 bench knn10 27.1 → **17.97ms** — 与 sqlite 精确扫描
+(18.4ms) 持平且零额外内存。调回 256MB 缓存档仍 4.4ms (35GB/s 堆带宽)。
+18ms 是页缓存带宽地板 (~8.4GB/s, macOS page-cache 读取约为堆带宽 1/4);
+再快只有缓存档 (换内存) 或近似索引两条路。其余形状持平
+(load 173K / groupby 0.80 / join 0.44ms)。
+
+验证: test_knn_parallel (L2+cosine 暴力对拍 + UPDATE/DELETE/NULL — 字节
+核与主核等价性) + vamana 27/27 + E2E 51 + CLI 17 + insert_arrays 15 +
+parallel_ab 11 + fetch_arrays 16 + fuzz 2seed×(on/off) + bigtable
+diverge=0 + 全量套件。

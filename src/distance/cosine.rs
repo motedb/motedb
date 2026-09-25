@@ -671,3 +671,92 @@ mod tests {
         assert!(sim.is_finite());
     }
 }
+
+
+/// b 侧为盘上 LE f32 字节切片 (任意对齐) 的余弦距离变体 — 流式 knn 直接
+/// 喂 mmap 列字节, 免对齐缓冲复制趟。NEON/AVX2 loadu 非对齐原生支持;
+/// 标量回退 from_le_bytes (可移植)。只覆盖本库实际形状 (小端主机 +
+/// SIMD 可用); 与主核同语义 (clamp, 零范数 → 0 相似度)。
+pub fn cosine_distance_bytes(a: &[f32], b: &[u8]) -> f32 {
+    let n = a.len();
+    debug_assert_eq!(b.len(), n * 4, "byte slice must hold exactly n f32 (LE)");
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { cosine_sim_neon_ab(a, b.as_ptr()) }
+            .map(|sim| 1.0 - sim)
+            .unwrap_or(1.0)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        cosine_sim_scalar_bytes(a, b).map(|sim| 1.0 - sim).unwrap_or(1.0)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        cosine_sim_scalar_bytes(a, b).map(|sim| 1.0 - sim).unwrap_or(1.0)
+    }
+}
+
+/// 标量可移植回退 (含 x86 无 AVX2 情形; BE 主机正确)。
+fn cosine_sim_scalar_bytes(a: &[f32], b: &[u8]) -> Option<f32> {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (i, av) in a.iter().enumerate() {
+        let o = i * 4;
+        let bv = f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        dot += av * bv;
+        na += av * av;
+        nb += bv * bv;
+    }
+    compute_cosine_similarity_bytes(dot, na, nb)
+}
+
+fn compute_cosine_similarity_bytes(dot: f32, na: f32, nb: f32) -> Option<f32> {
+    if na == 0.0 || nb == 0.0 {
+        None
+    } else {
+        Some((dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0))
+    }
+}
+
+/// NEON: b 侧非对齐字节指针 (vld1q 无对齐要求)。
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn cosine_sim_neon_ab(a: &[f32], b: *const u8) -> Option<f32> {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let bp = b as *const f32;
+    let chunks = n / 16;
+    let mut dot = [vdupq_n_f32(0.0); 4];
+    let mut na = [vdupq_n_f32(0.0); 4];
+    let mut nb = [vdupq_n_f32(0.0); 4];
+    for i in 0..chunks {
+        let o = i * 16;
+        for j in 0..4 {
+            let av = vld1q_f32(a.as_ptr().add(o + j * 4));
+            let bv = vld1q_f32(bp.add(o + j * 4));
+            dot[j] = vfmaq_f32(dot[j], av, bv);
+            na[j] = vfmaq_f32(na[j], av, av);
+            nb[j] = vfmaq_f32(nb[j], bv, bv);
+        }
+    }
+    let mut d = 0.0f32;
+    let mut va = 0.0f32;
+    let mut vb = 0.0f32;
+    for j in 0..4 {
+        d += vaddvq_f32(dot[j]);
+        va += vaddvq_f32(na[j]);
+        vb += vaddvq_f32(nb[j]);
+    }
+    for i in (chunks * 16)..n {
+        let bo = i * 4;
+        let bv = f32::from_le_bytes(std::ptr::read_unaligned(b.add(bo) as *const [u8; 4]));
+        let av = a[i];
+        d += av * bv;
+        va += av * av;
+        vb += bv * bv;
+    }
+    compute_cosine_similarity_bytes(d, va, vb)
+}

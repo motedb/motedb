@@ -20283,6 +20283,20 @@ impl QueryExecutor {
                     }
                 }
             };
+            // 同 offer, 但距离已算好 (字节核零拷贝路径)。
+            let offer_dist = |heap: &mut std::collections::BinaryHeap<(OrderedF32, u64)>,
+                              key: u64,
+                              dist: f32| {
+                let cand = (OrderedF32(dist), key);
+                if heap.len() < k {
+                    heap.push(cand);
+                } else if let Some(&(worst, _)) = heap.peek() {
+                    if cand.0 < worst {
+                        heap.pop();
+                        heap.push(cand);
+                    }
+                }
+            };
             // Rows must be handed to the SIMD kernels as `&[f32]`. In the
             // segment the floats follow a null bitmap and a u16 dim header, so
             // the raw bytes are never 4-byte aligned — the old in-place
@@ -20428,6 +20442,16 @@ impl QueryExecutor {
                         lh.push(cand);
                     }
                 };
+                let offer_dist_local =
+                    |lh: &mut std::collections::BinaryHeap<(OrderedF32, u64)>, key: u64, dist: f32| {
+                        let cand = (OrderedF32(dist), key);
+                        if lh.len() < k {
+                            lh.push(cand);
+                        } else if lh.peek().is_some_and(|&(worst, _)| cand.0 < worst) {
+                            lh.pop();
+                            lh.push(cand);
+                        }
+                    };
                 let parts: Vec<(
                     std::collections::BinaryHeap<(OrderedF32, u64)>,
                     Vec<u64>,
@@ -20483,35 +20507,20 @@ impl QueryExecutor {
                                 }
                                 let stride = dim * 4;
                                 let data_base = col_start + 1 + null_bytes + 2;
-                                // 🔑 并行任务各自缓冲 — 上限 1MB/任务 (并发 ×
-                                // 1MB 有界; 此前整段一次性读, 16 并发任务
-                                // ×7.7MB = ~120MB 瞬时, 首查 RSS 峰值爆表)。
-                                // f32 对齐直读 (行切片零二次拷贝, 同顺序路径)。
+                                // 🔑 零拷贝 + 分块: read_bytes_at 借出 mmap 切片,
+                                // 字节距离核 (非对齐加载) 直接消费 — 无缓冲分配
+                                // (此前整段一次性读 16 并发 ×7.7MB 瞬时 RSS 爆表;
+                                // 后改 1MB fbuf 落位一趟; 现在零分配零拷贝)。
                                 const CHUNK: usize = 1024 * 1024;
                                 let rows_per_chunk = (CHUNK / stride.max(1)).max(1);
-                                let mut fbuf: Vec<f32> = Vec::new();
                                 'outer: for cstart in (0..n).step_by(rows_per_chunk) {
                                     let cend = (cstart + rows_per_chunk).min(n);
                                     let need = (cend - cstart) * stride;
-                                    let floats = need / 4;
-                                    if fbuf.len() < floats {
-                                        fbuf.resize(floats, 0.0);
-                                    }
-                                    let ok = {
-                                        let raw = unsafe {
-                                            std::slice::from_raw_parts_mut(
-                                                fbuf.as_mut_ptr() as *mut u8,
-                                                floats * 4,
-                                            )
-                                        };
-                                        seg.sst
-                                            .read_bytes_at(data_base + cstart * stride, need)
-                                            .map(|b| raw.copy_from_slice(b.as_ref()))
-                                            .is_ok()
-                                    };
-                                    if !ok {
+                                    let Ok(bytes) =
+                                        seg.sst.read_bytes_at(data_base + cstart * stride, need)
+                                    else {
                                         break 'outer;
-                                    }
+                                    };
                                     for i in cstart..cend {
                                         if seg.sst.row_map.is_deleted(i) {
                                             tombstoned.push(seg.sst.row_map.key(i));
@@ -20520,8 +20529,19 @@ impl QueryExecutor {
                                         if (head[i / 8] >> (i % 8)) & 1 != 0 {
                                             continue;
                                         }
-                                        let base = (i - cstart) * dim;
-                                        offer_local(&mut lh, seg.sst.row_map.key(i), &fbuf[base..base + dim]);
+                                        let bo = (i - cstart) * stride;
+                                        let dist = if cosine {
+                                            crate::distance::cosine::cosine_distance_bytes(
+                                                query,
+                                                &bytes[bo..bo + stride],
+                                            )
+                                        } else {
+                                            crate::distance::euclidean::euclidean_distance_squared_bytes(
+                                                query,
+                                                &bytes[bo..bo + stride],
+                                            )
+                                        };
+                                        offer_dist_local(&mut lh, seg.sst.row_map.key(i), dist);
                                     }
                                 }
                             }
@@ -20728,34 +20748,19 @@ impl QueryExecutor {
                             let (mut claimed, mut tombstoned): (Vec<u64>, Vec<u64>) =
                                 (Vec::new(), Vec::new());
                             let row0 = rows[0];
-                            // 🔑 子分块 ≤1MB (此前整 chunk 一次性分配 ~15MB/
-                            // 任务 ×并发 = 首查 RSS 峰值爆表; 有界缓冲语义)。
-                            // f32 对齐直读 (行切片零二次拷贝)。
+                            // 🔑 零拷贝子分块: read_bytes_at 借出 mmap 切片,
+                            // 字节距离核直接消费 (此前整 chunk 分配 ~15MB/任务
+                            // RSS 爆表 → 1MB fbuf 一趟拷贝 → 现在零分配零拷贝)。
                             const SUB_CHUNK: usize = 1024 * 1024;
                             let sub_rows = (SUB_CHUNK / stride.max(1)).max(1);
-                            let mut fbuf: Vec<f32> = Vec::new();
                             'sub: for cstart in (row0..row0 + rows.len()).step_by(sub_rows) {
                                 let cend = (cstart + sub_rows).min(row0 + rows.len());
                                 let need = (cend - cstart) * stride;
-                                let floats = need / 4;
-                                if fbuf.len() < floats {
-                                    fbuf.resize(floats, 0.0);
-                                }
-                                let ok = {
-                                    let raw = unsafe {
-                                        std::slice::from_raw_parts_mut(
-                                            fbuf.as_mut_ptr() as *mut u8,
-                                            floats * 4,
-                                        )
-                                    };
-                                    seg.sst
-                                        .read_bytes_at(data_base + cstart * stride, need)
-                                        .map(|b| raw.copy_from_slice(b.as_ref()))
-                                        .is_ok()
-                                };
-                                if !ok {
+                                let Ok(bytes) =
+                                    seg.sst.read_bytes_at(data_base + cstart * stride, need)
+                                else {
                                     break 'sub;
-                                }
+                                };
                                 for i in cstart..cend {
                                     let key = seg.sst.row_map.key(i);
                                     if seg.sst.row_map.is_deleted(i) {
@@ -20765,19 +20770,19 @@ impl QueryExecutor {
                                     if (head[i / 8] >> (i % 8)) & 1 != 0 {
                                         continue;
                                     }
-                                    let base = (i - cstart) * dim;
+                                    let bo = (i - cstart) * stride;
                                     if prior.contains(&key) {
                                         continue;
                                     }
                                     let dist = if cosine {
-                                        crate::distance::cosine::cosine_distance(
+                                        crate::distance::cosine::cosine_distance_bytes(
                                             query,
-                                            &fbuf[base..base + dim],
+                                            &bytes[bo..bo + stride],
                                         )
                                     } else {
-                                        crate::distance::euclidean::euclidean_distance_squared(
+                                        crate::distance::euclidean::euclidean_distance_squared_bytes(
                                             query,
-                                            &fbuf[base..base + dim],
+                                            &bytes[bo..bo + stride],
                                         )
                                     };
                                     let cand = (OrderedF32(dist), key);
@@ -20809,32 +20814,16 @@ impl QueryExecutor {
                 }
                 const KNN_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024;
                 let rows_per_chunk = (KNN_STREAM_CHUNK_BYTES / stride.max(1)).max(1);
-                // 🔑 f32 对齐块缓冲: pread 直接落位, 行切片即 &[f32] — 此前
-                // bytes 块 + 每行 copy_le_f32 两趟拷贝 (154MB 表暖查翻倍的
-                // 主因)。LE 主机上盘上 f32 字节序即主机序 (aarch64/x86_64)。
-                let mut fbuf: Vec<f32> = Vec::new();
+                // 🔑 零拷贝: read_bytes_at 对 mmap 段返回借用切片, 字节距离
+                // 核 (非对齐加载) 直接消费 — 无对齐缓冲复制趟 (此前 bytes 块
+                // + 每行 copy_le_f32 两趟, 后改 fbuf 落位一趟; 现在零趟)。
                 for cstart in (0..n).step_by(rows_per_chunk) {
                     let cend = (cstart + rows_per_chunk).min(n);
                     let need = (cend - cstart) * stride;
-                    let floats = need / 4;
-                    if fbuf.len() < floats {
-                        fbuf.resize(floats, 0.0);
-                    }
-                    let ok = {
-                        let raw = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                fbuf.as_mut_ptr() as *mut u8,
-                                floats * 4,
-                            )
-                        };
-                        seg.sst
-                            .read_bytes_at(data_base + cstart * stride, need)
-                            .map(|b| raw.copy_from_slice(b.as_ref()))
-                            .is_ok()
-                    };
-                    if !ok {
+                    let Ok(bytes) = seg.sst.read_bytes_at(data_base + cstart * stride, need)
+                    else {
                         break;
-                    }
+                    };
                     for i in cstart..cend {
                         let key = seg.sst.row_map.key(i);
                         // Same as the cached branch: tombstone (NULL
@@ -20847,11 +20836,22 @@ impl QueryExecutor {
                         if (head[i / 8] >> (i % 8)) & 1 != 0 {
                             continue;
                         }
-                        let base = (i - cstart) * dim;
+                        let bo = (i - cstart) * stride;
                         if !seen.insert(key) {
                             continue;
                         }
-                        offer(&mut heap, key, &fbuf[base..base + dim]);
+                        let dist = if cosine {
+                            crate::distance::cosine::cosine_distance_bytes(
+                                query,
+                                &bytes[bo..bo + stride],
+                            )
+                        } else {
+                            crate::distance::euclidean::euclidean_distance_squared_bytes(
+                                query,
+                                &bytes[bo..bo + stride],
+                            )
+                        };
+                        offer_dist(&mut heap, key, dist);
                     }
                 }
             }
