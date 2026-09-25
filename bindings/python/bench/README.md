@@ -1528,3 +1528,23 @@ fuzz 2seed×(on/off) + bigtable diverge=0 + 全量套件。
 100 = 0.99/0.99/0.98, 增量 +5000 行 0.995/0.99/0.98); E2E 51 + CLI 17 +
 insert_arrays 15 + fuzz + bigtable diverge=0 + 全量套件。诊断测试
 (`churn_connectivity_diagnostic`, 默认 ignore) 留作工具。
+
+## resource_bench 全套资源画像复扫 (64MB 默认档, 2026-09)
+
+快照: `resource_bench_2026-09_profile.json` (基线 `resource_bench_v0.10.0.json`)。
+
+| 指标 | v0.10.0 基线 | 现在 | 评 |
+|---|---|---|---|
+| 加载 rows/s (executemany 口径) | 62,181 | **88,279** | +42% (WAL/pyo3 优化红利) |
+| 加载峰值 RSS Δ | 210.9 | **55.7** | −74% |
+| 查询内存 (点查/范围/分组/topk/join/FTS/knn/全扫) | ≈0 (join 63.2) | **全 ≈0 (join 0.1)** | join 物化优化红利 |
+| steady-state RSS Δ (全类跑热) | 159.5 | **18.8** | −88% (向量缓存 64MB 档) |
+| groupby 延迟 | 1.71ms | 0.98ms | |
+| knn10 延迟 | 6.14ms | 24.61ms | 已知取舍 (流式; 调回 256MB → 5.4ms) |
+| edge preset knn p50 | 26.39ms | 18.39ms | 更快 |
+| 磁盘 (checkpoint 后 / FTS) | 162.0 / 175.9 | 162.0 / 175.9 | 持平 |
+| 重开 / crash 恢复 (kill -9) | ok | ok (1300/1300 行可见) | ✓ |
+
+结论: 查询期与 steady-state 内存全部落在 ≤100MB 档位内 (实测最大
+steady 18.8MB); 唯一延迟回退是 knn 流式 (上节记录的画像优先取舍, 部署
+方可按表调回预算)。加载/查询吞吐、join 内存、edge preset 全面改善。
