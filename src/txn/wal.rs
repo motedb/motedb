@@ -665,7 +665,7 @@ struct PartitionWAL {
     last_checkpoint: LogSequenceNumber,
 
     /// WAL configuration
-    config: WALConfig,
+    pub(crate) config: WALConfig,
 }
 
 impl PartitionWAL {
@@ -1271,9 +1271,8 @@ pub struct WALManager {
     #[allow(dead_code)]
     num_partitions: u8,
 
-    /// WAL configuration
-    #[allow(dead_code)]
-    config: WALConfig,
+    /// WAL configuration (crud 侧 fast path 的耐久性门读取)
+    pub(crate) config: WALConfig,
 
     /// Background flush thread (Periodic mode)
     flush_thread: Option<FlushThread>,

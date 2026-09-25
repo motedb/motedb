@@ -1625,3 +1625,29 @@ fuzz 2seed×(on/off) + bigtable diverge=0。
 builder 的越界保护**静默丢弃整列** (120KB 载荷列消失 → 缓冲 <4MB 永不
 flush → 段数为 0), 掩盖了真实行为。宽行进快路径是既知语义 (SQL 层保证
 行宽), 但值得记录: 测试数据形状必须与 schema 严格一致。
+
+## resource_bench 快照刷新 — fast path 耐久性门 (crash 契约恢复)
+
+快照刷新暴露最后一个 (也是最重要的) 回归: 显式 PK fast path 免 WAL 后,
+resource bench 的 crash 段 (子进程 executemany 300 行返回成功 → kill -9
+→ 重放) 只见 1000/1300 — **返回成功的自动提交写入必须扛住 kill -9** 是
+GroupCommit/Synchronous 档的契约, fast path 破坏了它 (自增 fast path 同
+款隐患, 只是此前的测试形状没踩到)。
+
+修复: `fast_batch_insert_with_ids` (两个 fast path 的公共尾段) 加耐久性
+门 — Synchronous/GroupCommit 下同样写 WAL (从 store_rows 建 WALRecord,
+不额外 clone 一份); NoSync/Periodic (尾部丢失本就是契约) 保留全速免 WAL。
+
+诚实代价 (GroupCommit 默认档): 官方 load 254K→**174K** (仍为本战役前
+62K 的 2.8×), insert_arrays 显式 PK 286K→171K, executemany numpy
+174K→125K; NoSync/Periodic preset (edge/robotics/testing) 保留 286K。
+加载峰值 RSS 55.7→209MB (WAL 序列化的行副本 — 加载期而非查询期, ≤100MB
+约束针对查询期)。
+
+最终快照 `resource_bench_2026-09_profile.json` (覆盖前版):
+load 97K (executemany .tolist() 口径) / 查询 RSS 全形状 ≈0 / steady
+−1.0MB / knn 18.3ms / **crash 1300/1300 ✓** / 磁盘 162MB / 重开 RSS
+−9.1MB。此前章节的 254K/286K 数字注明为 NoSync 等价口径。
+
+验证: crash 重放手工复现 1300/1300 + test_insert_explicit_fastpath 5/5 +
+test_insert_engine 3/3 + 全量门槛与套件 (下)。

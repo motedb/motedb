@@ -3492,6 +3492,32 @@ impl MoteDB {
         // 合并 (WAL-less 加载的 auto-checkpoint 同样从不触发)。慢路径在
         // WAL append 前置位; 这里批末置位。
         self.increment_pending_updates();
+        // 🔑 耐久性门 (resource bench crash 段的契约: 返回成功的自动提交
+        // 写入必须扛住 kill -9): Synchronous/GroupCommit 下 fast path 也要
+        // 写 WAL — 免 WAL 的加速只对 NoSync/Periodic (尾部丢失本就是契约)
+        // 开放。两个 fast path (自增/显式 PK) 都经此函数, 一处门控。
+        let durable = !matches!(
+            self.wal.config.durability_level,
+            crate::config::DurabilityLevel::NoSync
+                | crate::config::DurabilityLevel::Periodic { .. }
+        );
+        if durable {
+            let wal_records: Vec<crate::txn::wal::WALRecord> = store_rows
+                .iter()
+                .map(|(key, _, row)| {
+                    let rid = key & 0xFFFFFFFF;
+                    crate::txn::wal::WALRecord::Insert {
+                        table_name: table_name.to_string(),
+                        row_id: rid,
+                        partition: (self.make_composite_key(table_name, rid)
+                            % self.num_partitions as u64) as PartitionId,
+                        data: row.clone(),
+                        txn_id: 0,
+                    }
+                })
+                .collect();
+            self.wal.batch_append(0, wal_records)?;
+        }
         let __ta = std::time::Instant::now();
         store.append_rows(&store_rows)?;
 
