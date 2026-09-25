@@ -54,23 +54,55 @@ cargo run --example hello_world
 For the multimodal features (vector / full-text / spatial search), see
 [`examples/crud.rs`](examples/crud.rs) and the [indexes overview](docs/06-indexes-overview.md).
 
+Python bindings (`pip install motedb`) — bulk load and columnar fetch are
+first-class:
+
+```python
+import motedb, numpy as np
+
+db = motedb.Database("app.mote")
+db.execute("CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP, emb VECTOR(384), tag TEXT)")
+
+# 🚀 列式批量导入 (numpy 直通, GroupCommit 耐久档 197K rows/s):
+db.insert_arrays("ev", {
+    "id":    np.arange(N),
+    "ts":    ts_micros_array,          # i64 micros
+    "emb":   emb_2d_float32,           # (N, 384) f32
+    "tag":   [f"t{i%16}" for i in range(N)],
+})
+
+# 🚀 列式取回 (同质数值列 → numpy 零拷贝; TEXT/NULL → Python 列表):
+cols, arrays = db.fetch_arrays("SELECT id, ts, emb_norm... FROM ev WHERE ts > ?",
+                               params=[t0])
+
+# INSERT ... SELECT (物化后走同一批量管线, 1.6M rows/s):
+db.execute("INSERT INTO archive SELECT * FROM ev WHERE ts < ?", params=[cutoff])
+```
+
 ## Performance
 
-Benchmark: 300K rows × 4 columns on Apple Silicon M-series vs SQLite 3.x WAL mode.
+Benchmark: 100K rows × 384-dim vectors (+TEXT/FLOAT/TIMESTAMP) on Apple
+Silicon M-series, official harness `bindings/python/bench/compete_bench.py`
+(SQLite 参照同形状; 详细方法学与历史曲线见 `bindings/python/bench/README.md`).
 
-| Operation | MoteDB | SQLite | Winner |
-|-----------|--------|--------|--------|
-| INSERT 300K | 125ms | 85ms | MoteDB (1.5x) |
-| CREATE INDEX ×2 | 30ms | 90ms | MoteDB (3x) |
-| WHERE = | 11ms | 14ms | MoteDB (1.3x) |
-| ORDER BY LIMIT | 2.6ms | 6.5ms | MoteDB (2.5x) |
-| COUNT/SUM/AVG WHERE | 2.8ms | 14ms | MoteDB (5x) |
-| PK SELECT | <1μs | 1μs | MoteDB |
-| LIKE | 13ms | 10ms | SQLite (1.3x) |
-| DISTINCT | 8.5ms | 4.6ms | SQLite (1.9x) |
-| SELECT * | 27ms | 9.7ms | SQLite (2.8x) |
+| Operation | MoteDB | SQLite | 倍数 |
+|-----------|--------|--------|------|
+| 批量导入 `insert_arrays` (GroupCommit 耐久档) | 197K rows/s | 2.4M rows/s* | *SQLite 无向量列 |
+| 批量导入 (NoSync/Periodic preset) | 286K rows/s | — | |
+| PK 点查 | 17µs | 7µs | |
+| 范围 COUNT+AVG (融合+并行) | 0.19ms | 0.39ms | 2.1x |
+| GROUP BY (morsel 并行) | 0.71ms | 58ms | 82x |
+| equi-JOIN + GROUP BY (批 hash join) | 0.44ms | 10.9ms | 25x |
+| top-k ORDER LIMIT | 0.45ms | 45.7ms | 100x |
+| 向量 top-10 (无索引精确扫描, SIMD+并行) | 18ms | 18.4ms** | **SQLite 无向量类型, 参照仅同数据量 |
+| FTS BM25 | 0.13ms | — | |
+| 笛卡尔积 COUNT(*) (6 亿对, 折叠) | 0.5ms | — | |
 
-**Memory: 257 B/row (vs SQLite 369 B/row — 30% less)**
+**查询内存**: 全部查询形状 RSS 增量 ≈0 (steady-state 实测 <20MB, 默认
+档约束 ≤100MB); 资源画像全套快照见 `resource_bench_*.json`。
+
+**执行内核**: 向量化 (VEC) + morsel 并行默认开启 (`MOTE_VEC=off` 一键
+回退旧行式路径); 无索引向量扫描为字节距离核零拷贝 (页缓存带宽地板)。
 
 ## Architecture
 
@@ -139,9 +171,15 @@ See [`examples/logging.rs`](examples/logging.rs) for a runnable demo.
 
 ### Embedded Optimized
 
-- **Low memory**: 222 B/row (vs SQLite's 335 B — 34% less)
-- **Zero-copy reads**: mmap with on-demand page loading
-- **Fast writes**: Zero-encode columnar INSERT (2.9M rows/s batch, 1.1M rows/s sustained in `for_edge` mode)
+- **Low memory**: 222 B/row (vs SQLite's 335 B — 34% less); 查询期 RSS 增量 ≈0
+  (默认档向量缓存预算 64MB, `set_vector_cache_budget` 按表调整)
+- **Zero-copy reads**: mmap with on-demand page loading; 无索引向量扫描为
+  字节距离核零拷贝 (非对齐 SIMD 直读页缓存)
+- **Fast writes**: 列式批量导入 insert_arrays — GroupCommit 耐久档 197K
+  rows/s / NoSync 档 286K (100K×384 口径); fast path 段直写耐久
+  (temp+fsync+rename 原子发布 + manifest fsync), WAL 只服务慢路径
+- **Auto-checkpoint 双触发**: WAL 大小 + 段计数 (`max_segment_count`,
+  默认 32; edge preset 16) — WAL-less 批量导入的段阵有界
 - **Small disk**: zstd compression in compact mode (~40-50% smaller, 67 B/row on disk)
 - **No daemon**: Single library, embedded directly
 
@@ -206,9 +244,10 @@ See [`docs/`](docs/) for the full configuration reference and per-field docs.
 **Supported:** `CREATE TABLE` / `CREATE INDEX` (column, vector, text, spatial,
 timestamp) / `CREATE TEXT|VECTOR|SPATIAL|TIMESTAMP INDEX`, `DROP TABLE [IF
 EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
-`INSERT`, `UPDATE`, `DELETE`, `SELECT` with:
+`INSERT` (含 `INSERT ... SELECT`), `UPDATE`, `DELETE`, `SELECT` with:
 
-- `WHERE`, `JOIN` (INNER / LEFT / RIGHT / FULL), subqueries in `WHERE`
+- `WHERE`, `JOIN` (INNER / LEFT / RIGHT / FULL), subqueries in `WHERE`,
+  `FROM (SELECT ...)` 派生表
 - `GROUP BY` (columns, expressions like `id % 5`, and SELECT aliases), `HAVING` (incl. aggregate aliases), `ORDER BY` (multi-key, expressions, non-projected columns, `NULLS FIRST/LAST`), `LIMIT/OFFSET`
 - `DISTINCT` (rows) and `COUNT(DISTINCT col)` aggregates
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`
