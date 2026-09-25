@@ -1,10 +1,10 @@
 //! VEC M4 集成回归：批投影（try_vec_projection）与批过滤 top-k
 //! （try_vec_filter_topk）直接调用（绕过 MOTE_VEC 环境门），与完整 SQL
 //! 执行器输出（旧路径权威语义）逐行对拍，覆盖 NULL/分页/多段去重/三值。
-use motedb::sql::{Lexer, Parser, QueryExecutor};
 use motedb::sql::ast::SelectStmt;
+use motedb::sql::{Lexer, Parser, QueryExecutor};
 use motedb::types::Value;
-use motedb::{MoteDB};
+use motedb::MoteDB;
 use std::sync::Arc;
 
 fn parse(sql: &str) -> SelectStmt {
@@ -64,17 +64,18 @@ fn seed(db: &Arc<MoteDB>) {
             &db,
             &format!(
                 "INSERT INTO t VALUES ({}, {}, 'dev-{:02}', {}, {})",
-                i, ts, i % 8, v, q
+                i,
+                ts,
+                i % 8,
+                v,
+                q
             ),
         );
     }
     db.checkpoint().unwrap();
 }
 
-fn vec_projection(
-    db: &Arc<MoteDB>,
-    sql: &str,
-) -> Vec<Vec<Value>> {
+fn vec_projection(db: &Arc<MoteDB>, sql: &str) -> Vec<Vec<Value>> {
     enable_vec();
     let stmt = parse(sql);
     let store = db.get_col_segment_store("t").expect("store");

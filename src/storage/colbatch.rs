@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use crate::types::{ColumnType, Timestamp, Value, ArcString};
+use crate::types::{ArcString, ColumnType, Timestamp, Value};
 
 /// 向量化批的标准行容量。
 pub const VEC_BATCH_ROWS: usize = 2048;
@@ -228,9 +228,9 @@ impl SelectionVec {
 /// `Values` 承接 VECTOR/GEOMETRY/TENSOR（knn 走现有 `&[f32]` SIMD 路径）。
 #[derive(Debug, Clone)]
 pub enum ColData {
-    I64(Vec<i64>),     // Integer / Timestamp(micros)
+    I64(Vec<i64>), // Integer / Timestamp(micros)
     F64(Vec<f64>),
-    Bool(Vec<u64>),    // bit i = 1 → true
+    Bool(Vec<u64>), // bit i = 1 → true
     Utf8(Vec<Arc<str>>),
     Values(Vec<Value>), // 复杂类型 fallback
 }
@@ -265,11 +265,12 @@ impl ColumnVector {
             ColData::I64(v) => v.len() * 8,
             ColData::F64(v) => v.len() * 8,
             ColData::Bool(bits) => bits.len() * 8,
-            ColData::Utf8(v) => v
-                .iter()
-                .map(|s| s.as_ptr() as usize + s.len() * 1 - s.as_ptr() as usize + 16)
-                .sum::<usize>()
-                + v.len() * 8,
+            ColData::Utf8(v) => {
+                v.iter()
+                    .map(|s| s.as_ptr() as usize + s.len() * 1 - s.as_ptr() as usize + 16)
+                    .sum::<usize>()
+                    + v.len() * 8
+            }
             ColData::Values(v) => v.len() * 16,
         };
         data + self.valid.words_len() * 8
@@ -281,9 +282,7 @@ impl ColumnVector {
             ColumnType::Float => ColData::F64(Vec::with_capacity(cap)),
             ColumnType::Boolean => ColData::Bool(Vec::with_capacity(cap.div_ceil(64))),
             ColumnType::Text => ColData::Utf8(Vec::with_capacity(cap)),
-            ColumnType::Tensor(_) | ColumnType::Spatial => {
-                ColData::Values(Vec::with_capacity(cap))
-            }
+            ColumnType::Tensor(_) | ColumnType::Spatial => ColData::Values(Vec::with_capacity(cap)),
         };
         Self {
             data,
@@ -528,7 +527,12 @@ mod tests {
     #[test]
     fn column_vector_push_get_roundtrip_all_types() {
         let mut cv = ColumnVector::with_type_capacity(&ColumnType::Integer, 8);
-        for v in [Value::Integer(1), Value::Null, Value::Integer(-5), Value::Integer(i64::MAX)] {
+        for v in [
+            Value::Integer(1),
+            Value::Null,
+            Value::Integer(-5),
+            Value::Integer(i64::MAX),
+        ] {
             assert!(cv.push_value(&v));
         }
         assert_eq!(cv.get(0), Value::Integer(1));
@@ -554,7 +558,12 @@ mod tests {
         assert_eq!(cv.get(3), Value::Float(-0.0));
 
         let mut cv = ColumnVector::with_type_capacity(&ColumnType::Boolean, 8);
-        for v in [Value::Bool(true), Value::Null, Value::Bool(false), Value::Bool(true)] {
+        for v in [
+            Value::Bool(true),
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+        ] {
             assert!(cv.push_value(&v));
         }
         assert_eq!(cv.get(0), Value::Bool(true));
@@ -595,8 +604,14 @@ mod tests {
         }
         let filtered = b.take_selection(sel);
         assert_eq!(filtered.row_count(), 3);
-        assert_eq!(filtered.get_row(0), vec![Value::Integer(0), Value::text("t0".to_string())]);
-        assert_eq!(filtered.get_row(2), vec![Value::Integer(4), Value::text("t4".to_string())]);
+        assert_eq!(
+            filtered.get_row(0),
+            vec![Value::Integer(0), Value::text("t0".to_string())]
+        );
+        assert_eq!(
+            filtered.get_row(2),
+            vec![Value::Integer(4), Value::text("t4".to_string())]
+        );
         let rows = filtered.materialize_rows(2);
         assert_eq!(rows.len(), 2);
         // 原批不受影响

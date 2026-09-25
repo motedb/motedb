@@ -317,7 +317,10 @@ impl Segment {
             ColumnType::Float => {
                 let seg = self.sst.read_fixed_i64(col_idx).ok()?;
                 let valid = ValidityBitmap::from_null_bytes(seg.null_bitmap_bytes(), n);
-                Some(ColumnVector::from_f64_slice(seg.raw_f64_typed_slice(), valid))
+                Some(ColumnVector::from_f64_slice(
+                    seg.raw_f64_typed_slice(),
+                    valid,
+                ))
             }
             ColumnType::Boolean => {
                 let seg = self.sst.read_fixed_i64(col_idx).ok()?;

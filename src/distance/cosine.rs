@@ -672,7 +672,6 @@ mod tests {
     }
 }
 
-
 /// b 侧为盘上 LE f32 字节切片 (任意对齐) 的余弦距离变体 — 流式 knn 直接
 /// 喂 mmap 列字节, 免对齐缓冲复制趟。NEON/AVX2 loadu 非对齐原生支持;
 /// 标量回退 from_le_bytes (可移植)。只覆盖本库实际形状 (小端主机 +
@@ -689,11 +688,15 @@ pub fn cosine_distance_bytes(a: &[f32], b: &[u8]) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        cosine_sim_scalar_bytes(a, b).map(|sim| 1.0 - sim).unwrap_or(1.0)
+        cosine_sim_scalar_bytes(a, b)
+            .map(|sim| 1.0 - sim)
+            .unwrap_or(1.0)
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        cosine_sim_scalar_bytes(a, b).map(|sim| 1.0 - sim).unwrap_or(1.0)
+        cosine_sim_scalar_bytes(a, b)
+            .map(|sim| 1.0 - sim)
+            .unwrap_or(1.0)
     }
 }
 

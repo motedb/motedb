@@ -845,10 +845,7 @@ impl QueryExecutor {
                 stmt.limit,
                 offset,
             )? {
-                return Ok(StreamingQueryResult::SelectReady {
-                    columns,
-                    rows,
-                });
+                return Ok(StreamingQueryResult::SelectReady { columns, rows });
             }
         }
 
@@ -1238,9 +1235,7 @@ impl QueryExecutor {
         // 键 + LIMIT/OFFSET：命中行只提排序键，select_nth 取前 k，只对最终
         // 页行做投影解码（旧路径解码全部命中行的全部投影列再全排序）。
         if where_clause.is_some() && stmt.order_by.is_some() && stmt.limit.is_some() {
-            if let Some(rows) =
-                crate::sql::vector_exec::try_vec_filter_topk(store, schema, stmt)?
-            {
+            if let Some(rows) = crate::sql::vector_exec::try_vec_filter_topk(store, schema, stmt)? {
                 return Ok(StreamingQueryResult::SelectReady { columns, rows });
             }
         }
@@ -1343,11 +1338,8 @@ impl QueryExecutor {
                                     };
                                     // 🔑 Page after the bounded sort: skip the
                                     // first `offset` best rows, keep `page`.
-                                    let top_indices: Vec<(usize, usize)> = top_indices
-                                        .into_iter()
-                                        .skip(offset)
-                                        .take(page)
-                                        .collect();
+                                    let top_indices: Vec<(usize, usize)> =
+                                        top_indices.into_iter().skip(offset).take(page).collect();
                                     let segs = store.segments_snapshot();
                                     let col_types = store.col_types();
                                     // Cache decoded columns per segment to avoid re-reading.

@@ -2,12 +2,15 @@
 //! 多线程在同一 Database 上并发执行参数化查询，各线程必须看到自己的行。
 //! (修复前: params 是 executor 上的共享 RwLock — 线程 A bind 后线程 B
 //! bind 覆盖, A 执行时用的是 B 的参数 → 静默错行。)
-use motedb::Database as MoteDB;
 use motedb::types::Value;
+use motedb::Database as MoteDB;
 use std::sync::Arc;
 
 fn ex(db: &Arc<MoteDB>, sql: &str, params: Vec<motedb::types::Value>) -> motedb::QueryResult {
-    db.execute_prepared(sql, params).unwrap().materialize().unwrap()
+    db.execute_prepared(sql, params)
+        .unwrap()
+        .materialize()
+        .unwrap()
 }
 
 #[test]
@@ -61,7 +64,11 @@ fn params_race_concurrent_parameterized_queries() {
         }));
     }
     let total_wrong: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
-    assert_eq!(total_wrong, 0, "{} parameterized reads returned WRONG rows", total_wrong);
+    assert_eq!(
+        total_wrong, 0,
+        "{} parameterized reads returned WRONG rows",
+        total_wrong
+    );
 }
 
 /// 同一 Database、无参数并发读 — 不得错果（雷#2/#3 的并行安全基线）。
@@ -69,7 +76,11 @@ fn params_race_concurrent_parameterized_queries() {
 fn concurrent_reads_no_params_correct() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("cread.mote")).unwrap());
-    ex(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v REAL)", vec![]);
+    ex(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, g INT, v REAL)",
+        vec![],
+    );
     for i in 0..2000i64 {
         ex(
             &db,
@@ -89,7 +100,11 @@ fn concurrent_reads_no_params_correct() {
         handles.push(std::thread::spawn(move || {
             let mut bad = 0usize;
             for _ in 0..200 {
-                let r = ex(&db, "SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g ORDER BY g", vec![]);
+                let r = ex(
+                    &db,
+                    "SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g ORDER BY g",
+                    vec![],
+                );
                 let rows = match r {
                     motedb::QueryResult::Select { rows, .. } => rows,
                     o => panic!("expected select: {:?}", o),
@@ -110,5 +125,8 @@ fn concurrent_reads_no_params_correct() {
         }));
     }
     let total_bad: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
-    assert_eq!(total_bad, 0, "concurrent GROUP BY reads returned wrong results");
+    assert_eq!(
+        total_bad, 0,
+        "concurrent GROUP BY reads returned wrong results"
+    );
 }

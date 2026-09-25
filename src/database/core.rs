@@ -2751,7 +2751,8 @@ impl MoteDB {
                         if total_segs >= config.max_segment_count {
                             debug_log!(
                                 "[AutoCheckpoint] 🔔 Trigger: segments {} >= {}",
-                                total_segs, config.max_segment_count
+                                total_segs,
+                                config.max_segment_count
                             );
                             triggered = true;
                         }

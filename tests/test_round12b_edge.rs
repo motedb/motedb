@@ -31,7 +31,9 @@ fn seed_vectors(db: &Database, n: i64, dim: usize) {
         let hi = (b + 500).min(n);
         let mut batch = Vec::new();
         for i in b..hi {
-            let emb: Vec<f32> = (0..dim).map(|k| ((i % 17) as f32) * 0.25 + k as f32).collect();
+            let emb: Vec<f32> = (0..dim)
+                .map(|k| ((i % 17) as f32) * 0.25 + k as f32)
+                .collect();
             batch.push(vec![
                 Value::Integer(i),
                 Value::Integer(i % 3),
@@ -46,7 +48,9 @@ fn seed_vectors(db: &Database, n: i64, dim: usize) {
 
 fn topk(db: &Database, k: usize) -> Vec<i64> {
     // Query vector close to row id%17==4's embedding (cat values irrelevant).
-    let q: Vec<String> = (0..8).map(|k| format!("{}", 4.0 * 0.25 + k as f64)).collect();
+    let q: Vec<String> = (0..8)
+        .map(|k| format!("{}", 4.0 * 0.25 + k as f64))
+        .collect();
     db.query(&format!(
         "SELECT id FROM v ORDER BY emb <-> [{}] ASC LIMIT {k}",
         q.join(", ")
@@ -109,18 +113,21 @@ fn reopen_allocates_fresh_row_ids_multi_segment() {
     let dir = TempDir::new().unwrap();
     {
         let db = Database::create_with_config(dir.path(), DBConfig::for_edge()).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v FLOAT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v FLOAT)")
+            .unwrap();
         let mut batch = Vec::new();
         for i in 0..300i64 {
             batch.push(vec![Value::Float(i as f64 * 0.1)]);
         }
-        db.execute_prepared_many("INSERT INTO t (v) VALUES (?)", batch).unwrap();
+        db.execute_prepared_many("INSERT INTO t (v) VALUES (?)", batch)
+            .unwrap();
         // A second flush → multiple segments, exercising per-segment hints.
         let mut batch2 = Vec::new();
         for i in 0..300i64 {
             batch2.push(vec![Value::Float(i as f64)]);
         }
-        db.execute_prepared_many("INSERT INTO t (v) VALUES (?)", batch2).unwrap();
+        db.execute_prepared_many("INSERT INTO t (v) VALUES (?)", batch2)
+            .unwrap();
         db.checkpoint().unwrap();
     }
     let db = Database::open_with_config(dir.path(), DBConfig::for_edge()).unwrap();
@@ -135,7 +142,8 @@ fn reopen_allocates_fresh_row_ids_multi_segment() {
     for i in 0..100i64 {
         batch3.push(vec![Value::Float(i as f64 * 2.0)]);
     }
-    db.execute_prepared_many("INSERT INTO t (v) VALUES (?)", batch3).unwrap();
+    db.execute_prepared_many("INSERT INTO t (v) VALUES (?)", batch3)
+        .unwrap();
     let rows = db.query("SELECT COUNT(*) FROM t").unwrap();
     let total = match &rows[0][0] {
         Value::Integer(c) => *c,
@@ -162,7 +170,10 @@ fn vector_cache_budget_honors_config() {
     assert_eq!(db.vector_cache_budget_bytes("v").unwrap(), 64 * 1024 * 1024);
     let (_d2, db2) = db_with(DBConfig::for_robotics());
     seed_vectors(&db2, 10, 8);
-    assert_eq!(db2.vector_cache_budget_bytes("v").unwrap(), 32 * 1024 * 1024);
+    assert_eq!(
+        db2.vector_cache_budget_bytes("v").unwrap(),
+        32 * 1024 * 1024
+    );
     let (_d3, db3) = db_with(DBConfig::for_testing());
     seed_vectors(&db3, 10, 8);
     assert_eq!(

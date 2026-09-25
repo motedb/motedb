@@ -582,8 +582,8 @@ impl DBConfig {
                 enable_compression: Some(true), // was false — enable zstd for disk savings
                 ..Default::default()
             },
-            row_cache_size: Some(200),     // was 500 — cut cache memory
-            col_cache_budget_mb: Some(16), // 16MB decoded-column budget per table
+            row_cache_size: Some(200),        // was 500 — cut cache memory
+            col_cache_budget_mb: Some(16),    // 16MB decoded-column budget per table
             vector_cache_budget_mb: Some(32), // vectors secondary on sensor nodes
             max_result_rows: Some(50_000),
             compact_storage: true, // 紧凑模式：zstd 压缩 segment（省 ~40% 磁盘）
@@ -637,10 +637,10 @@ impl DBConfig {
             },
             row_cache_size: Some(500),
             max_result_rows: Some(100_000),
-            compact_storage: true,        // 紧凑模式：zstd 压缩
-            col_cache_budget_mb: Some(8), // 8MB decoded-column budget per table
+            compact_storage: true,            // 紧凑模式：zstd 压缩
+            col_cache_budget_mb: Some(8),     // 8MB decoded-column budget per table
             vector_cache_budget_mb: Some(32), // "occasional image embeddings"
-            pk_lookup_capacity: 10_000,   // ~0.8MB per table for robotics
+            pk_lookup_capacity: 10_000,       // ~0.8MB per table for robotics
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 8 * 1024 * 1024, // 8MB
                 min_interval_secs: 60,

@@ -548,7 +548,6 @@ impl QueryExecutor {
         }
     }
 
-
     /// 🚀 全乘积/链式 INNER JOIN 的 COUNT(*) 折叠。
     ///
     /// `SELECT COUNT(*) FROM a JOIN b ON 1=1` (无跨表约束) 曾走通用路径:
@@ -674,12 +673,7 @@ impl QueryExecutor {
         }
 
         // 每步 ON: 常量 (true 继续 / falsy → 计数 0) 或单表谓词; 跨表 → decline。
-        let zero = |col: String| {
-            Some((
-                vec![col],
-                vec![vec![Value::Integer(0)]],
-            ))
-        };
+        let zero = |col: String| Some((vec![col], vec![vec![Value::Integer(0)]]));
         for (_, _, on) in &steps {
             let mut leaves: Vec<&Expr> = Vec::new();
             fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -792,9 +786,7 @@ impl QueryExecutor {
     pub(super) fn table_ref_alias(tr: &crate::sql::ast::TableRef) -> String {
         use crate::sql::ast::TableRef;
         match tr {
-            TableRef::Table { name, alias } => {
-                alias.clone().unwrap_or_else(|| name.clone())
-            }
+            TableRef::Table { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
             _ => String::new(),
         }
     }
@@ -878,8 +870,18 @@ impl QueryExecutor {
         if !crate::sql::vector_exec::vec_enabled() {
             return Ok(None);
         }
-        let (TableRef::Table { name: lt, alias: la, .. }, TableRef::Table { name: rt, alias: ra, .. }) =
-            (left, right)
+        let (
+            TableRef::Table {
+                name: lt,
+                alias: la,
+                ..
+            },
+            TableRef::Table {
+                name: rt,
+                alias: ra,
+                ..
+            },
+        ) = (left, right)
         else {
             return Ok(None);
         };
@@ -944,7 +946,10 @@ impl QueryExecutor {
         Ok(outcome)
     }
 
-    pub(super) fn try_multi_way_inner_join(&self, stmt: &SelectStmt) -> Result<Option<QueryResult>> {
+    pub(super) fn try_multi_way_inner_join(
+        &self,
+        stmt: &SelectStmt,
+    ) -> Result<Option<QueryResult>> {
         use crate::sql::ast::SelectColumn;
         use std::collections::HashMap;
 
@@ -1123,9 +1128,7 @@ impl QueryExecutor {
                 let mut equi: Option<Expr> = None;
                 let mut residual: Vec<Expr> = Vec::new();
                 for leaf in leaves {
-                    if equi.is_none()
-                        && self.extract_equi_join_columns(&leaf).is_some()
-                    {
+                    if equi.is_none() && self.extract_equi_join_columns(&leaf).is_some() {
                         equi = Some(leaf);
                     } else {
                         residual.push(leaf);
@@ -1338,8 +1341,7 @@ impl QueryExecutor {
             // Value equality does not.
             let comps = Self::parse_where_comparisons(wc, &acc_schema).filter(|comps| {
                 comps.iter().all(|(p, _, t)| {
-                    let boolish_col =
-                        matches!(acc_types.get(*p), Some(ColumnType::Boolean));
+                    let boolish_col = matches!(acc_types.get(*p), Some(ColumnType::Boolean));
                     let boolish_target = matches!(t, Value::Bool(_));
                     !boolish_col && !boolish_target
                 })
@@ -1591,7 +1593,11 @@ impl QueryExecutor {
                             .filter(|(_, n)| n.rsplit('.').next().unwrap_or(n) == bare)
                             .map(|(i, _)| i)
                             .collect();
-                        if hits.len() == 1 { Some(hits[0]) } else { None }
+                        if hits.len() == 1 {
+                            Some(hits[0])
+                        } else {
+                            None
+                        }
                     };
                     let Some(p) = out_match.or_else(|| {
                         stmt.columns.iter().position(|sc| match sc {
@@ -1694,34 +1700,38 @@ impl QueryExecutor {
             )
         };
 
-            // ORDER BY on projected output columns, then LIMIT/OFFSET.
-            let mut rows = projected;
-            if let Some(ref ob) = stmt.order_by {
-                let mut specs: Vec<(usize, bool)> = Vec::new();
-                for oe in ob {
-                    let Expr::Column(cn) = &oe.expr else {
-                        return Ok(None);
-                    };
-                    // 🔑 限定名必须精确匹配输出列; 裸名只允许唯一命中。
-                    // 此前 bare-name 回退让 `ORDER BY b.id` 误匹配输出列
-                    // `a.id` (同为裸名 "id")，第二排序键实际排的是 a.id —
-                    // 方向丢失、次序不稳定 (differential fuzz 抓出)。
-                    let p = if cn.contains('.') {
-                        column_names.iter().position(|n| n == cn)
+        // ORDER BY on projected output columns, then LIMIT/OFFSET.
+        let mut rows = projected;
+        if let Some(ref ob) = stmt.order_by {
+            let mut specs: Vec<(usize, bool)> = Vec::new();
+            for oe in ob {
+                let Expr::Column(cn) = &oe.expr else {
+                    return Ok(None);
+                };
+                // 🔑 限定名必须精确匹配输出列; 裸名只允许唯一命中。
+                // 此前 bare-name 回退让 `ORDER BY b.id` 误匹配输出列
+                // `a.id` (同为裸名 "id")，第二排序键实际排的是 a.id —
+                // 方向丢失、次序不稳定 (differential fuzz 抓出)。
+                let p = if cn.contains('.') {
+                    column_names.iter().position(|n| n == cn)
+                } else {
+                    let hits: Vec<usize> = column_names
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| n.rsplit('.').next().unwrap_or(n) == cn)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if hits.len() == 1 {
+                        Some(hits[0])
                     } else {
-                        let hits: Vec<usize> = column_names
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, n)| n.rsplit('.').next().unwrap_or(n) == cn)
-                            .map(|(i, _)| i)
-                            .collect();
-                        if hits.len() == 1 { Some(hits[0]) } else { None }
-                    };
-                    let Some(p) = p else {
-                        return Ok(None);
-                    };
-                    specs.push((p, oe.asc));
-                }
+                        None
+                    }
+                };
+                let Some(p) = p else {
+                    return Ok(None);
+                };
+                specs.push((p, oe.asc));
+            }
             if !specs.is_empty() {
                 rows.sort_by(|a, b| {
                     for &(i, asc) in &specs {
@@ -1788,12 +1798,20 @@ impl QueryExecutor {
             keys.as_ref()
                 .map_or(false, |k| refs.iter().all(|c| k.contains_key(c)))
         };
-        let (expr_left, col_side_right) = if all_in(&lk) && lk.as_ref().map_or(true, |k| !k.contains_key(&col_name) || rk.as_ref().map_or(true, |r| !r.contains_key(&col_name)) || true) {
+        let (expr_left, col_side_right) = if all_in(&lk)
+            && lk.as_ref().map_or(true, |k| {
+                !k.contains_key(&col_name)
+                    || rk.as_ref().map_or(true, |r| !r.contains_key(&col_name))
+                    || true
+            }) {
             // 表达式在左; 列须在右 (或列在左也行? 严格: 列在另一侧才省事)
             let col_in_right = rk.as_ref().map_or(false, |k| k.contains_key(&col_name));
             if col_in_right {
                 (true, true)
-            } else if rk.as_ref().map_or(false, |k| refs.iter().all(|c| k.contains_key(c))) {
+            } else if rk
+                .as_ref()
+                .map_or(false, |k| refs.iter().all(|c| k.contains_key(c)))
+            {
                 (false, false) // 表达式在右, 列在左
             } else {
                 return Ok(None);
@@ -1912,9 +1930,9 @@ impl QueryExecutor {
                     left_rows
                         .iter()
                         .filter(|(_, row)| {
-                            left_preds.iter().all(|(k, op, lit)| {
-                                apply_op_value(op, row.get(k), lit)
-                            })
+                            left_preds
+                                .iter()
+                                .all(|(k, op, lit)| apply_op_value(op, row.get(k), lit))
                         })
                         .cloned()
                         .collect()
@@ -1925,9 +1943,9 @@ impl QueryExecutor {
                     right_rows
                         .iter()
                         .filter(|(_, row)| {
-                            right_preds.iter().all(|(k, op, lit)| {
-                                apply_op_value(op, row.get(k), lit)
-                            })
+                            right_preds
+                                .iter()
+                                .all(|(k, op, lit)| apply_op_value(op, row.get(k), lit))
                         })
                         .cloned()
                         .collect()
@@ -1946,9 +1964,7 @@ impl QueryExecutor {
             }
             // 🔑 计算键 hash: `col = 单表表达式` (a.id = b.id - 1) — 此前
             // 嵌套循环 O(N×M) 逐候选建 SqlRow (2K×20K 自 join 23.5min)。
-            if let Some(joined) =
-                self.try_expr_key_hash_join(left_rows, right_rows, &on_equi)?
-            {
+            if let Some(joined) = self.try_expr_key_hash_join(left_rows, right_rows, &on_equi)? {
                 return Ok(joined);
             }
         }
@@ -2176,9 +2192,7 @@ impl QueryExecutor {
         let mut equi: Option<Expr> = None;
         let mut residual: Vec<Expr> = Vec::new();
         for leaf in leaves {
-            if equi.is_none()
-                && QueryExecutor::static_extract_equi_ok(&leaf)
-            {
+            if equi.is_none() && QueryExecutor::static_extract_equi_ok(&leaf) {
                 equi = Some(leaf);
             } else {
                 residual.push(leaf);
@@ -2196,9 +2210,18 @@ impl QueryExecutor {
     ) -> Option<(String, crate::sql::ast::BinaryOperator, Value)> {
         use crate::sql::ast::BinaryOperator;
         if let Expr::BinaryOp { left, op, right } = e {
-            let ok_op = matches!(op, BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt
-                | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge);
-            if let (Expr::Column(cn), Expr::Literal(v), true) = (left.as_ref(), right.as_ref(), ok_op) {
+            let ok_op = matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::Ne
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Le
+                    | BinaryOperator::Ge
+            );
+            if let (Expr::Column(cn), Expr::Literal(v), true) =
+                (left.as_ref(), right.as_ref(), ok_op)
+            {
                 return Some((cn.clone(), op.clone(), v.clone()));
             }
         }
@@ -2216,12 +2239,24 @@ impl QueryExecutor {
     }
 
     /// 残余叶是否为 `schema 列 op literal` 的单表谓词 (限定名)。
-    pub(super) fn residual_single_table(e: &Expr, schema: &TableSchema) -> Option<(String, crate::sql::ast::BinaryOperator, Value)> {
+    pub(super) fn residual_single_table(
+        e: &Expr,
+        schema: &TableSchema,
+    ) -> Option<(String, crate::sql::ast::BinaryOperator, Value)> {
         use crate::sql::ast::BinaryOperator;
         if let Expr::BinaryOp { left, op, right } = e {
-            let ok_op = matches!(op, BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt
-                | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge);
-            if let (Expr::Column(cn), Expr::Literal(v), true) = (left.as_ref(), right.as_ref(), ok_op) {
+            let ok_op = matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::Ne
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Le
+                    | BinaryOperator::Ge
+            );
+            if let (Expr::Column(cn), Expr::Literal(v), true) =
+                (left.as_ref(), right.as_ref(), ok_op)
+            {
                 if schema.columns.iter().any(|c| c.name == *cn) {
                     return Some((cn.clone(), op.clone(), v.clone()));
                 }
@@ -2264,9 +2299,9 @@ impl QueryExecutor {
             }
             if all_consumed && !right_preds.is_empty() {
                 for (rid, row) in right_rows {
-                    let keep = right_preds.iter().all(|(k, op, lit)| {
-                        apply_op_value(op, row.get(k), lit)
-                    });
+                    let keep = right_preds
+                        .iter()
+                        .all(|(k, op, lit)| apply_op_value(op, row.get(k), lit));
                     if keep {
                         right_f.push((*rid, row.clone()));
                     }

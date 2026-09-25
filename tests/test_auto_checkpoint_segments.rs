@@ -2,7 +2,7 @@
 //! fast path / insert_arrays 加载不写 WAL (WAL 大小触发对它们盲) —
 //! 段计数触发 (max_segment_count) 必须在持续加载下自动合并段阵。
 use motedb::types::Value;
-use motedb::{AutoCheckpointConfig, Database, DBConfig};
+use motedb::{AutoCheckpointConfig, DBConfig, Database};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 

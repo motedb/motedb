@@ -28,6 +28,26 @@ import time
 import motedb
 
 CLI = os.environ.get("MOTE_CLI", "motedb-cli")
+
+
+def _resolve_cli():
+    """MOTE_CLI > PATH > repo target/release。找不到返回 None (调用方 SKIP
+    CLI 段 — errors 套件曾因裸调用缺失二进制 FileNotFoundError 崩套件,
+    CI smoke 也挂在这)。"""
+    import shutil as _sh
+    c = os.environ.get("MOTE_CLI")
+    if c:
+        return c if os.path.exists(c) or _sh.which(c) else None
+    w = _sh.which("motedb-cli")
+    if w:
+        return w
+    # repo layout: bindings/python/e2e/ -> ../../target/release
+    for cand in (
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), *([".."] * 2 + ["target", "release", "motedb-cli"])),
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
 FAILURES = []
 
 
@@ -218,9 +238,9 @@ def suite_crash(root):
 
 
 def suite_cli(root):
-    cli = shutil.which(CLI) or CLI
-    if shutil.which(cli) is None and not os.path.exists(cli):
-        print(f"SKIP cli (binary '{CLI}' not found)")
+    cli = _resolve_cli()
+    if cli is None:
+        print("SKIP cli (binary 'motedb-cli' not found)")
         return
     db = os.path.join(root, "cli.mote")
     sql = ("CREATE TABLE c (id INT PRIMARY KEY, v TEXT);\n"
@@ -424,16 +444,19 @@ def suite_errors(root):
         db.execute("INSERT INTO t VALUES (3, 'ok')")
         _, r = db.query("SELECT COUNT(*) FROM t")
         check("db usable after errors", r[0][0] == 2, str(r))
-        # CLI: bad SQL must not kill the shell
-        cli = shutil.which(CLI) or CLI
-        out = subprocess.run([cli, os.path.join(root, "err_cli.mote")],
-                             input="CREATE TABLE z (id INT);\n"
-                                   "INSERT bogus;\n"
-                                   "INSERT INTO z VALUES (1);\n"
-                                   ".exit\n",
-                             capture_output=True, text=True, timeout=60)
-        check("cli survives bad SQL", "1 row(s) affected" in out.stdout
-              and "motedb-cli" not in out.stderr[:0], out.stdout[-80:])
+        # CLI: bad SQL must not kill the shell (缺二进制时 SKIP, 不崩套件)
+        cli = _resolve_cli()
+        if cli is None:
+            check("cli survives bad SQL", "SKIP (motedb-cli not found)", "SKIP")
+        else:
+            out = subprocess.run([cli, os.path.join(root, "err_cli.mote")],
+                                 input="CREATE TABLE z (id INT);\n"
+                                       "INSERT bogus;\n"
+                                       "INSERT INTO z VALUES (1);\n"
+                                       ".exit\n",
+                                 capture_output=True, text=True, timeout=60)
+            check("cli survives bad SQL", "1 row(s) affected" in out.stdout
+                  and "motedb-cli" not in out.stderr[:0], out.stdout[-80:])
     finally:
         db.close()
 

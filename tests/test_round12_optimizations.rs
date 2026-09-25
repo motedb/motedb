@@ -31,7 +31,10 @@ fn db() -> (TempDir, Database) {
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 33
     }
     fn f64(&mut self) -> f64 {
@@ -42,7 +45,10 @@ impl Lcg {
 fn one_i64(rows: &[Vec<Value>], col: usize) -> i64 {
     match &rows[0][col] {
         Value::Integer(i) => *i,
-        v => panic!("expected integer at col {col}, got {v:?} (row: {:?})", rows[0]),
+        v => panic!(
+            "expected integer at col {col}, got {v:?} (row: {:?})",
+            rows[0]
+        ),
     }
 }
 
@@ -65,7 +71,8 @@ fn one_f64(rows: &[Vec<Value>], col: usize) -> Option<f64> {
 fn checkpoint_deletes_superseded_segment_files() {
     let dir = TempDir::new().unwrap();
     let db = Database::create_with_config(dir.path(), DBConfig::for_testing()).unwrap();
-    db.execute("CREATE TABLE big (id INT PRIMARY KEY, note TEXT)").unwrap();
+    db.execute("CREATE TABLE big (id INT PRIMARY KEY, note TEXT)")
+        .unwrap();
 
     // ~120KB/row × 3 batches of 100 → each batch crosses the 8MB threshold,
     // producing one flushed segment per batch (3 segments before checkpoint).
@@ -79,11 +86,8 @@ fn checkpoint_deletes_superseded_segment_files() {
                 ]
             })
             .collect();
-        db.execute_prepared_many(
-            "INSERT INTO big (id, note) VALUES (?, ?)",
-            batch,
-        )
-        .unwrap();
+        db.execute_prepared_many("INSERT INTO big (id, note) VALUES (?, ?)", batch)
+            .unwrap();
     }
 
     let seg_dir = dir.path().join("columnar_ms").join("big");
@@ -129,9 +133,7 @@ fn checkpoint_deletes_superseded_segment_files() {
     let db = Database::open(dir.path()).unwrap();
     let rows = db.query("SELECT COUNT(*) FROM big").unwrap();
     assert_eq!(one_i64(&rows, 0), 300);
-    let rows = db
-        .query("SELECT note FROM big WHERE id = 250")
-        .unwrap();
+    let rows = db.query("SELECT note FROM big WHERE id = 250").unwrap();
     match &rows[0][0] {
         Value::Text(t) => assert_eq!(t.as_str().len(), 120_000),
         v => panic!("expected text, got {v:?}"),
@@ -151,10 +153,8 @@ struct AggRow {
 }
 
 fn seed_agg_table(db: &Database) -> Vec<AggRow> {
-    db.execute(
-        "CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP, dev TEXT, val FLOAT, n INT)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP, dev TEXT, val FLOAT, n INT)")
+        .unwrap();
     let mut rng = Lcg(42);
     let mut src = Vec::new();
     let mut batch: Vec<Vec<Value>> = Vec::new();
@@ -232,9 +232,20 @@ fn fused_range_aggregation_matches_expected() {
     );
     let sum: f64 = vals.iter().sum();
     assert!((one_f64(&rows, 2).unwrap() - sum).abs() < 1e-9, "SUM");
-    assert!((one_f64(&rows, 3).unwrap() - sum / vals.len() as f64).abs() < 1e-9, "AVG");
-    assert!((one_f64(&rows, 4).unwrap() - vals.iter().cloned().fold(f64::INFINITY, f64::min)).abs() < 1e-9, "MIN");
-    assert!((one_f64(&rows, 5).unwrap() - vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max)).abs() < 1e-9, "MAX");
+    assert!(
+        (one_f64(&rows, 3).unwrap() - sum / vals.len() as f64).abs() < 1e-9,
+        "AVG"
+    );
+    assert!(
+        (one_f64(&rows, 4).unwrap() - vals.iter().cloned().fold(f64::INFINITY, f64::min)).abs()
+            < 1e-9,
+        "MIN"
+    );
+    assert!(
+        (one_f64(&rows, 5).unwrap() - vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max)).abs()
+            < 1e-9,
+        "MAX"
+    );
 
     // Case B: dev equality + val range over an INTEGER agg column.
     let rows = db
@@ -242,7 +253,9 @@ fn fused_range_aggregation_matches_expected() {
         .unwrap();
     let sel: Vec<&AggRow> = src
         .iter()
-        .filter(|r| r.dev.as_deref() == Some("dev-1") && matches_sql(r.val, 0.0, true) && r.val != Some(0.0))
+        .filter(|r| {
+            r.dev.as_deref() == Some("dev-1") && matches_sql(r.val, 0.0, true) && r.val != Some(0.0)
+        })
         .collect();
     assert_eq!(one_i64(&rows, 0), sel.len() as i64);
     let ns: Vec<i64> = sel.iter().map(|r| r.n).collect();
@@ -265,8 +278,10 @@ fn fused_range_aggregation_matches_expected() {
 
     // Case D: empty result — COUNT 0, SUM/AVG/MIN/MAX NULL.
     let rows = db
-        .query("SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM ev \
-                WHERE ts >= 9999999999999999 AND dev = 'dev-3' AND val > 100")
+        .query(
+            "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM ev \
+                WHERE ts >= 9999999999999999 AND dev = 'dev-3' AND val > 100",
+        )
         .unwrap();
     assert_eq!(one_i64(&rows, 0), 0);
     for c in 1..5 {
@@ -305,7 +320,10 @@ fn fused_range_aggregation_matches_expected() {
         .query("SELECT COUNT(*), COUNT(val), SUM(val) FROM ev")
         .unwrap();
     assert_eq!(one_i64(&rows, 0), 2000);
-    assert_eq!(one_i64(&rows, 1), src.iter().filter(|r| r.val.is_some()).count() as i64);
+    assert_eq!(
+        one_i64(&rows, 1),
+        src.iter().filter(|r| r.val.is_some()).count() as i64
+    );
 }
 
 /// Boolean literals in a MULTI-predicate WHERE must coerce like the
@@ -355,8 +373,10 @@ fn fused_aggregation_respects_update_and_delete() {
     let (_d, db) = db();
     let src = seed_agg_table(&db);
     // UPDATE 100 rows into dev-4 with val 42, DELETE 50 others.
-    db.execute("UPDATE ev SET dev = 'dev-4', val = 42 WHERE id < 100").unwrap();
-    db.execute("DELETE FROM ev WHERE id >= 100 AND id < 150").unwrap();
+    db.execute("UPDATE ev SET dev = 'dev-4', val = 42 WHERE id < 100")
+        .unwrap();
+    db.execute("DELETE FROM ev WHERE id >= 100 AND id < 150")
+        .unwrap();
     db.checkpoint().unwrap(); // merge with tombstones dropped
 
     let rows = db
@@ -401,7 +421,8 @@ fn seed_join_tables(db: &Database) -> Vec<JoinRow> {
          emb VECTOR(8), note TEXT)",
     )
     .unwrap();
-    db.execute("CREATE TABLE sen (device TEXT PRIMARY KEY, zone INT)").unwrap();
+    db.execute("CREATE TABLE sen (device TEXT PRIMARY KEY, zone INT)")
+        .unwrap();
     let mut rng = Lcg(7);
     let mut src = Vec::new();
     let mut batch: Vec<Vec<Value>> = Vec::new();
@@ -458,7 +479,9 @@ fn expected_join_groups(
     };
     let mut groups: BTreeMap<String, (i64, i64, f64)> = BTreeMap::new();
     for r in src {
-        let Some(z) = zone_of(&r.device) else { continue };
+        let Some(z) = zone_of(&r.device) else {
+            continue;
+        };
         if let Some(want) = zone_filter {
             if z != want {
                 continue;
@@ -482,11 +505,7 @@ fn expected_join_groups(
         .collect()
 }
 
-fn check_join_result(
-    rows: &[Vec<Value>],
-    expected: &[(String, i64, i64, f64)],
-    ctx: &str,
-) {
+fn check_join_result(rows: &[Vec<Value>], expected: &[(String, i64, i64, f64)], ctx: &str) {
     assert_eq!(rows.len(), expected.len(), "{ctx}: group count");
     for (got, want) in rows.iter().zip(expected.iter()) {
         let dev = match &got[0] {
@@ -494,14 +513,22 @@ fn check_join_result(
             v => panic!("{ctx}: expected text group key, got {v:?}"),
         };
         assert_eq!(dev, want.0, "{ctx}: group key");
-        assert_eq!(match &got[1] {
-            Value::Integer(i) => *i,
-            v => panic!("{ctx}: {v:?}"),
-        }, want.1, "{ctx}: COUNT(*)");
-        assert_eq!(match &got[2] {
-            Value::Integer(i) => *i,
-            v => panic!("{ctx}: {v:?}"),
-        }, want.2, "{ctx}: COUNT(val)");
+        assert_eq!(
+            match &got[1] {
+                Value::Integer(i) => *i,
+                v => panic!("{ctx}: {v:?}"),
+            },
+            want.1,
+            "{ctx}: COUNT(*)"
+        );
+        assert_eq!(
+            match &got[2] {
+                Value::Integer(i) => *i,
+                v => panic!("{ctx}: {v:?}"),
+            },
+            want.2,
+            "{ctx}: COUNT(val)"
+        );
         match &got[3] {
             Value::Float(s) => assert!((s - want.3).abs() < 1e-8, "{ctx}: SUM(val)"),
             Value::Null => assert_eq!(want.2, 0, "{ctx}: SUM NULL only when no non-null vals"),
@@ -560,10 +587,13 @@ fn projected_join_groupby_avg_min_max() {
     let expected = expected_join_groups(&src, Some(2), None);
     assert_eq!(rows.len(), expected.len());
     for (got, want) in rows.iter().zip(expected.iter()) {
-        assert_eq!(match &got[0] {
-            Value::Text(t) => t.as_str(),
-            v => panic!("{v:?}"),
-        }, want.0);
+        assert_eq!(
+            match &got[0] {
+                Value::Text(t) => t.as_str(),
+                v => panic!("{v:?}"),
+            },
+            want.0
+        );
         let vals: Vec<f64> = src
             .iter()
             .filter(|r| {
@@ -621,7 +651,8 @@ fn join_count_text_column_counts_non_nulls() {
 fn three_table_join_chain_with_pruning() {
     let (_d, db) = db();
     let _src = seed_join_tables(&db);
-    db.execute("CREATE TABLE zone_names (zone INT PRIMARY KEY, label TEXT)").unwrap();
+    db.execute("CREATE TABLE zone_names (zone INT PRIMARY KEY, label TEXT)")
+        .unwrap();
     let zn: Vec<Vec<Value>> = (0..4i64)
         .map(|z| {
             vec![
@@ -671,29 +702,43 @@ fn three_table_join_chain_with_pruning() {
 #[test]
 fn join_null_keys_and_params() {
     let (_d, db) = db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, k INT, v FLOAT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, k INT, w FLOAT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, k INT, v FLOAT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, k INT, w FLOAT)")
+        .unwrap();
     let mut ba = Vec::new();
     for i in 0..50i64 {
-        let k = if i % 10 == 0 { Value::Null } else { Value::Integer(i % 7) };
+        let k = if i % 10 == 0 {
+            Value::Null
+        } else {
+            Value::Integer(i % 7)
+        };
         ba.push(vec![Value::Integer(i), k, Value::Float(i as f64)]);
     }
-    db.execute_prepared_many("INSERT INTO a (id, k, v) VALUES (?, ?, ?)", ba).unwrap();
+    db.execute_prepared_many("INSERT INTO a (id, k, v) VALUES (?, ?, ?)", ba)
+        .unwrap();
     let mut bb = Vec::new();
     for i in 0..7i64 {
-        let k = if i == 3 { Value::Null } else { Value::Integer(i) };
-        bb.push(vec![Value::Integer(100 + i), k, Value::Float(i as f64 * 2.0)]);
+        let k = if i == 3 {
+            Value::Null
+        } else {
+            Value::Integer(i)
+        };
+        bb.push(vec![
+            Value::Integer(100 + i),
+            k,
+            Value::Float(i as f64 * 2.0),
+        ]);
     }
-    db.execute_prepared_many("INSERT INTO b (id, k, w) VALUES (?, ?, ?)", bb).unwrap();
+    db.execute_prepared_many("INSERT INTO b (id, k, w) VALUES (?, ?, ?)", bb)
+        .unwrap();
 
     // NULL keys on either side drop out of the inner join.
     let rows = db
         .query("SELECT COUNT(*) FROM a JOIN b ON a.k = b.k")
         .unwrap();
     // keys 0..6 except 3 (b.k NULL) → a rows with k in {0,1,2,4,5,6}
-    let want = (0..50i64)
-        .filter(|i| i % 10 != 0 && (i % 7) != 3)
-        .count();
+    let want = (0..50i64).filter(|i| i % 10 != 0 && (i % 7) != 3).count();
     assert_eq!(one_i64(&rows, 0), want as i64);
 }
 

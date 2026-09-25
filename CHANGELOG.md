@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.11.0] — 2026-09-25
+
+### 执行内核: VEC 向量化 + morsel 并行 (默认开启)
+
+- 向量化执行内核 M0-M6 全量落地并**默认开启** (`MOTE_VEC=off` 一键回退
+  旧行式路径); 向量化单元矩阵 (NULL/NaN/类型强转/三值逻辑) 全量对拍
+- morsel 并行全覆盖: GROUP BY / JOIN / 范围聚合 / top-k / 无索引向量
+  扫描 (段内 ≥20K 行 + 跨段键区间判据两档门槛)
+- 1M 行实测: GROUP BY+ORDER 4.8ms (30×) / JOIN+GROUP BY 8.9ms (22×) /
+  范围聚合 1.7ms (4.7×); 无索引向量扫描字节距离核零拷贝 (非对齐
+  SIMD 直读页缓存, 18ms @100K×384 = 带宽地板)
+- 全乘积 COUNT 折叠: 6 亿对 join 的 COUNT(*) 144s → 0.5ms
+- `INSERT ... SELECT` (500K 行 1.59M rows/s); `FROM (SELECT ...)` 派生表
+
+### Python API: 列式进出
+
+- `db.insert_arrays(table, {列: numpy/列表})` 列式批量导入 — 按 schema
+  位置放置 (修复字典序错位静默损毁), numpy tobytes 直通解码
+- `db.fetch_arrays(sql)` 列式取回 — 同质数值列 numpy 零拷贝
+  (np.frombuffer), TEXT/NULL 列 Python 列表
+- executemany 接受 numpy 行视图参数 (免 .tolist(), 65K→176K rows/s)
+
+### 导入吞吐与耐久性
+
+- 加载吞吐 (官方口径 100K×384): 62K → **197K rows/s** (GroupCommit
+  耐久档) / 286K (NoSync/Periodic preset)
+- fast path 扩展显式整型 PK 批; **WAL 消除** — 段直写 (temp+fsync+
+  rename 原子发布) + manifest fsync 替代 WAL 重放, 数据只写一遍
+- 耐久契约修复: 返回成功的自动提交写入扛 kill -9 (resource bench
+  crash 段 1300/1300)
+- auto-checkpoint 双触发 (WAL 大小 + 段计数 `max_segment_count`),
+  WAL-less 批量导入的段阵有界
+
+### 资源画像 (≤100MB 查询档位)
+
+- 默认向量缓存预算 256→64MB (`set_vector_cache_budget` 按表调回);
+  查询 RSS 全形状 ≈0, steady-state <20MB, 加载峰值 RSS −74%
+- resource_bench 快照: steady 159.5→18.8MB, join 查询内存 63.2→0.1MB
+
+### 正确性 (10+ 静默错果修复, 各配回归测试)
+
+- GROUP BY 首查询栅栏键错果 (每 2048 行当同 key, 100K 行只剩 50 行)
+- insert_arrays 字典序错位损毁 / 省略自增 PK 覆盖首列 / fast path
+  静默丢弃显式 PK / TIMESTAMP Integer 强转缺失
+- DiskANN 孤立 2-环搁浅 (周期性领养 + 连通性守卫截断), churn 测试
+  40/40, 全量套件已知 flake 清零
+- knn 并行缓冲有界化 (1MB/任务), 首查 RSS 峰值 +288MB → +2MB
+
+### 工具与文档
+
+- 主 README 性能表/Quick Start/Features 刷新至官方基准口径;
+  bench/README.md 新增 12 章节战役记录; resource_bench 快照归档
+
 ## [Unreleased]
 
 ### 清理第二十五轮（废弃代码清理 —— 13 项死代码删除）

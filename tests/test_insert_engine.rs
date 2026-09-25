@@ -4,17 +4,15 @@
 //! 3. 字典序无关性由绑定层保证 (见 test_insert_arrays.py)
 
 use motedb::types::Value;
-use motedb::{Database, DBConfig};
+use motedb::{DBConfig, Database};
 use tempfile::TempDir;
 
 fn setup(dir: &TempDir) -> Database {
     let mut config = DBConfig::for_testing();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, c TEXT, v FLOAT)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, c TEXT, v FLOAT)")
+        .unwrap();
     db
 }
 
@@ -142,7 +140,11 @@ fn explicit_pk_in_large_batch_is_honored() {
     let r = rows(&db, "SELECT id FROM t WHERE c LIKE 'auto-%' ORDER BY id");
     for row in &r {
         if let Value::Integer(id) = &row[0] {
-            assert!(*id > 1149, "auto id {} must not collide with explicit ids", id);
+            assert!(
+                *id > 1149,
+                "auto id {} must not collide with explicit ids",
+                id
+            );
         }
     }
 }

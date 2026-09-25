@@ -73,8 +73,16 @@ jobs:
         run: pip install dist/${{ matrix.wheel-pattern }}.whl
       - name: Import + version smoke
         run: python -c "import motedb; print('motedb', motedb.__version__)"
+      # 🔑 e2e 的 errors/cli 套件需要 motedb-cli 二进制 — 本地构建并经
+      # MOTE_CLI 指定 (wheel 不携带 CLI; 此前 CI 上 FileNotFoundError 崩
+      # errors 套件, v0.11.0 smoke 双双挂在这)。
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build motedb-cli for e2e
+        run: cargo build --release --bin motedb-cli
       - name: Functional E2E smoke (11 suites, small data)
         run: python bindings/python/e2e/e2e_workload.py --root /tmp/e2e
+        env:
+          MOTE_CLI: ${{ github.workspace }}/target/release/motedb-cli
 
   publish:
     needs: [build, smoke]

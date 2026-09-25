@@ -3,8 +3,8 @@
 //! 来源: /tmp/fuzz_diff.py — SQLite(oracle) × MoteDB-LSM × MoteDB-列存 三路
 //! 对拍 + 随机变异复跑, 12 seed × 400 查询全绿前共挖出 8 个真 bug。
 use motedb::sql::{Lexer, Parser, QueryExecutor};
-use motedb::{MoteDB, QueryResult};
 use motedb::types::Value;
+use motedb::{MoteDB, QueryResult};
 use std::sync::Arc;
 
 fn ex(db: &Arc<MoteDB>, sql: &str) -> QueryResult {
@@ -44,9 +44,15 @@ fn join_where_ne_excludes_null_rows() {
     }
 
     // v <> 10: id=1,4 (id=3 的 NULL 是 UNKNOWN → 排除); SQLite 同语义
-    let r = rows(&db, "SELECT a.id FROM a JOIN b ON a.id = b.aid WHERE a.v <> 10 ORDER BY a.id ASC");
+    let r = rows(
+        &db,
+        "SELECT a.id FROM a JOIN b ON a.id = b.aid WHERE a.v <> 10 ORDER BY a.id ASC",
+    );
     assert_eq!(r, vec![vec![i(1)], vec![i(4)]]);
-    let r = rows(&db, "SELECT COUNT(*) FROM a JOIN b ON a.id = b.aid WHERE a.v <> 10");
+    let r = rows(
+        &db,
+        "SELECT COUNT(*) FROM a JOIN b ON a.id = b.aid WHERE a.v <> 10",
+    );
     assert_eq!(r[0][0], i(2));
 
     // 单表路径同样不得把 NULL 算进 <> / <
@@ -70,7 +76,10 @@ fn join_order_by_unprojected_secondary_key() {
     ex(&db, "INSERT INTO b VALUES (3, 1, 30.0)");
 
     // b.id 未投影: DESC 必须让 s 按 b.id 降序 → 30, 20, 10
-    let r = rows(&db, "SELECT a.id, b.s FROM a JOIN b ON a.id = b.aid ORDER BY a.id ASC, b.id DESC");
+    let r = rows(
+        &db,
+        "SELECT a.id, b.s FROM a JOIN b ON a.id = b.aid ORDER BY a.id ASC, b.id DESC",
+    );
     assert_eq!(
         r,
         vec![
@@ -79,7 +88,10 @@ fn join_order_by_unprojected_secondary_key() {
             vec![i(1), Value::Float(10.0)],
         ]
     );
-    let r = rows(&db, "SELECT a.id, b.s FROM a JOIN b ON a.id = b.aid ORDER BY a.id ASC, b.id ASC");
+    let r = rows(
+        &db,
+        "SELECT a.id, b.s FROM a JOIN b ON a.id = b.aid ORDER BY a.id ASC, b.id ASC",
+    );
     assert_eq!(
         r,
         vec![
@@ -96,13 +108,21 @@ fn join_order_by_limit_boundary_matches_unlimited() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("b2b.mote")).unwrap());
     ex(&db, "CREATE TABLE items (id INT PRIMARY KEY, val REAL)");
-    ex(&db, "CREATE TABLE tags (id INT PRIMARY KEY, item_id INT, score REAL)");
+    ex(
+        &db,
+        "CREATE TABLE tags (id INT PRIMARY KEY, item_id INT, score REAL)",
+    );
     for k in 1..=15i64 {
         ex(&db, &format!("INSERT INTO items VALUES ({}, {}.5)", k, k));
         for t in 1..=2i64 {
             ex(
                 &db,
-                &format!("INSERT INTO tags VALUES ({}, {}, {}.0)", k * 10 + t, k, (k * 10 + t) as f64),
+                &format!(
+                    "INSERT INTO tags VALUES ({}, {}, {}.0)",
+                    k * 10 + t,
+                    k,
+                    (k * 10 + t) as f64
+                ),
             );
         }
     }
@@ -131,7 +151,10 @@ fn three_valued_logic_not_over_null_comparisons() {
     // g < NULL → UNKNOWN; UNKNOWN OR false → UNKNOWN; NOT → UNKNOWN → 全排除
     let r = rows(&db, "SELECT id FROM t WHERE NOT (g < NULL OR g = -5)");
     assert!(r.is_empty());
-    let r = rows(&db, "SELECT id FROM t WHERE NOT ((g < NULL) OR (g IN (-5, -5)))");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE NOT ((g < NULL) OR (g IN (-5, -5)))",
+    );
     assert!(r.is_empty());
     // NOT (g = 5 OR g > NULL): SQL 语义下 g=0 → (false OR UNKNOWN)=UNKNOWN → NOT→UNKNOWN → 排除
     let r = rows(&db, "SELECT id FROM t WHERE NOT (g = 5 OR g > NULL)");
@@ -141,7 +164,10 @@ fn three_valued_logic_not_over_null_comparisons() {
     let r = rows(&db, "SELECT id FROM t WHERE NOT (g > NULL AND g = 5)");
     assert_eq!(r, vec![vec![i(1)]]);
     // 反向: NOT (g IS NULL) / NOT (g IN) 保持正确
-    let r = rows(&db, "SELECT id FROM t WHERE NOT (g IS NULL) ORDER BY id ASC");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE NOT (g IS NULL) ORDER BY id ASC",
+    );
     assert_eq!(r, vec![vec![i(1)], vec![i(3)]]);
 }
 
@@ -154,11 +180,11 @@ fn round_matches_binary_value_decimal_rounding() {
     ex(&db, "CREATE TABLE t (id INT PRIMARY KEY, v REAL)");
     // (输入, 期望 ROUND(v,1)) — 期望值与 SQLite 完全一致
     let cases: Vec<(f64, f64)> = vec![
-        (48.05, 48.0),   // f64 真值 48.0499… → 48.0 (旧实现给 48.1)
-        (0.15, 0.1),     // 真值 0.1499… → 0.1 (旧 0.2)
+        (48.05, 48.0), // f64 真值 48.0499… → 48.0 (旧实现给 48.1)
+        (0.15, 0.1),   // 真值 0.1499… → 0.1 (旧 0.2)
         (-0.15, -0.1),
-        (48.15, 48.1),   // 真值 48.1499… → 48.1 (旧 48.2)
-        (2.675, 2.7),    // ROUND(v,1) 不涉及; 见下行 2 位
+        (48.15, 48.1), // 真值 48.1499… → 48.1 (旧 48.2)
+        (2.675, 2.7),  // ROUND(v,1) 不涉及; 见下行 2 位
         (1.005, 1.0),
         (2.5, 2.5),
     ];
@@ -179,7 +205,10 @@ fn round_matches_binary_value_decimal_rounding() {
         }
     }
     // 2 位舍入: 2.675 的 f64 真值是 2.67499… → 2.67 (旧 2.68)
-    let r = rows(&db, "SELECT ROUND(2.675, 2), ROUND(0.5, 0), ROUND(1.5, 0), ROUND(2.5, 0) FROM t LIMIT 1");
+    let r = rows(
+        &db,
+        "SELECT ROUND(2.675, 2), ROUND(0.5, 0), ROUND(1.5, 0), ROUND(2.5, 0) FROM t LIMIT 1",
+    );
     if let Value::Float(f) = r[0][0].clone() {
         assert!((f - 2.67).abs() < 1e-12, "ROUND(2.675,2) = {}", f);
     }
@@ -201,10 +230,16 @@ fn in_subquery_sees_delete_and_update() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("b5.mote")).unwrap());
     ex(&db, "CREATE TABLE items (id INT PRIMARY KEY, cat TEXT)");
-    ex(&db, "CREATE TABLE tags (id INT PRIMARY KEY, item_id INT, tag TEXT)");
+    ex(
+        &db,
+        "CREATE TABLE tags (id INT PRIMARY KEY, item_id INT, tag TEXT)",
+    );
     for k in 1..=5i64 {
         let tag = if k % 2 == 1 { "red" } else { "blue" };
-        ex(&db, &format!("INSERT INTO tags VALUES ({}, {}, '{}')", k, k, tag));
+        ex(
+            &db,
+            &format!("INSERT INTO tags VALUES ({}, {}, '{}')", k, k, tag),
+        );
     }
     for k in 1..=10i64 {
         ex(&db, &format!("INSERT INTO items VALUES ({}, 'c{}')", k, k));
@@ -226,7 +261,11 @@ fn in_subquery_sees_delete_and_update() {
 
     // 全删后无 IN 子查询 WHERE 也正确
     ex(&db, "DELETE FROM tags");
-    assert!(rows(&db, "SELECT id FROM items WHERE id IN (SELECT item_id FROM tags)").is_empty());
+    assert!(rows(
+        &db,
+        "SELECT id FROM items WHERE id IN (SELECT item_id FROM tags)"
+    )
+    .is_empty());
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -235,7 +274,10 @@ fn in_subquery_sees_delete_and_update() {
 fn point_where_on_non_autoinc_pk_without_index() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("b6.mote")).unwrap());
-    ex(&db, "CREATE TABLE items (id INT PRIMARY KEY, cat TEXT, val REAL)");
+    ex(
+        &db,
+        "CREATE TABLE items (id INT PRIMARY KEY, cat TEXT, val REAL)",
+    );
     for k in 1..=100i64 {
         ex(
             &db,
@@ -243,7 +285,10 @@ fn point_where_on_non_autoinc_pk_without_index() {
         );
     }
     // 旧实现: "Index error: Column index 'items.id' not found"
-    let r = rows(&db, "SELECT COUNT(DISTINCT cat), MAX(val) FROM items WHERE id = 100");
+    let r = rows(
+        &db,
+        "SELECT COUNT(DISTINCT cat), MAX(val) FROM items WHERE id = 100",
+    );
     assert_eq!(r, vec![vec![i(1), Value::Float(100.0)]]);
     let r = rows(&db, "SELECT MAX(val) FROM items WHERE id BETWEEN 90 AND 99");
     assert_eq!(r, vec![vec![Value::Float(99.0)]]);
@@ -257,14 +302,20 @@ fn point_where_on_non_autoinc_pk_without_index() {
 fn aggregate_where_null_literal_comparison_yields_null() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("b7.mote")).unwrap());
-    ex(&db, "CREATE TABLE items (id INT PRIMARY KEY, grp INT, cat TEXT)");
+    ex(
+        &db,
+        "CREATE TABLE items (id INT PRIMARY KEY, grp INT, cat TEXT)",
+    );
     for k in 1..=20i64 {
         let grp = if k % 7 == 0 {
             "NULL".to_string()
         } else {
             (k % 5).to_string()
         };
-        ex(&db, &format!("INSERT INTO items VALUES ({}, {}, 'c{}')", k, grp, k % 3));
+        ex(
+            &db,
+            &format!("INSERT INTO items VALUES ({}, {}, 'c{}')", k, grp, k % 3),
+        );
     }
     // grp > NULL → UNKNOWN → 0 行 → MIN(cat) = NULL (旧实现返回 '' — 匹配了全部行)
     let r = rows(&db, "SELECT MIN(cat) FROM items WHERE grp > NULL");
@@ -284,7 +335,10 @@ fn aggregate_where_null_literal_comparison_yields_null() {
 fn latest_by_with_order_by_picks_correct_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("b8.mote")).unwrap());
-    ex(&db, "CREATE TABLE m (sensor TEXT, ts TIMESTAMP, v REAL) TIMESERIES(ts)");
+    ex(
+        &db,
+        "CREATE TABLE m (sensor TEXT, ts TIMESTAMP, v REAL) TIMESERIES(ts)",
+    );
     let data = [
         ("s1", 100i64, 1.0f64),
         ("s2", 101, 2.0),
@@ -300,18 +354,36 @@ fn latest_by_with_order_by_picks_correct_rows() {
         );
     }
     // 带 ORDER BY: 每 sensor 一行, 取 max-ts (旧实现错位: 返回 2 行 s2)
-    let r = rows(&db, "SELECT sensor, ts, v FROM m LATEST BY sensor ORDER BY sensor");
+    let r = rows(
+        &db,
+        "SELECT sensor, ts, v FROM m LATEST BY sensor ORDER BY sensor",
+    );
     assert_eq!(
         r,
         vec![
-            vec![motedb::types::Value::text("s1".to_string()), ts(105), Value::Float(6.0)],
-            vec![motedb::types::Value::text("s2".to_string()), ts(104), Value::Float(5.0)],
-            vec![motedb::types::Value::text("s3".to_string()), ts(103), Value::Float(4.0)],
+            vec![
+                motedb::types::Value::text("s1".to_string()),
+                ts(105),
+                Value::Float(6.0)
+            ],
+            vec![
+                motedb::types::Value::text("s2".to_string()),
+                ts(104),
+                Value::Float(5.0)
+            ],
+            vec![
+                motedb::types::Value::text("s3".to_string()),
+                ts(103),
+                Value::Float(4.0)
+            ],
         ]
     );
     // checkpoint (列存段) 后仍正确
     db.checkpoint().unwrap();
-    let r = rows(&db, "SELECT sensor, ts, v FROM m LATEST BY sensor ORDER BY sensor");
+    let r = rows(
+        &db,
+        "SELECT sensor, ts, v FROM m LATEST BY sensor ORDER BY sensor",
+    );
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][0], motedb::types::Value::text("s1".to_string()));
     assert_eq!(r[0][2], Value::Float(6.0));
@@ -341,19 +413,25 @@ fn spatial_order_by_distance_operator_sorts() {
             "poi",
             vec![
                 i(id),
-                Value::Spatial(Box::new(motedb::types::Geometry::Point(motedb::types::Point::new(
-                    x, y,
-                )))),
+                Value::Spatial(Box::new(motedb::types::Geometry::Point(
+                    motedb::types::Point::new(x, y),
+                ))),
             ],
         )
         .unwrap();
     }
     // 距 (50,50): id6 ≈ 4010 < id2 = id3 = 4100 → [6, 2, 3] (2/3 tie 稳定序)
-    let r = rows(&db, "SELECT id FROM poi ORDER BY loc <-> ST_POINT(50.0, 50.0) ASC LIMIT 3");
+    let r = rows(
+        &db,
+        "SELECT id FROM poi ORDER BY loc <-> ST_POINT(50.0, 50.0) ASC LIMIT 3",
+    );
     assert_eq!(r, vec![vec![i(6)], vec![i(2)], vec![i(3)]]);
     // checkpoint 后仍正确
     db.checkpoint().unwrap();
-    let r = rows(&db, "SELECT id FROM poi ORDER BY loc <-> ST_POINT(50.0, 50.0) ASC LIMIT 3");
+    let r = rows(
+        &db,
+        "SELECT id FROM poi ORDER BY loc <-> ST_POINT(50.0, 50.0) ASC LIMIT 3",
+    );
     assert_eq!(r, vec![vec![i(6)], vec![i(2)], vec![i(3)]]);
 }
 
@@ -365,10 +443,16 @@ fn group_by_alias_and_expression() {
     let db = Arc::new(MoteDB::create(tmp.path().join("r13b1.mote")).unwrap());
     ex(&db, "CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b INT)");
     for i in 1..=20i64 {
-        ex(&db, &format!("INSERT INTO t VALUES ({}, 'x{}', {})", i, i % 3, i * 2));
+        ex(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'x{}', {})", i, i % 3, i * 2),
+        );
     }
     // GROUP BY 列别名: SELECT a AS k … GROUP BY k
-    let r = rows(&db, "SELECT a AS k, COUNT(*) FROM t GROUP BY k ORDER BY k ASC");
+    let r = rows(
+        &db,
+        "SELECT a AS k, COUNT(*) FROM t GROUP BY k ORDER BY k ASC",
+    );
     assert_eq!(
         r,
         vec![
@@ -378,13 +462,19 @@ fn group_by_alias_and_expression() {
         ]
     );
     // GROUP BY 表达式: b % 3 (此前 parse error: % 截断语句)
-    let r = rows(&db, "SELECT b % 3 AS m, COUNT(*) FROM t GROUP BY b % 3 ORDER BY m ASC");
+    let r = rows(
+        &db,
+        "SELECT b % 3 AS m, COUNT(*) FROM t GROUP BY b % 3 ORDER BY m ASC",
+    );
     assert_eq!(
         r,
         vec![vec![i(0), i(6)], vec![i(1), i(7)], vec![i(2), i(7)]]
     );
     // GROUP BY 表达式别名形式
-    let r2 = rows(&db, "SELECT b % 3 AS m, COUNT(*) FROM t GROUP BY m ORDER BY m ASC");
+    let r2 = rows(
+        &db,
+        "SELECT b % 3 AS m, COUNT(*) FROM t GROUP BY m ORDER BY m ASC",
+    );
     assert_eq!(r, r2);
 }
 
@@ -408,10 +498,13 @@ fn concat_skips_null_arguments() {
     ex(&db, "INSERT INTO t VALUES (2, 'hello', NULL)");
     // CONCAT 跳过 NULL (SQLite concat()/PG CONCAT); || 保持传播
     let r = rows(&db, "SELECT CONCAT(a, b), a || b FROM t ORDER BY id ASC");
-    assert_eq!(r[0], vec![
-        motedb::types::Value::text("helloworld".into()),
-        motedb::types::Value::text("helloworld".into()),
-    ]);
+    assert_eq!(
+        r[0],
+        vec![
+            motedb::types::Value::text("helloworld".into()),
+            motedb::types::Value::text("helloworld".into()),
+        ]
+    );
     assert_eq!(r[1][0], motedb::types::Value::text("hello".into()));
     assert!(matches!(r[1][1], Value::Null));
 }
@@ -425,9 +518,19 @@ fn join_where_pushdown_selective_and_null_safe() {
     ex(&db, "CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
     ex(&db, "CREATE TABLE b (id INT PRIMARY KEY, g INT, w INT)");
     for i in 1..=50i64 {
-        let v = if i % 7 == 0 { "NULL" } else { &(i * 2).to_string() };
-        ex(&db, &format!("INSERT INTO a VALUES ({}, {}, {})", i, i % 5, v));
-        ex(&db, &format!("INSERT INTO b VALUES ({}, {}, {})", i, i % 5, i * 3));
+        let v = if i % 7 == 0 {
+            "NULL"
+        } else {
+            &(i * 2).to_string()
+        };
+        ex(
+            &db,
+            &format!("INSERT INTO a VALUES ({}, {}, {})", i, i % 5, v),
+        );
+        ex(
+            &db,
+            &format!("INSERT INTO b VALUES ({}, {}, {})", i, i % 5, i * 3),
+        );
     }
     // 双侧谓词 + 跨表不等式 + NULL 三值: 下推与后过滤结果一致
     let sql = "SELECT COUNT(*) FROM a x JOIN b y ON x.g = y.g \
@@ -472,7 +575,10 @@ fn join_on_conjunction_residual_evaluated() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("onc.mote")).unwrap());
     ex(&db, "CREATE TABLE items (id INT PRIMARY KEY, cat TEXT)");
-    ex(&db, "CREATE TABLE tags (id INT PRIMARY KEY, item_id INT, tag TEXT)");
+    ex(
+        &db,
+        "CREATE TABLE tags (id INT PRIMARY KEY, item_id INT, tag TEXT)",
+    );
     for (i, c) in [(1, "a"), (2, "b")] {
         ex(&db, &format!("INSERT INTO items VALUES ({}, '{}')", i, c));
     }
@@ -494,7 +600,10 @@ fn join_on_conjunction_residual_evaluated() {
         vec![vec![i(1), i(1)], vec![i(2), i(2)], vec![i(2), i(3)]]
     );
     // 单表残余仍走预过滤 hash (快路径覆盖): red tags = id1(item1) + id3(item2) → 2
-    let r = rows(&db, "SELECT COUNT(*) FROM items a JOIN tags b ON a.id = b.item_id AND b.tag = 'red'");
+    let r = rows(
+        &db,
+        "SELECT COUNT(*) FROM items a JOIN tags b ON a.id = b.item_id AND b.tag = 'red'",
+    );
     assert_eq!(r[0][0], i(2));
 }
 
@@ -509,8 +618,16 @@ fn groupby_double_expression_keys_all_groups() {
         ex(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
     }
     // 双 canonical 表达式组键: 曾双双解析到第一个 SELECT 表达式 → 3 组 (应 15)
-    let r = rows(&db, "SELECT id % 3, id % 5, COUNT(*) FROM t GROUP BY id % 3, id % 5");
-    assert_eq!(r.len(), 15, "double expression key groups: got {:?}", r.len());
+    let r = rows(
+        &db,
+        "SELECT id % 3, id % 5, COUNT(*) FROM t GROUP BY id % 3, id % 5",
+    );
+    assert_eq!(
+        r.len(),
+        15,
+        "double expression key groups: got {:?}",
+        r.len()
+    );
     // 快路径 (无 ORDER BY) 与物化路径 (ORDER BY 序号 decline) 一致
     let r2 = rows(
         &db,
@@ -523,7 +640,10 @@ fn groupby_double_expression_keys_all_groups() {
             _ => (i64::MIN, i64::MIN),
         }
     };
-    let mut a = r; a.sort_by_key(key); let mut b = r2; b.sort_by_key(key);
+    let mut a = r;
+    a.sort_by_key(key);
+    let mut b = r2;
+    b.sort_by_key(key);
     assert_eq!(a, b);
 }
 

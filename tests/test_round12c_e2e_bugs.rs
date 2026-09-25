@@ -28,7 +28,8 @@ fn ids(db: &Database, sql: &str) -> Vec<i64> {
 #[test]
 fn topk_limit_agrees_with_full_sort_on_nulls() {
     let (_d, db) = db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score FLOAT)")
+        .unwrap();
     let mut batch = Vec::new();
     for i in 0..10i64 {
         batch.push(vec![Value::Integer(i), Value::Float(i as f64 * 1.5)]);
@@ -41,21 +42,38 @@ fn topk_limit_agrees_with_full_sort_on_nulls() {
 
     let full_asc = ids(&db, "SELECT id FROM t ORDER BY score ASC");
     assert_eq!(full_asc[0], 100, "NULL first on ASC (full sort)");
-    assert_eq!(*full_asc.last().unwrap(), 101, "NaN last on ASC (full sort)");
+    assert_eq!(
+        *full_asc.last().unwrap(),
+        101,
+        "NaN last on ASC (full sort)"
+    );
 
     let asc3 = ids(&db, "SELECT id FROM t ORDER BY score ASC LIMIT 3");
-    assert_eq!(asc3, vec![100, 0, 1], "ASC LIMIT must include the NULL row: {asc3:?}");
+    assert_eq!(
+        asc3,
+        vec![100, 0, 1],
+        "ASC LIMIT must include the NULL row: {asc3:?}"
+    );
 
     let desc3 = ids(&db, "SELECT id FROM t ORDER BY score DESC LIMIT 3");
-    assert_eq!(desc3, vec![101, 9, 8], "DESC LIMIT: NaN first, NULL NOT in top: {desc3:?}");
+    assert_eq!(
+        desc3,
+        vec![101, 9, 8],
+        "DESC LIMIT: NaN first, NULL NOT in top: {desc3:?}"
+    );
 
     // DESC with k covering every non-null row: the NULL row comes LAST.
     let desc_all = ids(&db, "SELECT id FROM t ORDER BY score DESC LIMIT 12");
     assert_eq!(desc_all.len(), 12);
-    assert_eq!(*desc_all.last().unwrap(), 100, "NULL last on DESC when k covers it");
+    assert_eq!(
+        *desc_all.last().unwrap(),
+        100,
+        "NULL last on DESC when k covers it"
+    );
 
     // Integer sort column (same semantics through the i64 heap path).
-    db.execute("CREATE TABLE ti (id INT PRIMARY KEY, n INT)").unwrap();
+    db.execute("CREATE TABLE ti (id INT PRIMARY KEY, n INT)")
+        .unwrap();
     let mut b2 = Vec::new();
     for i in 0..8i64 {
         b2.push(vec![Value::Integer(i), Value::Integer(i * 3)]);
@@ -76,7 +94,8 @@ fn topk_limit_agrees_with_full_sort_on_nulls() {
 #[test]
 fn bm25_score_zero_arg_returns_scores() {
     let (_d, db) = db();
-    db.execute("CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)").unwrap();
+    db.execute("CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)")
+        .unwrap();
     let mut batch = Vec::new();
     for i in 0..30i64 {
         let body = if i % 2 == 0 {
@@ -92,7 +111,8 @@ fn bm25_score_zero_arg_returns_scores() {
     db.execute_prepared_many("INSERT INTO docs (id, body) VALUES (?, ?)", batch)
         .unwrap();
     db.checkpoint().unwrap();
-    db.execute("CREATE TEXT INDEX docs_body ON docs(body)").unwrap();
+    db.execute("CREATE TEXT INDEX docs_body ON docs(body)")
+        .unwrap();
 
     let rows = db
         .query("SELECT id, BM25_SCORE() FROM docs WHERE MATCH(body, 'alpha') LIMIT 5")
@@ -128,16 +148,16 @@ fn bm25_score_zero_arg_returns_scores() {
 #[test]
 fn latest_by_not_dropped_by_columnar_pushdown() {
     let (_d, db) = db();
-    db.execute(
-        "CREATE TABLE m (sensor TEXT, ts TIMESTAMP, temp FLOAT) TIMESERIES(ts)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE m (sensor TEXT, ts TIMESTAMP, temp FLOAT) TIMESERIES(ts)")
+        .unwrap();
     let mut batch = Vec::new();
     for k in 0..20i64 {
         batch.push(vec![
-            Value::Text(motedb::types::ArcString::from(
-                if k % 2 == 0 { "s0" } else { "s1" },
-            )),
+            Value::Text(motedb::types::ArcString::from(if k % 2 == 0 {
+                "s0"
+            } else {
+                "s1"
+            })),
             Value::Timestamp(motedb::types::Timestamp::from_micros(
                 1_700_000_000i64 * 1_000_000 + k * 1000,
             )),

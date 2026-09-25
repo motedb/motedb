@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::sql::ast::{BinaryOperator, Expr, SelectColumn, SelectStmt};
 use crate::storage::col_segment::ColSegmentStore;
 use crate::storage::colbatch::{ColData, ColumnBatch, ColumnVector, SelectionVec};
-use crate::types::{CompSum, ColumnType, TableSchema, Value};
+use crate::types::{ColumnType, CompSum, TableSchema, Value};
 use crate::Result;
 
 /// 🔑 M6 起默认开启 (MOTE_VEC=off 显式关闭回到全旧路径): 事务回滚 undo
@@ -32,9 +32,7 @@ use crate::Result;
 pub fn vec_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("MOTE_VEC").map_or(true, |v| {
-            !(v == "off" || v == "0" || v == "false")
-        })
+        std::env::var("MOTE_VEC").map_or(true, |v| !(v == "off" || v == "0" || v == "false"))
     })
 }
 
@@ -157,7 +155,11 @@ fn leaf_tv(cv: &ColumnVector, op: &BinaryOperator, lit: &Value, i: usize) -> TV 
             }
         }
         ColData::Utf8(v) => match lit {
-            Value::Text(l) => { let a: &str = &v[i]; let b: &str = l.0.as_ref(); ord_tv(a.cmp(b), op) }
+            Value::Text(l) => {
+                let a: &str = &v[i];
+                let b: &str = l.0.as_ref();
+                ord_tv(a.cmp(b), op)
+            }
             _ => TV::Unknown,
         },
         ColData::Values(v) => lit_cmp(&v[i], op, lit),
@@ -243,8 +245,7 @@ impl VecPred {
             Expr::UnaryOp {
                 op: crate::sql::ast::UnaryOperator::Not,
                 expr,
-            } => Self::compile_with_alias(expr, schema, alias)
-                .map(|p| VecPred::Not(Box::new(p))),
+            } => Self::compile_with_alias(expr, schema, alias).map(|p| VecPred::Not(Box::new(p))),
             Expr::IsNull { expr, negated } => {
                 let Expr::Column(c) = expr.as_ref() else {
                     return None;
@@ -537,9 +538,7 @@ impl VecAcc {
                     let x = v[s];
                     match func {
                         VecAggFunc::Count | VecAggFunc::CountStar => {}
-                        VecAggFunc::Sum | VecAggFunc::Avg => {
-                            self.add_int(x)
-                        }
+                        VecAggFunc::Sum | VecAggFunc::Avg => self.add_int(x),
                         VecAggFunc::Min => {
                             if self.min.as_ref().is_none_or(|m| match m {
                                 Value::Integer(mi) => x < *mi,
@@ -617,22 +616,16 @@ impl VecAcc {
                             _ => {}
                         },
                         VecAggFunc::Min => {
-                            if self
-                                .min
-                                .as_ref()
-                                .is_none_or(|m| val.partial_cmp(m) == Some(std::cmp::Ordering::Less))
-                            {
+                            if self.min.as_ref().is_none_or(|m| {
+                                val.partial_cmp(m) == Some(std::cmp::Ordering::Less)
+                            }) {
                                 self.min = Some(val);
                             }
                         }
                         VecAggFunc::Max => {
-                            if self
-                                .max
-                                .as_ref()
-                                .is_none_or(|m| {
-                                    val.partial_cmp(m) == Some(std::cmp::Ordering::Greater)
-                                })
-                            {
+                            if self.max.as_ref().is_none_or(|m| {
+                                val.partial_cmp(m) == Some(std::cmp::Ordering::Greater)
+                            }) {
                                 self.max = Some(val);
                             }
                         }
@@ -653,9 +646,7 @@ impl VecAcc {
             ColData::I64(v) => {
                 let x = v[i];
                 match func {
-                    VecAggFunc::Sum | VecAggFunc::Avg => {
-                        self.add_int(x)
-                    }
+                    VecAggFunc::Sum | VecAggFunc::Avg => self.add_int(x),
                     VecAggFunc::Min => {
                         if self.min.as_ref().is_none_or(|m| match m {
                             Value::Integer(mi) => x < *mi,
@@ -749,9 +740,7 @@ impl VecAcc {
             self.nn += 1;
             match &cv.data {
                 ColData::I64(v) => match func {
-                    VecAggFunc::Sum | VecAggFunc::Avg => {
-                        self.add_int(v[i])
-                    }
+                    VecAggFunc::Sum | VecAggFunc::Avg => self.add_int(v[i]),
                     VecAggFunc::Min => {
                         if self.min.as_ref().is_none_or(|m| match m {
                             Value::Integer(mi) => v[i] < *mi,
@@ -805,22 +794,16 @@ impl VecAcc {
                             _ => {}
                         },
                         VecAggFunc::Min => {
-                            if self
-                                .min
-                                .as_ref()
-                                .is_none_or(|m| val.partial_cmp(m) == Some(std::cmp::Ordering::Less))
-                            {
+                            if self.min.as_ref().is_none_or(|m| {
+                                val.partial_cmp(m) == Some(std::cmp::Ordering::Less)
+                            }) {
                                 self.min = Some(val);
                             }
                         }
                         VecAggFunc::Max => {
-                            if self
-                                .max
-                                .as_ref()
-                                .is_none_or(|m| {
-                                    val.partial_cmp(m) == Some(std::cmp::Ordering::Greater)
-                                })
-                            {
+                            if self.max.as_ref().is_none_or(|m| {
+                                val.partial_cmp(m) == Some(std::cmp::Ordering::Greater)
+                            }) {
                                 self.max = Some(val);
                             }
                         }
@@ -853,11 +836,15 @@ impl VecAcc {
                 }
             }
             VecAggFunc::Min => match self.min.clone().unwrap_or(Value::Null) {
-                Value::Integer(m) if ts => Value::Timestamp(crate::types::Timestamp::from_micros(m)),
+                Value::Integer(m) if ts => {
+                    Value::Timestamp(crate::types::Timestamp::from_micros(m))
+                }
                 v => v,
             },
             VecAggFunc::Max => match self.max.clone().unwrap_or(Value::Null) {
-                Value::Integer(m) if ts => Value::Timestamp(crate::types::Timestamp::from_micros(m)),
+                Value::Integer(m) if ts => {
+                    Value::Timestamp(crate::types::Timestamp::from_micros(m))
+                }
                 v => v,
             },
         }
@@ -950,10 +937,12 @@ pub fn try_vec_no_group_aggregate(
     }
     needed.sort_unstable();
     needed.dedup();
-    if needed
-        .iter()
-        .any(|&c| matches!(cts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
-    {
+    if needed.iter().any(|&c| {
+        matches!(
+            cts.get(c),
+            Some(ColumnType::Tensor(_) | ColumnType::Spatial)
+        )
+    }) {
         return Ok(None); // 复杂类型聚合走旧路径
     }
 
@@ -1153,16 +1142,12 @@ pub fn try_vec_no_group_aggregate(
                 let mut chain: Vec<&VecPredLeaf> = Vec::new();
                 if p.as_and_chain(&mut chain) {
                     // 🔑 融合过滤+聚合（AND 链, 可见集上单遍）。
-                    let has_fold = specs
-                        .iter()
-                        .any(|(_, sp)| sp.func != VecAggFunc::CountStar);
+                    let has_fold = specs.iter().any(|(_, sp)| sp.func != VecAggFunc::CountStar);
                     let fold_specs: Vec<(usize, VecAggFunc, usize)> = specs
                         .iter()
                         .enumerate()
                         .filter(|(_, (_, sp))| sp.func != VecAggFunc::CountStar)
-                        .map(|(ai, (_, sp))| {
-                            (ai, sp.func, sp.col.expect("non-CountStar has col"))
-                        })
+                        .map(|(ai, (_, sp))| (ai, sp.func, sp.col.expect("non-CountStar has col")))
                         .collect();
                     let mut hits: u64 = 0;
                     for r in vis_sel.iter() {
@@ -1193,10 +1178,8 @@ pub fn try_vec_no_group_aggregate(
                     // 混合形状 (OR/NOT): 谓词 selection ∩ 可见集
                     let pred_set: std::collections::HashSet<u32> =
                         p.eval_sel(&batch).iter().collect();
-                    let filtered: Vec<u32> = vis_sel
-                        .iter()
-                        .filter(|i| pred_set.contains(i))
-                        .collect();
+                    let filtered: Vec<u32> =
+                        vis_sel.iter().filter(|i| pred_set.contains(i)).collect();
                     let sel = crate::storage::colbatch::SelectionVec::from_vec(filtered);
                     if sel.is_empty() {
                         continue;
@@ -1225,7 +1208,12 @@ pub fn try_vec_no_group_aggregate(
 }
 
 #[inline]
-fn fold_row(accs: &mut [VecAcc], agg_specs: &[VecAggSpec], cols: &[std::sync::Arc<ColumnVector>], i: usize) {
+fn fold_row(
+    accs: &mut [VecAcc],
+    agg_specs: &[VecAggSpec],
+    cols: &[std::sync::Arc<ColumnVector>],
+    i: usize,
+) {
     for (ai, sp) in agg_specs.iter().enumerate() {
         match sp.func {
             VecAggFunc::CountStar => accs[ai].count += 1,
@@ -1343,7 +1331,12 @@ impl KeyExpr {
 
     /// 整型键快路径: 列与字面量均为整型时直接在切片上算 — 零 Value
     /// 构造 (Vec<Value> 键 + 每行分配曾占 1.8µs/行)。
-    fn eval_i64(&self, batch: &ColumnBatch, i: usize, remap: &dyn Fn(usize) -> usize) -> Option<i64> {
+    fn eval_i64(
+        &self,
+        batch: &ColumnBatch,
+        i: usize,
+        remap: &dyn Fn(usize) -> usize,
+    ) -> Option<i64> {
         match self {
             KeyExpr::Col(c) => {
                 if *c == usize::MAX {
@@ -1518,10 +1511,7 @@ pub fn try_vec_group_by(
                 // &str 零分配路径; 大表 (≥PARALLEL_MIN_ROWS) 走 M2 morsel
                 // 并行 — 1M 行实测 &str 串行 14.3ms vs M2 并行 4.8ms,
                 // "不截胡"在大表上是负优化。
-                if stmt.order_by.is_none()
-                    && stmt.limit.is_none()
-                    && stmt.offset.is_none()
-                {
+                if stmt.order_by.is_none() && stmt.limit.is_none() && stmt.offset.is_none() {
                     #[cfg(not(feature = "rayon"))]
                     {
                         return Ok(None);
@@ -1572,11 +1562,9 @@ pub fn try_vec_group_by(
                         Some(_) => return Ok(None),
                         None => None,
                     };
-                    out_names.push(
-                        alias
-                            .clone()
-                            .unwrap_or_else(|| crate::sql::executor::QueryExecutor::expr_to_column_name(expr)),
-                    );
+                    out_names.push(alias.clone().unwrap_or_else(|| {
+                        crate::sql::executor::QueryExecutor::expr_to_column_name(expr)
+                    }));
                     out_cols.push(Out::Agg(agg_specs.len()));
                     agg_specs.push(VecAggSpec {
                         func,
@@ -1587,15 +1575,17 @@ pub fn try_vec_group_by(
                     });
                 } else {
                     // 组键表达式 — canonical/别名须匹配某 GROUP BY 项
-                    let name = alias
-                        .clone()
-                        .unwrap_or_else(|| crate::sql::executor::QueryExecutor::expr_to_column_name(expr));
+                    let name = alias.clone().unwrap_or_else(|| {
+                        crate::sql::executor::QueryExecutor::expr_to_column_name(expr)
+                    });
                     let canonical = crate::sql::executor::QueryExecutor::expr_to_column_name(expr);
                     let matched = group_items.iter().any(|g| g == &name || g == &canonical);
                     if !matched || key_exprs.len() + 1 > group_items.len() {
                         return Ok(None);
                     }
-                    let Some(ke) = KeyExpr::compile(expr, schema) else { return Ok(None) };
+                    let Some(ke) = KeyExpr::compile(expr, schema) else {
+                        return Ok(None);
+                    };
                     out_names.push(name);
                     out_cols.push(Out::Key(key_exprs.len()));
                     key_exprs.push(ke);
@@ -1630,10 +1620,12 @@ pub fn try_vec_group_by(
     }
     needed.sort_unstable();
     needed.dedup();
-    if needed
-        .iter()
-        .any(|&c| matches!(cts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
-    {
+    if needed.iter().any(|&c| {
+        matches!(
+            cts.get(c),
+            Some(ColumnType::Tensor(_) | ColumnType::Spatial)
+        )
+    }) {
         return Ok(None);
     }
     if let Some(p) = pred.as_mut() {
@@ -1646,9 +1638,7 @@ pub fn try_vec_group_by(
             }
         }
     }
-    let key_remap = |c: usize| -> usize {
-        needed.iter().position(|&x| x == c).unwrap_or(0)
-    };
+    let key_remap = |c: usize| -> usize { needed.iter().position(|&x| x == c).unwrap_or(0) };
 
     let _ = store.flush_buffer();
     let segments = store.segments_snapshot();
@@ -1662,11 +1652,15 @@ pub fn try_vec_group_by(
     // 🔑 单整型键快路径: HashMap<i64> + 零 Value 构造; 键含 NULL/文本/浮点
     // 或多键 → 通用 Vec<Value> 路径。
     let single_key = key_exprs.len() == 1;
-    let single_int_key = key_exprs.len() == 1 && agg_specs.iter().all(|s| {
-        s.col.map_or(true, |c| {
-            matches!(batchless_type(&cts, needed[c]), ColumnType::Integer | ColumnType::Timestamp)
-        })
-    });
+    let single_int_key = key_exprs.len() == 1
+        && agg_specs.iter().all(|s| {
+            s.col.map_or(true, |c| {
+                matches!(
+                    batchless_type(&cts, needed[c]),
+                    ColumnType::Integer | ColumnType::Timestamp
+                )
+            })
+        });
     let mut groups_i: HashMap<i64, Vec<VecAcc>> = HashMap::new();
     // 🔑 单键 Value 组 (文本/浮点/混合): Value 克隆是 Arc 计数或 POD —
     // 零堆分配。此前单键也走 Vec<Value> 通用路径, 每行一次 Vec 分配
@@ -2153,7 +2147,7 @@ pub fn try_vec_equi_join_gb(
                     ppred = VecPred::compile_with_alias(&e, pschema, Some(palias));
                 }
             }
-            None => { return Ok(None) }
+            None => return Ok(None),
         }
     }
 
@@ -2183,14 +2177,17 @@ pub fn try_vec_equi_join_gb(
     }
     pneeded.sort_unstable();
     pneeded.dedup();
-    if bneeded
-        .iter()
-        .chain(pneeded.iter())
-        .any(|&c| matches!(bcts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
-        || pneeded
-            .iter()
-            .any(|&c| matches!(pcts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
-    {
+    if bneeded.iter().chain(pneeded.iter()).any(|&c| {
+        matches!(
+            bcts.get(c),
+            Some(ColumnType::Tensor(_) | ColumnType::Spatial)
+        )
+    }) || pneeded.iter().any(|&c| {
+        matches!(
+            pcts.get(c),
+            Some(ColumnType::Tensor(_) | ColumnType::Spatial)
+        )
+    }) {
         return Ok(None);
     }
     let mut bpred = bpred;
@@ -2208,9 +2205,7 @@ pub fn try_vec_equi_join_gb(
             }
         }
     }
-    let key_remap = |c: usize| -> usize {
-        pneeded.iter().position(|&x| x == c).unwrap_or(0)
-    };
+    let key_remap = |c: usize| -> usize { pneeded.iter().position(|&x| x == c).unwrap_or(0) };
 
     // 段门 (与 M1/M2 相同): 墓碑/多段 decline
     let _ = bstore.flush_buffer();
@@ -2228,8 +2223,7 @@ pub fn try_vec_equi_join_gb(
     // 组值: build 侧组键列的值 (维度表属性)。同 join 键的多行必须同组值,
     // 否则半连接折叠无法把 probe 行归到唯一组 → decline (PK 维度表不会触发)。
     let mut table: HashMap<JKey, (u64, Option<Value>)> = HashMap::new();
-    let bg_idx: Option<usize> = bgroup_col
-        .and_then(|gc| bneeded.iter().position(|&x| x == gc));
+    let bg_idx: Option<usize> = bgroup_col.and_then(|gc| bneeded.iter().position(|&x| x == gc));
     for seg in &bsegs {
         let n = seg.row_count;
         if n == 0 {
@@ -2243,14 +2237,20 @@ pub fn try_vec_equi_join_gb(
             cols.push(cv);
         }
         let batch = ColumnBatch::new_shared(cols);
-        let bkey_idx = bneeded.iter().position(|&x| x == build_key_col).unwrap_or(0);
+        let bkey_idx = bneeded
+            .iter()
+            .position(|&x| x == build_key_col)
+            .unwrap_or(0);
         let rows: Vec<u32> = match &bpred {
             Some(p) => {
                 let mut chain: Vec<&VecPredLeaf> = Vec::new();
                 if p.as_and_chain(&mut chain) {
                     let mut sel = Vec::with_capacity(n);
                     for i in 0..n {
-                        if chain.iter().all(|l| leaf_tv_leaf(&batch.cols, l, i) == TV::True) {
+                        if chain
+                            .iter()
+                            .all(|l| leaf_tv_leaf(&batch.cols, l, i) == TV::True)
+                        {
                             sel.push(i as u32);
                         }
                     }
@@ -2279,13 +2279,17 @@ pub fn try_vec_equi_join_gb(
     }
 
     // ── probe 侧: 扫描 + 过滤 + 命中直接折叠 ──
-    let pkey_idx = pneeded.iter().position(|&x| x == probe_key_col).unwrap_or(0);
+    let pkey_idx = pneeded
+        .iter()
+        .position(|&x| x == probe_key_col)
+        .unwrap_or(0);
     // 🔑 组键==join 键列 → JKey 组 (每行一次 hash); 单键 → Value 组;
     // 多键 → Vec<Value> 组。
     let group_is_join_key = key_exprs.len() == 1
         && matches!(&key_exprs[0], KeyExpr::Col(c) if key_remap(*c) == pkey_idx);
     let mut groups_j: HashMap<JKey, (Option<Value>, Vec<VecAcc>)> = HashMap::new();
-    let mut groups_1: std::collections::HashMap<Value, Vec<VecAcc>> = std::collections::HashMap::new();
+    let mut groups_1: std::collections::HashMap<Value, Vec<VecAcc>> =
+        std::collections::HashMap::new();
     let mut groups_v: HashMap<Vec<Value>, Vec<VecAcc>> = HashMap::new();
     let single_key = key_exprs.len() == 1;
     for seg in &psegs {
@@ -2307,7 +2311,10 @@ pub fn try_vec_equi_join_gb(
                 if p.as_and_chain(&mut chain) {
                     let mut sel = Vec::with_capacity(n);
                     for i in 0..n {
-                        if chain.iter().all(|l| leaf_tv_leaf(&batch.cols, l, i) == TV::True) {
+                        if chain
+                            .iter()
+                            .all(|l| leaf_tv_leaf(&batch.cols, l, i) == TV::True)
+                        {
                             sel.push(i as u32);
                         }
                     }
@@ -2353,11 +2360,9 @@ pub fn try_vec_equi_join_gb(
                         }
                         if bgroup_col.is_some() {
                             let gval = bgrp.unwrap_or(Value::Null);
-                            let accs = g1
-                                .entry(gval)
-                                .or_insert_with(|| {
-                                    agg_specs.iter().map(|_| VecAcc::default()).collect()
-                                });
+                            let accs = g1.entry(gval).or_insert_with(|| {
+                                agg_specs.iter().map(|_| VecAcc::default()).collect()
+                            });
                             for _ in 0..matches {
                                 fold_row(&mut accs[..], &agg_specs, &batch.cols, i);
                             }
@@ -2367,7 +2372,10 @@ pub fn try_vec_equi_join_gb(
                             let e = gj.entry(k.unwrap()).or_insert_with(|| {
                                 (
                                     key_exprs[0].eval(&batch, i, &key_remap),
-                                    agg_specs.iter().map(|_| VecAcc::default()).collect::<Vec<_>>(),
+                                    agg_specs
+                                        .iter()
+                                        .map(|_| VecAcc::default())
+                                        .collect::<Vec<_>>(),
                                 )
                             });
                             for _ in 0..matches {
@@ -2482,9 +2490,15 @@ pub fn try_vec_equi_join_gb(
             // 直接以 JKey 为组标识 — 每行只做这一次字符串 hash
             // (分别对 join 键和组键各 hash 一次曾比旧路径还慢)。
             if group_is_join_key {
-                let e = groups_j
-                    .entry(k.unwrap())
-                    .or_insert_with(|| (key_exprs[0].eval(&batch, i, &key_remap), agg_specs.iter().map(|_| VecAcc::default()).collect::<Vec<_>>()));
+                let e = groups_j.entry(k.unwrap()).or_insert_with(|| {
+                    (
+                        key_exprs[0].eval(&batch, i, &key_remap),
+                        agg_specs
+                            .iter()
+                            .map(|_| VecAcc::default())
+                            .collect::<Vec<_>>(),
+                    )
+                });
                 for _ in 0..matches {
                     fold_row(&mut (e.1)[..], &agg_specs, &batch.cols, i);
                 }
@@ -2639,12 +2653,12 @@ fn split_where_by_alias(
         if cols.is_empty() {
             return None; // 纯常量叶 — 保守 decline
         }
-        let all_b = cols.iter().all(|c| {
-            c.split_once('.').map(|(p, _)| p == balias).unwrap_or(false)
-        });
-        let all_p = cols.iter().all(|c| {
-            c.split_once('.').map(|(p, _)| p == palias).unwrap_or(false)
-        });
+        let all_b = cols
+            .iter()
+            .all(|c| c.split_once('.').map(|(p, _)| p == balias).unwrap_or(false));
+        let all_p = cols
+            .iter()
+            .all(|c| c.split_once('.').map(|(p, _)| p == palias).unwrap_or(false));
         if all_b {
             bside.push(leaf);
         } else if all_p {
@@ -2694,7 +2708,6 @@ fn strip_alias(e: &Expr, alias: &str) -> Expr {
         _ => e.clone(),
     }
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════
 // M4a: 批投影 — SELECT 纯列 [WHERE] [LIMIT/OFFSET] 的批输出边界
@@ -2764,10 +2777,12 @@ pub fn try_vec_projection(
     needed.extend_from_slice(&proj);
     needed.sort_unstable();
     needed.dedup();
-    if needed
-        .iter()
-        .any(|&c| matches!(cts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
-    {
+    if needed.iter().any(|&c| {
+        matches!(
+            cts.get(c),
+            Some(ColumnType::Tensor(_) | ColumnType::Spatial)
+        )
+    }) {
         return Ok(None);
     }
     // 谓词叶列位 → 批内相对位（M1 教训：按 schema 位索引批列会越界）。
@@ -2846,8 +2861,7 @@ pub fn try_vec_projection(
                         })
                         .collect()
                 } else {
-                    let set: std::collections::HashSet<u32> =
-                        p.eval_sel(&batch).iter().collect();
+                    let set: std::collections::HashSet<u32> = p.eval_sel(&batch).iter().collect();
                     vis.into_iter().filter(|r| set.contains(r)).collect()
                 }
             }
@@ -2910,42 +2924,38 @@ fn f64_ord_key(v: f64) -> u64 {
 #[inline]
 fn topk_ord_key(kc: &ColumnVector, i: usize, desc: bool) -> u64 {
     match &kc.data {
-        crate::storage::colbatch::ColData::F64(vs) => {
-            match (kc.valid.is_valid(i)).then(|| vs[i]) {
-                Some(v) => {
-                    if desc {
-                        u64::MAX - f64_ord_key(v)
-                    } else {
-                        f64_ord_key(v)
-                    }
-                }
-                None => {
-                    if desc {
-                        u64::MAX
-                    } else {
-                        u64::MIN
-                    }
+        crate::storage::colbatch::ColData::F64(vs) => match (kc.valid.is_valid(i)).then(|| vs[i]) {
+            Some(v) => {
+                if desc {
+                    u64::MAX - f64_ord_key(v)
+                } else {
+                    f64_ord_key(v)
                 }
             }
-        }
-        crate::storage::colbatch::ColData::I64(vs) => {
-            match (kc.valid.is_valid(i)).then(|| vs[i]) {
-                Some(v) => {
-                    if desc {
-                        !(v as u64 ^ (1u64 << 63))
-                    } else {
-                        v as u64 ^ (1u64 << 63)
-                    }
-                }
-                None => {
-                    if desc {
-                        u64::MAX
-                    } else {
-                        u64::MIN
-                    }
+            None => {
+                if desc {
+                    u64::MAX
+                } else {
+                    u64::MIN
                 }
             }
-        }
+        },
+        crate::storage::colbatch::ColData::I64(vs) => match (kc.valid.is_valid(i)).then(|| vs[i]) {
+            Some(v) => {
+                if desc {
+                    !(v as u64 ^ (1u64 << 63))
+                } else {
+                    v as u64 ^ (1u64 << 63)
+                }
+            }
+            None => {
+                if desc {
+                    u64::MAX
+                } else {
+                    u64::MIN
+                }
+            }
+        },
         // Bool 位图列按布尔序（false<true）折算 i64 键。
         crate::storage::colbatch::ColData::Bool(_) => {
             let v = match kc.get(i) {
@@ -3006,12 +3016,7 @@ pub fn try_vec_filter_topk(
     let key_float = matches!(cts.get(order_col), Some(ColumnType::Float));
     let key_ok = matches!(
         cts.get(order_col),
-        Some(
-            ColumnType::Integer
-                | ColumnType::Float
-                | ColumnType::Boolean
-                | ColumnType::Timestamp
-        )
+        Some(ColumnType::Integer | ColumnType::Float | ColumnType::Boolean | ColumnType::Timestamp)
     );
     if !key_ok {
         return Ok(None);
@@ -3061,10 +3066,12 @@ pub fn try_vec_filter_topk(
     needed.extend_from_slice(&proj);
     needed.sort_unstable();
     needed.dedup();
-    if needed
-        .iter()
-        .any(|&c| matches!(cts.get(c), Some(ColumnType::Tensor(_) | ColumnType::Spatial)))
-    {
+    if needed.iter().any(|&c| {
+        matches!(
+            cts.get(c),
+            Some(ColumnType::Tensor(_) | ColumnType::Spatial)
+        )
+    }) {
         return Ok(None);
     }
     remap_pred(&mut pred, &needed);

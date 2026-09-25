@@ -7228,7 +7228,11 @@ impl QueryExecutor {
         // OFFSET 3` 应返回 0 行 (此前点查快路径忽略 OFFSET, fuzz seed 14
         // 差分对拍 SQLite 抓出)。
         let skip = stmt.offset.unwrap_or(0);
-        let mut rows: Vec<Vec<Value>> = if skip > 0 { Vec::new() } else { vec![result_row] };
+        let mut rows: Vec<Vec<Value>> = if skip > 0 {
+            Vec::new()
+        } else {
+            vec![result_row]
+        };
         if let Some(l) = stmt.limit {
             rows.truncate(l);
         }
@@ -8263,7 +8267,9 @@ impl QueryExecutor {
                             },
                             Value::Float(f) => match fname.as_str() {
                                 "abs" => Ok(Value::Float(f.abs())),
-                                "round" => Ok(Value::Float(crate::sql::evaluator::round_f64_half_away(f, 0))),
+                                "round" => Ok(Value::Float(
+                                    crate::sql::evaluator::round_f64_half_away(f, 0),
+                                )),
                                 "floor" => Ok(Value::Float(f.floor())),
                                 "ceil" => Ok(Value::Float(f.ceil())),
                                 "log" | "log10" => Ok(Value::Float(f.log10())),
@@ -8371,18 +8377,21 @@ impl QueryExecutor {
                     .fold(0, |acc, row| {
                         acc.max(row.iter().fold(0, |a, e| a.max(walk_expr(e))))
                     })
-                    .max(i.select.as_ref().map(|s| {
-                        s.where_clause
+                    .max(
+                        i.select
                             .as_ref()
-                            .map(walk_expr)
-                            .unwrap_or(0)
-                            .max(s.columns.iter().fold(0, |acc, c| {
-                                acc.max(match c {
-                                    SelectColumn::Expr(e, _) => walk_expr(e),
-                                    _ => 0,
-                                })
-                            }))
-                    }).unwrap_or(0)),
+                            .map(|s| {
+                                s.where_clause.as_ref().map(walk_expr).unwrap_or(0).max(
+                                    s.columns.iter().fold(0, |acc, c| {
+                                        acc.max(match c {
+                                            SelectColumn::Expr(e, _) => walk_expr(e),
+                                            _ => 0,
+                                        })
+                                    }),
+                                )
+                            })
+                            .unwrap_or(0),
+                    ),
                 Statement::Update(u) => {
                     let where_max = u.where_clause.as_ref().map(walk_expr).unwrap_or(0);
                     let set_max = u
@@ -10370,9 +10379,9 @@ impl QueryExecutor {
             } = from
             {
                 if let Ok(schema) = self.db.get_table_schema(table_name) {
-                    if let Some((column_names, projected_rows)) =
-                        self.try_apply_group_by_positional(stmt, &schema, table_name)?
-                            .or(self.try_expression_group_by(stmt, &schema, table_name)?)
+                    if let Some((column_names, projected_rows)) = self
+                        .try_apply_group_by_positional(stmt, &schema, table_name)?
+                        .or(self.try_expression_group_by(stmt, &schema, table_name)?)
                     {
                         return Ok(QueryResult::Select {
                             columns: column_names,
@@ -11232,8 +11241,10 @@ impl QueryExecutor {
                 std::cmp::Ordering::Equal
             });
 
-            let (sorted_proj, sort_perm): (Vec<Vec<Value>>, Vec<usize>) =
-                rows_with_keys.into_iter().map(|(_, row, i)| (row, i)).unzip();
+            let (sorted_proj, sort_perm): (Vec<Vec<Value>>, Vec<usize>) = rows_with_keys
+                .into_iter()
+                .map(|(_, row, i)| (row, i))
+                .unzip();
             sorted_rows = sorted_proj;
             permutation = Some(sort_perm);
         }
@@ -11560,7 +11571,9 @@ impl QueryExecutor {
                 // col-op-literal 形状不推, 留给 join 后 WHERE。
                 let _push: Vec<(String, String, crate::sql::ast::BinaryOperator, Value)> =
                     push.to_vec();
-                let schema_row_get = |schema: &TableSchema, prefix: &str, bare: &str,
+                let schema_row_get = |schema: &TableSchema,
+                                      prefix: &str,
+                                      bare: &str,
                                       row: &SqlRow|
                  -> Option<Value> {
                     let q = format!("{}.{}", prefix, bare);
@@ -11595,10 +11608,8 @@ impl QueryExecutor {
                 };
                 let left_alias = Self::table_ref_alias(left);
                 let right_alias = Self::table_ref_alias(right);
-                let left_rows =
-                    filter_rows(left_rows, &left_schema, &left_alias);
-                let right_rows =
-                    filter_rows(right_rows, &right_schema, &right_alias);
+                let left_rows = filter_rows(left_rows, &left_schema, &left_alias);
+                let right_rows = filter_rows(right_rows, &right_schema, &right_alias);
 
                 // Perform JOIN based on type
                 let joined_rows = match join_type {
@@ -12486,8 +12497,7 @@ impl QueryExecutor {
         // 🔑 按输入顺序输出每组胜者 (两遍法): 调用方传入的 projected_rows
         // 可能已经 ORDER BY 排序 — 旧实现 HashMap::into_values 的迭代序
         // 会把排序打乱 (LATEST BY sensor ORDER BY sensor 输出乱序/逆序)。
-        let winners: std::collections::HashSet<usize> =
-            groups.values().map(|(_, i)| *i).collect();
+        let winners: std::collections::HashSet<usize> = groups.values().map(|(_, i)| *i).collect();
         Ok(projected_rows
             .into_iter()
             .enumerate()
@@ -12532,9 +12542,7 @@ impl QueryExecutor {
                     // 底层列名 (ColumnWithAlias 此前不匹配任何分支 → 分组键
                     // 解析失败, 后续 COUNT 求值报 not-implemented)。
                     let underlying = columns.iter().find_map(|c| match c {
-                        SelectColumn::ColumnWithAlias(n, a) if a == col_name => {
-                            Some(n.clone())
-                        }
+                        SelectColumn::ColumnWithAlias(n, a) if a == col_name => Some(n.clone()),
                         _ => None,
                     });
                     let col_name: &String = underlying.as_ref().unwrap_or(col_name);
@@ -13250,9 +13258,9 @@ impl QueryExecutor {
             }
             for r in refs {
                 let bare = r.rsplit('.').next().unwrap_or(&r);
-                let hit = out_names.iter().any(|n| {
-                    n == &r || n == bare || n.rsplit('.').next().unwrap_or(n) == bare
-                });
+                let hit = out_names
+                    .iter()
+                    .any(|n| n == &r || n == bare || n.rsplit('.').next().unwrap_or(n) == bare);
                 if !hit {
                     return true;
                 }
@@ -13284,10 +13292,7 @@ impl QueryExecutor {
                         .all(|e| Self::collect_column_names_strict(e, out))
             }
             Expr::Between {
-                expr,
-                low,
-                high,
-                ..
+                expr, low, high, ..
             } => {
                 Self::collect_column_names_strict(expr, out)
                     && Self::collect_column_names_strict(low, out)
@@ -14263,7 +14268,16 @@ impl QueryExecutor {
         }
         impl Acc {
             fn new() -> Self {
-                Self { count: 0, nn: 0, int_sum: 0, fsum: 0.0, has_f: false, has_v: false, min: None, max: None }
+                Self {
+                    count: 0,
+                    nn: 0,
+                    int_sum: 0,
+                    fsum: 0.0,
+                    has_f: false,
+                    has_v: false,
+                    min: None,
+                    max: None,
+                }
             }
             fn update(&mut self, v: Option<&Value>) {
                 self.count += 1;
@@ -14281,10 +14295,18 @@ impl QueryExecutor {
                     }
                     _ => {}
                 }
-                if self.min.as_ref().is_none_or(|m| order_by_cmp(v, m) == std::cmp::Ordering::Less) {
+                if self
+                    .min
+                    .as_ref()
+                    .is_none_or(|m| order_by_cmp(v, m) == std::cmp::Ordering::Less)
+                {
                     self.min = Some(v.clone());
                 }
-                if self.max.as_ref().is_none_or(|m| order_by_cmp(v, m) == std::cmp::Ordering::Greater) {
+                if self
+                    .max
+                    .as_ref()
+                    .is_none_or(|m| order_by_cmp(v, m) == std::cmp::Ordering::Greater)
+                {
                     self.max = Some(v.clone());
                 }
             }
@@ -14326,8 +14348,8 @@ impl QueryExecutor {
         }
         // SELECT 解析: 输出序的 [Key(expr) | Agg] 序列
         enum Out {
-            Key(usize),   // index into key_exprs
-            Agg(usize),   // index into agg_infos
+            Key(usize), // index into key_exprs
+            Agg(usize), // index into agg_infos
         }
         let mut key_exprs: Vec<Expr> = Vec::new();
         let mut out_names: Vec<String> = Vec::new();
@@ -14347,17 +14369,18 @@ impl QueryExecutor {
                             return Ok(None);
                         }
                         out_names.push(
-                            alias.clone().unwrap_or_else(|| Self::expr_to_column_name(expr)),
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| Self::expr_to_column_name(expr)),
                         );
                         out_cols.push(Out::Agg(agg_infos.len()));
                         agg_infos.push(agg);
                     } else {
-                        let name =
-                            alias.clone().unwrap_or_else(|| Self::expr_to_column_name(expr));
+                        let name = alias
+                            .clone()
+                            .unwrap_or_else(|| Self::expr_to_column_name(expr));
                         let canonical = Self::expr_to_column_name(expr);
-                        let matched = group_items
-                            .iter()
-                            .any(|g| g == &name || g == &canonical);
+                        let matched = group_items.iter().any(|g| g == &name || g == &canonical);
                         if !matched || key_exprs.len() + 1 > group_items.len() {
                             return Ok(None);
                         }
@@ -14381,10 +14404,7 @@ impl QueryExecutor {
             // WHERE 逐行求值 (Bool(true) 才收)
             if let Some(ref wc) = stmt.where_clause {
                 let sql_row = row_to_sql_row(&row, schema)?;
-                let ok = matches!(
-                    self.evaluator.eval(wc, &sql_row),
-                    Ok(Value::Bool(true))
-                );
+                let ok = matches!(self.evaluator.eval(wc, &sql_row), Ok(Value::Bool(true)));
                 if !ok {
                     continue;
                 }
@@ -14393,9 +14413,9 @@ impl QueryExecutor {
             for e in &key_exprs {
                 key_buf.push(Self::eval_expr_on_row(e, &row, schema)?);
             }
-            let accs = groups.entry(key_buf.clone()).or_insert_with(|| {
-                agg_infos.iter().map(|_| Acc::new()).collect::<Vec<_>>()
-            });
+            let accs = groups
+                .entry(key_buf.clone())
+                .or_insert_with(|| agg_infos.iter().map(|_| Acc::new()).collect::<Vec<_>>());
             for (ai, acc) in accs.iter_mut().enumerate() {
                 let info = &agg_infos[ai];
                 let v = info.col_pos.and_then(|p| row.get(p));
@@ -14411,10 +14431,9 @@ impl QueryExecutor {
                     .iter()
                     .map(|c| match c {
                         Out::Key(i) => keys[*i].clone(),
-                        Out::Agg(i) => accs[*i].finalize(
-                            agg_infos[*i].func.as_str(),
-                            agg_infos[*i].col_pos,
-                        ),
+                        Out::Agg(i) => {
+                            accs[*i].finalize(agg_infos[*i].func.as_str(), agg_infos[*i].col_pos)
+                        }
                     })
                     .collect::<Vec<_>>()
             })
@@ -14422,7 +14441,9 @@ impl QueryExecutor {
         if let Some(ref ob) = stmt.order_by {
             let mut specs: Vec<(usize, bool)> = Vec::new();
             for oe in ob {
-                let Expr::Column(cn) = &oe.expr else { return Ok(None) };
+                let Expr::Column(cn) = &oe.expr else {
+                    return Ok(None);
+                };
                 let hits: Vec<usize> = out_names
                     .iter()
                     .enumerate()
@@ -16096,8 +16117,9 @@ impl QueryExecutor {
                         value_row.len()
                     )));
                 }
-                let row =
-                    crate::sql::row_converter::values_to_row_by_columns(value_row, &columns, &schema)?;
+                let row = crate::sql::row_converter::values_to_row_by_columns(
+                    value_row, &columns, &schema,
+                )?;
                 prepared_rows.push(row);
             }
         }
@@ -16777,9 +16799,10 @@ impl QueryExecutor {
                 .update_row_in_table_with_schema(&stmt.table, rid, old_row, new_row, &schema)?;
             affected_rows += 1;
         } else if !pending_updates.is_empty() {
-            affected_rows += self
-                .db
-                .update_rows_batch_with_schema(&stmt.table, pending_updates, &schema)? as usize;
+            affected_rows +=
+                self.db
+                    .update_rows_batch_with_schema(&stmt.table, pending_updates, &schema)?
+                    as usize;
         }
 
         // 🔑 Process write_set rows (uncommitted INSERTs in this txn).
@@ -20396,9 +20419,9 @@ impl QueryExecutor {
                 }
                 // phase 1: 决策 + 缓存填充 (串行, 预算记账 — 同顺序路径)。
                 let mut cached_total_p: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
-                let plans: Vec<(std::sync::Arc<crate::storage::col_segment::Segment>, Plan)> =
-                    segs.iter()
-                        .map(|seg| {
+                let plans: Vec<(std::sync::Arc<crate::storage::col_segment::Segment>, Plan)> = segs
+                    .iter()
+                    .map(|seg| {
                         let n = seg.sst.num_rows;
                         if col_pos >= seg.sst.column_tags.len() {
                             return (std::sync::Arc::clone(seg), Plan::SkipTombstones);
@@ -20422,8 +20445,8 @@ impl QueryExecutor {
                             Some(_) => (std::sync::Arc::clone(seg), Plan::SkipTombstones),
                             None => (std::sync::Arc::clone(seg), Plan::Stream),
                         }
-                        })
-                        .collect();
+                    })
+                    .collect();
                 // phase 2: 段间并行评分 (段内串行 — 段数即并行度; 无
                 // overlap ⇒ 无需 seen 过滤)。
                 let offer_local = |lh: &mut std::collections::BinaryHeap<(OrderedF32, u64)>,
@@ -20443,7 +20466,9 @@ impl QueryExecutor {
                     }
                 };
                 let offer_dist_local =
-                    |lh: &mut std::collections::BinaryHeap<(OrderedF32, u64)>, key: u64, dist: f32| {
+                    |lh: &mut std::collections::BinaryHeap<(OrderedF32, u64)>,
+                     key: u64,
+                     dist: f32| {
                         let cand = (OrderedF32(dist), key);
                         if lh.len() < k {
                             lh.push(cand);
@@ -20572,7 +20597,8 @@ impl QueryExecutor {
                 &segs[..]
             })
             .iter()
-            .rev() {
+            .rev()
+            {
                 let n = seg.sst.num_rows;
                 // 🔑 Seed tombstones even when this segment's VECTOR column is
                 // unusable for scoring. A tombstone-only segment stores NULL
@@ -20820,8 +20846,7 @@ impl QueryExecutor {
                 for cstart in (0..n).step_by(rows_per_chunk) {
                     let cend = (cstart + rows_per_chunk).min(n);
                     let need = (cend - cstart) * stride;
-                    let Ok(bytes) = seg.sst.read_bytes_at(data_base + cstart * stride, need)
-                    else {
+                    let Ok(bytes) = seg.sst.read_bytes_at(data_base + cstart * stride, need) else {
                         break;
                     };
                     for i in cstart..cend {
@@ -22090,8 +22115,9 @@ impl QueryExecutor {
                         value_row.len()
                     )));
                 }
-                let row =
-                    crate::sql::row_converter::values_to_row_by_columns(value_row, columns, schema)?;
+                let row = crate::sql::row_converter::values_to_row_by_columns(
+                    value_row, columns, schema,
+                )?;
                 rows.push(row);
             }
         }

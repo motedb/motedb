@@ -666,8 +666,7 @@ impl ColumnarRowSet {
 
         for (col_idx, col_array) in self.data.iter().enumerate() {
             let valid = self.validity.get(col_idx);
-            let is_null_at =
-                |row_idx: usize| valid.map_or(false, |b| b.is_null(row_idx));
+            let is_null_at = |row_idx: usize| valid.map_or(false, |b| b.is_null(row_idx));
             let mut put = |row_idx: usize, v: Value| {
                 let n = if is_null_at(row_idx) { Value::Null } else { v };
                 rows[row_idx].push(n);

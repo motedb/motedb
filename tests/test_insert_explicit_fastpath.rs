@@ -2,7 +2,7 @@
 //! row_id=PK 语义 / 批内与存量唯一性 + 回滚 / auto-inc 表 counter 越位 /
 //! 负值 PK 回退慢路径 / 重开一致 / 后续 UPDATE/DELETE 的 pk_cache 精确性。
 use motedb::types::Value;
-use motedb::{Database, DBConfig};
+use motedb::{DBConfig, Database};
 use tempfile::TempDir;
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
@@ -38,14 +38,21 @@ fn row_id_equals_pk() {
     let mut config = DBConfig::for_testing();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v FLOAT)")
+        .unwrap();
     db.insert_rows("t", mk_rows(1000, 500, 1.0)).unwrap();
     assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 500);
     // 点查 (row_id 二分路径)
     let r = rows(&db, "SELECT s, v FROM t WHERE id = 1234");
-    assert_eq!(r, vec![vec![Value::Text("row-1234".into()), Value::Float(235.0)]]);
+    assert_eq!(
+        r,
+        vec![vec![Value::Text("row-1234".into()), Value::Float(235.0)]]
+    );
     // 范围 + ORDER BY id
-    let r = rows(&db, "SELECT id FROM t WHERE id >= 1495 ORDER BY id DESC LIMIT 3");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE id >= 1495 ORDER BY id DESC LIMIT 3",
+    );
     assert_eq!(
         r,
         vec![
@@ -63,7 +70,8 @@ fn intra_batch_duplicate_errors_cleanly() {
     let mut config = DBConfig::for_testing();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v FLOAT)")
+        .unwrap();
     let mut batch = mk_rows(10, 150, 1.0);
     batch[149][0] = Value::Integer(10); // 与首行重复
     let err = db.insert_rows("t", batch);
@@ -84,12 +92,14 @@ fn autoinc_table_explicit_ids_counter_bumps() {
     let mut config = DBConfig::for_testing();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, s TEXT, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, s TEXT, v FLOAT)")
+        .unwrap();
     db.insert_rows("t", mk_rows(5000, 150, 1.0)).unwrap();
     let r = rows(&db, "SELECT s FROM t WHERE id = 5149");
     assert_eq!(r, vec![vec![Value::Text("row-5149".into())]]);
     // 后续 auto 分配必须 > 5149
-    db.execute("INSERT INTO t (s, v) VALUES ('auto', 9.0)").unwrap();
+    db.execute("INSERT INTO t (s, v) VALUES ('auto', 9.0)")
+        .unwrap();
     let r = rows(&db, "SELECT id FROM t WHERE s = 'auto'");
     match &r[0][0] {
         Value::Integer(id) => assert!(*id > 5149, "auto id {} must exceed explicit max", id),
@@ -104,7 +114,8 @@ fn negative_pk_falls_back_correctly() {
     let mut config = DBConfig::for_testing();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v FLOAT)")
+        .unwrap();
     let batch: Vec<Vec<Value>> = (0..150)
         .map(|i| {
             vec![
@@ -128,7 +139,8 @@ fn reopen_and_crud_after_fastpath() {
         let mut config = DBConfig::for_testing();
         config.max_result_rows = None;
         let db = Database::create_with_config(dir.path(), config).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v FLOAT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v FLOAT)")
+            .unwrap();
         db.insert_rows("t", mk_rows(1, 300, 1.0)).unwrap();
         db.execute("UPDATE t SET v = 99.5 WHERE id = 150").unwrap();
         db.execute("DELETE FROM t WHERE id = 151").unwrap();

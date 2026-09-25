@@ -856,14 +856,7 @@ impl MoteDB {
     ) -> Result<u64> {
         let mut n = 0u64;
         for (row_id, old_row, new_row) in updates {
-            self.update_row_with_schema_impl(
-                table_name,
-                row_id,
-                &old_row,
-                new_row,
-                schema,
-                true,
-            )?;
+            self.update_row_with_schema_impl(table_name, row_id, &old_row, new_row, schema, true)?;
             n += 1;
         }
         self.wal.wal_group_barrier();
@@ -976,12 +969,7 @@ impl MoteDB {
         // 6. Write to WAL first (durability) — raw bytes
         if defer_wal {
             self.wal.log_update_raw_ref_deferred(
-                table_name,
-                partition,
-                row_id,
-                &raw_old,
-                &raw_new,
-                0,
+                table_name, partition, row_id, &raw_old, &raw_new, 0,
             )?;
         } else {
             self.wal
@@ -3420,9 +3408,10 @@ impl MoteDB {
         if schema.is_primary_key_auto_increment() {
             let max_id = row_ids.iter().copied().max().unwrap_or(0) as i64;
             if let Some(counter) = self.table_auto_increment.get(table_name) {
-                counter
-                    .value()
-                    .fetch_max(max_id.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+                counter.value().fetch_max(
+                    max_id.saturating_add(1),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
         self.fast_batch_insert_with_ids(table_name, rows, schema, row_ids)

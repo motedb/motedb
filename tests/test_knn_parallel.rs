@@ -2,7 +2,7 @@
 //! 期望值由测试内暴力计算; 覆盖 UPDATE (newest-wins 去重) / DELETE
 //! (墓碑声明, 无幽灵行) / cosine / 空 NULL 向量。
 use motedb::types::Value;
-use motedb::{Database, DBConfig};
+use motedb::{DBConfig, Database};
 use tempfile::TempDir;
 
 const N: usize = 60_000; // > PARALLEL_MORSEL_MIN_ROWS(20K): 并行分支必走
@@ -83,8 +83,9 @@ fn knn_parallel_matches_bruteforce() {
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
     db.execute(&format!(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, emb VECTOR({}))"
-    , DIM))
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, emb VECTOR({}))",
+        DIM
+    ))
     .unwrap();
     // 两个 30K 批 (两段, 各 ≥20K → 并行分支)
     for batch_start in [0usize, 30_000] {
@@ -138,10 +139,7 @@ fn knn_parallel_matches_bruteforce() {
 
     // DELETE 700 行: 结果必须排除且不缺行 (幽灵行/丢行双向检查)
     db.execute("DELETE FROM t WHERE id > 59300").unwrap();
-    let live3: Vec<(i64, Vec<f32>)> = live2
-        .into_iter()
-        .filter(|(id, _)| *id <= 59300)
-        .collect();
+    let live3: Vec<(i64, Vec<f32>)> = live2.into_iter().filter(|(id, _)| *id <= 59300).collect();
     for qi in [0usize, 42] {
         let q = gen_vec(qi, 7);
         let got = knn_ids(&db, "l2", &q, 10);
@@ -151,7 +149,8 @@ fn knn_parallel_matches_bruteforce() {
     }
 
     // NULL 向量行不参与
-    db.execute("INSERT INTO t (id, emb) VALUES (999999, NULL)").unwrap();
+    db.execute("INSERT INTO t (id, emb) VALUES (999999, NULL)")
+        .unwrap();
     let q = gen_vec(5, 7);
     let got = knn_ids(&db, "l2", &q, 10);
     assert_eq!(got.len(), 10);

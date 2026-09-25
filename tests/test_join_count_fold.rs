@@ -2,7 +2,7 @@
 //! ON 常量真/假、单表 ON 谓词、WHERE 单表下推、多步链 — 与通用路径 (禁用
 //! 折叠的等价 SQL 形状) 对拍必须全等。
 use motedb::types::Value;
-use motedb::{Database, DBConfig};
+use motedb::{DBConfig, Database};
 use tempfile::TempDir;
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
@@ -24,18 +24,12 @@ fn setup(dir: &TempDir) -> Database {
     let mut config = DBConfig::for_testing();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
-    db.execute(
-        "CREATE TABLE a (id INTEGER PRIMARY KEY AUTO_INCREMENT, x INTEGER, t TEXT)",
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE b (id INTEGER PRIMARY KEY AUTO_INCREMENT, y INTEGER)",
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE c (id INTEGER PRIMARY KEY AUTO_INCREMENT, z INTEGER)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY AUTO_INCREMENT, x INTEGER, t TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY AUTO_INCREMENT, y INTEGER)")
+        .unwrap();
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY AUTO_INCREMENT, z INTEGER)")
+        .unwrap();
     let a_rows: Vec<Vec<Value>> = (0..500)
         .map(|i| {
             vec![
@@ -65,7 +59,10 @@ fn constant_true_on_folds_to_product() {
     let db = setup(&dir);
     // 500 × 300
     assert_eq!(count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1=1"), 150_000);
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM a JOIN b ON 2 > 1"), 150_000);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM a JOIN b ON 2 > 1"),
+        150_000
+    );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1=1 AND 3 = 3"),
         150_000
@@ -85,7 +82,10 @@ fn constant_false_on_is_zero() {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1=0"), 0);
     assert_eq!(count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1 > 2"), 0);
     // 混合: 真与假合取 → 0
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1=1 AND 1=0"), 0);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1=1 AND 1=0"),
+        0
+    );
     // NULL 比较 → UNKNOWN → falsy → 0
     assert_eq!(count(&db, "SELECT COUNT(*) FROM a JOIN b ON NULL = 1"), 0);
 }
@@ -98,7 +98,10 @@ fn single_table_on_pred_factores() {
     // a.x % 7 < 3 → x∈{0,1,2}: i%7 ∈ {0,1,2} 的行数
     let a_pred = count(&db, "SELECT COUNT(*) FROM a WHERE a.x < 3");
     let expect = a_pred * 300;
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM a JOIN b ON a.x < 3"), expect);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM a JOIN b ON a.x < 3"),
+        expect
+    );
     // 谓词在 b 侧
     let b_pred = count(&db, "SELECT COUNT(*) FROM b WHERE b.y = 5");
     assert_eq!(
@@ -120,12 +123,18 @@ fn where_pushdown_combines_with_on() {
     let a_p = count(&db, "SELECT COUNT(*) FROM a WHERE a.x < 3");
     let b_p = count(&db, "SELECT COUNT(*) FROM b WHERE b.y >= 8");
     assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1=1 WHERE a.x < 3 AND b.y >= 8"),
+        count(
+            &db,
+            "SELECT COUNT(*) FROM a JOIN b ON 1=1 WHERE a.x < 3 AND b.y >= 8"
+        ),
         a_p * b_p
     );
     // 谓词同时在 ON 和 WHERE
     assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM a JOIN b ON a.x < 3 WHERE a.x < 2"),
+        count(
+            &db,
+            "SELECT COUNT(*) FROM a JOIN b ON a.x < 3 WHERE a.x < 2"
+        ),
         count(&db, "SELECT COUNT(*) FROM a WHERE a.x < 2") * 300
     );
 }
@@ -137,7 +146,10 @@ fn cross_table_on_still_correct() {
     let db = setup(&dir);
     // 等值: a.x = b.y — hash join
     let equi = count(&db, "SELECT COUNT(*) FROM a JOIN b ON a.x = b.y");
-    assert_eq!(equi, count(&db, "SELECT COUNT(*) FROM a JOIN b ON a.x = b.y"));
+    assert_eq!(
+        equi,
+        count(&db, "SELECT COUNT(*) FROM a JOIN b ON a.x = b.y")
+    );
     // 与物化路径对拍: 加一个恒假的单表谓词强制非折叠形状? 更直接:
     // 用 MOTE 语义 — b.y IS NOT NULL 形状 WHERE 不下推 → 通用路径对拍
     let v1 = count(&db, "SELECT COUNT(*) FROM a JOIN b ON a.x = b.y");
@@ -166,7 +178,10 @@ fn deleted_rows_excluded() {
     let db = setup(&dir);
     db.execute("DELETE FROM b WHERE b.y < 5").unwrap();
     let b_left = count(&db, "SELECT COUNT(*) FROM b");
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1=1"), 500 * b_left);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM a JOIN b ON 1=1"),
+        500 * b_left
+    );
 }
 
 /// 非可折叠 WHERE (跨表比较) → decline, 结果与手工一致 (通用路径)。

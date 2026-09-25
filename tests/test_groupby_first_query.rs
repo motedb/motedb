@@ -1,5 +1,5 @@
 use motedb::types::Value;
-use motedb::{Database, DBConfig};
+use motedb::{DBConfig, Database};
 use tempfile::TempDir;
 
 // 回归: 多段表上 GROUP BY 是首个需要 keys 的查询时, col_segment_group_by
@@ -45,13 +45,30 @@ fn groupby_first_query_multi_segment() {
                 _ => 0,
             })
             .sum();
-        println!("columns={:?} groups={} total={}", columns, rows.len(), total);
-        for r in rows.iter().take(3) { println!("  row: {:?}", r); }
-        let r2 = db.execute("SELECT id, device FROM s LIMIT 5").unwrap().materialize().unwrap();
-        if let motedb::sql::QueryResult::Select { rows: rr, .. } = r2 {
-            for r in rr.iter() { println!("  scan: {:?}", r); }
+        println!(
+            "columns={:?} groups={} total={}",
+            columns,
+            rows.len(),
+            total
+        );
+        for r in rows.iter().take(3) {
+            println!("  row: {:?}", r);
         }
-        let r3 = db.execute("SELECT COUNT(*) FROM s WHERE device = 'dev-000'").unwrap().materialize().unwrap();
+        let r2 = db
+            .execute("SELECT id, device FROM s LIMIT 5")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        if let motedb::sql::QueryResult::Select { rows: rr, .. } = r2 {
+            for r in rr.iter() {
+                println!("  scan: {:?}", r);
+            }
+        }
+        let r3 = db
+            .execute("SELECT COUNT(*) FROM s WHERE device = 'dev-000'")
+            .unwrap()
+            .materialize()
+            .unwrap();
         println!("dev-000 count: {:?}", r3);
         assert_eq!(rows.len(), 64, "64 device groups");
         assert_eq!(total, 100_000, "all rows counted");

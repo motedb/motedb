@@ -1,7 +1,7 @@
 //! INSERT ... SELECT 差分测试: 列序映射/WHERE 过滤/自插/参数化/事务/
 //! TimeSeries 表/错误形状 — 与手工期望及 VALUES 路径对拍。
 use motedb::types::Value;
-use motedb::{Database, DBConfig};
+use motedb::{DBConfig, Database};
 use tempfile::TempDir;
 
 fn setup(dir: &TempDir) -> Database {
@@ -61,13 +61,29 @@ fn basic_shapes() {
         vec![vec![Value::Integer(40)]]
     );
     let r = rows(&db, "SELECT v, t, n FROM dst WHERE n = 39");
-    assert_eq!(r, vec![vec![Value::Float(19.5), Value::Text("t4".into()), Value::Integer(39)]]);
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Float(19.5),
+            Value::Text("t4".into()),
+            Value::Integer(39)
+        ]]
+    );
     // 表达式投影 + 别名
-    db.execute("INSERT INTO dst (v, t, n) SELECT v * 2.0, 'lit', n + 1 FROM src WHERE n >= 40 AND n < 50")
-        .unwrap();
+    db.execute(
+        "INSERT INTO dst (v, t, n) SELECT v * 2.0, 'lit', n + 1 FROM src WHERE n >= 40 AND n < 50",
+    )
+    .unwrap();
     // src.n=44 → dst.n = n+1 = 45, v = 44*0.5*2 = 44.0
     let r = rows(&db, "SELECT v, t, n FROM dst WHERE n = 45");
-    assert_eq!(r, vec![vec![Value::Float(44.0), Value::Text("lit".into()), Value::Integer(45)]]);
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Float(44.0),
+            Value::Text("lit".into()),
+            Value::Integer(45)
+        ]]
+    );
 }
 
 /// 无列序: SELECT 输出必须按 schema 全宽 (含 NULL PK → auto)。
@@ -110,10 +126,7 @@ fn order_by_limit_source() {
     db.execute("INSERT INTO dst (v, t, n) SELECT v, t, n FROM src ORDER BY n DESC LIMIT 5")
         .unwrap();
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM dst"), Value::Integer(5));
-    assert_eq!(
-        scalar(&db, "SELECT MIN(n) FROM dst"),
-        Value::Integer(95)
-    );
+    assert_eq!(scalar(&db, "SELECT MIN(n) FROM dst"), Value::Integer(95));
 }
 
 /// JOIN 子查询源。
@@ -121,8 +134,10 @@ fn order_by_limit_source() {
 fn join_source() {
     let dir = TempDir::new().unwrap();
     let db = setup(&dir);
-    db.execute("CREATE TABLE dim (k INTEGER, label TEXT)").unwrap();
-    db.execute("INSERT INTO dim VALUES (1, 'one'), (2, 'two')").unwrap();
+    db.execute("CREATE TABLE dim (k INTEGER, label TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO dim VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
     db.execute(
         "INSERT INTO dst (v, t, n) SELECT s.v, d.label, s.n FROM src s JOIN dim d ON s.n = d.k",
     )
@@ -131,7 +146,10 @@ fn join_source() {
     let r = rows(&db, "SELECT t FROM dst ORDER BY n");
     assert_eq!(
         r,
-        vec![vec![Value::Text("one".into())], vec![Value::Text("two".into())]]
+        vec![
+            vec![Value::Text("one".into())],
+            vec![Value::Text("two".into())]
+        ]
     );
 }
 
@@ -181,7 +199,9 @@ fn parameterized_source() {
         )
         .unwrap();
     match r {
-        motedb::sql::StreamingQueryResult::Modification { affected_rows } => assert_eq!(affected_rows, 9),
+        motedb::sql::StreamingQueryResult::Modification { affected_rows } => {
+            assert_eq!(affected_rows, 9)
+        }
         _ => panic!("expected modification"),
     }
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM dst"), Value::Integer(9));
@@ -192,10 +212,8 @@ fn parameterized_source() {
 fn timeseries_target() {
     let dir = TempDir::new().unwrap();
     let db = setup(&dir);
-    db.execute(
-        "CREATE TABLE ts (time TIMESTAMP, device TEXT, val FLOAT) TIMESERIES(time)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE ts (time TIMESTAMP, device TEXT, val FLOAT) TIMESERIES(time)")
+        .unwrap();
     db.execute("INSERT INTO ts SELECT n, t, v FROM src WHERE n < 20")
         .unwrap();
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM ts"), Value::Integer(20));

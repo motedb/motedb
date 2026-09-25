@@ -2861,9 +2861,7 @@ impl ColSegmentStore {
         let need_dedup = self.may_have_duplicate_keys();
         let segs = self.segments_snapshot();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
-            std::collections::HashSet::with_capacity(
-                segs.iter().map(|s| s.sst.num_rows).sum(),
-            )
+            std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
         } else {
             std::collections::HashSet::new()
         };
@@ -2903,7 +2901,10 @@ impl ColSegmentStore {
 
         let mut result = MultiAggResult {
             rows: 0,
-            per_col: agg_cols.iter().map(|_| AggregateResult::default()).collect(),
+            per_col: agg_cols
+                .iter()
+                .map(|_| AggregateResult::default())
+                .collect(),
         };
 
         for seg in segs.iter().rev() {
@@ -2912,8 +2913,12 @@ impl ColSegmentStore {
                 let _ = seg.sst.load_full_keys();
             }
             // Decode each DISTINCT predicate column once per segment.
-            let mut preds: Vec<(usize, BinaryOperator, Option<FixedSegment>, Option<TextSegment>)> =
-                Vec::with_capacity(comparisons.len());
+            let mut preds: Vec<(
+                usize,
+                BinaryOperator,
+                Option<FixedSegment>,
+                Option<TextSegment>,
+            )> = Vec::with_capacity(comparisons.len());
             for (col, op, _) in comparisons.iter() {
                 if *col < seg.sst.column_tags.len() {
                     if seg.sst.column_tags[*col].is_fixed() {
@@ -3002,23 +3007,21 @@ impl ColSegmentStore {
                     let r = &mut result.per_col[ai];
                     if let Some(ref af) = fixed {
                         match tag {
-                            ColumnTypeTag::Float => {
-                                match af.get_f64(i) {
-                                    Some(v) => {
-                                        r.count += 1;
-                                        r.float_sum.add(v);
-                                        r.has_float = true;
-                                        if r.count == 1 {
-                                            r.min_float = v;
-                                            r.max_float = v;
-                                        } else {
-                                            r.min_float = r.min_float.min(v);
-                                            r.max_float = r.max_float.max(v);
-                                        }
+                            ColumnTypeTag::Float => match af.get_f64(i) {
+                                Some(v) => {
+                                    r.count += 1;
+                                    r.float_sum.add(v);
+                                    r.has_float = true;
+                                    if r.count == 1 {
+                                        r.min_float = v;
+                                        r.max_float = v;
+                                    } else {
+                                        r.min_float = r.min_float.min(v);
+                                        r.max_float = r.max_float.max(v);
                                     }
-                                    None => r.null_count += 1,
                                 }
-                            }
+                                None => r.null_count += 1,
+                            },
                             ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
                                 match af.get_i64(i) {
                                     Some(v) => {

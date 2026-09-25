@@ -2827,7 +2827,11 @@ pub(crate) fn round_f64_half_away(v: f64, decimals: i32) -> f64 {
         ri
     };
     let mag = out.parse::<f64>().unwrap_or(v);
-    if neg { -mag } else { mag }
+    if neg {
+        -mag
+    } else {
+        mag
+    }
 }
 
 #[cfg(test)]

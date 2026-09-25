@@ -344,7 +344,6 @@ mod tests {
     }
 }
 
-
 /// b 侧为盘上 LE f32 字节切片 (任意对齐) 的欧氏平方距离变体 — 流式 knn
 /// 直接喂 mmap 借出的列字节, 免对齐缓冲复制趟 (154MB 表 ~8-12ms)。
 /// aarch64 vld1q / x86 loadu 非对齐加载原生支持; 标量回退用 from_le_bytes

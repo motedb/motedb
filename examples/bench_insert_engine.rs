@@ -3,7 +3,7 @@
 //! 用法: cargo run --release --example bench_insert_engine [n_rows] [batch] [vec]
 //!   vec=0 → 标量表; vec=DIM → 含 VECTOR(DIM) 列
 use motedb::types::{ArcVec, Value};
-use motedb::{Database, DBConfig};
+use motedb::{DBConfig, Database};
 use std::sync::Arc;
 use std::time::Instant;
 

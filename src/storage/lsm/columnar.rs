@@ -418,7 +418,9 @@ impl RowMap {
     pub fn key_opt(&self, row_idx: usize) -> Option<u64> {
         let data = self.keys_data.as_ref()?;
         let s = data.slice(row_idx * 8, 8);
-        Some(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+        Some(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
     }
 
     /// Get the file offset where the full keys array starts.

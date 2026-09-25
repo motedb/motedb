@@ -229,9 +229,7 @@ impl QueryExecutor {
                     } else {
                         return Ok(None);
                     }
-                } else if let Some(comparisons) =
-                    Self::parse_where_comparisons(wc, &schema)
-                {
+                } else if let Some(comparisons) = Self::parse_where_comparisons(wc, &schema) {
                     // 🚀 COUNT(*) over a multi-term AND predicate: fused
                     // single-pass scan over raw column bytes. The old path
                     // returned None here → the materialized fallback decoded
@@ -578,9 +576,7 @@ impl QueryExecutor {
                             op: crate::sql::ast::UnaryOperator::Minus,
                             expr: inner,
                         } => match inner.as_ref() {
-                            Expr::Literal(Value::Integer(i)) => {
-                                i.checked_neg().map(Value::Integer)
-                            }
+                            Expr::Literal(Value::Integer(i)) => i.checked_neg().map(Value::Integer),
                             Expr::Literal(Value::Float(f)) => Some(Value::Float(-f)),
                             _ => None,
                         },
@@ -811,13 +807,11 @@ impl QueryExecutor {
                                     match a.func.as_str() {
                                         // COUNT(*) counts matching rows;
                                         // COUNT(col) counts non-NULL values.
-                                        "COUNT" => row.push(Value::Integer(
-                                            if a.col.is_none() {
-                                                stats.count + stats.null_count
-                                            } else {
-                                                stats.count
-                                            },
-                                        )),
+                                        "COUNT" => row.push(Value::Integer(if a.col.is_none() {
+                                            stats.count + stats.null_count
+                                        } else {
+                                            stats.count
+                                        })),
                                         // 🔑 Empty set: SUM/MIN/MAX/AVG → NULL.
                                         // SUM of an empty set is NULL (per SQL).
                                         "SUM" => {
@@ -1254,15 +1248,11 @@ impl QueryExecutor {
             let numeric_agg = |pos: usize| {
                 matches!(
                     schema.col_types().get(pos),
-                    Some(
-                        ColumnType::Integer
-                            | ColumnType::Float
-                            | ColumnType::Timestamp
-                    )
+                    Some(ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp)
                 )
             };
-            let preds_ok = comparisons.len() <= 8
-                && comparisons.iter().all(|(c, _, _)| scalar_pred(*c));
+            let preds_ok =
+                comparisons.len() <= 8 && comparisons.iter().all(|(c, _, _)| scalar_pred(*c));
             let aggs_ok = aggs.iter().all(|a| match (a.func.as_str(), a.col) {
                 ("COUNT", None) => true,
                 // COUNT(col): any scalar column (TEXT counts via the raw text
@@ -1283,11 +1273,12 @@ impl QueryExecutor {
                     }
                 }
                 let res = store.aggregate_multi_filtered(&comparisons, &agg_cols);
-                let agg_res = |a: &AggInfo| -> Option<&crate::storage::col_segment::AggregateResult> {
-                    a.col
-                        .and_then(|c| agg_cols.iter().position(|&x| x == c))
-                        .map(|i| &res.per_col[i])
-                };
+                let agg_res =
+                    |a: &AggInfo| -> Option<&crate::storage::col_segment::AggregateResult> {
+                        a.col
+                            .and_then(|c| agg_cols.iter().position(|&x| x == c))
+                            .map(|i| &res.per_col[i])
+                    };
                 let columns: Vec<String> = self
                     .build_select_columns(&stmt.columns, schema)
                     .unwrap_or_default();
@@ -1867,7 +1858,7 @@ impl QueryExecutor {
                     let off_bytes = ftext.offsets_bytes();
                     let str_bytes = ftext.strings_bytes();
                     // 🔑 u32: 组索引曾用 u16 — 超 65535 个不同组时静默截断错组。
-                        let mut row_groups: Vec<u32> = Vec::with_capacity(n);
+                    let mut row_groups: Vec<u32> = Vec::with_capacity(n);
                     const LINEAR_THRESHOLD: usize = 16;
                     let mut use_hash = group_keys.len() >= LINEAR_THRESHOLD;
                     for i in 0..n {

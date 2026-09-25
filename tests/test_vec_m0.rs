@@ -2,7 +2,7 @@
 //! 以及 ColumnarRowSet null 修复后的 to_row_based 还原。
 use motedb::sql::{Lexer, Parser, QueryExecutor};
 use motedb::types::Value;
-use motedb::{MoteDB};
+use motedb::MoteDB;
 use std::sync::Arc;
 
 fn ex(db: &Arc<MoteDB>, sql: &str) -> motedb::QueryResult {
@@ -45,10 +45,7 @@ fn segment_batch_roundtrip_matches_sql() {
         };
         ex(
             &db,
-            &format!(
-                "INSERT INTO t VALUES ({}, {}, {}, {}, {})",
-                i, v, b, s, ts
-            ),
+            &format!("INSERT INTO t VALUES ({}, {}, {}, {}, {})", i, v, b, s, ts),
         );
     }
     db.checkpoint().unwrap();
@@ -135,12 +132,32 @@ fn columnar_row_set_null_alignment() {
     // 50 行: i%3==0 → a/c NULL, 其余 → b NULL; d/ts 混 NULL
     for i in 0..50i64 {
         let row = vec![
-            if i % 3 == 0 { Value::Null } else { Value::Integer(i) },
-            if i % 3 == 0 { Value::text(format!("x{}", i)) } else { Value::Null },
-            if i % 3 == 0 { Value::Null } else { Value::Float(i as f64 * 0.5) },
-            if i % 5 == 0 { Value::Null } else { Value::Bool(i % 2 == 0) },
-            if i % 7 == 0 { Value::Null } else {
-                Value::Timestamp(motedb::types::Timestamp::from_micros(1_700_000_000_000_000 + i))
+            if i % 3 == 0 {
+                Value::Null
+            } else {
+                Value::Integer(i)
+            },
+            if i % 3 == 0 {
+                Value::text(format!("x{}", i))
+            } else {
+                Value::Null
+            },
+            if i % 3 == 0 {
+                Value::Null
+            } else {
+                Value::Float(i as f64 * 0.5)
+            },
+            if i % 5 == 0 {
+                Value::Null
+            } else {
+                Value::Bool(i % 2 == 0)
+            },
+            if i % 7 == 0 {
+                Value::Null
+            } else {
+                Value::Timestamp(motedb::types::Timestamp::from_micros(
+                    1_700_000_000_000_000 + i,
+                ))
             },
         ];
         let bytes = encode(&row, &cts).unwrap();
@@ -164,11 +181,21 @@ fn columnar_row_set_null_alignment() {
         if fi % 3 == 0 {
             assert!(matches!(r[0], Value::Null), "行{} a", i);
         } else {
-            assert!(matches!(&r[0], Value::Integer(v) if *v == fi), "行{} a={:?}", i, r[0]);
+            assert!(
+                matches!(&r[0], Value::Integer(v) if *v == fi),
+                "行{} a={:?}",
+                i,
+                r[0]
+            );
         }
         // b (与 a 反相)
         if fi % 3 == 0 {
-            assert!(matches!(&r[1], Value::Text(t) if t.len() == 2 + i.to_string().len() - i.to_string().len() || !t.is_empty()), "行{} b={:?}", i, r[1]);
+            assert!(
+                matches!(&r[1], Value::Text(t) if t.len() == 2 + i.to_string().len() - i.to_string().len() || !t.is_empty()),
+                "行{} b={:?}",
+                i,
+                r[1]
+            );
         } else {
             assert!(matches!(r[1], Value::Null), "行{} b", i);
         }
@@ -238,7 +265,10 @@ fn vec_no_group_aggregate_matches_expectations() {
             qsum += i % 11 - 5;
         }
     }
-    let r = rows(&db, "SELECT COUNT(*), COUNT(val), SUM(val), MIN(val), MAX(val), SUM(qty) FROM t");
+    let r = rows(
+        &db,
+        "SELECT COUNT(*), COUNT(val), SUM(val), MIN(val), MAX(val), SUM(qty) FROM t",
+    );
     assert_eq!(
         r[0],
         vec![
@@ -252,7 +282,10 @@ fn vec_no_group_aggregate_matches_expectations() {
     );
 
     // WHERE + BETWEEN + OR/NOT 三值
-    let r = rows(&db, "SELECT COUNT(*), AVG(val) FROM t WHERE id BETWEEN 50 AND 350 AND qty > 0");
+    let r = rows(
+        &db,
+        "SELECT COUNT(*), AVG(val) FROM t WHERE id BETWEEN 50 AND 350 AND qty > 0",
+    );
     let mut w = 0i64;
     let mut wsum = 0.0;
     let mut wnn = 0i64;
@@ -269,7 +302,10 @@ fn vec_no_group_aggregate_matches_expectations() {
         o => panic!("{:?}", o),
     }
 
-    let r = rows(&db, "SELECT COUNT(*) FROM t WHERE dev = 'dev-003' OR qty IS NULL");
+    let r = rows(
+        &db,
+        "SELECT COUNT(*) FROM t WHERE dev = 'dev-003' OR qty IS NULL",
+    );
     let mut orc = 0i64;
     for i in 1..=400i64 {
         if i % 8 == 3 || i % 7 == 0 {
@@ -294,11 +330,20 @@ fn vec_no_group_aggregate_matches_expectations() {
 fn pk_point_query_respects_offset() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("off.mote")).unwrap());
-    ex(&db, "CREATE TABLE items (id INT PRIMARY KEY, cat TEXT, val REAL, qty INT)");
+    ex(
+        &db,
+        "CREATE TABLE items (id INT PRIMARY KEY, cat TEXT, val REAL, qty INT)",
+    );
     for i in 1..=20i64 {
         ex(
             &db,
-            &format!("INSERT INTO items VALUES ({}, 'c{}', {}, {})", i, i % 3, i, i),
+            &format!(
+                "INSERT INTO items VALUES ({}, 'c{}', {}, {})",
+                i,
+                i % 3,
+                i,
+                i
+            ),
         );
     }
     let r = rows(
@@ -338,7 +383,10 @@ fn vec_group_by_matches_expectations() {
     db.checkpoint().unwrap();
 
     // 手工期望: id % 5 分组 COUNT(*) / SUM(qty) (qty 跳 NULL)
-    let r = rows(&db, "SELECT id % 5, COUNT(*), SUM(qty) FROM t GROUP BY id % 5 ORDER BY 1");
+    let r = rows(
+        &db,
+        "SELECT id % 5, COUNT(*), SUM(qty) FROM t GROUP BY id % 5 ORDER BY 1",
+    );
     let mut want: Vec<(i64, i64, i64)> = Vec::new();
     for m in 0..5i64 {
         let mut c = 0;
@@ -401,16 +449,16 @@ fn vec_group_by_matches_expectations() {
 fn vec_equi_join_group_by_matches_expectations() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(MoteDB::create(tmp.path().join("m3.mote")).unwrap());
-    ex(&db, "CREATE TABLE ev (id INT PRIMARY KEY, dev TEXT, val REAL, qty INT)");
+    ex(
+        &db,
+        "CREATE TABLE ev (id INT PRIMARY KEY, dev TEXT, val REAL, qty INT)",
+    );
     ex(&db, "CREATE TABLE sen (dev TEXT PRIMARY KEY, zone INT)");
     for i in 1..=300i64 {
         let (v, q) = if i % 7 == 0 {
             ("NULL".into(), "NULL".into())
         } else {
-            (
-                format!("{:.3}", i as f64 * 0.5),
-                (i % 11 - 5).to_string(),
-            )
+            (format!("{:.3}", i as f64 * 0.5), (i % 11 - 5).to_string())
         };
         ex(
             &db,
@@ -424,7 +472,10 @@ fn vec_equi_join_group_by_matches_expectations() {
         );
     }
     for d in 0..8i64 {
-        ex(&db, &format!("INSERT INTO sen VALUES ('dev-{:02}', {})", d, d % 3));
+        ex(
+            &db,
+            &format!("INSERT INTO sen VALUES ('dev-{:02}', {})", d, d % 3),
+        );
     }
     db.checkpoint().unwrap();
 
@@ -475,7 +526,10 @@ fn vec_equi_join_group_by_matches_expectations() {
     }
 
     // 整型 join 键 + 表达式组键 + 双侧 WHERE
-    ex(&db, "CREATE TABLE ev2 (id INT PRIMARY KEY, dev_id INT, v REAL)");
+    ex(
+        &db,
+        "CREATE TABLE ev2 (id INT PRIMARY KEY, dev_id INT, v REAL)",
+    );
     ex(&db, "CREATE TABLE sen2 (dev_id INT PRIMARY KEY, zone INT)");
     for i in 1..=200i64 {
         ex(
