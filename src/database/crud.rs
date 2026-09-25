@@ -3502,21 +3502,23 @@ impl MoteDB {
                 | crate::config::DurabilityLevel::Periodic { .. }
         );
         if durable {
-            let wal_records: Vec<crate::txn::wal::WALRecord> = store_rows
+            // 🔑 借用式 WAL: 直接从 store_rows 的 &Row 序列化 — 免整行
+            // clone (384 维向量行 clone 是 GroupCommit 档加载吞吐的主要
+            // 差额; 原型 clone 版实测 174K, 借用版见 README)。
+            let wal_rows: Vec<(RowId, PartitionId, &Row)> = store_rows
                 .iter()
                 .map(|(key, _, row)| {
                     let rid = key & 0xFFFFFFFF;
-                    crate::txn::wal::WALRecord::Insert {
-                        table_name: table_name.to_string(),
-                        row_id: rid,
-                        partition: (self.make_composite_key(table_name, rid)
+                    (
+                        rid,
+                        (self.make_composite_key(table_name, rid)
                             % self.num_partitions as u64) as PartitionId,
-                        data: row.clone(),
-                        txn_id: 0,
-                    }
+                        row,
+                    )
                 })
                 .collect();
-            self.wal.batch_append(0, wal_records)?;
+            self.wal
+                .batch_append_rows(0, table_name, &wal_rows, 0)?;
         }
         let __ta = std::time::Instant::now();
         store.append_rows(&store_rows)?;

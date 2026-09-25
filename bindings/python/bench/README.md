@@ -1651,3 +1651,20 @@ load 97K (executemany .tolist() 口径) / 查询 RSS 全形状 ≈0 / steady
 
 验证: crash 重放手工复现 1300/1300 + test_insert_explicit_fastpath 5/5 +
 test_insert_engine 3/3 + 全量门槛与套件 (下)。
+
+## WAL 序列化零 clone — 假设证伪, 借用版保留
+
+耐久性门后的假设: WALRecord::Insert 的整行 clone 是 GroupCommit 档加载
+的主要差额, `batch_append` 借用化 (直接从 &Row 序列化 — bincode 本就
+借用; 字节格式与 Insert/InsertRaw 逐位一致, 重放走既有解码器) 可把
+174K 拉回 250K+。
+
+**实测证伪**: clone 版 171-174K vs 借用版 167-169K (噪声内持平)。差额
+的真正构成是 WAL 序列化 + 写盘本身 (100K×384 行 = 160MB 额外 bincode
+编码与 IO) — 耐久性的固有价格, 不是 clone。借用版保留 (少一份整行
+materialize, 分配更少, 代码更直白); crash 契约复验 1300/1300 ✓。
+
+GroupCommit 档的加载吞吐地板因此定格 ~170K (战役前 62K 的 2.7×);
+需要 286K 的批量导入场景用 NoSync/Periodic preset (尾部丢失是契约)。
+更进一步的路径是 WAL 消除 (段文件直写 + manifest/段双 fsync 替代 WAL
+重放), 属另线战役。
