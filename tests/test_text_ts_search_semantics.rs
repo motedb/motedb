@@ -11,6 +11,8 @@
 //!    both (partial flush) hid every earlier document;
 //!  * the unranked path INTERSECTED multi-term postings while the ranked path
 //!    unioned them — same query, different sets with and without LIMIT;
+//!    (since 0.12 the default is FTS5-style AND with explicit `a OR b`
+//!    groups — see match_and_or_group_semantics_on_every_path);
 //!  * `MATCH(c, q) AND other` silently dropped the other predicate, and
 //!    COUNT(*) WHERE MATCH returned one row per match instead of a count;
 //!  * the unindexed fallback answered an AND-of-substrings check.
@@ -113,7 +115,8 @@ fn bm25_ranking_survives_backfill_auto_flush() {
 #[test]
 fn match_set_semantics_with_and_without_limit_and_index() {
     let (db, _d, _docs) = text_db(4_000);
-    // 'apple banana' must be the OR union on every path.
+    // 'apple banana' must be the AND intersection on every path (every doc
+    // in this corpus holds both words, so the set equals the full corpus).
     let with_limit = ids(
         &db,
         "SELECT id FROM d WHERE MATCH(content, 'apple banana') LIMIT 1000000",
@@ -152,7 +155,7 @@ fn match_set_semantics_with_and_without_limit_and_index() {
     assert_eq!(
         no_index.len(),
         33,
-        "no-index MATCH: OR semantics (33 docs + …)"
+        "no-index MATCH: AND semantics (apple AND banana live in the same 33 docs)"
     );
     // The no-index COUNT path must agree with the row path.
     assert_eq!(
@@ -161,6 +164,144 @@ fn match_set_semantics_with_and_without_limit_and_index() {
             "SELECT COUNT(*) FROM n WHERE MATCH(content, 'apple banana')"
         ),
         Value::Integer(33)
+    );
+}
+
+/// 🔒 B0 semantics: default AND, explicit `OR` groups — and every path
+/// (index fast path, no-index fallback, COUNT fast path, ranked vs
+/// unranked, with and without LIMIT) must agree on the same set.
+///
+/// Corpus is deliberately PARTIAL-overlap: docs 1-30 hold `alpha`, 11-40
+/// hold `beta` (so alpha AND beta = 11-30, alpha OR beta = 1-40), and one
+/// doc holds `alpha` without `beta` to catch a flat-OR regression.
+#[test]
+fn match_and_or_group_semantics_on_every_path() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create_with_config(dir.path(), DBConfig::for_testing()).unwrap();
+    db.execute("CREATE TABLE d (id INT PRIMARY KEY, content TEXT)")
+        .unwrap();
+    let mut vals = Vec::new();
+    for i in 1..=50 {
+        let doc = if (11..=30).contains(&i) {
+            "alpha beta gamma" // both terms
+        } else if (1..=10).contains(&i) || (31..=40).contains(&i) {
+            if i <= 10 {
+                "alpha delta"
+            } else {
+                "beta delta"
+            } // exactly one
+        } else {
+            "gamma delta"
+        };
+        vals.push(format!("({}, '{}')", i, doc));
+    }
+    db.execute(&format!("INSERT INTO d VALUES {}", vals.join(",")))
+        .unwrap();
+    db.execute("CREATE TEXT INDEX d_content ON d(content)")
+        .unwrap();
+
+    let expect_and: Vec<i64> = (11..=30).collect();
+    let expect_or: Vec<i64> = (1..=40).collect();
+
+    // AND: index path (ranked w/ LIMIT, unranked w/o LIMIT)…
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM d WHERE MATCH(content, 'alpha beta') ORDER BY id"
+        ),
+        expect_and,
+        "index ranked path: AND"
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM d WHERE MATCH(content, 'alpha beta') LIMIT 1000000"
+        ),
+        expect_and.clone(),
+        "index LIMIT path: AND"
+    );
+    // …COUNT fast path…
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM d WHERE MATCH(content, 'alpha beta')"
+        ),
+        Value::Integer(20)
+    );
+    // …and the ranked/unranked sets agree.
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM d WHERE MATCH(content, 'alpha beta') LIMIT 1000000"
+        ),
+        ids(
+            &db,
+            "SELECT id FROM d WHERE MATCH(content, 'alpha beta') ORDER BY id"
+        )
+    );
+
+    // Explicit OR: union of groups on every path.
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM d WHERE MATCH(content, 'alpha OR beta') ORDER BY id"
+        ),
+        expect_or,
+        "index path: explicit OR"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM d WHERE MATCH(content, 'alpha OR beta')"
+        ),
+        Value::Integer(40)
+    );
+
+    // Unknown term ANDs to nothing; OR is the escape hatch.
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM d WHERE MATCH(content, 'alpha zzzqqq') LIMIT 5"
+        )
+        .len(),
+        0
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM d WHERE MATCH(content, 'alpha OR zzzqqq') ORDER BY id"
+        ),
+        (1..=30).collect::<Vec<i64>>()
+    );
+
+    // No-index fallback table with the identical corpus must agree.
+    db.execute("CREATE TABLE n (id INT PRIMARY KEY, content TEXT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO n VALUES {}", vals.join(",")))
+        .unwrap();
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM n WHERE MATCH(content, 'alpha beta') ORDER BY id"
+        ),
+        expect_and,
+        "no-index fallback: AND"
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM n WHERE MATCH(content, 'alpha OR beta') ORDER BY id"
+        ),
+        expect_or,
+        "no-index fallback: OR"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM n WHERE MATCH(content, 'alpha beta')"
+        ),
+        Value::Integer(20),
+        "no-index COUNT: AND"
     );
 }
 
@@ -633,8 +774,8 @@ fn count_where_match_uses_index_postings() {
             &db,
             "SELECT COUNT(*) AS n FROM d WHERE MATCH(content, 'banana elephant')"
         ),
-        Value::Integer(n_match), // every doc contains both
-        "alias + two-token OR"
+        Value::Integer(n_match), // every doc contains both terms
+        "alias + two-token AND"
     );
     assert_eq!(
         scalar(

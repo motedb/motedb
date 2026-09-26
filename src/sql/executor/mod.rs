@@ -12098,14 +12098,27 @@ impl QueryExecutor {
                 ) {
                     (Some(t), Some(r)) => (t, r),
                     _ => {
+                        // Same OR-of-AND-groups semantics as the index path
+                        // (default AND, explicit `a OR b`).
                         use crate::index::tokenizers::{Tokenizer as _, WhitespaceTokenizer};
                         match row.get(column) {
                             Some(Value::Text(text)) => {
                                 let tok = WhitespaceTokenizer::default();
-                                let q: Vec<String> =
-                                    tok.tokenize(query).iter().map(|t| t.text.clone()).collect();
+                                let groups = crate::index::expand_groups(
+                                    crate::index::parse_query_groups(query),
+                                    |w| {
+                                        tok.tokenize(w)
+                                            .into_iter()
+                                            .map(|t| t.text)
+                                            .collect::<Vec<_>>()
+                                    },
+                                );
+                                let text_tokens: std::collections::HashSet<String> =
+                                    tok.tokenize(text).into_iter().map(|t| t.text).collect();
                                 return Ok(Value::Bool(
-                                    tok.tokenize(text).iter().any(|t| q.contains(&t.text)),
+                                    groups
+                                        .iter()
+                                        .any(|g| g.iter().all(|t| text_tokens.contains(t))),
                                 ));
                             }
                             _ => return Ok(Value::Bool(false)),
@@ -20157,13 +20170,21 @@ impl QueryExecutor {
         let schema = self.db.get_table_schema(table)?;
         let col_pos = schema.get_column_position(column).unwrap_or(0);
         let tok = WhitespaceTokenizer::default();
-        let q_tokens: Vec<String> = tok.tokenize(query).iter().map(|t| t.text.clone()).collect();
+        // OR-of-AND-groups — same semantics as the index path (default AND,
+        // explicit `a OR b`).
+        let groups = crate::index::expand_groups(crate::index::parse_query_groups(query), |w| {
+            tok.tokenize(w)
+                .into_iter()
+                .map(|t| t.text)
+                .collect::<Vec<_>>()
+        });
         let mut ids = Vec::new();
         let mut matches = |id: u64, text: &str| {
-            if tok
-                .tokenize(text)
+            let text_tokens: std::collections::HashSet<String> =
+                tok.tokenize(text).into_iter().map(|t| t.text).collect();
+            if groups
                 .iter()
-                .any(|t| q_tokens.contains(&t.text))
+                .any(|g| g.iter().all(|t| text_tokens.contains(t)))
             {
                 ids.push(id);
             }

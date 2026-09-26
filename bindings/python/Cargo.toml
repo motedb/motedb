@@ -1,6 +1,6 @@
 [package]
 name = "motedb-python"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 description = "Python bindings for MoteDB — AI-native embedded multimodal database."
 license = "MIT"

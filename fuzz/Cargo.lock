@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "motedb"
-version = "0.9.1"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "bincode",

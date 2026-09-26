@@ -45,6 +45,24 @@ def tokenize(text):
     return [t for t in TOKEN_RE.split(text.lower()) if 1 <= len(t) <= 64]
 
 
+def parse_groups(query):
+    """Mirror src/index/text_query.rs: uppercase OR splits OR-of-AND groups,
+    uppercase AND is a no-op separator, everything else is a term."""
+    groups, current = [], []
+    for w in [w for w in TOKEN_RE.split(query) if w]:
+        if w == "OR":
+            if current:
+                groups.append(current)
+                current = []
+        elif w == "AND":
+            pass
+        else:
+            current.append(w.lower())
+    if current:
+        groups.append(current)
+    return [sorted(set(g)) for g in groups if g]
+
+
 class ReferenceBM25:
     def __init__(self, docs, quantize_fieldnorm=False):
         self.docs = [tokenize(d) for d in docs]
@@ -73,9 +91,17 @@ class ReferenceBM25:
         return float(np.log(1.0 + (self.N - df + 0.5) / (df + 0.5)))
 
     def match_set(self, query):
-        """Docs containing ≥1 query token (the engine's OR semantics)."""
-        terms = tokenize(query)
-        return {i for i, d in enumerate(self.docs) if any(t in d for t in terms)}
+        """OR-of-AND-groups (the engine's FTS5-compatible semantics since
+        0.12): a doc matches when it contains every token of at least one
+        group; uppercase OR splits groups, implicit AND within a group."""
+        groups = parse_groups(query)
+        if not groups:
+            return set()
+        return {
+            i
+            for i, d in enumerate(self.docs)
+            if any(all(t in d for t in g) for g in groups)
+        }
 
     def score(self, i, terms):
         s = 0.0
@@ -186,7 +212,7 @@ def main():
             if truth or got:
                 prec.append(inter / len(got) if got else 1.0)
                 rec.append(inter / len(truth) if truth else 1.0)
-        log(f"  MATCH set vs reference OR-set: precision {np.mean(prec):.4f}  recall {np.mean(rec):.4f}   [{lat_str(lat)}]")
+        log(f"  MATCH set vs reference AND-group set: precision {np.mean(prec):.4f}  recall {np.mean(rec):.4f}   [{lat_str(lat)}]")
         results["match_set"] = {"precision": float(np.mean(prec)), "recall": float(np.mean(rec)),
                                 "latency_ms_avg": float(np.mean(lat) * 1e3)}
 
@@ -226,17 +252,17 @@ def main():
         for label, q, expect_any in [
             ("upper-case query", queries[0].upper(), True),
             ("unknown term only", "zzzqqqxyzzw", False),
-            ("term + unknown", f"{queries[0]} zzzqqqxyzzw", True),
+            # AND semantics: a known term ANDed with an unknown one is empty.
+            ("term AND unknown", f"{queries[0]} zzzqqqxyzzw", False),
+            # …while explicit OR is the escape hatch back to the term alone.
+            ("term OR unknown", f"{queries[0]} OR zzzqqqxyzzw", True),
         ]:
             _, rows = db.query(f"SELECT id FROM docs WHERE MATCH(content, '{esc(q)}') LIMIT 5")
-            truth_empty = not ref.match_set(q.replace("zzzqqqxyzzw", ""))
+            got_n = len(rows)
             if expect_any:
-                got_n = len(rows)
-                base = ref.match_set(queries[0] if "zzzqqq" not in q else q.split()[0])
-                ok = got_n > 0 and (truth_empty or True)
                 log(f"  {label:22} -> {got_n} rows")
             else:
-                log(f"  {label:22} -> {len(rows)} rows (expect 0)")
+                log(f"  {label:22} -> {got_n} rows (expect 0)")
 
         # ---- 4. compound predicate (KNOWN BUG: AND dropped)
         q = queries[0]

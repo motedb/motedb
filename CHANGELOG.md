@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.12.0] — 未发布
+
+### 🔒 FTS: 修复 shard 发现跨词污染 (重开丢词根因)
+
+- `(shard<<24)|term_id` 键布局下，一个词的 range 扫描区间天然包含所有
+  更高 base 词的分片键；`discover_shard_count` 未按 base 过滤，把别的
+  词的分片指数当成自己的 → flush 把 posting 写到任意高位 shard（如
+  alpha@shard2 而 shard 0/1 缺失），重开后该词彻底丢失（复现率 ~5%，
+  随 HashMap 迭代序随机）。修复：发现扫描按 base 过滤；读路径连续
+  点探测 + 空结果回退到 base 过滤收集（兼容历史散落布局）
+
+### FTS: 流式块游标 + zig-zag 交集 (B1)
+
+- posting 不再物化: 查询直接在磁盘块字节上流式解码 (每块 128 doc 按需
+  bit-unpack), 免除每查询的 per-doc `add_with_freq` + HashMap 合并 + 重
+  排序; posting_cache 改存压缩块 (Arc 共享, ~3 bits/doc, 比物化 pairs
+  省 ~20× 内存)
+- AND 组交集改 zig-zag: 最短 posting 驱动 + 单调 seek (块粒度摊还解码),
+  复杂度与最大 posting 长度解耦; OR 组候选合并后单遍单调评分
+- df / max_tf 上界改从块头 + skip 表读取 (不解码任何块)
+- **修复 fresh 稀有词 10ms 地雷**: shard 发现的 range 扫描会物化整个键
+  区间 (10 万唯一词词表下单次 ~10ms); 搜索路径改为顺序点探测 (shard
+  按构造连续), df=1 词 fresh 查询 10ms → 0.008ms
+- **修复 flush 后 posting_cache 陈旧**: flush 追加新 shard 后旧缓存永
+  不过期, 查过的词丢新文档; flush 现在清 posting_cache + topk_cache
+- 基准 (100K docs, 200 distinct 查询/形状): 双词 AND 0.37→0.15ms、
+  高低 df AND 0.32→0.11ms、三词 0.37→0.07ms、稀有词 fresh
+  10.2→0.018ms; 全形状超 SQLite FTS5 (同形 0.10-0.34ms)
+
+### ⚠️ 破坏性变更: MATCH 多词默认语义 OR → AND (FTS5 兼容)
+
+- `MATCH(col, 'a b')` 现在要求文档**同时包含 a 和 b** (此前为任一命中
+  即匹配的 OR 并集)。与 SQLite FTS5 / Lucene 等行业默认对齐。
+- 显式 `OR` 保留并集逃生门: `'a OR b'` 命中任一词; 隐式 AND 结合更紧
+  (`'a b OR c'` = `(a AND b) OR c`); 大写 `AND` 为显式分隔符; 小写
+  `or`/`and` 仍是普通词。仅识别**大写** `OR`/`AND` (FTS5 规则)。
+- 全路径一致: 索引 fast path / 无索引回退 / COUNT 快径 / 排名与不排
+  名路径同一语义; 多词 AND 交集由最短 posting 驱动 (FTS5 策略)。
+- 受影响查询: 依赖旧 OR 行为的多词 MATCH 需改为 `a OR b` 显式并集。
+
 ## [0.11.0] — 2026-09-25
 
 ### 执行内核: VEC 向量化 + morsel 并行 (默认开启)

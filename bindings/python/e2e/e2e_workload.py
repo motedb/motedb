@@ -87,6 +87,17 @@ def suite_multimodal(root):
         _, a = db.query("SELECT COUNT(*) FROM txt WHERE MATCH(content, 'sensor')")
         _, b = db.query("SELECT id FROM txt WHERE MATCH(content, 'sensor')")
         check("text MATCH count == set size", a[0][0] == len(b), f"{a[0][0]} vs {len(b)}")
+        # AND default (FTS5-compatible): every doc holds sensor+reading;
+        # 'sensor 7' narrows to the 25 docs whose i%20==7; unknown ANDs to 0;
+        # explicit OR is the escape hatch back to the full set.
+        _, r = db.query("SELECT COUNT(*) FROM txt WHERE MATCH(content, 'sensor reading')")
+        check("text AND default: both terms", r[0][0] == 500, f"{r[0][0]}")
+        _, r = db.query("SELECT COUNT(*) FROM txt WHERE MATCH(content, 'sensor 7')")
+        check("text AND: partial overlap", r[0][0] == 25, f"{r[0][0]}")
+        _, r = db.query("SELECT COUNT(*) FROM txt WHERE MATCH(content, 'sensor zzzqqq')")
+        check("text AND unknown term is empty", r[0][0] == 0, f"{r[0][0]}")
+        _, r = db.query("SELECT COUNT(*) FROM txt WHERE MATCH(content, 'zzzqqq OR sensor')")
+        check("text explicit OR union", r[0][0] == 500, f"{r[0][0]}")
 
         # spatial
         db.execute("CREATE TABLE pts (id INT PRIMARY KEY, pt GEOMETRY)")

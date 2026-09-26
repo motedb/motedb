@@ -256,7 +256,8 @@ EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
 - `WITH` / Common Table Expressions (non-recursive; `WITH name [(cols)] AS
   (SELECT ...), ... <main query>`)
 - Scalar functions: `UPPER`/`LOWER`/`LENGTH`/`TRIM`/`SUBSTR`/`REPLACE`/`CONCAT` (skips NULL args, SQLite/Postgres semantics; `||` propagates NULL)/`INSTR`/`COALESCE`/`ROUND` (binary-exact decimal rounding)/`ABS`/arithmetic
-- Multimodal predicates: `MATCH(col) AGAINST('q')` (BM25 ranked FTS),
+- Multimodal predicates: `MATCH(col) AGAINST('q')` (BM25 ranked FTS;
+  multi-word default is AND, explicit `a OR b` unions — FTS5-compatible),
   vector `<->`/`<~>` ordering (DiskANN ANN), geometry `loc <-> ST_POINT(x, y)`
   distance ordering, `ST_WITHIN`, `ST_DISTANCE`, `ST_KNN`
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints, read-your-writes

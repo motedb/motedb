@@ -256,13 +256,14 @@ fn test_match_against_basic() {
     let (db, _dir) = create_db();
     setup_text(&db);
 
+    // Since 0.12 the default multi-word conjunction is AND (FTS5-compatible):
+    // 'Rust programming' matches only docs holding BOTH words (doc 2 has
+    // Rust but not "programming").
     let result = rows(
         &db,
         "SELECT id, title FROM articles WHERE MATCH(body) AGAINST('Rust programming') ORDER BY id",
     );
-    assert!(!result.is_empty(), "Should find Rust-related articles");
-
-    // Should find at least docs 1, 2
+    assert!(!result.is_empty(), "Should find Rust+programming articles");
     let ids: Vec<i64> = result
         .iter()
         .filter_map(|r| match &r[0] {
@@ -271,7 +272,25 @@ fn test_match_against_basic() {
         })
         .collect();
     assert!(ids.contains(&1), "Should find 'Intro to Rust'");
-    assert!(ids.contains(&2), "Should find 'Rust Concurrency'");
+    assert!(
+        !ids.contains(&2),
+        "doc 2 lacks 'programming' — AND must exclude it"
+    );
+
+    // Explicit OR restores the union (old default behavior).
+    let result = rows(
+        &db,
+        "SELECT id, title FROM articles WHERE MATCH(body) AGAINST('Rust OR programming') ORDER BY id",
+    );
+    let ids: Vec<i64> = result
+        .iter()
+        .filter_map(|r| match &r[0] {
+            Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(ids.contains(&1), "Should find 'Intro to Rust'");
+    assert!(ids.contains(&2), "OR union should match 'Rust Concurrency'");
 }
 
 #[test]

@@ -10,6 +10,7 @@ use crate::{Result, StorageError};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Term ID (32-bit, supports 4B unique tokens)
 pub type TermId = u32;
@@ -931,6 +932,41 @@ impl BlockPostingList {
         cursor
     }
 
+    /// Global max tf over the whole list, read from the skip table alone
+    /// (no block decode). O(num_blocks) × 3 bytes.
+    pub fn skip_max_tf(&self) -> u16 {
+        (0..self.num_blocks)
+            .map(|i| self.block_skip_meta(i).0)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Owning streaming cursor (B1): decode one block at a time as the
+    /// cursor advances, tracking the next block's offset so sequential
+    /// iteration is O(1) per block (unlike `BlockCursor`, which re-walks
+    /// block headers, and unlike the legacy load path, which materializes
+    /// every doc into a `PostingList` before the first result).
+    pub fn stream(self: Arc<Self>) -> BlockStream {
+        let num_blocks = self.num_blocks;
+        let mut s = BlockStream {
+            num_blocks,
+            list: self,
+            block_idx: 0,
+            next_off: 12, // header size
+            docs: Vec::new(),
+            tfs: Vec::new(),
+            pos: 0,
+            done: num_blocks == 0,
+        };
+        if !s.done {
+            s.decode_at(12);
+            if s.docs.is_empty() {
+                s.done = true;
+            }
+        }
+        s
+    }
+
     /// Decode a specific block, filling decoded_docs and decoded_tfs.
     fn decode_block_data(data: &[u8], offset: usize) -> (Vec<u32>, Vec<u16>, usize) {
         if offset >= data.len() {
@@ -1086,6 +1122,120 @@ impl<'a> BlockCursor<'a> {
     }
 }
 
+/// Owning streaming cursor over an `Arc<BlockPostingList>`: one 128-doc
+/// block is bit-unpacked at a time as the cursor advances (see
+/// `BlockPostingList::stream`). Sequential advance tracks the next block's
+/// offset — O(1) per block, no header re-walk.
+pub struct BlockStream {
+    list: Arc<BlockPostingList>,
+    num_blocks: u16,
+    block_idx: u16,
+    /// Offset of the next undecoded block in `list.as_bytes()`.
+    next_off: usize,
+    docs: Vec<u32>,
+    tfs: Vec<u16>,
+    pos: usize,
+    done: bool,
+}
+
+impl BlockStream {
+    fn decode_at(&mut self, off: usize) {
+        let (docs, tfs, next) = BlockPostingList::decode_block_data(self.list.as_bytes(), off);
+        self.docs = docs;
+        self.tfs = tfs;
+        self.next_off = next;
+        self.pos = 0;
+    }
+
+    /// Current (doc, tf), or None when exhausted.
+    pub fn current(&self) -> Option<(u32, u16)> {
+        if self.done || self.pos >= self.docs.len() {
+            None
+        } else {
+            Some((self.docs[self.pos], self.tfs[self.pos]))
+        }
+    }
+
+    /// Advance past the current doc. Returns the new current, or None.
+    pub fn advance(&mut self) -> Option<(u32, u16)> {
+        if self.done {
+            return None;
+        }
+        self.pos += 1;
+        if self.pos >= self.docs.len() {
+            if self.block_idx + 1 >= self.num_blocks {
+                self.done = true;
+                return None;
+            }
+            self.block_idx += 1;
+            self.decode_at(self.next_off);
+            if self.docs.is_empty() {
+                self.done = true;
+                return None;
+            }
+        }
+        self.current()
+    }
+
+    /// Move to the first doc >= target. Only moves forward.
+    pub fn seek(&mut self, target: u32) -> Option<(u32, u16)> {
+        if self.done {
+            return None;
+        }
+        if let Some(p) = self.docs[self.pos..].iter().position(|&d| d >= target) {
+            self.pos += p;
+            return self.current();
+        }
+        while self.block_idx + 1 < self.num_blocks {
+            self.block_idx += 1;
+            self.decode_at(self.next_off);
+            match self.docs.last() {
+                Some(&last) if last < target => continue,
+                _ => {
+                    if let Some(p) = self.docs.iter().position(|&d| d >= target) {
+                        self.pos = p;
+                        return self.current();
+                    }
+                }
+            }
+        }
+        self.done = true;
+        None
+    }
+
+    /// Skip the rest of the current block, landing on the next block's
+    /// first doc (block-granular skip; the B2 block-max hook).
+    #[allow(dead_code)]
+    pub fn advance_block(&mut self) -> Option<(u32, u16)> {
+        if self.done || self.block_idx + 1 >= self.num_blocks {
+            self.done = true;
+            return None;
+        }
+        self.block_idx += 1;
+        self.decode_at(self.next_off);
+        if self.docs.is_empty() {
+            self.done = true;
+            return None;
+        }
+        self.current()
+    }
+
+    /// Max tf within the CURRENT block (skip table — no decode).
+    pub fn block_max_tf(&self) -> u16 {
+        self.list.block_skip_meta(self.block_idx).0
+    }
+
+    #[cfg(test)]
+    fn collect(mut self) -> Vec<(u32, u16)> {
+        let mut out = Vec::new();
+        while let Some(p) = self.current() {
+            out.push(p);
+            self.advance();
+        }
+        out
+    }
+}
+
 /// Unified posting list format that handles both legacy and block formats.
 pub enum PostingListFormat {
     /// Legacy RoaringBitmap format
@@ -1231,6 +1381,44 @@ mod tests {
         let block_list = BlockPostingList::from_sorted_pairs(&doc_ids, &tfs);
         let (max_tf, _min_fn) = block_list.block_skip_meta(0);
         assert_eq!(max_tf, 128); // max TF in block
+    }
+
+    /// B1: BlockStream (lazy per-block decode) must yield exactly the same
+    /// pairs as the full-cursor walk, and seek identically — across multiple
+    /// blocks and varying tfs.
+    #[test]
+    fn test_block_stream_matches_cursor() {
+        use std::sync::Arc;
+        // 300 docs → 3 blocks; sparse ids, mixed tfs.
+        let doc_ids: Vec<u32> = (0..300).map(|i| i * 7 + (i % 3)).collect();
+        let tfs: Vec<u16> = (0..300).map(|i| ((i * 13) % 50 + 1) as u16).collect();
+
+        let list = Arc::new(BlockPostingList::from_sorted_pairs(&doc_ids, &tfs));
+        let expect: Vec<(u32, u16)> = doc_ids.iter().copied().zip(tfs.iter().copied()).collect();
+
+        // Sequential stream == ground truth.
+        assert_eq!(Arc::clone(&list).stream().collect(), expect);
+
+        // skip_max_tf == real max tf, without decoding any block.
+        assert_eq!(list.skip_max_tf(), 50);
+
+        // seek: exact hits, between docs, and past the end — expectations
+        // derived from the ground-truth pairs, not hand-computed.
+        let seek_to = |target: u32| expect.iter().copied().find(|(d, _)| *d >= target);
+        let mut s = Arc::clone(&list).stream();
+        assert_eq!(s.seek(7), seek_to(7));
+        assert_eq!(s.current(), seek_to(7));
+        assert_eq!(s.seek(8), seek_to(8));
+        assert_eq!(s.seek(doc_ids[150]), seek_to(doc_ids[150]));
+        assert_eq!(s.seek(doc_ids[299]), seek_to(doc_ids[299]));
+
+        let mut s3 = Arc::clone(&list).stream();
+        assert_eq!(s3.seek(u32::MAX / 2), None);
+        assert!(s3.current().is_none());
+
+        // block_max_tf on the first block == skip metadata for block 0.
+        let s4 = Arc::clone(&list).stream();
+        assert_eq!(s4.block_max_tf(), list.block_skip_meta(0).0);
     }
 
     #[test]

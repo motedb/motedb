@@ -82,9 +82,11 @@ pub struct TextFTSIndex {
     /// Tracks which terms have been removed from which documents
     deleted_term_docs: Arc<RwLock<HashSet<(TermId, DocId)>>>,
 
-    /// 🚀 Posting list cache: avoids re-reading posting lists from disk on
-    /// every search. Bounded LRU to cap memory (256 entries × ~2KB = ~512KB).
-    posting_cache: Arc<RwLock<LruCache<TermId, PostingList>>>,
+    /// 🚀 Posting shard cache: per-term disk sources (block bytes shared via
+    /// Arc, ~3 bits/doc compressed). Avoids re-reading + re-decoding posting
+    /// shards from the B+Tree on every search. Invalidated on flush (a flush
+    /// appends new shards / consolidates old ones).
+    posting_cache: Arc<RwLock<LruCache<TermId, DiskPostings>>>,
 
     /// 🚀 Top-K results cache: (token_string) → Vec<(doc_id, score)>.
     /// Avoids re-scoring the entire posting list on repeated queries.
@@ -109,53 +111,185 @@ struct DocLengthMap {
     lengths: HashMap<DocId, u32>,
 }
 
-/// Internal cursor for WAND query processing.
-struct TermCursorData {
-    idf: f32,
-    upper_bound: f32,
-    /// Sorted (doc_id, tf) entries
-    entries: Vec<(u32, u16)>,
-    /// Current position within entries
-    pos: usize,
+/// One disk source for a term's postings — one B+Tree shard. Block-format
+/// shards stay in compressed form (decoded 128 docs at a time by the
+/// stream); legacy shards materialize to sorted pairs once.
+#[derive(Clone)]
+enum DiskSource {
+    Block(Arc<super::text_types::BlockPostingList>),
+    Pairs(Arc<[(u32, u16)]>),
 }
 
-impl TermCursorData {
-    fn current_doc(&self) -> u32 {
-        if self.pos >= self.entries.len() {
-            u32::MAX // exhausted cursors sort to end
-        } else {
-            self.entries[self.pos].0
+/// Cached per-term disk sources (all shards).
+type DiskPostings = Vec<DiskSource>;
+
+/// Streaming merged, sorted (doc_id, tf) cursor over one term: the pending
+/// posting (small, bounded by the flush threshold) plus the cached disk
+/// shards. B1: replaces full posting materialization — the old path decoded
+/// every doc into a PostingList via per-doc `add_with_freq`, then HashMap-
+/// merged + re-sorted per query; this decodes one block at a time and only
+/// the blocks actually visited. Doc dedup across sources keeps the FIRST
+/// source's tf (pending wins — same precedence as the old merge).
+struct TermStream {
+    /// Ascending pair sources (pending first, then legacy shards).
+    pairs: Vec<Arc<[(u32, u16)]>>,
+    pair_pos: Vec<usize>,
+    /// Block-format shard streams.
+    blocks: Vec<super::text_types::BlockStream>,
+    /// Total entries across sources (headers only — no decode needed).
+    df: u64,
+    /// Max tf across sources (pending scan + block skip tables).
+    max_tf: u16,
+}
+
+impl TermStream {
+    fn empty() -> Self {
+        Self {
+            pairs: Vec::new(),
+            pair_pos: Vec::new(),
+            blocks: Vec::new(),
+            df: 0,
+            max_tf: 0,
         }
     }
 
-    fn current_tf(&self) -> u16 {
-        if self.pos >= self.entries.len() {
-            0
-        } else {
-            self.entries[self.pos].1
+    fn is_empty(&self) -> bool {
+        self.df == 0
+    }
+
+    /// Current (doc, tf) — the minimum head across sources; on ties the
+    /// earliest source (pending) wins.
+    fn current(&self) -> Option<(u32, u16)> {
+        let mut best: Option<(u32, u16)> = None;
+        for (i, src) in self.pairs.iter().enumerate() {
+            if let Some(&(d, t)) = src.get(self.pair_pos[i]) {
+                if best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, t));
+                }
+            }
         }
+        for b in &self.blocks {
+            if let Some((d, t)) = b.current() {
+                if best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, t));
+                }
+            }
+        }
+        best
     }
 
-    fn is_exhausted(&self) -> bool {
-        self.pos >= self.entries.len()
-    }
-
+    /// Advance past the current merged doc (single step).
     fn advance(&mut self) {
-        self.pos += 1;
+        if let Some((d, _)) = self.current() {
+            self.advance_past(d);
+        }
     }
 
-    fn seek(&mut self, target: u32) {
-        // Binary search for first entry >= target
-        if self.is_exhausted() {
-            return;
+    /// First merged doc >= target (monotonic only).
+    fn seek(&mut self, target: u32) -> Option<(u32, u16)> {
+        for (i, src) in self.pairs.iter().enumerate() {
+            if self.pair_pos[i] < src.len() && src[self.pair_pos[i]].0 < target {
+                self.pair_pos[i] = src.partition_point(|&(d, _)| d < target);
+            }
         }
-        if self.entries[self.pos].0 >= target {
-            return;
+        for b in &mut self.blocks {
+            if b.current().is_none_or(|(d, _)| d < target) {
+                b.seek(target);
+            }
         }
-        match self.entries[self.pos..].binary_search_by_key(&target, |&(d, _)| d) {
-            Ok(idx) => self.pos += idx,
-            Err(idx) => self.pos += idx,
+        self.current()
+    }
+
+    /// Move every source strictly past `doc` (monotonic only).
+    fn advance_past(&mut self, doc: u32) {
+        for (i, src) in self.pairs.iter().enumerate() {
+            if self.pair_pos[i] < src.len() && src[self.pair_pos[i]].0 <= doc {
+                self.pair_pos[i] = src.partition_point(|&(d, _)| d <= doc);
+            }
         }
+        for b in &mut self.blocks {
+            if b.current().is_some_and(|(d, _)| d <= doc) {
+                b.seek(doc + 1);
+            }
+        }
+    }
+}
+
+/// Zig-zag AND intersection across term streams (FTS5/Lucene strategy):
+/// the SMALLEST-df stream drives; every other stream gallops to the driver's
+/// doc via monotonic seeks (block-granular, amortized one decode per block
+/// across the whole query). Docs where all heads agree are the
+/// intersection. O(min_df seeks + blocks touched), independent of the
+/// largest posting's length. Deleted docs and (term, doc) tombstones are
+/// skipped. `streams` and `term_ids` are reordered together (driver first).
+fn intersect_streams(
+    streams: &mut [TermStream],
+    term_ids: &mut [TermId],
+    deleted: &HashSet<DocId>,
+    deleted_term_docs: &HashSet<(TermId, DocId)>,
+    out: &mut Vec<u32>,
+) {
+    // Drive by the shortest posting.
+    let mut order: Vec<usize> = (0..streams.len()).collect();
+    order.sort_by_key(|&i| streams[i].df);
+    let mut s2: Vec<TermStream> = Vec::with_capacity(streams.len());
+    let mut t2: Vec<TermId> = Vec::with_capacity(term_ids.len());
+    for i in order {
+        s2.push(std::mem::replace(&mut streams[i], TermStream::empty()));
+        t2.push(term_ids[i]);
+    }
+    for (i, s) in s2.into_iter().enumerate() {
+        streams[i] = s;
+    }
+    for (i, t) in t2.into_iter().enumerate() {
+        term_ids[i] = t;
+    }
+
+    'outer: loop {
+        // Reach consensus: every stream at the same doc, or a strictly
+        // increasing target until someone exhausts.
+        let (mut target, _) = match streams[0].current() {
+            Some(p) => p,
+            None => break,
+        };
+        loop {
+            let mut stable = true;
+            for s in streams[1..].iter_mut() {
+                if s.current().is_none_or(|(d, _)| d < target) {
+                    s.seek(target);
+                }
+                match s.current() {
+                    Some((d, _)) if d == target => {}
+                    Some((d, _)) => {
+                        target = d;
+                        stable = false;
+                    }
+                    None => break 'outer,
+                }
+            }
+            if stable {
+                break;
+            }
+            // A follower jumped past target — pull the driver up and retry.
+            if streams[0].current().is_none_or(|(d, _)| d < target) {
+                streams[0].seek(target);
+            }
+            match streams[0].current() {
+                Some((d, _)) if d == target => {}
+                Some((d, _)) => target = d,
+                None => break 'outer,
+            }
+        }
+
+        let doc_id = target as DocId;
+        let alive = !deleted.contains(&doc_id)
+            && term_ids
+                .iter()
+                .all(|tid| !deleted_term_docs.contains(&(*tid, doc_id)));
+        if alive {
+            out.push(target);
+        }
+        streams[0].advance_past(target);
     }
 }
 
@@ -622,8 +756,17 @@ impl TextFTSIndex {
     /// Discover shard count for a term by probing the BTree.
     ///
     /// Scans keys in range [base_term_id, (0xFE << 24) | base_term_id] and
-    /// counts how many distinct shard indices exist (shard 0..0xFE, excluding
-    /// the position key at shard 0xFE).
+    /// counts how many distinct shard indices exist (shard 0..0xFE,
+    /// excluding the position key at shard 0xFE).
+    ///
+    /// 🔑 The range spans OTHER terms' shard keys too — `(s<<24)|t` layouts
+    /// interleave every term's shards across the whole key space — so every
+    /// key must be filtered to this term's base. The unfiltered version
+    /// returned the MAX shard index across all higher-base terms: a term
+    /// flushing after a high-shard neighbor got `next_shard_idx` pushed
+    /// arbitrarily high, scattering its shards (measured: alpha@shard2 with
+    /// shard 0/1 missing after a mid-backfill auto-checkpoint; reopen then
+    /// lost the term on any contiguity-assuming reader).
     fn discover_shard_count(&self, term_id: TermId, btree: &GenericBTree<u32>) -> Result<u32> {
         let base_term_id = term_id & 0x00FFFFFF;
         let range_start = base_term_id; // shard 0 key
@@ -633,6 +776,9 @@ impl TextFTSIndex {
 
         let mut max_shard_idx: u32 = 0;
         for (key, _) in &entries {
+            if *key & 0x00FF_FFFF != base_term_id {
+                continue; // another term's shard living inside this range
+            }
             let shard_idx = *key >> 24;
             // Only count data shards (0..0xFE), skip position shard (0xFE)
             if shard_idx < 0xFE && shard_idx + 1 > max_shard_idx {
@@ -643,10 +789,183 @@ impl TextFTSIndex {
         Ok(max_shard_idx)
     }
 
+    /// Gather EVERY shard of a term (any layout, including legacy scattered
+    /// keys) via a base-filtered range scan. Fallback for
+    /// `probe_shard_count` == 0 — a term whose shard 0 is missing but higher
+    /// shards exist (the old cross-term discovery bug could scatter writes
+    /// like that).
+    fn scattered_shard_keys(
+        &self,
+        term_id: TermId,
+        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
+    ) -> Result<Vec<u32>> {
+        let base_term_id = term_id & 0x00FFFFFF;
+        let entries = btree.range(&base_term_id, &(0xFEu32 << 24 | base_term_id))?;
+        Ok(entries
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| {
+                let shard = k >> 24;
+                shard < 0xFE && k & 0x00FF_FFFF == base_term_id
+            })
+            .collect())
+    }
+
+    /// Shard count by sequential point probes: shards for a term are
+    /// CONTIGUOUS (0..k-1) by construction — flush appends at the discovered
+    /// next index, and consolidation rewrites everything as shard 0 — so the
+    /// first missing key ends the run. This replaces the old full-range
+    /// discovery on the search path: `(s<<24)|t` keys interleave every
+    /// term's shards across the whole key space, so a range scan walks (and
+    /// materializes values for) a huge slice of the tree — measured 10ms per
+    /// fresh rare term on a 100K-unique-term vocabulary.
+    fn probe_shard_count(
+        &self,
+        term_id: TermId,
+        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
+    ) -> Result<u32> {
+        let base_term_id = term_id & 0x00FFFFFF;
+        let mut count = 0u32;
+        while count < 0xFE {
+            let shard_key = (count << 24) | base_term_id;
+            match btree.get(&shard_key)? {
+                Some(bytes) if !bytes.is_empty() => count += 1,
+                _ => break,
+            }
+        }
+        Ok(count)
+    }
+
+    /// Load (and cache) a term's DISK sources — one per shard, block format
+    /// kept compressed. `None` = no shard on disk at all.
+    fn load_disk_sources(
+        &self,
+        term_id: TermId,
+        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
+    ) -> Result<Option<DiskPostings>> {
+        if let Some(cached) = self.posting_cache.write().get(&term_id) {
+            return Ok(Some(cached.clone()));
+        }
+        let base_term_id = term_id & 0x00FFFFFF;
+        // Probe WITHOUT caching into shard_counters: the cached value is
+        // flush's "next write index" and must equal max+1, which a
+        // contiguous probe UNDERCOUNTS on legacy scattered trees. The probe
+        // is 1-3 point gets — cheap enough uncached.
+        let max_shard_idx = self.probe_shard_count(term_id, btree)?;
+
+        // Shard keys to load: the contiguous run 0..count (native layout),
+        // or — when the probe found nothing — every same-base key via a
+        // base-filtered range scan (legacy trees scattered by the old
+        // cross-term discovery bug).
+        let mut shard_keys: Vec<u32> = (0..max_shard_idx)
+            .map(|s| (s << 24) | base_term_id)
+            .collect();
+        if shard_keys.is_empty() {
+            shard_keys = self.scattered_shard_keys(term_id, btree)?;
+        }
+
+        let mut sources = Vec::new();
+        let mut found_any = false;
+        for shard_key in shard_keys {
+            let Some(bytes) = btree.get(&shard_key)? else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            found_any = true;
+            if super::text_types::BlockPostingList::is_block_format(&bytes) {
+                if let Ok(block) = super::text_types::BlockPostingList::deserialize(&bytes) {
+                    sources.push(DiskSource::Block(Arc::new(block)));
+                    continue;
+                }
+            }
+            // Legacy shard: materialize to sorted pairs once.
+            if let Ok(shard) = PostingList::deserialize_compact(&bytes) {
+                let pairs: Vec<(u32, u16)> = shard.iter_doc_tf();
+                sources.push(DiskSource::Pairs(Arc::from(pairs.into_boxed_slice())));
+            }
+        }
+        if !found_any {
+            return Ok(None);
+        }
+        self.posting_cache.write().put(term_id, sources.clone());
+        Ok(Some(sources))
+    }
+
+    /// Build the streaming cursor for one term: pending posting first (its
+    /// tf wins on cross-source duplicates), then the cached disk sources.
+    /// Returns None when the term has no postings anywhere.
+    #[allow(clippy::type_complexity)]
+    fn term_stream(
+        &self,
+        term_id: TermId,
+        pending: &HashMap<TermId, PostingList>,
+        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
+    ) -> Result<Option<TermStream>> {
+        let mut stream = TermStream::empty();
+        if let Some(pend) = pending.get(&term_id) {
+            let pairs = pend.iter_doc_tf(); // ascending (Roaring iteration)
+            stream.df += pairs.len() as u64;
+            stream.max_tf = stream
+                .max_tf
+                .max(pairs.iter().map(|&(_, t)| t).max().unwrap_or(0));
+            stream.pair_pos.push(0);
+            stream.pairs.push(Arc::from(pairs.into_boxed_slice()));
+        }
+        match self.load_disk_sources(term_id, btree)? {
+            Some(sources) => {
+                for src in sources {
+                    match src {
+                        DiskSource::Block(b) => {
+                            stream.df += b.num_docs() as u64;
+                            stream.max_tf = stream.max_tf.max(b.skip_max_tf());
+                            stream.blocks.push(b.stream());
+                        }
+                        DiskSource::Pairs(p) => {
+                            stream.df += p.len() as u64;
+                            stream.max_tf = stream
+                                .max_tf
+                                .max(p.iter().map(|&(_, t)| t).max().unwrap_or(0));
+                            stream.pair_pos.push(0);
+                            stream.pairs.push(p);
+                        }
+                    }
+                }
+            }
+            None => {
+                if stream.pairs.is_empty() {
+                    return Ok(None);
+                }
+            }
+        }
+        if stream.df == 0 {
+            if std::env::var_os("MOTE_TRACE_FTS").is_some() {
+                let shard_count = self.probe_shard_count(term_id, btree).unwrap_or(u32::MAX);
+                eprintln!(
+                    "[fts-stream] EMPTY term_id={term_id} base={:#x} probe_shards={shard_count}",
+                    term_id & 0x00FFFFFF
+                );
+            }
+            return Ok(None);
+        }
+        Ok(Some(stream))
+    }
+
     /// Search for documents containing query terms
+    /// Unranked match-set search.
+    ///
+    /// B0 semantics — OR-of-AND-groups (FTS5-compatible): a document matches
+    /// when it contains every term of at least one group. Default
+    /// conjunction between words is AND; `a OR b` unions the groups.
+    /// (Pre-0.12 every multi-term query was an OR union over tokens.)
+    ///
+    /// B1: groups resolve via streaming lockstep intersection over block
+    /// cursors — no posting materialization, and blocks are decoded only
+    /// where the intersection actually walks.
     pub fn search(&self, query: &str) -> Result<Vec<DocumentId>> {
-        let tokens = self.tokenizer.tokenize(query);
-        if tokens.is_empty() {
+        let groups = self.parse_query_expanded(query);
+        if groups.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -655,52 +974,67 @@ impl TextFTSIndex {
         let deleted = self.deleted_docs.read();
         let deleted_term_docs = self.deleted_term_docs.read();
 
-        // Get posting lists for all query terms
-        let num_tokens = tokens.len();
-        let mut results: Option<Vec<DocumentId>> = None;
-
-        for token in tokens {
-            if let Some(term_id) = self.dictionary.get(&token.text) {
-                // Pending UNION disk — a partial flush (e.g. the 2K-doc
-                // auto-flush inside a bulk backfill) splits a term's posting
-                // across both, and taking whichever comes first hid every
-                // earlier document.
-                let pairs = match self.term_pairs_merged(term_id, &pending, &btree) {
-                    Ok(v) => v,
-                    Err(e) => return Err(e),
-                };
-                let Some(pairs) = pairs else {
-                    continue;
-                };
-                let mut doc_ids: Vec<DocId> = pairs.into_iter().map(|(d, _)| d as DocId).collect();
-                doc_ids.sort_unstable();
-                doc_ids.dedup();
-
-                // Filter out deleted documents
-                doc_ids.retain(|id| !deleted.contains(id));
-
-                // Filter out deleted (term_id, doc_id) pairs
-                doc_ids.retain(|id| !deleted_term_docs.contains(&(term_id, *id)));
-
-                // Union (OR) — the same semantics as search_ranked / the
-                // no-index fallback. This used to INTERSECT, so an unranked
-                // multi-term query (no LIMIT) returned a different set than
-                // the ranked path for the same query.
-                match &mut results {
-                    Some(current) => {
-                        current.extend(doc_ids);
+        let mut results: Vec<DocumentId> = Vec::new();
+        for group in &groups {
+            // A fresh stream per term per group (a term may appear in two
+            // groups; streams are consumed by the intersection). A term
+            // with no posting empties the whole group (AND).
+            let mut group_streams: Vec<TermStream> = Vec::with_capacity(group.len());
+            let mut group_tids: Vec<TermId> = Vec::with_capacity(group.len());
+            let mut complete = true;
+            for term in group {
+                let term_id = match self.dictionary.get(term) {
+                    Some(id) => id,
+                    None => {
+                        complete = false;
+                        break;
                     }
-                    None => results = Some(doc_ids),
+                };
+                match self.term_stream(term_id, &pending, &btree)? {
+                    Some(s) => {
+                        group_tids.push(term_id);
+                        group_streams.push(s);
+                    }
+                    None => {
+                        complete = false;
+                        break;
+                    }
                 }
+            }
+            if complete && !group_streams.is_empty() {
+                let mut docs: Vec<u32> = Vec::new();
+                intersect_streams(
+                    &mut group_streams,
+                    &mut group_tids,
+                    &deleted,
+                    &deleted_term_docs,
+                    &mut docs,
+                );
+                results.extend(docs.into_iter().map(|d| d as DocumentId));
             }
         }
 
-        let mut ids = results.unwrap_or_default();
-        if num_tokens > 1 {
-            ids.sort_unstable();
-            ids.dedup();
+        if groups.len() > 1 {
+            results.sort_unstable();
+            results.dedup();
         }
-        Ok(ids)
+        Ok(results)
+    }
+
+    /// Parse a MATCH query into OR-of-AND groups of TOKENIZED terms (each
+    /// raw word expanded through this index's tokenizer, so ngram/length
+    /// filters apply exactly as at index time).
+    fn parse_query_expanded(&self, query: &str) -> Vec<Vec<String>> {
+        crate::index::text_query::expand_groups(
+            crate::index::text_query::parse_query_groups(query),
+            |w| {
+                self.tokenizer
+                    .tokenize(w)
+                    .into_iter()
+                    .map(|t| t.text)
+                    .collect()
+            },
+        )
     }
 
     /// Search for documents containing an exact phrase (consecutive token positions).
@@ -805,64 +1139,9 @@ impl TextFTSIndex {
         Ok(result)
     }
 
-    /// Doc→tf pairs for one term: the pending buffer UNION the on-disk
-    /// posting (cache or B+Tree), pending winning on doc conflicts.
-    /// The three search paths used to return whichever source they found
-    /// FIRST — after a partial flush (e.g. the 2K-doc auto-flush in the
-    /// middle of a bulk backfill) a term living in both sources exposed only
-    /// its pending half, hiding every earlier document (a 20K-doc backfill
-    /// matched exactly the second 10K).
-    fn term_pairs_merged<'g>(
-        &self,
-        term_id: TermId,
-        pending: &std::collections::HashMap<TermId, PostingList>,
-        btree: &'g parking_lot::RwLockReadGuard<'g, GenericBTree<u32>>,
-    ) -> Result<Option<Vec<(u32, u16)>>> {
-        let mut merged: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
-        let mut any = false;
-        if let Some(pend) = pending.get(&term_id) {
-            for (doc, tf) in pend.iter_doc_tf() {
-                merged.insert(doc, tf);
-            }
-            any = true;
-        }
-        // Disk (through the posting cache — it memoizes B+Tree reads only).
-        // The cache guard must be DROPPED before re-acquiring write() below:
-        // a temporary guard in an `if let` condition lives for the whole
-        // if/else, and parking_lot is not reentrant — every merged lookup on
-        // a cache miss self-deadlocked.
-        let cached = self.posting_cache.write().get(&term_id).cloned();
-        let disk = if let Some(cached) = cached {
-            Some(cached)
-        } else {
-            match self.load_posting_list_sharded(term_id, &btree)? {
-                Some(p) => {
-                    self.posting_cache.write().put(term_id, p.clone());
-                    Some(p)
-                }
-                None => None,
-            }
-        };
-        if let Some(p) = disk {
-            for (doc, tf) in p.iter_doc_tf_cached_ref() {
-                merged.entry(doc).or_insert(tf);
-            }
-            any = true;
-        }
-        if !any {
-            return Ok(None);
-        }
-        // WAND cursors binary-search doc ids — the merged pairs must be
-        // sorted (a HashMap's iteration order silently broke multi-term
-        // ranking).
-        let mut pairs: Vec<(u32, u16)> = merged.into_iter().collect();
-        pairs.sort_unstable();
-        Ok(Some(pairs))
-    }
-
     /// 🚀 Fast single-term search: score all docs for one term, return top-K.
-    /// O(N) but with minimal overhead — no WAND, no cursor merge, no Vec cloning.
-    /// ~10x faster than WAND for single-term queries (the common case).
+    /// B1: streams the posting (one 128-doc block decoded at a time) — no
+    /// materialization, no per-query HashMap merge/sort.
     fn search_single_term(&self, token: &str, top_k: usize) -> Result<Vec<(DocumentId, f32)>> {
         // 🚀 Top-K result cache: return cached results for repeated queries.
         // Cache key includes top_k to handle different LIMIT values.
@@ -881,6 +1160,17 @@ impl TextFTSIndex {
             }
         };
 
+        let mut stream = {
+            let pending = self.pending_posting_lists.read();
+            let btree = self.btree.read();
+            match self.term_stream(term_id, &pending, &btree)? {
+                Some(s) => s,
+                None => return Ok(Vec::new()),
+            }
+        };
+        let df = stream.df;
+        let idf = ((self.total_docs as f32 - df as f32 + 0.5) / (df as f32 + 0.5) + 1.0).ln();
+
         let doc_lengths = self.get_doc_lengths_cached()?;
         let avg_dl = if self.avg_doc_length > 0.0 {
             self.avg_doc_length
@@ -889,38 +1179,14 @@ impl TextFTSIndex {
         };
         let k1 = self.bm25_config.k1;
         let b = self.bm25_config.b;
-        let total_docs = self.total_docs as f32;
 
-        // Pending UNION disk (see term_pairs_merged) — the old
-        // first-source-wins chain hid documents that lived in the other half
-        // after a partial flush.
-        let pairs: Vec<(u32, u16)>;
-        let df: u64;
-        {
-            let pending = self.pending_posting_lists.read();
-            let btree = self.btree.read();
-            let merged = self
-                .term_pairs_merged(term_id, &pending, &btree)?
-                .unwrap_or_default();
-            pairs = merged;
-            df = pairs.len() as u64;
-        }
-
-        if df == 0 {
-            return Ok(Vec::new());
-        }
-
-        let idf = ((total_docs - df as f32 + 0.5) / (df as f32 + 0.5) + 1.0).ln();
-
-        // Score all docs, maintain a bounded min-heap of top-K.
         let deleted = self.deleted_docs.read();
         let deleted_td = self.deleted_term_docs.read();
         let deleted_empty = deleted.is_empty() && deleted_td.is_empty();
 
-        // Use a simple Vec + partial sort for small top_k (faster than BinaryHeap).
-        let mut scored: Vec<(DocumentId, f32)> = Vec::with_capacity(pairs.len());
-
-        for (doc_id_u32, tf) in pairs {
+        let mut scored: Vec<(DocumentId, f32)> = Vec::with_capacity(df.min(4096) as usize);
+        while let Some((doc_id_u32, tf)) = stream.current() {
+            stream.advance();
             if tf == 0 {
                 continue;
             }
@@ -933,12 +1199,8 @@ impl TextFTSIndex {
                     continue;
                 }
             }
-            // get_doc_lengths_cached returns ENCODED fieldnorm bytes
-            // (FieldNormTable::encode), not lengths — the raw byte was used as
-            // dl here, so every document scored as if it were ~100× the
-            // average length and BM25 length normalization was effectively
-            // disabled (single-term rankings diverged from reference BM25;
-            // overlap@10 as low as 2/10). The WAND path already decodes.
+            // doc_lengths holds ENCODED fieldnorm bytes (FieldNormTable),
+            // not raw lengths — decode before the BM25 norm.
             let fieldnorm = doc_lengths.get(&doc_id).copied().unwrap_or(0);
             let dl = FieldNormTable::decode(fieldnorm, avg_dl).max(1.0);
             let norm = 1.0 - b + b * (dl / avg_dl);
@@ -956,31 +1218,44 @@ impl TextFTSIndex {
         Ok(scored)
     }
 
-    /// Search with BM25 ranking using WAND (Weak AND) for top-K early termination.
+    /// Ranked BM25 search with top-K early termination.
     ///
-    /// WAND skips documents that cannot make it into the top-K results by
-    /// maintaining a score threshold and using per-term upper bounds.
+    /// B0 semantics — OR-of-AND-groups (FTS5-compatible): a document is a
+    /// candidate only when it contains every term of at least one group
+    /// (default conjunction AND; `a OR b` unions groups). Candidates come
+    /// from each group's lockstep intersection — the old WAND loop admitted
+    /// every doc holding ANY term, so a multi-term query scanned the union.
+    ///
+    /// B1: intersections stream over block cursors (no posting
+    /// materialization); df/max_tf for IDF and upper bounds come from block
+    /// headers and skip tables without decoding. Candidates merge into one
+    /// ascending list; a single monotonic scoring pass probes each term's
+    /// stream once — the per-doc sum of matched bounds gates the heap.
     pub fn search_ranked(&self, query: &str, top_k: usize) -> Result<Vec<(DocumentId, f32)>> {
-        let tokens = self.tokenizer.tokenize(query);
-        if tokens.is_empty() {
+        let groups = self.parse_query_expanded(query);
+        if groups.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut unique_tokens: Vec<_> = tokens.iter().map(|t| t.text.clone()).collect();
-        unique_tokens.sort();
-        unique_tokens.dedup();
-
         // 🚀 Fast path for single-term queries (most common case).
-        // Skip WAND overhead — just score all docs for this term and return top-K.
-        if unique_tokens.len() == 1 {
-            return self.search_single_term(&unique_tokens[0], top_k);
+        // Skip the cursor machinery — score one posting, partial-sort, done.
+        if groups.len() == 1 && groups[0].len() == 1 {
+            return self.search_single_term(&groups[0][0], top_k);
         }
 
-        // 🚀 Multi-term top-K cache: repeated queries with the same token set
-        // (e.g. benchmark loops, hot search terms) hit the cache and skip the
-        // WAND loop entirely. Key includes top_k so different LIMIT values
-        // don't collide.
-        let cache_key = format!("{}|{}", unique_tokens.join("\x1f"), top_k);
+        // 🚀 Multi-term top-K cache: repeated queries with the same GROUP
+        // STRUCTURE hit the cache and skip scoring entirely. The key
+        // serializes groups, not just the token set — `a b` and `a OR b`
+        // share tokens but not semantics.
+        let cache_key = format!(
+            "{}|{}",
+            groups
+                .iter()
+                .map(|g| g.join("\x1f"))
+                .collect::<Vec<_>>()
+                .join("\x1e"),
+            top_k
+        );
         {
             let mut cache = self.topk_cache.write();
             if let Some(cached) = cache.get(&cache_key) {
@@ -1004,91 +1279,121 @@ impl TextFTSIndex {
         let b = self.bm25_config.b;
         let total_docs = self.total_docs as f32;
 
-        // Build term cursors: for each token, load posting list and compute IDF + upper bound
-        let mut cursors: Vec<TermCursorData> = Vec::new();
-        for token_text in &unique_tokens {
+        // Distinct terms across all groups; one SCORING stream each (df and
+        // max_tf read from headers/skip tables — no block decode).
+        let mut term_order: Vec<String> = groups.iter().flatten().cloned().collect();
+        term_order.sort();
+        term_order.dedup();
+
+        let mut term_idx: HashMap<&str, usize> = HashMap::new();
+        let mut streams: Vec<TermStream> = Vec::new();
+        let mut term_ids: Vec<TermId> = Vec::new();
+        let mut idfs: Vec<f32> = Vec::new();
+        let mut bounds: Vec<f32> = Vec::new();
+        for token_text in &term_order {
             let term_id = match self.dictionary.get(token_text) {
                 Some(id) => id,
-                None => {
-                    continue;
-                }
+                None => continue,
             };
-
-            // Pending UNION disk (see term_pairs_merged) — same
-            // partial-visibility fix as the other search paths.
-            let pairs_all = match self.term_pairs_merged(term_id, &pending, &btree) {
-                Ok(v) => v,
-                Err(e) => return Err(e),
+            let stream = match self.term_stream(term_id, &pending, &btree)? {
+                Some(s) => s,
+                None => continue,
             };
-            let Some(pairs_all) = pairs_all else {
-                continue;
-            };
-            let df = pairs_all.len() as f32;
+            let df = stream.df as f32;
             if df == 0.0 {
                 continue;
             }
-            // Compute max possible BM25 score for this term (upper bound)
-            let max_tf = pairs_all.iter().map(|&(_, tf)| tf).max().unwrap_or(0);
-            // BM25 IDF: non-negative variant (Lucene-compatible). The +1 ensures
-            // terms appearing in every document still get a small positive weight.
+            let max_tf = stream.max_tf;
+            // BM25 IDF: non-negative variant (Lucene-compatible). The +1
+            // ensures terms in every document keep a small positive weight.
             let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
-
-            // Compute max possible BM25 score for this term (upper bound)
             let upper_bound = {
                 let tf = max_tf as f32;
-                // Use dl=1 as the minimum possible doc length for a tighter bound
+                // dl=1 as the minimum possible doc length (tighter bound)
                 let min_norm = 1.0 - b + b / self.avg_doc_length.max(1.0);
                 idf * (tf * (k1 + 1.0)) / (tf + k1 * min_norm)
             };
-
-            // Collect non-deleted doc_ids with their TFs.
-            // 🚀 Fast path: skip all deletion checks when sets are empty.
-            let pairs = pairs_all;
-            let deleted_empty = deleted.is_empty();
-            let deleted_td_empty = deleted_term_docs.is_empty();
-            let entries: Vec<(u32, u16)> = if deleted_empty && deleted_td_empty {
-                // No deletions at all — skip all checks (100x faster).
-                pairs.into_iter().filter(|&(_, tf)| tf > 0).collect()
-            } else {
-                let mut e: Vec<(u32, u16)> = Vec::with_capacity(pairs.len());
-                for (doc_id_u32, tf) in pairs {
-                    let doc_id = doc_id_u32 as DocId;
-                    if deleted.contains(&doc_id) {
-                        continue;
-                    }
-                    if deleted_term_docs.contains(&(term_id, doc_id)) {
-                        continue;
-                    }
-                    if tf > 0 {
-                        e.push((doc_id_u32, tf));
-                    }
-                }
-                e
-            };
-
-            if entries.is_empty() {
-                continue;
-            }
-            // Posting lists are already sorted by doc_id (RoaringBitmap iterates
-            // in order). Skip re-sorting — saves O(N log N) per term.
-            // entries.sort_by_key(|&(d, _)| d);
-
-            cursors.push(TermCursorData {
-                idf,
-                upper_bound,
-                entries,
-                pos: 0,
-            });
+            term_idx.insert(token_text, streams.len());
+            term_ids.push(term_id);
+            idfs.push(idf);
+            bounds.push(upper_bound);
+            streams.push(stream);
         }
 
-        if cursors.is_empty() {
+        if streams.is_empty() {
             return Ok(Vec::new());
         }
-        // Sort cursors by upper bound descending (for better pruning)
-        cursors.sort_by(|a, b| b.upper_bound.partial_cmp(&a.upper_bound).unwrap());
 
-        // WAND execution
-        // Use ordered floats for the heap (Reverse<(OrderedFloat, u32)>)
+        // Per-group candidate sets: fresh streams (the scoring streams above
+        // stay untouched for the scoring pass), lockstep intersection. A
+        // term with no stream empties its group (AND semantics).
+        let mut group_sets: Vec<Vec<u32>> = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let mut group_streams: Vec<TermStream> = Vec::with_capacity(group.len());
+            let mut group_tids: Vec<TermId> = Vec::with_capacity(group.len());
+            let mut complete = true;
+            for t in group {
+                match term_idx.get(t.as_str()) {
+                    Some(&i) => {
+                        // Rebuild from cached sources — cheap (Arc clones +
+                        // one block decode), and stateful streams can't be
+                        // shared with the scoring pass.
+                        match self.term_stream(term_ids[i], &pending, &btree)? {
+                            Some(s) => {
+                                group_tids.push(term_ids[i]);
+                                group_streams.push(s);
+                            }
+                            None => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            let mut docs = Vec::new();
+            if complete && !group_streams.is_empty() {
+                intersect_streams(
+                    &mut group_streams,
+                    &mut group_tids,
+                    &deleted,
+                    &deleted_term_docs,
+                    &mut docs,
+                );
+            }
+            group_sets.push(docs);
+        }
+
+        // Merge the per-group sets into one ascending candidate list.
+        let mut candidates: Vec<u32> = Vec::new();
+        if group_sets.len() == 1 {
+            candidates = group_sets.into_iter().next().unwrap();
+        } else {
+            let mut heads: Vec<usize> = vec![0; group_sets.len()];
+            loop {
+                let mut mn = u32::MAX;
+                for (gi, docs) in group_sets.iter().enumerate() {
+                    if heads[gi] < docs.len() {
+                        mn = mn.min(docs[heads[gi]]);
+                    }
+                }
+                if mn == u32::MAX {
+                    break;
+                }
+                candidates.push(mn);
+                for (gi, docs) in group_sets.iter().enumerate() {
+                    if heads[gi] < docs.len() && docs[heads[gi]] == mn {
+                        heads[gi] += 1;
+                    }
+                }
+            }
+        }
+
+        // Ordered floats for the heap (Reverse<(OrderedFloat, u32)>)
         #[derive(Clone, PartialEq)]
         struct OrdF32(f32);
         impl Eq for OrdF32 {}
@@ -1109,92 +1414,54 @@ impl TextFTSIndex {
             std::collections::BinaryHeap::with_capacity(top_k + 1);
         let mut threshold = 0.0f32;
 
-        // Calculate sum of all upper bounds
-        let total_upper: f32 = cursors.iter().map(|c| c.upper_bound).sum();
-        if total_upper < threshold {
-            return Ok(Vec::new());
-        }
-
-        // Iterate using WAND pivot selection
-        loop {
-            // Sort cursors by current doc_id
-            cursors.sort_by_key(|c| c.current_doc());
-
-            // Find pivot: smallest p where sum(upper_bound[0..p+1]) >= threshold
-            let mut prefix_sum = 0.0f32;
-            let mut pivot_idx = None;
-            for (i, cursor) in cursors.iter().enumerate() {
-                if cursor.is_exhausted() {
-                    continue;
+        // One monotonic scoring pass: candidates ascend, so each stream only
+        // ever seeks forward. A doc's score is the BM25 sum over the terms
+        // whose stream lands exactly on it (dedup across groups is free —
+        // each doc appears once in the merged candidate list).
+        for &doc in &candidates {
+            let doc_id = doc as DocId;
+            if !deleted.is_empty() && deleted.contains(&doc_id) {
+                continue;
+            }
+            let mut tfs: Vec<(usize, u16)> = Vec::with_capacity(streams.len());
+            let mut bound = 0.0f32;
+            for (i, s) in streams.iter_mut().enumerate() {
+                if s.current().is_none_or(|(d, _)| d < doc) {
+                    s.seek(doc);
                 }
-                prefix_sum += cursor.upper_bound;
-                if prefix_sum >= threshold {
-                    pivot_idx = Some(i);
-                    break;
+                if s.current().is_some_and(|(d, _)| d == doc)
+                    && !(!deleted_term_docs.is_empty()
+                        && deleted_term_docs.contains(&(term_ids[i], doc_id)))
+                {
+                    bound += bounds[i];
+                    tfs.push((i, s.current().unwrap().1));
                 }
             }
-
-            let pivot_idx = match pivot_idx {
-                Some(idx) => idx,
-                None => break, // No doc can exceed threshold
-            };
-
-            let pivot_doc = cursors[pivot_idx].current_doc();
-
-            // Check if all cursors up to pivot are at pivot_doc
-            let mut all_at_pivot = true;
-            for cursor in &mut cursors[..=pivot_idx] {
-                if cursor.is_exhausted() {
-                    continue;
-                }
-                if cursor.current_doc() < pivot_doc {
-                    cursor.seek(pivot_doc);
-                }
-                if cursor.current_doc() != pivot_doc {
-                    all_at_pivot = false;
-                }
+            if tfs.is_empty() {
+                continue;
+            }
+            if heap.len() >= top_k && bound <= threshold {
+                continue;
             }
 
-            if !all_at_pivot {
-                continue; // Re-sort and retry
-            }
-
-            // Score pivot document
-            let doc_id = pivot_doc as DocId;
             let doc_len = doc_lengths.get(&doc_id).copied().unwrap_or(0);
             let dl_approx = FieldNormTable::decode(doc_len, avg_dl);
             let norm = 1.0 - b + b * (dl_approx / avg_dl);
-
             let mut score = 0.0f32;
-            for cursor in &cursors {
-                if !cursor.is_exhausted() && cursor.current_doc() == pivot_doc {
-                    let tf = cursor.current_tf() as f32;
-                    score += cursor.idf * (tf * (k1 + 1.0)) / (tf + k1 * norm);
-                }
+            for (i, tf) in tfs {
+                let tf = tf as f32;
+                score += idfs[i] * (tf * (k1 + 1.0)) / (tf + k1 * norm);
             }
 
-            // Update heap
             if heap.len() < top_k {
-                heap.push(std::cmp::Reverse((OrdF32(score), pivot_doc)));
+                heap.push(std::cmp::Reverse((OrdF32(score), doc)));
                 if heap.len() == top_k {
                     threshold = heap.peek().map(|h| h.0 .0 .0).unwrap_or(0.0);
                 }
             } else if score > threshold {
                 heap.pop();
-                heap.push(std::cmp::Reverse((OrdF32(score), pivot_doc)));
+                heap.push(std::cmp::Reverse((OrdF32(score), doc)));
                 threshold = heap.peek().map(|h| h.0 .0 .0).unwrap_or(0.0);
-            }
-
-            // Advance all cursors at pivot_doc
-            for cursor in &mut cursors {
-                if !cursor.is_exhausted() && cursor.current_doc() == pivot_doc {
-                    cursor.advance();
-                }
-            }
-
-            // Check if any active cursors remain
-            if cursors.iter().all(|c| c.is_exhausted()) {
-                break;
             }
         }
 
@@ -1248,6 +1515,12 @@ impl TextFTSIndex {
     pub fn flush(&mut self) -> Result<()> {
         use std::time::Instant;
         let flush_start = Instant::now();
+
+        // A flush appends new shards (and may consolidate old ones), so the
+        // cached per-term disk sources and every top-K result are stale — a
+        // term searched before the flush must see the new shard's docs.
+        self.posting_cache.write().clear();
+        self.topk_cache.write().clear();
 
         // 1. Get pending posting lists (use take to avoid clone)
         let _t1 = Instant::now();
@@ -1352,6 +1625,12 @@ impl TextFTSIndex {
 
             // Append-only: write as a new shard (no merge with existing shards)
             let shard_key = (next_shard_idx << 24) | base_term_id;
+            if std::env::var_os("MOTE_TRACE_FTS").is_some() {
+                eprintln!(
+                    "[fts-flush] term={term_id} base={base_term_id} next_shard={next_shard_idx} docs={}",
+                    clean_ids.len()
+                );
+            }
             btree.insert(shard_key, bytes.to_vec())?;
 
             shard_counters.put(*term_id, next_shard_idx + 1);
@@ -1768,6 +2047,198 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.contains(&2));
         assert!(results.contains(&3));
+    }
+
+    /// 🔒 Cross-term shard discovery: `(s<<24)|t` keys interleave every
+    /// term's shards, so an unfiltered range "discover" returns the max
+    /// shard across ALL higher-base terms — a term flushing after a
+    /// high-shard neighbor got its next_shard_idx pushed arbitrarily high,
+    /// scattering its shards (alpha@shard2, shard 0/1 missing) and losing
+    /// the term on reopen. Staggered multi-round flushes must keep every
+    /// term's shards contiguous AND fully findable after reopen.
+    #[test]
+    fn shard_discovery_not_cross_term_contaminated() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("t");
+        {
+            let mut index = TextFTSIndex::new(path.clone()).unwrap();
+            // Round 1: a wide term vocabulary (drives many distinct bases).
+            for i in 0..40u64 {
+                index
+                    .insert(i, &format!("shared alpha{i} beta{i} gamma common{}", i % 7))
+                    .unwrap();
+            }
+            index.flush().unwrap();
+            // Round 2: RE-TOUCH terms (pending again) so the next flush
+            // assigns next_shard_idx per term under contention — the
+            // contamination window.
+            for i in 0..40u64 {
+                index
+                    .insert(
+                        100 + i,
+                        &format!("shared alpha{i} beta{i} gamma common{}", i % 7),
+                    )
+                    .unwrap();
+            }
+            index.flush().unwrap();
+            // Round 3 once more for good measure.
+            for i in 0..40u64 {
+                index
+                    .insert(
+                        200 + i,
+                        &format!("shared alpha{i} beta{i} gamma common{}", i % 7),
+                    )
+                    .unwrap();
+            }
+            index.flush().unwrap();
+        }
+        // Reopen: EVERY term must see its full doc set (3 docs each for the
+        // alphaX/betaX terms, 120 for the dense shared terms).
+        let index = TextFTSIndex::new(path).unwrap();
+        for i in 0..40u64 {
+            for term in [format!("alpha{i}"), format!("beta{i}")] {
+                let r = index.search(&term).unwrap();
+                assert_eq!(r.len(), 3, "term {term} lost docs after reopen");
+            }
+        }
+        assert_eq!(index.search("shared").unwrap().len(), 120);
+        assert_eq!(index.search("gamma").unwrap().len(), 120);
+        // And the layout is contiguous: the contiguous probe must agree
+        // with the base-filtered range count (no scattered writes).
+        let btree = index.btree.read();
+        for term in ["shared", "gamma", "alpha0", "beta39"] {
+            let tid = index.dictionary.get(term).expect(term);
+            let count = index.probe_shard_count(tid, &btree).unwrap();
+            assert!(count >= 1, "{term}: no shards");
+            let scattered = index.scattered_shard_keys(tid, &btree).unwrap().len() as u32;
+            assert_eq!(
+                count, scattered,
+                "{term}: shards scattered (probe {count} vs range {scattered})"
+            );
+        }
+    }
+
+    /// 🔒 Legacy-scattered layout (shard 0 missing, data at a higher shard —
+    /// what the old cross-term discovery bug wrote) must still load via the
+    /// base-filtered range fallback.
+    #[test]
+    fn scattered_shard_layout_still_searchable() {
+        let temp_dir = TempDir::new().unwrap();
+        {
+            let mut index = TextFTSIndex::new(temp_dir.path().join("t")).unwrap();
+            for i in 1..=5u64 {
+                index.insert(i, "legacy shard survivor").unwrap();
+            }
+            index.flush().unwrap();
+        }
+
+        // Rewrite the term's single shard at index 3 (simulate scatter) by
+        // moving the key inside the B+Tree, then reopen.
+        {
+            let index = TextFTSIndex::new(temp_dir.path().join("t")).unwrap();
+            let term_id = index.dictionary.get("legacy").unwrap();
+            let base = term_id & 0x00FF_FFFF;
+            let mut btree = index.btree.write();
+            let bytes = btree.get(&base).unwrap().unwrap();
+            btree.insert((3u32 << 24) | base, bytes).unwrap();
+            let _ = btree.delete(&base);
+            btree.flush().unwrap();
+        }
+
+        let index = TextFTSIndex::new(temp_dir.path().join("t")).unwrap();
+        let r = index.search("legacy").unwrap();
+        assert_eq!(
+            r.len(),
+            5,
+            "scattered layout (shard 0 missing) must load via range fallback"
+        );
+    }
+
+    /// 🔒 B1: a term searched BEFORE a flush must see the docs the flush
+    /// added afterwards — the posting cache used to keep serving the stale
+    /// pre-flush shard snapshot forever (no invalidation on flush).
+    #[test]
+    fn test_posting_cache_invalidated_on_flush() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut index = TextFTSIndex::new(temp_dir.path().join("test")).unwrap();
+
+        index.insert(1, "cache me apple").unwrap();
+        index.insert(2, "cache me apple").unwrap();
+        // Populate the posting cache with the pre-flush (pending) posting.
+        assert_eq!(index.search("apple").unwrap().len(), 2);
+
+        // These land in pending; flush() turns them into a NEW shard while
+        // the old "apple" entry sits in the posting cache.
+        index.insert(3, "cache me apple").unwrap();
+        index.flush().unwrap();
+
+        let mut r = index.search("apple").unwrap();
+        r.sort_unstable();
+        assert_eq!(r, vec![1, 2, 3], "flush must invalidate the posting cache");
+        let ranked = index.search_ranked("apple", 10).unwrap();
+        assert_eq!(ranked.len(), 3, "ranked path too");
+    }
+
+    /// B0: multi-term default conjunction is AND (FTS5-compatible); explicit
+    /// uppercase `OR` unions groups; lowercase `or` is an ordinary term.
+    #[test]
+    fn test_match_query_and_or_groups() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut index = TextFTSIndex::new(temp_dir.path().join("test")).unwrap();
+
+        index.insert(1, "apple pie").unwrap();
+        index.insert(2, "banana bread").unwrap();
+        index.insert(3, "apple banana bread").unwrap();
+        index.insert(4, "either or both").unwrap();
+        index.insert(5, "banana tart").unwrap();
+        index.insert(6, "banana").unwrap();
+
+        // Default AND: only docs holding EVERY term.
+        let mut r = index.search("apple banana").unwrap();
+        r.sort_unstable();
+        assert_eq!(r, vec![3], "default conjunction must be AND");
+        let ranked = index.search_ranked("apple banana", 10).unwrap();
+        assert_eq!(ranked.len(), 1, "ranked path must agree with AND");
+        assert_eq!(ranked[0].0, 3);
+
+        // Explicit OR: union of groups.
+        let mut r = index.search("apple OR banana").unwrap();
+        r.sort_unstable();
+        assert_eq!(r, vec![1, 2, 3, 5, 6]);
+        let ranked = index.search_ranked("apple OR banana", 10).unwrap();
+        let mut ids: Vec<u64> = ranked.iter().map(|(d, _)| *d).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 5, 6]);
+
+        // Implicit AND binds tighter than OR: (apple) OR (banana AND bread).
+        // Docs 5/6 hold `banana` but NOT the group — a flat OR would admit them.
+        let mut r = index.search("apple OR banana bread").unwrap();
+        r.sort_unstable();
+        assert_eq!(r, vec![1, 2, 3]);
+
+        // Uppercase AND is an explicit no-op separator.
+        let mut r = index.search("apple AND banana").unwrap();
+        r.sort_unstable();
+        assert_eq!(r, vec![3]);
+
+        // An unknown term ANDs the group to nothing.
+        assert!(index.search("apple zzzqqq").unwrap().is_empty());
+        let ranked = index.search_ranked("apple zzzqqq", 10).unwrap();
+        assert!(ranked.is_empty());
+        // …but ORs as an escape hatch.
+        let mut r = index.search("apple OR zzzqqq").unwrap();
+        r.sort_unstable();
+        assert_eq!(r, vec![1, 3]);
+
+        // Lowercase `or` is a term, not an operator.
+        let mut r = index.search("either or").unwrap();
+        r.sort_unstable();
+        assert_eq!(r, vec![4]);
+
+        // Single term keeps the fast path (cache + single-term scoring).
+        let mut r = index.search("bread").unwrap();
+        r.sort_unstable();
+        assert_eq!(r, vec![2, 3]);
     }
 
     #[test]
