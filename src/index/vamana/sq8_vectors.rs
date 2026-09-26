@@ -48,7 +48,18 @@ pub struct SQ8Vectors {
     /// non-resident vector (measured recall@10 3% after incremental
     /// inserts). The sidecar file remains the durable form (rebuilt at
     /// flush, loaded at open); this map is the in-memory truth.
-    offsets: Arc<RwLock<HashMap<RowId, u64>>>,
+    /// 🔑 A2 后采样: 键为 u64、每次距离求值查一次 — SipHash 占
+    /// with_quantized_guarded 自时间的绝大头 (793 vs SIMD 核 102 样本),
+    /// 换 FxHash (u64 键 3-5×)。
+    offsets: Arc<
+        RwLock<
+            HashMap<
+                RowId,
+                u64,
+                std::hash::BuildHasherDefault<crate::storage::lsm::columnar::FxHasher>,
+            >,
+        >,
+    >,
 
     /// Total entries (tracked incrementally on insert/delete)
     count: Arc<RwLock<u64>>,
@@ -83,7 +94,10 @@ pub struct SQ8Vectors {
 /// 样本)。守卫持有期间写入者阻塞 (搜索 ~1ms, 嵌入式写入者可接受)。
 pub struct SQ8ReadGuard<'a> {
     tomb: parking_lot::MutexGuard<'a, std::collections::HashSet<RowId>>,
-    offsets: parking_lot::RwLockReadGuard<'a, HashMap<RowId, u64>>,
+    offsets: parking_lot::RwLockReadGuard<
+        'a,
+        HashMap<RowId, u64, std::hash::BuildHasherDefault<crate::storage::lsm::columnar::FxHasher>>,
+    >,
     mmap: parking_lot::RwLockReadGuard<'a, Option<Mmap>>,
 }
 
@@ -125,7 +139,7 @@ impl SQ8Vectors {
             quantizer,
             _entry_size: entry_size,
             data_mmap: Arc::new(RwLock::new(None)),
-            offsets: Arc::new(RwLock::new(HashMap::new())),
+            offsets: Arc::new(RwLock::new(HashMap::default())),
             count: Arc::new(RwLock::new(0)),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size.max(1)).unwrap(),
@@ -200,7 +214,11 @@ impl SQ8Vectors {
         // sidecar covers every physical entry: trusted-marker form is
         // post-flush complete; the untrusted form was just rebuilt).
         let offsets = {
-            let mut map: HashMap<RowId, u64> = HashMap::new();
+            let mut map: HashMap<
+                RowId,
+                u64,
+                std::hash::BuildHasherDefault<crate::storage::lsm::columnar::FxHasher>,
+            > = HashMap::default();
             let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
             idx.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE))
                 .map_err(StorageError::Io)?;

@@ -11,6 +11,10 @@ pub struct VamanaConfig {
     /// Search list size during construction (L parameter)
     pub search_list_size: usize,
 
+    /// 🔑 A3: 邻接表 LRU 容量 (None = 默认 1M 节点 — 覆盖嵌入式档位的
+    /// 全图驻留; 设小可约束 RSS)。
+    pub graph_cache_capacity: Option<usize>,
+
     /// Alpha parameter for pruning (typically 1.2)
     pub alpha: f32,
 
@@ -29,6 +33,7 @@ impl Default for VamanaConfig {
             // 0.97 — 区域导航已通, 枚举近邻不足); 300 配合度地板图收敛
             // 后实测 recall@10 ≥0.95、p50 <1ms (drought=64 终止)。
             search_list_size: 300,
+            graph_cache_capacity: None,
             alpha: 1.2,
             beam_width: 48,                  // 🔧 折中: 32 → 48 (介于32和64之间)
             metric: DistanceKind::Euclidean, // 默认 L2（和 SQL <-> 一致）
@@ -57,6 +62,7 @@ impl VamanaConfig {
         Self {
             max_degree,
             search_list_size: max_degree * 2,
+            graph_cache_capacity: None,
             alpha: 1.2,
             beam_width: max_degree / 2,
             metric: DistanceKind::Euclidean,
@@ -76,6 +82,7 @@ impl VamanaConfig {
         Self {
             max_degree,
             search_list_size: max_degree * 3,
+            graph_cache_capacity: None,
             alpha: 1.2,
             beam_width: max_degree,
             metric: DistanceKind::Euclidean,

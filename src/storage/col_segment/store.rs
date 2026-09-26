@@ -791,6 +791,61 @@ impl ColSegmentStore {
         None
     }
 
+    /// 🚀 A4/C1: 投影点读 — 只解码 col_pos 一列 (向量/文本/定长通用)。
+    /// 与 get() 同可见性语义 (buffer 新版本优先/墓碑/跨段逆序), 免掉其它
+    /// 列的解码与分配 (ANN rerank 的 k_over 个候选只取向量列; fast_pk
+    /// 点查只取投影列)。
+    pub fn get_projected(&self, key: u64, col_pos: usize) -> Option<crate::types::Value> {
+        let col_types = self.col_types.load();
+        if col_pos >= col_types.len() {
+            return None;
+        }
+        let ct = col_types[col_pos].clone();
+        if self.buffered_count.load(Ordering::Relaxed) > 0 {
+            let buf = self.write_buf.lock();
+            if let Some(idx) = buf.keys.iter().rposition(|&k| k == key) {
+                if buf.deleted[idx] {
+                    return None;
+                }
+                if col_pos < buf.column_buffers.len() {
+                    return Some(decode_buffered_value(&buf, col_pos, idx, &ct));
+                }
+                return Some(crate::types::Value::Null);
+            }
+        }
+        let segs = self.segs();
+        for seg in segs.iter().rev() {
+            if let Some(idx) = seg.sst.find_row_by_key(key) {
+                if seg.sst.row_map.is_deleted(idx) {
+                    return None;
+                }
+                // 列越界 (ALTER 后旧段) → NULL; 变长列走 read_var_value_at
+                // (向量专用快路径在内部), 定长列走 fixed 点读。
+                if col_pos >= seg.sst.column_tags.len() {
+                    return Some(crate::types::Value::Null);
+                }
+                use crate::storage::lsm::columnar::ColumnTypeTag;
+                let v = match seg.sst.column_tags[col_pos] {
+                    ColumnTypeTag::Vector | ColumnTypeTag::Spatial => {
+                        seg.read_var_value_at(col_pos, idx)
+                    }
+                    _ => match ct {
+                        crate::types::ColumnType::Tensor(_) | crate::types::ColumnType::Spatial => {
+                            seg.read_var_value_at(col_pos, idx)
+                        }
+                        _ => seg
+                            .get_row_at_idx(idx, std::slice::from_ref(&ct))
+                            .into_iter()
+                            .next()
+                            .unwrap_or(crate::types::Value::Null),
+                    },
+                };
+                return Some(v);
+            }
+        }
+        None
+    }
+
     /// Full-table ordered scan via multi-way merge. Newest version wins.
     pub fn scan(&self) -> MergeCursor {
         let col_types = self.col_types.load();

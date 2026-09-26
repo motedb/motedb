@@ -1723,3 +1723,42 @@ DuckDB 互有胜负 (join 快 2.3×, groupby 慢 1.4× — 均在双方固定开
 级); 加载/存储/内存画像领先。落后项: 点查 vs SQLite 3.4×, FTS vs
 FTS5 10×, ANN 索引路径 vs FAISS IVF 类 ~10×, >内存规模的 spill/外存
 路径未建, SQL 广度 (窗口函数/递归 CTE/代价优化器) vs DuckDB 一代。
+
+## Workstream A 收官 — DiskANN 搜索现代化 (ANN 战役四里程碑)
+
+按行业差距补齐计划执行 A0→A5 (基准/终止/去锁/邻接/外围), 各层实测:
+
+| 阶段 | 改动 | 真实嵌入 (all-nli 220K×384) | 合成门 (高斯混合) |
+|---|---|---|---|
+| 基线 (战役前) | — | p50 13.75ms, recall@10 0.99 | — |
+| A1+A5 | 入选干旱终止 + robust_prune 出度地板 + L=300 | p50 5.93ms, recall 0.9990 | 0.89ms / 0.9985 |
+| A2 | SQ8ReadGuard (每节点 6 锁→0) + prefetch 退役 | 5.69ms | 0.83ms |
+| A3+A4+Fx | 邻接 LRU 1M + rerank 投影列取回 + offsets FxHash | **p50 5.32ms** | — |
+| 热循环 (200 held-out 查询×8s) | 同上 | **1.19ms/查** (6742 查/8s) | — |
+
+构建: 827s → **140-160s** (5-6×; 出度地板反哺图构建行走)。recall
+@1/10/100 = 1.0000/0.9990/0.9928-0.9936, 重开与 +5000 增量后保持。
+
+工程发现 (README 留档):
+- **终止式三版迭代**: 距离上界式 (hnswlib 同构) 在本图误杀 — 根因是图
+  病态 (紧簇上 alpha 剪枝把出度剪到 1-4) 而非终止式; 最优改进干旱只感
+  知 top-1; **top-L 入选干旱** (枚举近邻持续刷新, 真收敛才旱) 终获
+  recall/延迟双达标。
+- **robust_prune 出度地板**是图质量的真正根因修复 — max(8, degree/8)
+  补选被拒者中最近的; Vamana 多样性只约束边构成, 不承诺剪到多少条。
+- **锁 6→0**: SQ8ReadGuard 三把锁各持一次贯穿整个 greedy_search;
+  guarded 路径的 mmap-miss 回退必须走 read_file (独立锁) — 回退到
+  with_quantized 是自锁死锁 (vamana 测试挂死实锤)。
+- **基准方法论 ×3**: 表 id 1 基 vs numpy 0 基; argpartition 前 k 无序;
+  语料难度三档 (均匀随机=图导航最坏情形 recall 0.10; 紧簇 215 近并列
+  =SQ8 重排最难 recall 卡 0.87; noise 0.30 对齐真实嵌入)。
+- **SipHash→FxHash**: offsets 表 u64 键, 每距离求值查一次, 采样 793 vs
+  SIMD 102 样本 — 换 FxHash 后热循环 1.37→1.19ms/查。
+
+eval 口径 (5.32ms) 与热循环 (1.19ms) 的差额 = 每查 Python 边界 + SQL
+路径 + 首触页错误 — 归 C 战役 (点查路径固定开销) 与 A4 剩余项
+(vector_search 的 memtable 全扫) 接力; 行走本身已到 SIMD 计算地板
+(greedy_search 95% 样本在 NEON 距离核内)。
+
+工具资产: bench/prof_ann.py (合成门, 持久化索引) + bench/prof_real.py
+(真实嵌入热循环, 持久化) + MOTE_TRACE_ANN 行走轨迹仪器。

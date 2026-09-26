@@ -300,7 +300,6 @@ impl DiskANNIndex {
             .unwrap_or(f32::MAX)
     }
 
-
     /// Create new DiskANN index
     pub fn create(
         data_dir: impl AsRef<Path>,
@@ -314,7 +313,12 @@ impl DiskANNIndex {
         // - 图缓存：search_list_size * 并行度 = 100 * 10 = 1000
         // 内存占用：1000 vectors * 128 dim * 4B ≈ 0.5 MB + 1000 nodes * 64 edges * 8B ≈ 0.5 MB = 1 MB
         let vector_cache = (config.search_list_size * 10).max(1000);
-        let graph_cache = (config.search_list_size * 10).max(1000);
+        // 🔑 A3: 邻接 LRU 必须 ≥ 图节点数, 否则每次查询的每跳都 miss
+        // (mmap 读 + Arc<Vec> 分配 + 全局 Mutex LRU 写)。220K 节点 ×
+        // (度 8-64 × 8B + Arc 头) ≈ 20-60MB — 邻接表是图的**热数据**,
+        // 与向量缓存 (64MB 预算) 不同层级; 嵌入式 RSS 档位实测 <100MB 内
+        // 可容纳。旧值 search_list_size×10=3000, 220K 图全 miss。
+        let graph_cache = config.graph_cache_capacity.unwrap_or(1_000_000).max(1000);
 
         // Create SQ8 vector storage
         debug_log!("[DiskANN] Using SQ8 compression (4x, ~98% accuracy)");
@@ -358,7 +362,12 @@ impl DiskANNIndex {
 
         // 🚀 激进缓存策略：查询期间也使用大缓存提高命中率
         let vector_cache = (config.search_list_size * 10).max(1000);
-        let graph_cache = (config.search_list_size * 10).max(1000);
+        // 🔑 A3: 邻接 LRU 必须 ≥ 图节点数, 否则每次查询的每跳都 miss
+        // (mmap 读 + Arc<Vec> 分配 + 全局 Mutex LRU 写)。220K 节点 ×
+        // (度 8-64 × 8B + Arc 头) ≈ 20-60MB — 邻接表是图的**热数据**,
+        // 与向量缓存 (64MB 预算) 不同层级; 嵌入式 RSS 档位实测 <100MB 内
+        // 可容纳。旧值 search_list_size×10=3000, 220K 图全 miss。
+        let graph_cache = config.graph_cache_capacity.unwrap_or(1_000_000).max(1000);
 
         // Load SQ8 vector storage
         let quantizer_path = data_dir.join("quantizer.sq8");
@@ -1768,7 +1777,12 @@ impl DiskANNIndex {
             let neighbors = self.graph.neighbors(current.id);
             nbr_total += neighbors.len();
             if dbg_on && popped <= 3 {
-                eprintln!("[ann-walk] pop#{} id={} deg={}", popped, current.id, neighbors.len());
+                eprintln!(
+                    "[ann-walk] pop#{} id={} deg={}",
+                    popped,
+                    current.id,
+                    neighbors.len()
+                );
             }
 
             let prefetch_ids: Vec<_> = neighbors

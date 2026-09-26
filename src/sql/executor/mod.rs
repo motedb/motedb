@@ -20092,23 +20092,42 @@ impl QueryExecutor {
         let col_pos = schema.get_column_position(col).unwrap_or(0);
         let ids: Vec<RowId> = approx.iter().map(|(id, _)| *id).collect();
         let approx_dist: std::collections::HashMap<RowId, f32> = approx.into_iter().collect();
-        let rows = self.db.get_table_rows_batch(table, &ids)?;
-        let mut exact: Vec<(RowId, f32)> = Vec::with_capacity(rows.len());
-        for (rid, row) in rows {
-            let Some(row) = row else {
-                continue;
-            };
-            let d = match row.get(col_pos) {
-                Some(Value::Vector(v)) if v.len() == query.len() => {
-                    if cosine {
-                        crate::distance::cosine::cosine_distance(query, &v.0)
-                    } else {
-                        crate::distance::euclidean::euclidean_distance_squared(query, &v.0)
+        // 🚀 A4: 只取向量列 (列投影批量取回), 免 k_over=64 个整行解码 —
+        // 竞态表的整行含 TEXT/其它 VECTOR 列, 整行取回曾占 eval 口径延迟
+        // 的 1/3。旧路径 (整行) 保留为非向量列回退。
+        let mut exact: Vec<(RowId, f32)> = Vec::with_capacity(ids.len());
+        if let Some(vectors) = self.db.get_table_column_vectors(table, col_pos, &ids)? {
+            for (rid, vopt) in vectors {
+                let d = match vopt {
+                    Some(v) if v.len() == query.len() => {
+                        if cosine {
+                            crate::distance::cosine::cosine_distance(query, &v)
+                        } else {
+                            crate::distance::euclidean::euclidean_distance_squared(query, &v)
+                        }
                     }
-                }
-                _ => approx_dist.get(&rid).copied().unwrap_or(f32::MAX),
-            };
-            exact.push((rid, d));
+                    _ => approx_dist.get(&rid).copied().unwrap_or(f32::MAX),
+                };
+                exact.push((rid, d));
+            }
+        } else {
+            let rows = self.db.get_table_rows_batch(table, &ids)?;
+            for (rid, row) in rows {
+                let Some(row) = row else {
+                    continue;
+                };
+                let d = match row.get(col_pos) {
+                    Some(Value::Vector(v)) if v.len() == query.len() => {
+                        if cosine {
+                            crate::distance::cosine::cosine_distance(query, &v.0)
+                        } else {
+                            crate::distance::euclidean::euclidean_distance_squared(query, &v.0)
+                        }
+                    }
+                    _ => approx_dist.get(&rid).copied().unwrap_or(f32::MAX),
+                };
+                exact.push((rid, d));
+            }
         }
         exact.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)

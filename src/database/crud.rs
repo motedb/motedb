@@ -3712,6 +3712,46 @@ impl MoteDB {
     }
 
     /// Batch fetch rows, returning Arc<Row> to avoid clone on cache hit
+    /// 🚀 A4: 批量取一个 VECTOR 列的 f32 值 (散乱 row_id)。None → 调用方
+    /// 回退整行批量取回 (列不存在/表非 ColSegmentStore)。逐 id 经
+    /// get_table_row 的向量列点读 — 与整行解码相比免掉其它列的
+    /// 解码/分配; row_cache 不参与 (向量列 1.5KB×64 的临时集不值得驻留)。
+    pub fn get_table_column_vectors(
+        &self,
+        table_name: &str,
+        col_pos: usize,
+        row_ids: &[RowId],
+    ) -> Result<Option<Vec<(RowId, Option<Vec<f32>>)>>> {
+        let schema = self.table_registry.get_table(table_name)?;
+        let ct = schema.col_types().get(col_pos).cloned();
+        let Some(ct) = ct else {
+            return Ok(None);
+        };
+        if !matches!(ct, crate::types::ColumnType::Tensor(_)) {
+            return Ok(None);
+        }
+        let store = match self.get_col_segment_store(table_name) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let _ = store.prepare_for_query();
+        let mut out = Vec::with_capacity(row_ids.len());
+        for &rid in row_ids {
+            let key = self.make_composite_key(table_name, rid);
+            // 🔑 投影点读: 只解码向量列 (整行解码曾让 6 列竞态表的 rerank
+            // 占 eval 口径延迟 1/3)
+            let v = store.get_projected(key, col_pos);
+            out.push((
+                rid,
+                match v {
+                    Some(crate::types::Value::Vector(av)) => Some(av.0.to_vec()),
+                    _ => None,
+                },
+            ));
+        }
+        Ok(Some(out))
+    }
+
     pub fn get_table_rows_batch_arc(
         &self,
         table_name: &str,
