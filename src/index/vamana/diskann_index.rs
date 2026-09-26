@@ -1624,7 +1624,7 @@ impl DiskANNIndex {
             }
         }
 
-        let mut result = Vec::new();
+        let mut result: Vec<Candidate> = Vec::new();
         let mut iterations = 0;
 
         let max_iterations = if graph_size < 5000 {
@@ -1633,7 +1633,59 @@ impl DiskANNIndex {
             (beam_width * 20).min(10000)
         };
 
+        // 🔑 A1'' 收敛终止 — top-L 入选干旱 (entrancy drought):
+        // 连续 DROUGHT 个 pop 无候选进入当前 top-L 结果集即终止。两个前
+        // 版教训: (a) 距离上界式 (hnswlib lowerBound) 在紧簇图上误杀 (束
+        // 搜索须穿"先变差再变好"的谷地); (b) 最优距离改进干旱只感知 top-1
+        // — 枚举第 2..L 名不产生改进事件, top-1 找到即旱死 (recall@1 0.97
+        // 而 recall@10 卡 0.857, 三个配置完全同值实锤)。入选干旱在枚举
+        // 近邻时持续刷新 (它们进 top-L), 真收敛 (无人能进) 才旱。
+        // max_iterations (=beam×20) 保留兜底。
+        const DROUGHT: usize = 64;
+        let dbg_on = std::env::var_os("MOTE_TRACE_ANN").is_some();
+        let mut evals = 0usize;
+        let mut popped = 0usize;
+        let mut nbr_total = 0usize;
+        // top-L 堆: Reverse 使堆顶 = 当前第 L 优 (最差保留者)
+        let mut top_l: BinaryHeap<std::cmp::Reverse<Candidate>> = BinaryHeap::new();
+        let mut drought = 0usize;
+        // 返回是否入选 (进 top-L 或替换堆顶)
+        fn offer_top_l(
+            cand: Candidate,
+            top_l: &mut BinaryHeap<std::cmp::Reverse<Candidate>>,
+            cap: usize,
+        ) -> bool {
+            if top_l.len() < cap {
+                top_l.push(std::cmp::Reverse(cand));
+                true
+            } else if let Some(worst) = top_l.peek() {
+                if cand.distance < worst.0.distance {
+                    top_l.pop();
+                    top_l.push(std::cmp::Reverse(cand));
+                    return true;
+                }
+                false
+            } else {
+                false
+            }
+        }
         while let Some(current) = candidates.pop() {
+            let entered = offer_top_l(current.clone(), &mut top_l, beam_width);
+            if entered {
+                drought = 0;
+            } else {
+                drought += 1;
+                if drought >= DROUGHT {
+                    if dbg_on {
+                        eprintln!(
+                            "[ann-walk] converged(entrancy-drought): pops={} evals={} nbr_total={}",
+                            popped, evals, nbr_total
+                        );
+                    }
+                    break;
+                }
+            }
+            popped += 1;
             result.push(current.clone());
             iterations += 1;
 
@@ -1643,6 +1695,10 @@ impl DiskANNIndex {
 
             // Explore neighbors
             let neighbors = self.graph.neighbors(current.id);
+            nbr_total += neighbors.len();
+            if dbg_on && popped <= 3 {
+                eprintln!("[ann-walk] pop#{} id={} deg={}", popped, current.id, neighbors.len());
+            }
 
             let prefetch_ids: Vec<_> = neighbors
                 .iter()
@@ -1676,6 +1732,19 @@ impl DiskANNIndex {
                     }
 
                     let dist = self.vectors.distance(query, neighbor_id, self.metric);
+                    evals += 1;
+                    // 求值侧候选若能进 top-L 同样刷新干旱 (枚举近邻的关键:
+                    // 它们大多不是新"最优", 但都是 top-L 入选者)
+                    if offer_top_l(
+                        Candidate {
+                            id: neighbor_id,
+                            distance: dist,
+                        },
+                        &mut top_l,
+                        beam_width,
+                    ) {
+                        drought = 0;
+                    }
                     candidates.push(Candidate {
                         id: neighbor_id,
                         distance: dist,

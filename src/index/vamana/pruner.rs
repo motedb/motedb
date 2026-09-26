@@ -71,7 +71,7 @@ where
 
     let mut pruned = Vec::with_capacity(max_degree);
 
-    for candidate in sorted_candidates {
+    for candidate in sorted_candidates.iter() {
         if pruned.len() >= max_degree {
             break;
         }
@@ -92,6 +92,24 @@ where
 
         if should_add {
             pruned.push(candidate.id);
+        }
+    }
+
+    // 🔑 最小出度地板 (A5 前置): 紧簇数据上 alpha 多样性规则把出度剪到
+    // 1-3 (簇内候选彼此近且到查询距离相近, alpha×d 判据几乎全拒) — 图
+    // 失去导航性, 搜索侧任何收敛终止都误杀 (A1 实测 recall@10 0.966→
+    // 0.35, 图上实测存在 deg=1 节点)。地板补选被拒者中最近的 (候选已按
+    // 距离排序, 天然就近), 保住导航公路; Vamana 多样性只约束"前
+    // max_degree 条边的构成", 不承诺剪到多少条。
+    let min_degree = (max_degree / 8).max(8).min(max_degree);
+    if pruned.len() < min_degree {
+        for candidate in sorted_candidates.iter() {
+            if pruned.len() >= min_degree {
+                break;
+            }
+            if !pruned.contains(&candidate.id) {
+                pruned.push(candidate.id);
+            }
         }
     }
 

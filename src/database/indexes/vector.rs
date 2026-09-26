@@ -282,7 +282,11 @@ impl MoteDB {
         let metric = index_guard.metric();
 
         debug_log!("[vector_search] 开始搜索DiskANN index...");
-        let mut index_results = index_guard.search(query, k * 2)?;
+        // 🔑 A4: 不再 ×2 — executor 侧已经过度取数 (k_over = max(2k, k+16))
+        // 供 rerank_exact 精确重排; 此处再翻倍只是让 rerank 多取一倍整行
+        // (64→32 个候选行取回, rerank 成本减半)。幽灵行过滤发生在
+        // search() 内部 (过滤后才 take(k)), 无需外层冗余。
+        let mut index_results = index_guard.search(query, k)?;
         drop(index_guard);
 
         // 🔍 Debug: 打印前5个结果

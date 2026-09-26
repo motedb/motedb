@@ -25,7 +25,10 @@ impl Default for VamanaConfig {
     fn default() -> Self {
         Self {
             max_degree: 64,
-            search_list_size: 180, // 🔧 折中: 128 → 180 (介于128和256之间)
+            // 🔑 A1/A5 校准: 180 在紧簇数据上 recall@10 卡 0.86 (top-1
+            // 0.97 — 区域导航已通, 枚举近邻不足); 300 配合度地板图收敛
+            // 后实测 recall@10 ≥0.95、p50 <1ms (drought=64 终止)。
+            search_list_size: 300,
             alpha: 1.2,
             beam_width: 48,                  // 🔧 折中: 32 → 48 (介于32和64之间)
             metric: DistanceKind::Euclidean, // 默认 L2（和 SQL <-> 一致）
@@ -88,7 +91,7 @@ mod tests {
     fn test_default_config() {
         let config = VamanaConfig::default();
         assert_eq!(config.max_degree, 64);
-        assert_eq!(config.search_list_size, 180); // Updated to match actual default
+        assert_eq!(config.search_list_size, 300); // A1/A5 校准 (紧簇 recall 门) // Updated to match actual default
         assert!((config.alpha - 1.2).abs() < 0.001);
     }
 

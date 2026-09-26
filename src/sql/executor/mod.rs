@@ -21032,7 +21032,10 @@ impl QueryExecutor {
             // a slightly larger candidate set recovers most of that. For
             // small k the extra candidates come from the search list the
             // graph walk already visited, so it costs no extra traversal.
-            let k_over = (plan.k * 2).max(plan.k + 16).min(1024);
+            // 🔑 A1 校准: 过度取数必须覆盖 SQ8 量化重排噪声 — 紧簇数据上
+            // 精确 top-10 的成员在 SQ8 序中落到 32 名开外 (k_over=32 时
+            // recall@10 卡 0.857 与 L 无关); 64 起 recall 门达标。
+            let k_over = (plan.k * 6).max(plan.k + 64).min(1024);
             let approx = self
                 .db
                 .vector_search(&index_name, &plan.query_vector, k_over)?;
