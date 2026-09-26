@@ -2,6 +2,17 @@
 
 ## [0.12.0] — 未发布
 
+### FTS: Block-Max WAND + 缓存扩容 (B2+B3)
+
+- 纯 OR 查询 (各分组单词) 走块级 WAND: pivot 前缀上界和 (每词上界取
+  剩余 skip 表后缀 max_tf, 免解码) 剪掉进不了 top-K 的文档, 阈值升高
+  后整块低 tf 块被跳过; OR 形状 0.62→0.14ms (FTS5 同形 6.7ms)
+- TermStream 增加剩余 max_tf 上界 (块源 skip 表后缀 / pairs 源后缀数
+  组), 供 WAND 与评分门
+- 缓存扩容 (预算 <20MB): posting 页缓存 128→1024 页 (8MB)、
+  posting_cache 256→2048 压缩 shard、字典 chunk 4→32
+- 差分测试: OR 查询分 = 各单词 BM25 分之和 + 排序不变
+
 ### 🔒 FTS: 修复 shard 发现跨词污染 (重开丢词根因)
 
 - `(shard<<24)|term_id` 键布局下，一个词的 range 扫描区间天然包含所有

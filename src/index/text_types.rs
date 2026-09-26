@@ -941,6 +941,17 @@ impl BlockPostingList {
             .unwrap_or(0)
     }
 
+    /// Suffix-max tf over the skip table: `out[b]` = max tf of any doc in
+    /// blocks b.. (out[num_blocks] = 0). The B2 block-max WAND bound — an
+    /// upper bound on any doc's tf from block b onward, no decode.
+    pub fn skip_suffix_max_tf(&self) -> Vec<u16> {
+        let mut out = vec![0u16; self.num_blocks as usize + 1];
+        for b in (0..self.num_blocks as usize).rev() {
+            out[b] = out[b + 1].max(self.block_skip_meta(b as u16).0);
+        }
+        out
+    }
+
     /// Owning streaming cursor (B1): decode one block at a time as the
     /// cursor advances, tracking the next block's offset so sequential
     /// iteration is O(1) per block (unlike `BlockCursor`, which re-walks
@@ -1223,6 +1234,11 @@ impl BlockStream {
     /// Max tf within the CURRENT block (skip table — no decode).
     pub fn block_max_tf(&self) -> u16 {
         self.list.block_skip_meta(self.block_idx).0
+    }
+
+    /// Index of the block the cursor currently sits on.
+    pub fn current_block_idx(&self) -> u16 {
+        self.block_idx
     }
 
     #[cfg(test)]

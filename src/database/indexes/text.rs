@@ -43,13 +43,13 @@ impl MoteDB {
                 index_path,
                 std::sync::Arc::new(WhitespaceTokenizer::default()),
                 true,
-                4,
+                32,
             )?,
             Some(("ngram", Some(n))) if (1..=16).contains(&n) => TextFTSIndex::with_config(
                 index_path,
                 std::sync::Arc::new(NgramTokenizer::new(n)),
                 false, // n-gram positions are not meaningful for phrases
-                4,
+                32,
             )?,
             Some((other, _)) => {
                 return Err(StorageError::InvalidData(format!(

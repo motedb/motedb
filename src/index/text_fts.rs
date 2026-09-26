@@ -123,6 +123,17 @@ enum DiskSource {
 /// Cached per-term disk sources (all shards).
 type DiskPostings = Vec<DiskSource>;
 
+/// Suffix-max tf of an ascending pairs slice: `out[i]` = max tf from entry
+/// i on (trailing 0 for the exhausted position). B2 WAND bound for
+/// pending/legacy pair sources.
+fn pairs_suffix_max(pairs: &[(u32, u16)]) -> Vec<u16> {
+    let mut out = vec![0u16; pairs.len() + 1];
+    for i in (0..pairs.len()).rev() {
+        out[i] = out[i + 1].max(pairs[i].1);
+    }
+    out
+}
+
 /// Streaming merged, sorted (doc_id, tf) cursor over one term: the pending
 /// posting (small, bounded by the flush threshold) plus the cached disk
 /// shards. B1: replaces full posting materialization — the old path decoded
@@ -140,6 +151,13 @@ struct TermStream {
     df: u64,
     /// Max tf across sources (pending scan + block skip tables).
     max_tf: u16,
+    /// B2 suffix-max tf per source, for the block-max WAND bound:
+    /// `pairs_suffix[i][pos]` = max tf of pairs source i from `pos` on;
+    /// `blocks_suffix[j][b]` = max tf of block source j from block `b` on
+    /// (skip tables — no decode). One entry longer than the source
+    /// (trailing 0) so an exhausted position reads 0.
+    pairs_suffix: Vec<Vec<u16>>,
+    blocks_suffix: Vec<Vec<u16>>,
 }
 
 impl TermStream {
@@ -150,7 +168,23 @@ impl TermStream {
             blocks: Vec::new(),
             df: 0,
             max_tf: 0,
+            pairs_suffix: Vec::new(),
+            blocks_suffix: Vec::new(),
         }
+    }
+
+    /// Max tf over everything REMAINING in this stream (an upper bound on
+    /// any future doc's tf). Block sources read their skip-table suffix.
+    fn remaining_max_tf(&self) -> u16 {
+        let mut m = 0u16;
+        for (i, suffix) in self.pairs_suffix.iter().enumerate() {
+            m = m.max(suffix[self.pair_pos[i].min(suffix.len() - 1)]);
+        }
+        for (j, suffix) in self.blocks_suffix.iter().enumerate() {
+            let b = self.blocks[j].current_block_idx() as usize;
+            m = m.max(suffix[b.min(suffix.len() - 1)]);
+        }
+        m
     }
 
     fn is_empty(&self) -> bool {
@@ -300,7 +334,7 @@ impl TextFTSIndex {
             storage_path,
             Arc::new(WhitespaceTokenizer::default()),
             true, // enable positions for phrase query support
-            4,
+            32,
         )
     }
 
@@ -339,8 +373,10 @@ impl TextFTSIndex {
         // Create or open B+Tree for posting lists
         let btree_path = storage_dir.join("postings.gbtree");
         let btree_config = GenericBTreeConfig {
-            cache_size: 128, // 🚀 P0: 降低到128 pages (1MB)，原192页(1.5MB)
-            // Trade-off: -25% cache for strict memory constraint
+            // B3: 1024 pages (8MB) — fresh-term loads were page-cache bound
+            // (each btree.get descends 2-3 pages); still well inside the
+            // ≤100MB query tier alongside the posting cache.
+            cache_size: 1024,
             unique_keys: false,
             allow_updates: true,
             immediate_sync: false,
@@ -378,7 +414,8 @@ impl TextFTSIndex {
             deleted_docs: Arc::new(RwLock::new(deleted_docs)),
             deleted_term_docs: Arc::new(RwLock::new(deleted_term_docs)),
             posting_cache: Arc::new(RwLock::new(LruCache::new(
-                std::num::NonZeroUsize::new(256).unwrap(),
+                // B3: 2048 compressed shards (~4KB avg ≈ 8MB worst case).
+                std::num::NonZeroUsize::new(2048).unwrap(),
             ))),
             topk_cache: Arc::new(RwLock::new(LruCache::new(
                 std::num::NonZeroUsize::new(128).unwrap(),
@@ -910,6 +947,7 @@ impl TextFTSIndex {
             stream.max_tf = stream
                 .max_tf
                 .max(pairs.iter().map(|&(_, t)| t).max().unwrap_or(0));
+            stream.pairs_suffix.push(pairs_suffix_max(&pairs));
             stream.pair_pos.push(0);
             stream.pairs.push(Arc::from(pairs.into_boxed_slice()));
         }
@@ -920,6 +958,7 @@ impl TextFTSIndex {
                         DiskSource::Block(b) => {
                             stream.df += b.num_docs() as u64;
                             stream.max_tf = stream.max_tf.max(b.skip_max_tf());
+                            stream.blocks_suffix.push(b.skip_suffix_max_tf());
                             stream.blocks.push(b.stream());
                         }
                         DiskSource::Pairs(p) => {
@@ -927,6 +966,7 @@ impl TextFTSIndex {
                             stream.max_tf = stream
                                 .max_tf
                                 .max(p.iter().map(|&(_, t)| t).max().unwrap_or(0));
+                            stream.pairs_suffix.push(pairs_suffix_max(&p));
                             stream.pair_pos.push(0);
                             stream.pairs.push(p);
                         }
@@ -1324,9 +1364,152 @@ impl TextFTSIndex {
             return Ok(Vec::new());
         }
 
-        // Per-group candidate sets: fresh streams (the scoring streams above
-        // stay untouched for the scoring pass), lockstep intersection. A
-        // term with no stream empties its group (AND semantics).
+        // Ordered floats for the heap (Reverse<(OrderedFloat, u32)>)
+        #[derive(Clone, PartialEq)]
+        struct OrdF32(f32);
+        impl Eq for OrdF32 {}
+        impl PartialOrd for OrdF32 {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for OrdF32 {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0
+                    .partial_cmp(&other.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(OrdF32, u32)>> =
+            std::collections::BinaryHeap::with_capacity(top_k + 1);
+        let mut threshold = 0.0f32;
+        let min_norm = 1.0 - b + b / self.avg_doc_length.max(1.0);
+
+        // B2: PURE-OR queries (every group a single term — plain union
+        // semantics) run block-max WAND directly over the streams: the
+        // pivot's prefix bound sum (per-term bounds from the CURRENT
+        // remaining max tf — block skip-table suffixes, no decode) prunes
+        // docs that cannot enter the top-K, skipping whole low-tf blocks
+        // once the threshold rises.
+        if groups.iter().all(|g| g.len() == 1) {
+            let term_bound = |i: usize, tf: u16| -> f32 {
+                let tf = tf as f32;
+                if tf == 0.0 {
+                    0.0
+                } else {
+                    idfs[i] * (tf * (k1 + 1.0)) / (tf + k1 * min_norm)
+                }
+            };
+            // Streams in ascending current-doc order (exhausted last).
+            let mut order: Vec<usize> = (0..streams.len()).collect();
+            loop {
+                order.sort_by_key(|&i| streams[i].current().map(|(d, _)| d).unwrap_or(u32::MAX));
+                // Pivot: smallest prefix (in doc order) whose bound sum can
+                // still reach the threshold.
+                let mut sum = 0.0f32;
+                let mut pivot = None;
+                for &i in &order {
+                    let Some((d, _)) = streams[i].current() else {
+                        break; // exhausted tail — nothing after can sum
+                    };
+                    let _ = d;
+                    sum += term_bound(i, streams[i].remaining_max_tf());
+                    if sum >= threshold {
+                        pivot = Some(i);
+                        break;
+                    }
+                }
+                let Some(pivot_idx) = pivot else {
+                    break; // no doc can beat the threshold anymore
+                };
+                let pivot_doc = streams[pivot_idx].current().unwrap().0;
+
+                // Pull every stream ordered before the pivot up to pivot_doc;
+                // if one jumps past it the order changed — re-sort and retry.
+                let mut all_at_pivot = true;
+                for &i in &order {
+                    if i == pivot_idx {
+                        break;
+                    }
+                    let Some((d, _)) = streams[i].current() else {
+                        continue;
+                    };
+                    if d < pivot_doc {
+                        streams[i].seek(pivot_doc);
+                    }
+                    match streams[i].current() {
+                        Some((d, _)) if d == pivot_doc => {}
+                        Some(_) => {
+                            all_at_pivot = false;
+                            break;
+                        }
+                        None => {
+                            all_at_pivot = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_at_pivot {
+                    continue;
+                }
+
+                // Score pivot_doc over every stream sitting on it.
+                let doc_id = pivot_doc as DocId;
+                if deleted.is_empty() || !deleted.contains(&doc_id) {
+                    let mut score = 0.0f32;
+                    let mut present = false;
+                    for (i, s) in streams.iter().enumerate() {
+                        if s.current().is_some_and(|(d, _)| d == pivot_doc)
+                            && !(!deleted_term_docs.is_empty()
+                                && deleted_term_docs.contains(&(term_ids[i], doc_id)))
+                        {
+                            present = true;
+                            let tf = s.current().unwrap().1 as f32;
+                            let doc_len = doc_lengths.get(&doc_id).copied().unwrap_or(0);
+                            let dl = FieldNormTable::decode(doc_len, avg_dl).max(1.0);
+                            let norm = 1.0 - b + b * (dl / avg_dl);
+                            score += idfs[i] * (tf * (k1 + 1.0)) / (tf + k1 * norm);
+                        }
+                    }
+                    if present {
+                        if heap.len() < top_k {
+                            heap.push(std::cmp::Reverse((OrdF32(score), pivot_doc)));
+                            if heap.len() == top_k {
+                                threshold = heap.peek().map(|h| h.0 .0 .0).unwrap_or(0.0);
+                            }
+                        } else if score > threshold {
+                            heap.pop();
+                            heap.push(std::cmp::Reverse((OrdF32(score), pivot_doc)));
+                            threshold = heap.peek().map(|h| h.0 .0 .0).unwrap_or(0.0);
+                        }
+                    }
+                }
+
+                // Advance every stream at pivot_doc.
+                for s in streams.iter_mut() {
+                    if s.current().is_some_and(|(d, _)| d == pivot_doc) {
+                        s.advance_past(pivot_doc);
+                    }
+                }
+            }
+
+            // Extract results
+            let mut results: Vec<(DocumentId, f32)> = heap
+                .into_iter()
+                .map(|std::cmp::Reverse((OrdF32(score), doc))| (doc as DocId, score))
+                .collect();
+            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            if !results.is_empty() {
+                self.topk_cache.write().put(cache_key, results.clone());
+            }
+            return Ok(results);
+        }
+
+        // Mixed queries: per-group candidate sets (fresh streams — the
+        // scoring streams above stay untouched for the scoring pass),
+        // lockstep intersection. A term with no stream empties its group
+        // (AND semantics).
         let mut group_sets: Vec<Vec<u32>> = Vec::with_capacity(groups.len());
         for group in &groups {
             let mut group_streams: Vec<TermStream> = Vec::with_capacity(group.len());
@@ -1392,27 +1575,6 @@ impl TextFTSIndex {
                 }
             }
         }
-
-        // Ordered floats for the heap (Reverse<(OrderedFloat, u32)>)
-        #[derive(Clone, PartialEq)]
-        struct OrdF32(f32);
-        impl Eq for OrdF32 {}
-        impl PartialOrd for OrdF32 {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for OrdF32 {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.0
-                    .partial_cmp(&other.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
-        }
-
-        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(OrdF32, u32)>> =
-            std::collections::BinaryHeap::with_capacity(top_k + 1);
-        let mut threshold = 0.0f32;
 
         // One monotonic scoring pass: candidates ascend, so each stream only
         // ever seeks forward. A doc's score is the BM25 sum over the terms
@@ -2047,6 +2209,46 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.contains(&2));
         assert!(results.contains(&3));
+    }
+
+    /// 🔒 B2: pure-OR queries take the block-max WAND path. Differential:
+    /// a doc matching several OR'd terms must score the SUM of its per-term
+    /// BM25 scores, and the OR top-K must equal the union ranked by that sum.
+    #[test]
+    fn wand_or_query_scores_match_term_sum() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut index = TextFTSIndex::new(temp_dir.path().join("t")).unwrap();
+        // Deliberate tf/length spread: tf saturation + length normalization
+        // must match between the paths.
+        for i in 1..=60u64 {
+            let doc = match i % 3 {
+                0 => "apple apple apple filler filler",
+                1 => "banana filler",
+                _ => "apple banana filler filler filler filler filler",
+            };
+            index.insert(i, doc).unwrap();
+        }
+        index.flush().unwrap();
+
+        let or = index.search_ranked("apple OR banana", 60).unwrap();
+        let a = index.search_ranked("apple", 60).unwrap();
+        let b = index.search_ranked("banana", 60).unwrap();
+
+        let score_of =
+            |v: &Vec<(DocumentId, f32)>, id: u64| v.iter().find(|(d, _)| *d == id).map(|(_, s)| *s);
+        // Every doc of either single-term set appears in the OR result.
+        assert_eq!(or.len(), 60, "every doc holds apple or banana");
+        for (id, s) in &or {
+            let sum: f32 = score_of(&a, *id).unwrap_or(0.0) + score_of(&b, *id).unwrap_or(0.0);
+            assert!(
+                (s - sum).abs() < 1e-4,
+                "doc {id}: OR score {s} != sum of term scores {sum}"
+            );
+        }
+        // OR results are score-descending.
+        for w in or.windows(2) {
+            assert!(w[0].1 >= w[1].1 - 1e-6, "OR results not sorted: {:?}", or);
+        }
     }
 
     /// 🔒 Cross-term shard discovery: `(s<<24)|t` keys interleave every
