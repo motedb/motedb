@@ -77,6 +77,16 @@ pub struct SQ8Vectors {
     pinned: Arc<RwLock<Option<HashMap<RowId, Arc<QuantizedVector>>>>>,
 }
 
+/// 🔑 A2 搜索期读守卫: 三把锁 (tombstones Mutex / offsets RwLock /
+/// data_mmap RwLock) 各获取一次、贯穿整个 greedy_search — 采样实锤
+/// with_quantized 的每节点锁+查表开销是 SIMD 距离核的 5 倍 (524 vs 86
+/// 样本)。守卫持有期间写入者阻塞 (搜索 ~1ms, 嵌入式写入者可接受)。
+pub struct SQ8ReadGuard<'a> {
+    tomb: parking_lot::MutexGuard<'a, std::collections::HashSet<RowId>>,
+    offsets: parking_lot::RwLockReadGuard<'a, HashMap<RowId, u64>>,
+    mmap: parking_lot::RwLockReadGuard<'a, Option<Mmap>>,
+}
+
 impl SQ8Vectors {
     /// Create new SQ8 vector storage
     pub fn create(
@@ -351,6 +361,56 @@ impl SQ8Vectors {
         }
 
         Some(arc_vec)
+    }
+
+    pub fn read_guard(&self) -> SQ8ReadGuard<'_> {
+        SQ8ReadGuard {
+            tomb: self.tombstones.lock(),
+            offsets: self.offsets.read(),
+            mmap: self.data_mmap.read(),
+        }
+    }
+
+    /// 无锁变体 (守卫由调用方持有): 查 offsets → mmap 切片 → f。
+    /// 与 with_quantized 语义逐位一致 (含墓碑过滤)。
+    pub fn with_quantized_guarded<R>(
+        &self,
+        g: &SQ8ReadGuard<'_>,
+        row_id: RowId,
+        f: impl FnOnce(f32, f32, &[u8]) -> R,
+    ) -> Option<R> {
+        if g.tomb.contains(&row_id) {
+            return None;
+        }
+        let offset = g.offsets.get(&row_id).copied()?;
+        if let Some(ref mmap) = *g.mmap {
+            let off = offset as usize + 8;
+            let end = off + 8 + self.dimension;
+            if end <= mmap.len() {
+                let min = f32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
+                let max = f32::from_le_bytes(mmap[off + 4..off + 8].try_into().unwrap());
+                return Some(f(min, max, &mmap[off + 8..end]));
+            }
+        }
+        // 🔑 mmap 未映射/越界 (未 flush 的尾部): 走 read_file 的 seek+read —
+        // 与守卫的三把锁 (tombstones/offsets/mmap) 互不相干, 不会死锁。
+        // (绝不能回退 with_quantized — 它重取同样的锁, 守卫持有期间自锁,
+        // vamana 测试挂死实锤。)
+        let mut buf = vec![0u8; 8 + self.dimension];
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = self.read_file.write();
+            if file
+                .seek(SeekFrom::Start(offset + 8))
+                .and_then(|_| file.read_exact(&mut buf))
+                .is_err()
+            {
+                return None;
+            }
+        }
+        let min = f32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let max = f32::from_le_bytes(buf[4..8].try_into().unwrap());
+        Some(f(min, max, &buf[8..]))
     }
 
     /// Run `f` on an entry's `(min, max, codes)` without copying it out:

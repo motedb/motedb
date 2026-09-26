@@ -87,6 +87,20 @@ impl VectorStorage {
         self.vectors.get(row_id)
     }
 
+    /// 🔑 A2: 搜索期读守卫透传
+    fn read_guard(&self) -> crate::index::vamana::sq8_vectors::SQ8ReadGuard<'_> {
+        self.vectors.read_guard()
+    }
+
+    fn with_quantized_guarded<R>(
+        &self,
+        g: &crate::index::vamana::sq8_vectors::SQ8ReadGuard<'_>,
+        row_id: RowId,
+        f: impl FnOnce(f32, f32, &[u8]) -> R,
+    ) -> Option<R> {
+        self.vectors.with_quantized_guarded(g, row_id, f)
+    }
+
     /// 🔥 Build mode: pin the full quantized set in RAM (see SQ8Vectors).
     fn pin_all(&self) -> Result<()> {
         self.vectors.pin_all()
@@ -232,6 +246,61 @@ pub struct DiskANNIndex {
 }
 
 impl DiskANNIndex {
+    /// 🔑 A2 守卫式距离: 三把锁由调用方 (greedy_search) 持一次。
+    fn distance_guarded(
+        &self,
+        query: &[f32],
+        g: &crate::index::vamana::sq8_vectors::SQ8ReadGuard<'_>,
+        row_id: RowId,
+        metric: DistanceKind,
+    ) -> f32 {
+        self.vectors
+            .with_quantized_guarded(g, row_id, |min, max, codes| match metric {
+                DistanceKind::Euclidean => {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.vectors
+                            .quantizer
+                            .asymmetric_distance_l2_neon_raw(query, codes, min, max)
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        self.vectors
+                            .quantizer
+                            .asymmetric_distance_l2_avx2_raw(query, codes, min, max)
+                    }
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                    {
+                        self.vectors
+                            .quantizer
+                            .asymmetric_distance_l2_raw(query, codes, min, max)
+                    }
+                }
+                DistanceKind::Cosine => {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.vectors
+                            .quantizer
+                            .asymmetric_distance_cosine_neon_raw(query, codes, min, max)
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        self.vectors
+                            .quantizer
+                            .asymmetric_distance_cosine_avx2_raw(query, codes, min, max)
+                    }
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                    {
+                        self.vectors
+                            .quantizer
+                            .asymmetric_distance_cosine_raw(query, codes, min, max)
+                    }
+                }
+            })
+            .unwrap_or(f32::MAX)
+    }
+
+
     /// Create new DiskANN index
     pub fn create(
         data_dir: impl AsRef<Path>,
@@ -1608,8 +1677,10 @@ impl DiskANNIndex {
         // BinaryHeap<Candidate> acts as a min-heap — pop() returns the BEST.
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::new();
 
-        // Start with start_id
-        let dist = self.vectors.distance(query, start_id, self.metric);
+        // 🔑 A2: 三把锁 (tombstones/offsets/mmap) 整个搜索各持一次 —
+        // 每节点 6 次锁获取 → 0 次 (采样: 锁+查表 524 样本 vs SIMD 核 86)。
+        let guard = self.vectors.read_guard();
+        let dist = self.distance_guarded(query, &guard, start_id, self.metric);
         candidates.push(Candidate {
             id: start_id,
             distance: dist,
@@ -1714,14 +1785,9 @@ impl DiskANNIndex {
                 .collect();
 
             if !prefetch_ids.is_empty() {
-                // 🚀 两阶段预加载：先批量触发所有邻居的 get_quantized（mmap page
-                // fault + LRU cache 填充），再串行算距离。第二阶段 distance 调
-                // get_quantized 时 cache 命中，无 page fault stall。
-                // 这是 DiskANN 论文的核心优化（访存与计算重叠）。
-                for &nid in &prefetch_ids {
-                    self.vectors.prefetch(nid);
-                }
-
+                // 🔑 A2: 两阶段预加载退役 — 它的存在是给旧路径 (每次
+                // with_quantized 自带锁+LRU) 预热; 守卫式直读 mmap 后每次
+                // 访问本身就是一次切片索引, 预取只剩重复工作。
                 for neighbor_id in prefetch_ids {
                     // mark visited
                     let idx = neighbor_id as usize;
@@ -1731,7 +1797,7 @@ impl DiskANNIndex {
                         visited_overflow.insert(neighbor_id);
                     }
 
-                    let dist = self.vectors.distance(query, neighbor_id, self.metric);
+                    let dist = self.distance_guarded(query, &guard, neighbor_id, self.metric);
                     evals += 1;
                     // 求值侧候选若能进 top-L 同样刷新干旱 (枚举近邻的关键:
                     // 它们大多不是新"最优", 但都是 top-L 入选者)
