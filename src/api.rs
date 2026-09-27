@@ -24,6 +24,9 @@ struct FastPkMeta {
     /// "select", "update", or "delete"
     stmt_type: &'static str,
     table_name: String,
+    /// Pre-stored table registry id (C3): composite-key building used to
+    /// hit the table registry on every point read.
+    table_id: u64,
     param_idx: usize,
     /// Only for SELECT: whether it's SELECT *
     is_star: bool,
@@ -1097,9 +1100,11 @@ impl Database {
             (vec![], vec![])
         };
 
+        let table_id = db.table_registry.get_table_id(table_ref).unwrap_or(0) as u64;
         Ok(Some(FastPkMeta {
             stmt_type,
             table_name: table_ref.to_string(),
+            table_id,
             param_idx,
             is_star,
             select_col_positions,
@@ -1235,7 +1240,26 @@ impl Database {
                 }))
             }
             _ => {
-                // SELECT
+                // SELECT. C1: non-star queries read ONLY the projected
+                // columns straight from the store (one row-location resolve,
+                // one decode per requested column) — the old path decoded
+                // EVERY column of the row, including 1.5KB vectors and text,
+                // then threw the rest away.
+                if !meta.is_star && !meta.select_col_positions.is_empty() {
+                    if let Some(store) = self.inner.get_col_segment_store(&meta.table_name) {
+                        let composite = (meta.table_id << 32) | (row_id & 0xFFFFFFFF);
+                        if let Some(vals) =
+                            store.get_projected_multi(composite, &meta.select_col_positions)
+                        {
+                            return Ok(Some(StreamingQueryResult::SelectReady {
+                                columns: (*meta.column_names).clone(),
+                                rows: vec![vals],
+                            }));
+                        }
+                        // None → fall through to the full path (absent row,
+                        // or a table split between store and LSM).
+                    }
+                }
                 let row_opt =
                     self.inner
                         .get_table_row_arc(&meta.table_name, row_id, &meta.schema)?;
@@ -2070,6 +2094,27 @@ impl Database {
             Some(s) => s,
             None => return Ok(None), // no store yet → full parse path
         };
+        // C1: non-star SELECTs decode ONLY the projected columns (one row
+        // resolve + per-column read) instead of materializing the full row.
+        if !is_star {
+            let mut positions: Vec<usize> = Vec::new();
+            for cname in select_part.split(',').map(|s| s.trim()) {
+                match schema.get_column(cname) {
+                    Some(cd) => positions.push(cd.position),
+                    None => return Ok(None), // unknown column → full parser error
+                }
+            }
+            return match store.get_projected_multi(composite_key, &positions) {
+                Some(vals) => Ok(Some(StreamingQueryResult::SelectReady {
+                    columns: column_names,
+                    rows: vec![vals],
+                })),
+                None => Ok(Some(StreamingQueryResult::SelectReady {
+                    columns: column_names,
+                    rows: vec![],
+                })),
+            };
+        }
         let row: Vec<Value> = match store.get(composite_key) {
             Some(r) => r,
             None => {

@@ -116,6 +116,23 @@ fn cmp_str(v: Option<&str>, target: Option<&str>, op: &crate::sql::ast::BinaryOp
 /// Used by ColSegmentStore::get() to read buffered (unflushed) rows.
 /// Format matches add_values: Integer/Timestamp = [8B i64 LE], Float = [8B f64 LE],
 /// Bool = [1B], Text = [u16 len][bytes].
+/// Per-column projected read at a RESOLVED segment row (shared by
+/// get_projected / get_projected_multi). Column out of the segment's tag
+/// range (ALTER-ed old segment) → NULL; variable-length columns (vector /
+/// spatial / tensor) go through read_var_value_at, fixed-length through the
+/// single-column fixed read.
+fn projected_value_at(
+    seg: &Segment,
+    idx: usize,
+    col_pos: usize,
+    ct: &crate::types::ColumnType,
+) -> crate::types::Value {
+    if col_pos >= seg.sst.column_tags.len() {
+        return crate::types::Value::Null;
+    }
+    seg.read_column_at_idx(idx, col_pos, ct)
+}
+
 fn decode_buffered_value(
     buf: &crate::storage::lsm::columnar::ColumnarSSTableBuilder,
     col_idx: usize,
@@ -819,28 +836,60 @@ impl ColSegmentStore {
                 if seg.sst.row_map.is_deleted(idx) {
                     return None;
                 }
-                // 列越界 (ALTER 后旧段) → NULL; 变长列走 read_var_value_at
-                // (向量专用快路径在内部), 定长列走 fixed 点读。
-                if col_pos >= seg.sst.column_tags.len() {
-                    return Some(crate::types::Value::Null);
+                return Some(projected_value_at(seg, idx, col_pos, &ct));
+            }
+        }
+        None
+    }
+
+    /// Projected MULTI-column point read (C1): resolve the row's location
+    /// (write buffer / segment index entry) ONCE, then decode only the
+    /// requested columns — the fast-PK paths used to materialize every
+    /// column of the row (including 1.5KB vectors and text) to project a
+    /// single small column. Same visibility semantics as `get` /
+    /// `get_projected`: buffer-newest wins, tombstones hide, segments in
+    /// reverse order, ALTER-short columns read as NULL.
+    pub fn get_projected_multi(
+        &self,
+        key: u64,
+        col_pos: &[usize],
+    ) -> Option<Vec<crate::types::Value>> {
+        let col_types = self.col_types.load();
+        if col_pos.iter().any(|&p| p >= col_types.len()) {
+            return None;
+        }
+        if self.buffered_count.load(Ordering::Relaxed) > 0 {
+            let buf = self.write_buf.lock();
+            if let Some(idx) = buf.keys.iter().rposition(|&k| k == key) {
+                if buf.deleted[idx] {
+                    return None;
                 }
-                use crate::storage::lsm::columnar::ColumnTypeTag;
-                let v = match seg.sst.column_tags[col_pos] {
-                    ColumnTypeTag::Vector | ColumnTypeTag::Spatial => {
-                        seg.read_var_value_at(col_pos, idx)
-                    }
-                    _ => match ct {
-                        crate::types::ColumnType::Tensor(_) | crate::types::ColumnType::Spatial => {
-                            seg.read_var_value_at(col_pos, idx)
-                        }
-                        _ => seg
-                            .get_row_at_idx(idx, std::slice::from_ref(&ct))
-                            .into_iter()
-                            .next()
-                            .unwrap_or(crate::types::Value::Null),
-                    },
-                };
-                return Some(v);
+                return Some(
+                    col_pos
+                        .iter()
+                        .map(|&p| {
+                            if p < buf.column_buffers.len() {
+                                decode_buffered_value(&buf, p, idx, &col_types[p])
+                            } else {
+                                crate::types::Value::Null
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+        let segs = self.segs();
+        for seg in segs.iter().rev() {
+            if let Some(idx) = seg.sst.find_row_by_key(key) {
+                if seg.sst.row_map.is_deleted(idx) {
+                    return None;
+                }
+                return Some(
+                    col_pos
+                        .iter()
+                        .map(|&p| projected_value_at(seg, idx, p, &col_types[p]))
+                        .collect(),
+                );
             }
         }
         None
@@ -5062,5 +5111,63 @@ mod manifest_durability_tests {
 
     fn store_dir(st: &ColSegmentStore) -> std::path::PathBuf {
         st.dir.clone()
+    }
+}
+
+#[cfg(test)]
+mod projected_tests {
+    use super::*;
+    use crate::types::Value;
+
+    /// C1: projected multi-column point read must agree with the full-row
+    /// get() on every column, before AND after flush_buffer.
+    #[test]
+    fn projected_multi_matches_full_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let col_types = vec![
+            crate::types::ColumnType::Integer,
+            crate::types::ColumnType::Text,
+            crate::types::ColumnType::Float,
+        ];
+        let store = ColSegmentStore::create(dir.path(), "t", col_types).unwrap();
+        let rows: Vec<(u64, u64, Vec<Value>)> = (0..20u64)
+            .map(|i| {
+                (
+                    (7u64 << 32) | i,
+                    i,
+                    vec![
+                        Value::Integer(i as i64),
+                        Value::Text(crate::types::ArcString::from(format!("row-{i}"))),
+                        Value::Float(i as f64),
+                    ],
+                )
+            })
+            .collect();
+        store.append_rows(&rows).unwrap();
+
+        let check = |stage: &str| {
+            for i in [0u64, 1, 7, 19] {
+                let key = (7u64 << 32) | i;
+                let full = store.get(key).expect(stage);
+                let proj = store.get_projected_multi(key, &[0, 1, 2]).expect(stage);
+                assert_eq!(full[1], proj[1], "{stage}: name mismatch at {i}");
+                match (&full[2], &proj[2]) {
+                    (Value::Float(a), Value::Float(b)) => {
+                        assert!((a - b).abs() < 1e-9, "{stage}: float mismatch at {i}")
+                    }
+                    other => panic!("{stage}: {other:?}"),
+                }
+                let name_only = store.get_projected_multi(key, &[1]).expect(stage);
+                assert_eq!(full[1], name_only[0], "{stage}: single-col mismatch at {i}");
+            }
+        };
+        check("buffered");
+        store.flush_buffer().unwrap();
+        check("on-disk");
+
+        // Absent key → None (not a Null row).
+        assert!(store
+            .get_projected_multi((7u64 << 32) | 999, &[1])
+            .is_none());
     }
 }

@@ -584,3 +584,93 @@ fn test_text_search_after_insert() {
     );
     assert!(!result.is_empty(), "Text search should find 'database'");
 }
+
+/// 🔒 C1: fast-PK projected SELECTs (`SELECT col FROM t WHERE id = ?`) must
+/// return exactly what the full materialization path returns — across wide
+/// rows (text + vector columns that the projected read must skip), NULL
+/// cells, both the prepared (FastPkMeta) and raw-SQL (string literal) fast
+/// paths, and post-checkpoint (on-disk) rows.
+#[test]
+fn fast_pk_projected_select_matches_full_row() {
+    let (db, _dir) = create_db();
+    exec(
+        &db,
+        "CREATE TABLE w (id INT PRIMARY KEY, name TEXT, score FLOAT, note TEXT)",
+    );
+    let mut expect_name: std::collections::HashMap<i64, Option<String>> =
+        std::collections::HashMap::new();
+    for i in 0..50i64 {
+        let name = if i % 7 == 3 {
+            None
+        } else {
+            Some(format!("row-{i}"))
+        };
+        let score = i as f64 * 1.5;
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO w VALUES ({i}, {}, {score}, 'note {i} bytes of text')",
+                match &name {
+                    Some(n) => format!("'{n}'"),
+                    None => "NULL".to_string(),
+                }
+            ),
+        );
+        expect_name.insert(i, name);
+    }
+    db.checkpoint().unwrap();
+
+    // Prepared fast-PK path (params) — projected single + multi column.
+    for i in 0..50i64 {
+        let r = db
+            .execute_prepared("SELECT name FROM w WHERE id = ?", vec![Value::Integer(i)])
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let (_, rows) = r.select_rows().unwrap();
+        let got: Option<String> = match rows.first().and_then(|r| r.first()) {
+            Some(Value::Text(s)) => Some(s.to_string()),
+            Some(Value::Null) | None => None,
+            other => panic!("id {i}: unexpected {other:?}"),
+        };
+        assert_eq!(got, expect_name[&i], "id {i} projected name mismatch");
+
+        let r = db
+            .execute_prepared(
+                "SELECT name, score FROM w WHERE id = ?",
+                vec![Value::Integer(i)],
+            )
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let (_, rows2) = r.select_rows().unwrap();
+        let row = rows2.first().expect("multi-col row");
+        assert!(matches!(row[1], Value::Float(f) if (f - i as f64 * 1.5).abs() < 1e-9));
+    }
+
+    // Raw-SQL fast path (literal PK).
+    let r = db
+        .execute("SELECT score FROM w WHERE id = 17")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let (_, rows) = r.select_rows().unwrap();
+    assert!(matches!(rows[0][0], Value::Float(f) if (f - 25.5).abs() < 1e-9));
+
+    // Absent PK → empty (both paths), not an error and not a NULL row.
+    let r = db
+        .execute_prepared(
+            "SELECT name FROM w WHERE id = ?",
+            vec![Value::Integer(9999)],
+        )
+        .unwrap()
+        .materialize()
+        .unwrap();
+    assert!(r.select_rows().unwrap().1.is_empty());
+    let r = db
+        .execute("SELECT name FROM w WHERE id = 9999")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    assert!(r.select_rows().unwrap().1.is_empty());
+}

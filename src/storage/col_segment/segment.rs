@@ -493,6 +493,69 @@ impl Segment {
     /// Used by store.get() which already found the index via find_row_by_key,
     /// avoiding a duplicate binary search + key block read (~2-3µs saved).
     /// Caller MUST verify the row is not deleted before calling this.
+    /// Single-column point read at a RESOLVED row index (C1): decodes ONLY
+    /// column `ci` — fixed tags via the O(1) direct byte read (falling back to
+    /// the cached full-column decode for Snappy segments, exactly like
+    /// decode_row_at), text via the paged window read, vector/spatial via the
+    /// bounded per-row read.
+    ///
+    /// 🔑 decode_row_at enumerates the PASSED type slice (`ci` = slice index),
+    /// so slicing one type reads column 0 — projected point reads of any
+    /// later column got the WRONG column (or Null) before this existed.
+    pub fn read_column_at_idx(
+        &self,
+        idx: usize,
+        ci: usize,
+        ct: &crate::types::ColumnType,
+    ) -> crate::types::Value {
+        use crate::types::Value;
+        let tag = self.sst.column_tags.get(ci).copied();
+
+        if matches!(tag, Some(t) if t.is_fixed()) {
+            match self.sst.read_fixed_i64_at(ci, idx) {
+                Ok(Some(v)) => {
+                    let mut out = Vec::with_capacity(1);
+                    push_fixed_value(&mut out, v, ct);
+                    return out.pop().unwrap_or(Value::Null);
+                }
+                Ok(None) => return Value::Null,
+                Err(_) => {} // compressed segment — cached full-column decode
+            }
+            {
+                let mut cache = self.col_cache.lock();
+                if let Some(cached) = cache.get(ci) {
+                    return decode_cached_value(cached, idx, ct);
+                }
+            }
+            if let Ok(seg) = self.sst.read_fixed_i64(ci) {
+                let cached = CachedCol::Fixed(seg);
+                let v = decode_cached_value(&cached, idx, ct);
+                self.col_cache.lock().insert(ci, cached);
+                return v;
+            }
+            return Value::Null;
+        }
+
+        if matches!(tag, Some(ColumnTypeTag::Text)) {
+            return match self.read_text_paged(ci, idx) {
+                Some(s) => Value::Text(s.into()),
+                None => Value::Null,
+            };
+        }
+
+        if matches!(
+            tag,
+            Some(ColumnTypeTag::Vector) | Some(ColumnTypeTag::Spatial)
+        ) || matches!(
+            ct,
+            crate::types::ColumnType::Tensor(_) | crate::types::ColumnType::Spatial
+        ) {
+            return self.read_var_value_at(ci, idx);
+        }
+
+        Value::Null
+    }
+
     pub fn get_row_at_idx(
         &self,
         idx: usize,

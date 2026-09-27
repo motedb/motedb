@@ -2,6 +2,19 @@
 
 ## [0.12.0] — 未发布
 
+### 点查: 投影下推 (C1) — 17µs → 5.4µs, 超 SQLite
+
+- fast-PK 投影 SELECT (`SELECT col FROM t WHERE id = ?`) 不再整行解码:
+  `ColSegmentStore::get_projected_multi` 定位一次行, 只解码请求列 —
+  100K×6 列表 (含 384 维向量 + 文本) 投影 1 列 17µs → 5.4µs p50
+  (SQLite 同形 6.1µs); 整行 SELECT * 对照 51µs 证明向量/文本解码被跳过
+- 预编译路径 (FastPkMeta) 预存 table_id (省每次表注册表查询)
+- 🔒 修复 A4 起的潜伏列错位: `get_row_at_idx` 按传入类型切片枚举列下
+  标, 单列切片永远读第 0 列 — 新增 `Segment::read_column_at_idx` 真单
+  列点读 (定长直读 + 压缩段缓存回退 / 文本分页窗读 / 变长有界读),
+  get_projected 对中间列此前返回错列或 Null
+- 差分测试: 投影 vs 整行逐值对拍 (缓冲/盘上/缺席键/双快路径)
+
 ### FTS: Block-Max WAND + 缓存扩容 (B2+B3)
 
 - 纯 OR 查询 (各分组单词) 走块级 WAND: pivot 前缀上界和 (每词上界取
