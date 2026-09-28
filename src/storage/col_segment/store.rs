@@ -121,6 +121,123 @@ fn cmp_str(v: Option<&str>, target: Option<&str>, op: &crate::sql::ast::BinaryOp
 /// range (ALTER-ed old segment) → NULL; variable-length columns (vector /
 /// spatial / tensor) go through read_var_value_at, fixed-length through the
 /// single-column fixed read.
+/// One column of a merge-emitted row, encoded into the builder's raw
+/// format (bytes + null flag). Reads through the bounded point readers
+/// (fixed direct / text paged window / var-length per-row); a column
+/// missing from a pre-ALTER segment gets the ADD COLUMN DEFAULT backfill
+/// or a width-correct NULL placeholder.
+#[allow(clippy::too_many_arguments)]
+fn encode_column_raw(
+    seg: &Segment,
+    idx: usize,
+    ci: usize,
+    col_types: &[crate::types::ColumnType],
+    new_col_default: Option<&crate::types::Value>,
+    row_bytes: &mut Vec<Vec<u8>>,
+    row_nulls: &mut Vec<bool>,
+) {
+    use crate::types::{ColumnType, Value};
+
+    if ci >= seg.sst.column_tags.len() {
+        // Column doesn't exist in this segment (ALTER TABLE ADD COLUMN).
+        let mut buf = Vec::new();
+        if let Some(dv) = new_col_default {
+            let encoded = match dv {
+                Value::Integer(iv) => iv.to_le_bytes().to_vec(),
+                Value::Float(fv) => fv.to_le_bytes().to_vec(),
+                Value::Timestamp(tv) => tv.as_micros().to_le_bytes().to_vec(),
+                Value::Bool(bv) => vec![if *bv { 1u8 } else { 0u8 }],
+                Value::Text(ts) => {
+                    // [len:u32][bytes] — matches the builder's Text encoding.
+                    let bytes = ts.as_bytes();
+                    let mut b = (bytes.len() as u32).to_le_bytes().to_vec();
+                    b.extend_from_slice(bytes);
+                    b
+                }
+                _ => Vec::new(),
+            };
+            if !encoded.is_empty() {
+                buf.extend_from_slice(&encoded);
+                row_nulls.push(false);
+                row_bytes.push(buf);
+                return;
+            }
+        }
+        // No default — width-correct NULL placeholder so the raw buffer
+        // matches the column's declared encoding.
+        match col_types.get(ci) {
+            Some(ColumnType::Integer) | Some(ColumnType::Float) | Some(ColumnType::Timestamp) => {
+                buf.extend_from_slice(&[0u8; 8]);
+            }
+            Some(ColumnType::Boolean) => buf.push(0u8),
+            Some(ColumnType::Text) => buf.extend_from_slice(&0u32.to_le_bytes()),
+            _ => buf.extend_from_slice(&0xFFFFu16.to_le_bytes()),
+        }
+        row_nulls.push(true);
+        row_bytes.push(buf);
+        return;
+    }
+
+    let ct = &col_types[ci];
+    let mut buf = Vec::new();
+    let null = match seg.read_column_at_idx(idx, ci, ct) {
+        Value::Integer(v) => {
+            buf.extend_from_slice(&v.to_le_bytes());
+            false
+        }
+        Value::Float(v) => {
+            buf.extend_from_slice(&v.to_bits().to_le_bytes());
+            false
+        }
+        Value::Timestamp(v) => {
+            buf.extend_from_slice(&v.as_micros().to_le_bytes());
+            false
+        }
+        Value::Bool(v) => {
+            buf.push(if v { 1u8 } else { 0u8 });
+            false
+        }
+        Value::Text(ts) => {
+            buf.extend_from_slice(&(ts.len() as u32).to_le_bytes());
+            buf.extend_from_slice(ts.as_bytes());
+            false
+        }
+        Value::Vector(v) => {
+            // [dim:u16][f32×dim le] — one block copy: on LE targets the
+            // f32 bit pattern IS the encoded form (per-element to_le_bytes
+            // dominated vector-column merge time: 384 extends per row).
+            buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            let bytes =
+                unsafe { std::slice::from_raw_parts(v.0.as_ptr().cast::<u8>(), v.0.len() * 4) };
+            buf.extend_from_slice(bytes);
+            false
+        }
+        Value::Spatial(g) => {
+            let bytes = bincode::serialize(&*g).unwrap_or_default();
+            crate::storage::lsm::columnar::ColumnarSSTable::spatial_prefix_write(
+                &mut buf,
+                bytes.len(),
+            );
+            buf.extend_from_slice(&bytes);
+            false
+        }
+        _ => {
+            // Stored NULL: type-correct prefix width (text u32 / var u16).
+            match ct {
+                ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp => {
+                    buf.extend_from_slice(&[0u8; 8])
+                }
+                ColumnType::Boolean => buf.push(0u8),
+                ColumnType::Text => buf.extend_from_slice(&0u32.to_le_bytes()),
+                _ => buf.extend_from_slice(&0u16.to_le_bytes()),
+            }
+            true
+        }
+    };
+    row_nulls.push(null);
+    row_bytes.push(buf);
+}
+
 fn projected_value_at(
     seg: &Segment,
     idx: usize,
@@ -4317,409 +4434,120 @@ impl ColSegmentStore {
             .compact_storage
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        // Check if ALL columns are fixed-width (integer/float/bool/timestamp).
-        // If so, use the fast column-direct path (no Vec<Value>).
-        // all_fixed = every column is 8-byte fixed (Integer/Float/Timestamp).
-        // Boolean is fixed-width but only 1 byte, so it must go through the
-        // mixed path (which reads via the type-correct accessor); including it
-        // here would write 8 bytes per Boolean row and corrupt the segment.
-        let all_fixed = col_types.iter().all(|ct| {
-            matches!(
-                ct,
-                ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp
-            )
-        });
+        // 🔑 D2 streaming k-way merge: walk the segments' SORTED keys with a
+        // heap (smallest key first; the NEWEST segment wins ties, older
+        // duplicates drain without emitting), reading each emitted row's
+        // columns through the bounded point readers. Merge memory is
+        // O(#segments) + the builder's output buffer. The old shape
+        // collected EVERY row first — per-row Vec allocations (~180B × 10M
+        // ≈ 1.8GB), a seen HashSet over all keys, and whole-column
+        // text/vector pre-decodes — peaking at 3.5GB on a 500MB table and
+        // 7.1GB on a 1.5GB one (D1 P0).
+        for seg in &old_segs {
+            let _ = seg.sst.load_full_keys();
+            let _ = seg.sst.load_all_timestamps();
+        }
 
-        if all_fixed {
-            // Column-direct compaction: extract raw i64 bytes per row, no Value.
-            // 🔑 CRITICAL: collect ALL rows, sort by key, THEN add to builder.
-            // The builder's row_map stores keys in insertion order and find_key()
-            // uses binary search (requires sorted keys). Without sorting, a merge
-            // of multiple segments (iterated newest-first) produces an unsorted
-            // row_map, breaking point lookups (get/where id=...) after compaction.
-            let single_seg = old_segs.len() <= 1;
-            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            let mut collected: Vec<(u64, u64, Vec<[u8; 8]>, Vec<bool>, bool)> = Vec::new();
-            for seg in old_segs.iter().rev() {
-                let n = seg.sst.num_rows;
-                // Load timestamps from disk (lazy — only needed during merge).
-                let _ = seg.sst.load_all_timestamps();
-                let _ = seg.sst.load_full_keys();
-                let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = (0
-                    ..ncols)
-                    .map(|ci| {
-                        if ci < seg.sst.column_tags.len() && seg.sst.column_tags[ci].is_fixed() {
-                            seg.sst.read_fixed_i64(ci).ok()
-                        } else {
-                            None
+        struct MergeHead {
+            key: u64,
+            /// Index into old_segs; higher = newer (append order = age).
+            rank: u32,
+            idx: usize,
+        }
+        impl PartialEq for MergeHead {
+            fn eq(&self, o: &Self) -> bool {
+                self.key == o.key && self.rank == o.rank
+            }
+        }
+        impl Eq for MergeHead {}
+        impl PartialOrd for MergeHead {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for MergeHead {
+            // Max-heap inversion: pops the SMALLEST key; among equal keys
+            // the LARGEST rank — the newest version wins, exactly the old
+            // first-seen-wins over a newest-first iteration.
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                o.key.cmp(&self.key).then(self.rank.cmp(&o.rank))
+            }
+        }
+
+        let mut heap: std::collections::BinaryHeap<MergeHead> =
+            std::collections::BinaryHeap::with_capacity(old_segs.len());
+        for (rank, seg) in old_segs.iter().enumerate() {
+            if seg.sst.num_rows > 0 {
+                heap.push(MergeHead {
+                    key: seg.sst.row_map.key(0),
+                    rank: rank as u32,
+                    idx: 0,
+                });
+            }
+        }
+
+        let mut row_bytes: Vec<Vec<u8>> = Vec::with_capacity(ncols);
+        let mut row_nulls: Vec<bool> = Vec::with_capacity(ncols);
+        while let Some(head) = heap.pop() {
+            let key = head.key;
+            let seg = &old_segs[head.rank as usize];
+            let ts = seg.sst.row_map.timestamp_loaded(head.idx);
+            let deleted = seg.sst.row_map.is_deleted(head.idx);
+            if !deleted || keep_tombstones {
+                row_bytes.clear();
+                row_nulls.clear();
+                if deleted {
+                    // Tiered merge keeps the tombstone: width-correct NULL
+                    // placeholders (values are never read, but the builder's
+                    // column buffers must stay in sync with num_rows).
+                    for ct in col_types.iter().take(ncols) {
+                        match ct {
+                            ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp => {
+                                row_bytes.push(vec![0u8; 8])
+                            }
+                            ColumnType::Boolean => row_bytes.push(vec![0u8]),
+                            ColumnType::Text => row_bytes.push(0u32.to_le_bytes().to_vec()),
+                            _ => row_bytes.push(0xFFFFu16.to_le_bytes().to_vec()),
                         }
-                    })
-                    .collect();
-                for i in 0..n {
-                    let key = seg.sst.row_map.key(i);
-                    if !seen.insert(key) {
-                        continue;
+                        row_nulls.push(true);
                     }
-                    if seg.sst.row_map.is_deleted(i) {
-                        if keep_tombstones {
-                            // Tiered (subset) merge: the older live version may
-                            // live in a base segment outside this merge set —
-                            // the tombstone must survive to keep shadowing it.
-                            collected.push((
-                                key,
-                                seg.sst.row_map.timestamp_loaded(i),
-                                vec![[0u8; 8]; ncols],
-                                vec![true; ncols],
-                                true,
-                            ));
-                        }
-                        continue;
-                    }
-                    let ts = seg.sst.row_map.timestamp_loaded(i);
-                    let mut col_vals: Vec<[u8; 8]> = Vec::with_capacity(ncols);
-                    let mut col_nulls: Vec<bool> = Vec::with_capacity(ncols);
+                } else {
                     for ci in 0..ncols {
-                        match fixed_cols
-                            .get(ci)
-                            .and_then(|x| x.as_ref())
-                            .and_then(|f| f.get_i64(i))
-                        {
-                            Some(v) => {
-                                col_vals.push(v.to_le_bytes());
-                                col_nulls.push(false);
-                            }
-                            None => {
-                                // 🔑 Backfill: if this is the new column (ci is
-                                // the last column, beyond old segment's tags)
-                                // AND a default value exists, encode it instead
-                                // of NULL. For the all-fixed path, the default
-                                // must be a fixed-width numeric (Integer/Float/
-                                // Timestamp — encoded as i64 bytes).
-                                if ci >= seg.sst.column_tags.len() {
-                                    if let Some(dv) = new_col_default {
-                                        match dv {
-                                            crate::types::Value::Integer(iv) => {
-                                                col_vals.push(iv.to_le_bytes());
-                                                col_nulls.push(false);
-                                                continue;
-                                            }
-                                            crate::types::Value::Float(fv) => {
-                                                col_vals.push(fv.to_le_bytes());
-                                                col_nulls.push(false);
-                                                continue;
-                                            }
-                                            crate::types::Value::Timestamp(tv) => {
-                                                col_vals.push(tv.as_micros().to_le_bytes());
-                                                col_nulls.push(false);
-                                                continue;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                col_vals.push(0i64.to_le_bytes());
-                                col_nulls.push(true);
-                            }
-                        }
+                        encode_column_raw(
+                            seg,
+                            head.idx,
+                            ci,
+                            &col_types,
+                            new_col_default,
+                            &mut row_bytes,
+                            &mut row_nulls,
+                        );
                     }
-                    collected.push((key, ts, col_vals, col_nulls, false));
                 }
+                let slices: Vec<&[u8]> = row_bytes.iter().map(|b| b.as_slice()).collect();
+                builder.add_values_raw_with_nulls(key, ts, deleted, &slices, &row_nulls)?;
             }
-            // Single-segment data is already sorted (sequential insert); skip the
-            // sort for that case to avoid the O(N log N) overhead.
-            if !single_seg {
-                collected.sort_unstable_by_key(|(k, _, _, _, _)| *k);
+            let next = head.idx + 1;
+            if next < seg.sst.num_rows {
+                heap.push(MergeHead {
+                    key: seg.sst.row_map.key(next),
+                    rank: head.rank,
+                    idx: next,
+                });
             }
-            for (key, ts, col_vals, col_nulls, deleted) in collected {
-                let col_bytes: Vec<&[u8]> = col_vals.iter().map(|b| b.as_slice()).collect();
-                builder.add_values_raw_with_nulls(key, ts, deleted, &col_bytes, &col_nulls)?;
-            }
-        } else {
-            // Mixed columns (has Text and/or Vector/Spatial): direct copy with
-            // temp buffers. Avoids MergeCursor's per-row Vec<Value> + SegmentCursor
-            // pre-decode.
-            // 🔑 CRITICAL: collect ALL rows, sort by key, THEN add (see note above).
-            // 🔑 Vector/Spatial columns must be decoded+re-encoded here (they have
-            // no zero-copy segment readers); otherwise a multi-segment merge would
-            // silently DROP those columns (each row's buffer stayed empty).
-            use crate::storage::lsm::columnar::ColumnTypeTag;
-            let single_seg = old_segs.len() <= 1;
-            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            let mut collected: Vec<(u64, u64, Vec<Vec<u8>>, Vec<bool>, bool)> = Vec::new();
-            for seg in old_segs.iter().rev() {
-                let n = seg.sst.num_rows;
-                // Load timestamps from disk (lazy — only needed during merge).
-                let _ = seg.sst.load_all_timestamps();
-                let _ = seg.sst.load_full_keys();
-                let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = (0
-                    ..ncols)
-                    .map(|ci| {
-                        if ci < seg.sst.column_tags.len() && seg.sst.column_tags[ci].is_fixed() {
-                            seg.sst.read_fixed_i64(ci).ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let text_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = (0..ncols)
-                    .map(|ci| {
-                        if ci < seg.sst.column_tags.len()
-                            && matches!(
-                                seg.sst.column_tags[ci],
-                                crate::storage::lsm::columnar::ColumnTypeTag::Text
-                            )
-                        {
-                            seg.sst.read_text(ci).ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                // Pre-decode Vector columns into per-idx option vecs.
-                let vec_cols: Vec<Vec<Option<Vec<f32>>>> = (0..ncols)
-                    .map(|ci| {
-                        if ci < seg.sst.column_tags.len()
-                            && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Vector)
-                        {
-                            let decoded = seg.sst.read_vectors(ci).unwrap_or_default();
-                            let mut per_row = vec![None; n];
-                            let mut di = 0usize;
-                            for i in 0..n {
-                                if seg.sst.row_map.is_deleted(i) {
-                                    continue;
-                                }
-                                let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                                while di < decoded.len() && decoded[di].0 != ek {
-                                    di += 1;
-                                }
-                                if di < decoded.len() {
-                                    per_row[i] = Some(decoded[di].1.clone());
-                                    di += 1;
-                                }
-                            }
-                            per_row
-                        } else {
-                            Vec::new()
-                        }
-                    })
-                    .collect();
-                // Pre-decode Spatial columns into per-idx option vecs.
-                let spatial_cols: Vec<Vec<Option<crate::types::Geometry>>> = (0..ncols)
-                    .map(|ci| {
-                        if ci < seg.sst.column_tags.len()
-                            && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Spatial)
-                        {
-                            let decoded = seg.sst.read_spatial(ci).unwrap_or_default();
-                            let mut per_row = vec![None; n];
-                            let mut di = 0usize;
-                            for i in 0..n {
-                                if seg.sst.row_map.is_deleted(i) {
-                                    continue;
-                                }
-                                let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                                while di < decoded.len() && decoded[di].0 != ek {
-                                    di += 1;
-                                }
-                                if di < decoded.len() {
-                                    per_row[i] = Some(decoded[di].1.clone());
-                                    di += 1;
-                                }
-                            }
-                            per_row
-                        } else {
-                            Vec::new()
-                        }
-                    })
-                    .collect();
-                for i in 0..n {
-                    let key = seg.sst.row_map.key(i);
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    if seg.sst.row_map.is_deleted(i) {
-                        if keep_tombstones {
-                            // Tiered (subset) merge: keep the tombstone — the
-                            // older live version may live in a base segment
-                            // outside this merge set (see all_fixed path).
-                            let ts = seg.sst.row_map.timestamp_loaded(i);
-                            let mut ph: Vec<Vec<u8>> = Vec::with_capacity(ncols);
-                            let mut pn: Vec<bool> = Vec::with_capacity(ncols);
-                            for ci in 0..ncols {
-                                // Width-correct NULL placeholders (values of
-                                // deleted rows are never read, but column
-                                // buffers must stay in sync with num_rows).
-                                match col_types.get(ci) {
-                                    Some(ColumnType::Integer)
-                                    | Some(ColumnType::Float)
-                                    | Some(ColumnType::Timestamp) => {
-                                        ph.push(vec![0u8; 8]);
-                                    }
-                                    Some(ColumnType::Boolean) => {
-                                        ph.push(vec![0u8]);
-                                    }
-                                    // Text: [u32 len] (0 = NULL-width placeholder)
-                                    Some(ColumnType::Text) => ph.push(0u32.to_le_bytes().to_vec()),
-                                    // Vector/Spatial: [u16 dim/len] sentinel
-                                    _ => ph.push(0xFFFFu16.to_le_bytes().to_vec()),
-                                }
-                                pn.push(true);
-                            }
-                            collected.push((key, ts, ph, pn, true));
-                        }
-                        continue;
-                    }
-                    let ts = seg.sst.row_map.timestamp_loaded(i);
-                    let mut row_bytes: Vec<Vec<u8>> = Vec::with_capacity(ncols);
-                    let mut row_nulls: Vec<bool> = Vec::with_capacity(ncols);
-                    for ci in 0..ncols {
-                        let mut buf = Vec::new();
-                        let tag = seg.sst.column_tags.get(ci).copied();
-                        if matches!(
-                            tag,
-                            Some(crate::storage::lsm::columnar::ColumnTypeTag::Bool)
-                        ) {
-                            // Boolean: 1-byte fixed. Read via get_bool, write 1 byte.
-                            match fixed_cols
-                                .get(ci)
-                                .and_then(|x| x.as_ref())
-                                .and_then(|f| f.get_bool(i))
-                            {
-                                Some(b) => {
-                                    buf.push(if b { 1u8 } else { 0u8 });
-                                    row_nulls.push(false);
-                                }
-                                None => {
-                                    buf.push(0u8);
-                                    row_nulls.push(true);
-                                }
-                            }
-                        } else if let Some(f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
-                            match f.get_i64(i) {
-                                Some(v) => {
-                                    buf.extend_from_slice(&v.to_le_bytes());
-                                    row_nulls.push(false);
-                                }
-                                None => {
-                                    buf.extend_from_slice(&0i64.to_le_bytes());
-                                    row_nulls.push(true);
-                                }
-                            }
-                        } else if let Some(t) = text_cols.get(ci).and_then(|x| x.as_ref()) {
-                            match t.get_str(i) {
-                                Some(s) => {
-                                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                                    buf.extend_from_slice(s.as_bytes());
-                                    row_nulls.push(false);
-                                }
-                                None => {
-                                    buf.extend_from_slice(&0u32.to_le_bytes());
-                                    row_nulls.push(true);
-                                }
-                            }
-                        } else if ci < vec_cols.len() && !vec_cols[ci].is_empty() {
-                            // Vector: re-encode [dim:u16][f32×dim] (NULL → dim=0).
-                            if let Some(ref v) = vec_cols[ci][i] {
-                                buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
-                                for x in v {
-                                    buf.extend_from_slice(&x.to_le_bytes());
-                                }
-                                row_nulls.push(false);
-                            } else {
-                                buf.extend_from_slice(&0u16.to_le_bytes());
-                                row_nulls.push(true);
-                            }
-                        } else if ci < spatial_cols.len() && !spatial_cols[ci].is_empty() {
-                            // Spatial: re-encode [escape len-prefix][bincode(Geometry)]
-                            // (NULL → len=0). Same escape scheme as the builder
-                            // (0xFFFF → u32 follows) so merges don't re-truncate
-                            // large geometries back to NULL.
-                            if let Some(ref g) = spatial_cols[ci][i] {
-                                let bytes = bincode::serialize(g).unwrap_or_default();
-                                crate::storage::lsm::columnar::ColumnarSSTable::spatial_prefix_write(
-                                    &mut buf,
-                                    bytes.len(),
-                                );
-                                buf.extend_from_slice(&bytes);
-                                row_nulls.push(false);
-                            } else {
-                                crate::storage::lsm::columnar::ColumnarSSTable::spatial_prefix_write(&mut buf, 0);
-                                row_nulls.push(true);
-                            }
-                        } else {
-                            // 🚨 Column ci doesn't exist in this segment (e.g.
-                            // ALTER TABLE ADD COLUMN added it after this segment
-                            // was written; ci >= column_tags.len()).
-                            // 🔑 If a DEFAULT value exists for this new column,
-                            // encode it instead of NULL (SQL: ADD COLUMN DEFAULT
-                            // backfills existing rows with the default).
-                            if let Some(dv) = new_col_default {
-                                let encoded_default = match dv {
-                                    crate::types::Value::Integer(iv) => {
-                                        iv.to_le_bytes().to_vec() // fixed-width 8 bytes, null=false
-                                    }
-                                    crate::types::Value::Float(fv) => fv.to_le_bytes().to_vec(),
-                                    crate::types::Value::Timestamp(tv) => {
-                                        tv.as_micros().to_le_bytes().to_vec()
-                                    }
-                                    crate::types::Value::Bool(bv) => {
-                                        vec![if *bv { 1u8 } else { 0u8 }]
-                                    }
-                                    crate::types::Value::Text(ts) => {
-                                        // [len:u32][bytes] (matches the builder's
-                                        // Text encoding — u32 since the 64KB lift)
-                                        let bytes = ts.as_bytes();
-                                        let mut b = (bytes.len() as u32).to_le_bytes().to_vec();
-                                        b.extend_from_slice(bytes);
-                                        b
-                                    }
-                                    _ => Vec::new(),
-                                };
-                                if !encoded_default.is_empty() {
-                                    buf.extend_from_slice(&encoded_default);
-                                    row_nulls.push(false);
-                                    row_bytes.push(buf);
-                                    continue;
-                                }
-                            }
-                            // No default — emit a NULL placeholder sized for the
-                            // column's declared type so add_values_raw_with_nulls
-                            // gets the right byte width.
-                            match col_types.get(ci) {
-                                Some(ColumnType::Integer)
-                                | Some(ColumnType::Float)
-                                | Some(ColumnType::Timestamp) => {
-                                    buf.extend_from_slice(&[0u8; 8]);
-                                }
-                                Some(ColumnType::Boolean) => {
-                                    buf.push(0u8);
-                                }
-                                // Text rows in the raw buffer are prefixed by
-                                // a u32 length (NULL = 0; null_flags is
-                                // authoritative). Without these 4 bytes the
-                                // finish() path would see pos+4 > raw.len()
-                                // and truncate the column. Vector/Spatial keep
-                                // their own u16-dim/len prefixes (appended below
-                                // via their default encoders).
-                                Some(ColumnType::Text) => {
-                                    buf.extend_from_slice(&0u32.to_le_bytes());
-                                }
-                                _ => {
-                                    buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
-                                }
-                            }
-                            row_nulls.push(true);
-                        }
-                        row_bytes.push(buf);
-                    }
-                    collected.push((key, ts, row_bytes, row_nulls, false));
+            // Drain older duplicates of the same key (newest already
+            // handled above — emit or drop decided there).
+            while heap.peek().is_some_and(|h| h.key == key) {
+                let dup = heap.pop().unwrap();
+                let dseg = &old_segs[dup.rank as usize];
+                let dnext = dup.idx + 1;
+                if dnext < dseg.sst.num_rows {
+                    heap.push(MergeHead {
+                        key: dseg.sst.row_map.key(dnext),
+                        rank: dup.rank,
+                        idx: dnext,
+                    });
                 }
-            }
-            if !single_seg {
-                collected.sort_unstable_by_key(|(k, _, _, _, _)| *k);
-            }
-            for (key, ts, row_bytes, row_nulls, deleted) in collected {
-                let col_slices: Vec<&[u8]> = row_bytes.iter().map(|b| b.as_slice()).collect();
-                builder.add_values_raw_with_nulls(key, ts, deleted, &col_slices, &row_nulls)?;
             }
         }
         builder.finish()?;
@@ -5169,5 +4997,246 @@ mod projected_tests {
         assert!(store
             .get_projected_multi((7u64 << 32) | 999, &[1])
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod merge_stream_tests {
+    use super::*;
+    use crate::types::Value;
+
+    /// 🔒 D2 streaming merge: multi-segment compaction must dedup newest-wins,
+    /// drop tombstones, preserve NULLs, and round-trip every column family
+    /// (fixed / bool / text / vector), plus the ALTER DEFAULT backfill for
+    /// rows from pre-ALTER segments.
+    #[test]
+    fn streaming_merge_full_semantics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let col_types = vec![
+            crate::types::ColumnType::Integer,
+            crate::types::ColumnType::Boolean,
+            crate::types::ColumnType::Text,
+            crate::types::ColumnType::Float,
+        ];
+        let store = ColSegmentStore::create(dir.path(), "t", col_types.clone()).unwrap();
+        let k = |r: u64| (3u64 << 32) | r;
+
+        // Segment 1: rows 1..=5. Row 3 text NULL, row 4 bool false.
+        store
+            .append_rows(&[
+                (
+                    k(1),
+                    1,
+                    vec![
+                        Value::Integer(10),
+                        Value::Bool(true),
+                        Value::Text("alpha".into()),
+                        Value::Float(1.5),
+                    ],
+                ),
+                (
+                    k(2),
+                    2,
+                    vec![
+                        Value::Integer(20),
+                        Value::Bool(false),
+                        Value::Text("beta".into()),
+                        Value::Float(2.5),
+                    ],
+                ),
+                (
+                    k(3),
+                    3,
+                    vec![
+                        Value::Integer(30),
+                        Value::Bool(true),
+                        Value::Null,
+                        Value::Float(3.5),
+                    ],
+                ),
+                (
+                    k(4),
+                    4,
+                    vec![
+                        Value::Integer(40),
+                        Value::Bool(false),
+                        Value::Text("delta".into()),
+                        Value::Null,
+                    ],
+                ),
+                (
+                    k(5),
+                    5,
+                    vec![
+                        Value::Null,
+                        Value::Bool(true),
+                        Value::Text("epsilon".into()),
+                        Value::Float(5.5),
+                    ],
+                ),
+            ])
+            .unwrap();
+        store.flush_buffer().unwrap();
+
+        // Segment 2: overwrite row 2 (newer), add row 6, delete row 5.
+        store
+            .append_rows(&[
+                (
+                    k(2),
+                    7,
+                    vec![
+                        Value::Integer(99),
+                        Value::Bool(true),
+                        Value::Text("beta-v2".into()),
+                        Value::Float(9.5),
+                    ],
+                ),
+                (
+                    k(6),
+                    8,
+                    vec![
+                        Value::Integer(60),
+                        Value::Bool(false),
+                        Value::Text("zeta".into()),
+                        Value::Float(6.5),
+                    ],
+                ),
+            ])
+            .unwrap();
+        store.append_tombstone(k(5), 9).unwrap();
+        store.flush_buffer().unwrap();
+
+        // Segment 3: one more row (forces a real 3-way merge).
+        store
+            .append_rows(&[(
+                k(7),
+                10,
+                vec![
+                    Value::Integer(70),
+                    Value::Null,
+                    Value::Null,
+                    Value::Float(7.5),
+                ],
+            )])
+            .unwrap();
+        store.flush_buffer().unwrap();
+
+        store.force_compact_all().unwrap();
+
+        // Newest-wins dedup, tombstone drop, all values intact.
+        let expect: Vec<(u64, Vec<Value>)> = vec![
+            (
+                k(1),
+                vec![
+                    Value::Integer(10),
+                    Value::Bool(true),
+                    Value::Text("alpha".into()),
+                    Value::Float(1.5),
+                ],
+            ),
+            (
+                k(2),
+                vec![
+                    Value::Integer(99),
+                    Value::Bool(true),
+                    Value::Text("beta-v2".into()),
+                    Value::Float(9.5),
+                ],
+            ),
+            (
+                k(3),
+                vec![
+                    Value::Integer(30),
+                    Value::Bool(true),
+                    Value::Null,
+                    Value::Float(3.5),
+                ],
+            ),
+            (
+                k(4),
+                vec![
+                    Value::Integer(40),
+                    Value::Bool(false),
+                    Value::Text("delta".into()),
+                    Value::Null,
+                ],
+            ),
+            (
+                k(6),
+                vec![
+                    Value::Integer(60),
+                    Value::Bool(false),
+                    Value::Text("zeta".into()),
+                    Value::Float(6.5),
+                ],
+            ),
+            (
+                k(7),
+                vec![
+                    Value::Integer(70),
+                    Value::Null,
+                    Value::Null,
+                    Value::Float(7.5),
+                ],
+            ),
+        ];
+        for (key, want) in &expect {
+            let got = store.get(*key).expect("row present after merge");
+            assert_eq!(got.len(), want.len(), "col count for {key}");
+            for (ci, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                let ok = match (g, w) {
+                    (Value::Float(a), Value::Float(b)) => (a - b).abs() < 1e-9,
+                    _ => g == w,
+                };
+                assert!(ok, "key {key} col {ci}: got {g:?} want {w:?}");
+            }
+        }
+        assert!(store.get(k(5)).is_none(), "tombstoned row must be gone");
+        // Exactly one segment now, with the deduped row count.
+        assert_eq!(store.segment_count(), 1);
+        let n = store.scan().count() as u64;
+        assert_eq!(n, expect.len() as u64, "scan count after merge");
+    }
+
+    /// Vector columns must survive a multi-segment merge (the old fixed-only
+    /// fast path silently dropped them; the streaming reader re-encodes).
+    #[test]
+    fn streaming_merge_vector_columns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let col_types = vec![
+            crate::types::ColumnType::Integer,
+            crate::types::ColumnType::Tensor(3),
+        ];
+        let store = ColSegmentStore::create(dir.path(), "t", col_types.clone()).unwrap();
+        let k = |r: u64| (5u64 << 32) | r;
+        let v = |a: f32, b: f32, c: f32| Value::Vector(crate::types::ArcVec::new(vec![a, b, c]));
+
+        store
+            .append_rows(&[
+                (k(1), 1, vec![Value::Integer(1), v(1.0, 2.0, 3.0)]),
+                (k(2), 2, vec![Value::Integer(2), Value::Null]),
+            ])
+            .unwrap();
+        store.flush_buffer().unwrap();
+        store
+            .append_rows(&[(k(3), 3, vec![Value::Integer(3), v(9.0, 8.0, 7.0)])])
+            .unwrap();
+        store.flush_buffer().unwrap();
+        store.force_compact_all().unwrap();
+
+        let got = store.get(k(1)).unwrap();
+        match &got[1] {
+            Value::Vector(vec) => {
+                assert_eq!(&vec.0[..], &[1.0f32, 2.0, 3.0][..]);
+            }
+            other => panic!("vector lost in merge: {other:?}"),
+        }
+        assert!(matches!(store.get(k(2)).unwrap()[1], Value::Null));
+        match &store.get(k(3)).unwrap()[1] {
+            Value::Vector(vec) => {
+                assert_eq!(&vec.0[..], &[9.0f32, 8.0, 7.0][..]);
+            }
+            other => panic!("vector lost in merge: {other:?}"),
+        }
     }
 }

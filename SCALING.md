@@ -85,3 +85,27 @@ p50 5.32ms, recall 0.999); 1M 构建线性外推 ~10-12 分钟。
 
 探查工具: `bindings/python/bench/prof_scale.py` / `prof_scale_vec.py`
 (结果 JSON → ~/.cache/motedb_eval/scale_results.json)。
+
+
+---
+
+# D2 P0 修复: 流式 k 路归并 (2026-09-28)
+
+`merge_segments_locked_with_default` 从"收集全部行 → 排序 → 写出"改为
+**堆式流式归并**: 各段键已排序, 最小键先出、同键最新段胜出 (旧段重复
+直接排空不发射), 每行列值经有界点读器 (定长直读 / 文本分页窗 / 变长
+逐行) 即读即编码。归并内存 O(段数) + builder 输出缓冲, 消除三座大山:
+逐行 Vec 分配 (~180B × 10M ≈ 1.8GB)、全键 seen HashSet、整列
+text/vector 预解码。向量列编码改单次块拷贝 (LE 平台 f32 位模式即编
+码, 免 384 次/行的逐元素 extend)。
+
+| 形状 | 旧 checkpoint 峰值 | 新峰值 | checkpoint 耗时 |
+|---|---|---|---|
+| 窄表 10M (500MB 数据) | 3.5GB (7×) | **2.09GB (4.2×)** | 7.2s → **4.6s** |
+| 向量 1M×384 (1.5GB) | 7.1GB (4.7×) | **5.6GB (3.7×)** | 7.0s → 7.5s |
+
+剩余峰值 = builder 全量输出缓冲 (列字节 + keys/timestamps/null 位
+图), 改 builder 流式写盘是后续独立工作项。查询行为不变: 差分测试覆
+盖多段覆写 (最新胜出) / 墓碑删除 / NULL / 定长+bool+text+vector 混合
+列 / 向量列存活性; 10M 窄表重开 COUNT 精确、GROUP BY/JOIN/点查无回
+退 (p50 14.5µs)。
