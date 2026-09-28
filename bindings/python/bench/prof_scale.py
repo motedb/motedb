@@ -23,7 +23,9 @@ import motedb  # noqa: E402
 
 
 def peak_rss_mb():
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    # macOS ru_maxrss is in BYTES (Linux: KB) — both land on MB here.
+    v = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return v / (1024 * 1024) if v > 10_000_000 else v / 1024.0
 
 
 def cur_rss_mb():
@@ -98,8 +100,8 @@ def main():
                         "val": [k * 0.5 for k in range(s, j)],
                     },
                 )
-            st.r["rows_per_s"] = round(N / report["rows_per_stage"]["s1_load"]["s"])
-            print(f"    load rate: {st.r['rows_per_s']:,} rows/s", flush=True)
+        report["load_rows_per_s"] = round(N / report["rows_per_stage"]["s1_load"]["s"])
+        print(f"    load rate: {report['load_rows_per_s']:,} rows/s", flush=True)
 
         with Stage(report["rows_per_stage"], "s2_checkpoint_reopen"):
             db.checkpoint()
@@ -138,11 +140,11 @@ def main():
                 db.query("SELECT val FROM ev WHERE id = ?", params=[i])
                 lat.append(time.perf_counter() - t0)
             lat.sort()
-            st.r["point_p50_us"] = round(lat[500] * 1e6, 1)
-            st.r["point_p95_us"] = round(lat[950] * 1e6, 1)
-            print(f"    point p50 {st.r['point_p50_us']}µs p95 {st.r['point_p95_us']}µs")
+            report["point_p50_us"] = round(lat[500] * 1e6, 1)
+            report["point_p95_us"] = round(lat[950] * 1e6, 1)
 
         db.close()
+        print(f"    point p50 {report['point_p50_us']}µs p95 {report['point_p95_us']}µs")
         report["disk_mb"] = round(
             sum(
                 os.path.getsize(os.path.join(dp, f))
