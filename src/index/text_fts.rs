@@ -444,8 +444,8 @@ impl TextFTSIndex {
             }
         }
 
-        const AUTO_FLUSH_THRESHOLD_TERMS: usize = 200;
-        const AUTO_FLUSH_THRESHOLD_DOCS: usize = 2000;
+        const AUTO_FLUSH_THRESHOLD_TERMS: usize = 2000;
+        const AUTO_FLUSH_THRESHOLD_DOCS: usize = 20000;
 
         {
             let pending_terms = self.pending_posting_lists.read().len();

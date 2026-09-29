@@ -2,6 +2,17 @@
 
 ## [0.12.0] — 未发布
 
+### 存储: 大段读去锁 (pread 替换 seek+read)
+
+- 🔒 ColumnarSSTable 的共享读句柄从 `Mutex<File>` + seek+read 改为
+  `Arc<File>` + pread (read_at): 旧实现在游标共享下必须持锁, 大段
+  (>8MB lazy-load) 的所有并行 morsel 串行化到一把锁上 — D2 全量归并
+  产出大段后, 无索引暴力 knn 100K×384 从 1.6ms 跌到 19ms (单核带宽)
+- pread 无锁且 offset 在系统调用内, 并行 morsel 各自缓冲; 修复后同形
+  19→8.9ms (负载 5-6; 空闲机更快), 正确性对拍 numpy 真值一致
+- 查询内存不变 (流式 1MB 有界子块, 无整列驻留); resource_bench 复核:
+  9 查询形状 RSS Δ ≤1.1MB / steady 3.3MB / edge 无回归
+
 ### 压缩: 流式 k 路归并 (D2, D1 P0 修复)
 
 - 段合并从"收集全部行 → 排序 → 写出"改为堆式流式归并 (最小键先出,

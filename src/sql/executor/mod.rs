@@ -20300,6 +20300,19 @@ impl QueryExecutor {
         let col_pos = schema.get_column_position(col).unwrap_or(0);
         let qdim = query.len();
 
+        if std::env::var_os("MOTE_TRACE_KNN").is_some() {
+            let nsegs = self
+                .db
+                .get_or_create_col_segment_store(table, &[])
+                .map(|s| {
+                    s.segments_snapshot()
+                        .iter()
+                        .map(|g| g.sst.num_rows)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            eprintln!("[knn] brute_force enter: seg sizes={nsegs:?}");
+        }
         if let Ok(store) = self.db.get_or_create_col_segment_store(table, &[]) {
             // 🔑 Consistent read: hold the flush lock across the segment
             // snapshot AND the buffered-rows read. Without it, the auto-flush
@@ -20787,6 +20800,11 @@ impl QueryExecutor {
                 }
                 let dim = u16::from_le_bytes([head[null_bytes], head[null_bytes + 1]]) as usize;
                 if dim != qdim {
+                    if std::env::var_os("MOTE_TRACE_KNN").is_some() {
+                        eprintln!(
+                            "[knn] dim mismatch: seg dim={dim} qdim={qdim} n={n} — segment SKIPPED"
+                        );
+                    }
                     seed_tombstones(&mut seen);
                     continue;
                 }
@@ -20801,6 +20819,12 @@ impl QueryExecutor {
                     let nchunks = crate::sql::vector_exec::par_chunk_count(n);
                     let chunk_len = n.div_ceil(nchunks).max(1);
                     let prior = &seen;
+                    if std::env::var_os("MOTE_TRACE_KNN").is_some() {
+                        eprintln!(
+                            "[knn] intra-seg parallel: n={n} chunks={nchunks} threads={}",
+                            rayon::current_num_threads()
+                        );
+                    }
                     let parts: Vec<(
                         std::collections::BinaryHeap<(OrderedF32, u64)>,
                         Vec<u64>,

@@ -80,6 +80,35 @@ use std::sync::Arc;
 #[allow(unused_imports)]
 use memmap2::{Mmap, MmapOptions};
 
+/// 🔑 Positional read that needs NO lock: pread keeps the offset in the
+/// syscall, so a shared &File serves any number of concurrent readers
+/// (each with its own buffer). Loops until the buffer is full (read_at may
+/// return short reads).
+fn read_exact_at(f: &File, buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            f.read_at(&mut buf[done..], offset)?
+        };
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            f.seek_read(&mut buf[done..], offset)?
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read_exact_at hit EOF",
+            ));
+        }
+        done += n;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
 // ── Fast byte-set hashing (IN-list / IN-subquery row matching) ────────────
 //
 // Every row of a column is hashed against the IN set during
@@ -1481,7 +1510,12 @@ pub struct ColumnarSSTable {
     pub(crate) file_data: Vec<u8>,
     #[allow(dead_code)]
     mmap: Option<Arc<Mmap>>,
-    file: Option<parking_lot::Mutex<File>>,
+    /// Read-only handle for lazy column reads. 🔑 pread (read_at) — &File,
+    /// no cursor — so parallel morsels read WITHOUT a mutex. The old
+    /// `Mutex<File>` + seek+read serialized every parallel chunk of a large
+    /// lazy-loaded segment onto one lock (single-core bandwidth: 12× slower
+    /// brute-force knn on a post-compaction 100K×384 segment).
+    file: Option<Arc<File>>,
     #[allow(dead_code)]
     header: ColumnarHeader,
     pub column_index: Vec<ColumnIndexEntry>,
@@ -1776,7 +1810,7 @@ impl ColumnarSSTable {
 
         // Cache the file handle for column data reads (seek+read on demand).
         let file = if file_data.is_empty() && mmap.is_none() {
-            std::fs::File::open(&path).ok().map(parking_lot::Mutex::new)
+            std::fs::File::open(&path).ok().map(Arc::new)
         } else {
             None
         };
@@ -1858,7 +1892,7 @@ impl ColumnarSSTable {
             return true;
         }
         let file_len = match &self.file {
-            Some(f) => f.lock().metadata().map(|m| m.len()).unwrap_or(0),
+            Some(f) => f.metadata().map(|m| m.len()).unwrap_or(0),
             None => 0,
         };
         if file_len == 0 || file_len > max_bytes as u64 {
@@ -1872,7 +1906,7 @@ impl ColumnarSSTable {
             return Ok(()); // Already loaded (small file or previously called).
         }
         let file_len = match &self.file {
-            Some(f) => f.lock().metadata().map(|m| m.len() as usize).unwrap_or(0),
+            Some(f) => f.metadata().map(|m| m.len() as usize).unwrap_or(0),
             None => 0,
         };
         if file_len == 0 {
@@ -1880,11 +1914,9 @@ impl ColumnarSSTable {
         }
         let mut buf = vec![0u8; file_len];
         use std::io::{Read, Seek, SeekFrom};
-        let ok = if let Some(ref cached) = self.file {
-            let mut f = cached.lock();
-            f.seek(SeekFrom::Start(0)).is_ok() && f.read_exact(&mut buf).is_ok()
-        } else {
-            false
+        let ok = match &self.file {
+            Some(f) => read_exact_at(f, &mut buf, 0).is_ok(),
+            None => false,
         };
         if !ok {
             return Ok(());
@@ -2216,7 +2248,6 @@ impl ColumnarSSTable {
     /// Read raw bytes from the file at an absolute offset. Uses the cached file
     /// handle (no File::open per call).
     pub(crate) fn read_raw(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
-        use std::io::{Read, Seek};
         if !self.file_data.is_empty() {
             let end = offset + buf.len();
             if end <= self.file_data.len() {
@@ -2226,9 +2257,7 @@ impl ColumnarSSTable {
             return Err(StorageError::InvalidData("read_raw out of bounds".into()));
         }
         if let Some(ref cached) = self.file {
-            let mut f = cached.lock();
-            f.seek(SeekFrom::Start(offset as u64))?;
-            f.read_exact(buf)?;
+            read_exact_at(cached, buf, offset as u64)?;
             Ok(())
         } else {
             Err(StorageError::InvalidData("No file handle".into()))
@@ -2312,9 +2341,8 @@ impl ColumnarSSTable {
         {
             use std::os::unix::io::AsRawFd;
             if let Some(ref cached) = self.file {
-                let f = cached.lock();
                 unsafe {
-                    libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+                    libc::posix_fadvise(cached.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
                 }
             }
         }
@@ -2370,10 +2398,9 @@ impl ColumnarSSTable {
             let mut buf = vec![0u8; len];
             use std::io::{Read, Seek};
             let ok = if let Some(ref cached) = self.file {
-                let mut f = cached.lock();
-                f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
-            } else if let Ok(mut f) = std::fs::File::open(&self.path) {
-                f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
+                read_exact_at(cached, &mut buf, start as u64).is_ok()
+            } else if let Ok(f) = std::fs::File::open(&self.path) {
+                read_exact_at(&f, &mut buf, start as u64).is_ok()
             } else {
                 false
             };
@@ -2509,10 +2536,9 @@ impl ColumnarSSTable {
         let mut buf = vec![0u8; len];
         use std::io::{Read, Seek};
         let ok = if let Some(ref cached) = self.file {
-            let mut f = cached.lock();
-            f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
-        } else if let Ok(mut f) = std::fs::File::open(&self.path) {
-            f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
+            read_exact_at(cached, &mut buf, start as u64).is_ok()
+        } else if let Ok(f) = std::fs::File::open(&self.path) {
+            read_exact_at(&f, &mut buf, start as u64).is_ok()
         } else {
             false
         };
@@ -2544,10 +2570,9 @@ impl ColumnarSSTable {
         let mut buf = vec![0u8; len];
         use std::io::{Read, Seek};
         let ok = if let Some(ref cached) = self.file {
-            let mut f = cached.lock();
-            f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
-        } else if let Ok(mut f) = std::fs::File::open(&self.path) {
-            f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
+            read_exact_at(cached, &mut buf, start as u64).is_ok()
+        } else if let Ok(f) = std::fs::File::open(&self.path) {
+            read_exact_at(&f, &mut buf, start as u64).is_ok()
         } else {
             false
         };
