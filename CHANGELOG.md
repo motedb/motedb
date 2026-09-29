@@ -2,6 +2,31 @@
 
 ## [0.12.0] — 未发布
 
+### 对抗验证修复: 参数化 MATCH + 事务 DELETE 快路径
+
+- 🔒 `MATCH(col, ?)` / `MATCH(col) AGAINST (?)` 参数化查询支持 (此前解析
+  层直接报错 "second argument must be a string"): 解析器编码哨兵 +
+  substitute_params_stmt 解析绑定 (必须 Text); contains_match_sentinel
+  触发代入 (漏检会拿哨兵字面量查询 — 0 行)
+- 🔒 事务内 `DELETE ... WHERE pk = ?` 走 PK 快路径 (此前事务模式整体
+  跳过快路径 → 每条语句全表流式扫描: 100K 行表实测 512ms/条, 对抗验
+  证器 2 rows/s 且触发段合并风暴): execute_delete_pk 事务安全化 —
+  txn_lookup_row 可见性 (已删不复活, write_set 版本优先, 普通存储行
+  回退 get_table_row) + write_set 同 PK 行清理 (未提交 INSERT 删除后
+  COMMIT 不复活); 事务 DELETE 512→6.7ms/条 (76×), 与非事务持平
+- 回归测试: 参数化 MATCH 六用例 (短/长形式/AND 语义/第二参数/非字符
+  串报错/未绑定报错) + 事务 PK DELETE 语义 (rollback 恢复/重复删计一
+  次/write_set 清理/防全表扫描计时门)
+- 新增对抗验证器 bindings/python/bench/adversarial_verify.py: 随机对
+  抗数据 (乱序/NULL/中文/唯一词表) + 400 查询与 SQLite 逐结果集对拍 +
+  120 FTS 对拍 FTS5 + 写删后复检 + 重开 + recall — 全绿
+
+### 已知项 (如实记录, 未修)
+- 非事务逐条 UPDATE/DELETE ~4-7ms/条 (每语句 WAL fsync + FTS 维护恒定
+  成本; 事务/executemany 批量可摊)
+- 乱序键 executemany INSERT ~4.7K rows/s (排序 fast path 206K)
+- execute_prepared_many 仅支持 INSERT
+
 ### FTS: 构建加速 (B4) — CREATE TEXT INDEX 3.5s → 0.77s
 
 - 🔒 flush 的 shard 计数从 discover 的 range 扫描改为顺序点探测: 大批

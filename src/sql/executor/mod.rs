@@ -8970,6 +8970,26 @@ impl QueryExecutor {
                 .having
                 .as_ref()
                 .is_some_and(Self::contains_parameter)
+            // 🔑 Parameterized MATCH: the parser folds `MATCH(c, ?)` into a
+            // sentinel string, so no Expr::Parameter survives — without this
+            // arm the stmt skipped substitution and matched the LITERAL
+            // sentinel text (0 rows).
+            || stmt.where_clause.as_ref().is_some_and(Self::contains_match_sentinel)
+    }
+
+    /// True if any MATCH query in the expression is an unresolved parameter
+    /// sentinel (`"\x00?N"` from the parser).
+    fn contains_match_sentinel(expr: &Expr) -> bool {
+        match expr {
+            Expr::Match { query, .. } => query.starts_with('\x00'),
+            Expr::BinaryOp { left, right, .. } => {
+                Self::contains_match_sentinel(left) || Self::contains_match_sentinel(right)
+            }
+            Expr::UnaryOp { expr: inner, .. } => Self::contains_match_sentinel(inner),
+            Expr::FunctionCall { args, .. } => args.iter().any(Self::contains_match_sentinel),
+            Expr::IsNull { expr: inner, .. } => Self::contains_match_sentinel(inner),
+            _ => false,
+        }
     }
 
     /// Validate that all Parameter nodes in stmt are bound to a value in params.
@@ -9097,6 +9117,50 @@ impl QueryExecutor {
                         idx,
                         params.len()
                     ))
+                })
+            }
+            // 🔑 Parameterized MATCH: the parser encodes `MATCH(c, ?)` as a
+            // sentinel query string — resolve it against the bound params
+            // (must be Text) so every downstream fast path sees a plain
+            // literal query.
+            Expr::Match {
+                column,
+                query,
+                phrase,
+            } => {
+                if let Some(rest) = query.strip_prefix('\x00') {
+                    let idx: usize = rest[1..].parse().map_err(|_| {
+                        MoteDBError::InvalidArgument("bad MATCH parameter sentinel".to_string())
+                    })?;
+                    let i = idx.checked_sub(1).ok_or_else(|| {
+                        MoteDBError::InvalidArgument(
+                            "Unnamed ? parameter not resolved (internal error)".to_string(),
+                        )
+                    })?;
+                    let v = params.get(i).ok_or_else(|| {
+                        MoteDBError::InvalidArgument(format!(
+                            "Parameter ?{idx} not bound ({} parameters provided)",
+                            params.len()
+                        ))
+                    })?;
+                    let q = match v {
+                        Value::Text(t) => t.to_string(),
+                        other => {
+                            return Err(MoteDBError::InvalidArgument(format!(
+                                "MATCH query parameter ?{idx} must be a string, got {other:?}"
+                            )))
+                        }
+                    };
+                    return Ok(Expr::Match {
+                        column: column.clone(),
+                        query: q,
+                        phrase: *phrase,
+                    });
+                }
+                Ok(Expr::Match {
+                    column: column.clone(),
+                    query: query.clone(),
+                    phrase: *phrase,
                 })
             }
             Expr::BinaryOp { left, op, right } => {
@@ -16916,10 +16980,15 @@ impl QueryExecutor {
             return Ok(QueryResult::Modification { affected_rows: n });
         }
 
-        // 🚀 PK fast path: skip full table scan for WHERE pk = value
-        // 🔑 Skip PK fast path in transaction mode (same reason as execute_update:
-        // the row may exist only in write_set, invisible to resolve_pk_row_ids).
-        if !self.is_in_transaction() {
+        // 🚀 PK fast path: skip full table scan for WHERE pk = value.
+        // 🔑 Valid inside transactions too — execute_delete_pk resolves the
+        // row with txn visibility (txn_lookup_row) and drains same-PK rows
+        // from the write_set. The old blanket skip forced EVERY transactional
+        // `DELETE ... WHERE pk = ?` through the full streaming scan: on a
+        // 100K-row table that is ~0.5s per statement (scan + FTS column
+        // reads + visibility flushes triggering segment merges) — measured
+        // 2 rows/s in the adversarial harness vs 7ms non-transactional.
+        {
             if let Some(ref where_clause) = stmt.where_clause {
                 if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
                     let is_pk = schema
@@ -16931,27 +17000,31 @@ impl QueryExecutor {
                         return self.execute_delete_pk(&stmt, &schema, &target_value);
                     }
 
-                    // 🚀 Column index fast path: use index to find matching rows
-                    if let Some(index_name) = self.db.index_registry.find_by_column(
-                        &stmt.table,
-                        &col_name,
-                        crate::database::index_metadata::IndexType::Column,
-                    ) {
-                        if let Some(index) = self.db.column_indexes.get(&index_name) {
-                            let matching_row_ids = index
-                                .value()
-                                .get_arc(&target_value)
-                                .unwrap_or_else(|_| Arc::new(Vec::new()));
-                            if matching_row_ids.is_empty() {
-                                return Ok(QueryResult::Modification { affected_rows: 0 });
+                    // 🚀 Column index fast path (non-transactional only: the
+                    // index does not cover write_set rows; the scan path's
+                    // write_set pass handles those).
+                    if !self.is_in_transaction() {
+                        if let Some(index_name) = self.db.index_registry.find_by_column(
+                            &stmt.table,
+                            &col_name,
+                            crate::database::index_metadata::IndexType::Column,
+                        ) {
+                            if let Some(index) = self.db.column_indexes.get(&index_name) {
+                                let matching_row_ids = index
+                                    .value()
+                                    .get_arc(&target_value)
+                                    .unwrap_or_else(|_| Arc::new(Vec::new()));
+                                if matching_row_ids.is_empty() {
+                                    return Ok(QueryResult::Modification { affected_rows: 0 });
+                                }
+                                return self.execute_delete_by_row_ids(
+                                    &stmt,
+                                    &schema,
+                                    &matching_row_ids,
+                                    &col_name,
+                                    &target_value,
+                                );
                             }
-                            return self.execute_delete_by_row_ids(
-                                &stmt,
-                                &schema,
-                                &matching_row_ids,
-                                &col_name,
-                                &target_value,
-                            );
                         }
                     }
                 }
@@ -17401,20 +17474,34 @@ impl QueryExecutor {
         target_value: &Value,
     ) -> Result<QueryResult> {
         let row_ids = self.resolve_pk_row_ids(&stmt.table, schema, target_value)?;
-        if row_ids.is_empty() {
-            return Ok(QueryResult::Modification { affected_rows: 0 });
-        }
 
+        let in_txn = self.is_in_transaction();
         let mut affected_rows = 0;
+
+        // Stored rows (may be empty — the row could live only in write_set).
         for row_id in row_ids {
-            let row = match self.db.get_table_row(&stmt.table, row_id)? {
-                Some(r) => r,
-                None => continue,
+            // 🔑 Transaction visibility: a row deleted earlier in this txn
+            // must not be resurrected, and a write_set-buffered version is
+            // handled by the write_set pass below (same contract as
+            // execute_update_pk).
+            let row = if in_txn {
+                match self.txn_lookup_row(&stmt.table, row_id) {
+                    Some(Some(r)) => r,     // write_set version
+                    Some(None) => continue, // deleted in this txn already
+                    None => match self.db.get_table_row(&stmt.table, row_id)? {
+                        Some(r) => r, // plain stored row
+                        None => continue,
+                    },
+                }
+            } else {
+                match self.db.get_table_row(&stmt.table, row_id)? {
+                    Some(r) => r,
+                    None => continue,
+                }
             };
 
             // 🔑 Record undo delta for transactional DELETE (PK fast path).
-            let txn_id = self.current_txn_id();
-            if let Some(tid) = txn_id {
+            if let Some(tid) = self.current_txn_id() {
                 let _ = self.db.txn_coordinator.record_write_delta(
                     tid,
                     crate::txn::coordinator::DeltaOperation::Delete(
@@ -17427,6 +17514,35 @@ impl QueryExecutor {
 
             self.db.delete_row_from_table(&stmt.table, row_id, row)?;
             affected_rows += 1;
+        }
+
+        // 🔑 Rows INSERTed in this txn (write_set only, no stored copy): a
+        // DELETE by PK must drop them from the write_set so COMMIT doesn't
+        // flush them. They were never durable, so no undo delta is needed.
+        if in_txn {
+            if let Some(tid) = self.current_txn_id() {
+                let pk_pos = schema
+                    .primary_key()
+                    .and_then(|pk| schema.get_column(&pk))
+                    .map(|cd| cd.position);
+                let ctx = self.db.txn_coordinator.get_context(tid)?;
+                let ws_rows: Vec<(RowId, Row)> = ctx
+                    .write_set
+                    .read()
+                    .iter()
+                    .filter(|((t, _), _)| t == &stmt.table)
+                    .map(|((_, rid), row)| (*rid, row.clone()))
+                    .collect();
+                for (row_id, row) in ws_rows {
+                    let matches = pk_pos
+                        .and_then(|pos| row.get(pos))
+                        .is_some_and(|v| v == target_value);
+                    if matches {
+                        ctx.write_set.write().remove(&(stmt.table.clone(), row_id));
+                        affected_rows += 1;
+                    }
+                }
+            }
         }
 
         Ok(QueryResult::Modification { affected_rows })

@@ -2002,10 +2002,14 @@ impl Parser {
                             };
                             let query = match &args[1] {
                                 Expr::Literal(Value::Text(s)) => s.to_string(),
+                                // 🔑 Parameterized MATCH: encode as a sentinel
+                                // the executor's substitute_params_stmt resolves
+                                // against the bound params (must be Text).
+                                Expr::Parameter(idx) => format!("\x00?{idx}"),
                                 _ => {
-                                    return Err(
-                                        self.error("MATCH() second argument must be a string")
-                                    )
+                                    return Err(self.error(
+                                        "MATCH() second argument must be a string or parameter",
+                                    ))
                                 }
                             };
                             Ok(Expr::Match {
@@ -2031,7 +2035,24 @@ impl Parser {
                             self.expect(TokenType::LParen)?;
                             let query = match self.current().token_type {
                                 TokenType::String(ref s) => s.clone(),
-                                _ => return Err(self.error("AGAINST() requires a string literal")),
+                                TokenType::Parameter(idx) => {
+                                    // 🔑 Parameterized AGAINST(?) — sentinel,
+                                    // resolved by substitute_params_stmt. (No
+                                    // advance here — the shared one below runs
+                                    // for every branch.)
+                                    let idx = if idx == 0 {
+                                        let next = self.next_param_idx;
+                                        self.next_param_idx += 1;
+                                        next
+                                    } else {
+                                        idx
+                                    };
+                                    format!("\x00?{idx}")
+                                }
+                                _ => {
+                                    return Err(self
+                                        .error("AGAINST() requires a string literal or parameter"))
+                                }
                             };
                             self.advance();
                             self.expect(TokenType::RParen)?;
