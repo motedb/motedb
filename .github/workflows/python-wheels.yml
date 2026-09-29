@@ -56,7 +56,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            wheel-pattern: "*x86_64*"
+            # 🔑 Tighten to manylinux: plain *x86_64* also matched the macOS
+            # x86_64 wheel in dist/, and pip rejects the whole install when
+            # ANY argument is unsupported on the platform.
+            wheel-pattern: "manylinux*x86_64*"
           - os: macos-latest
             wheel-pattern: "*arm64*"
     runs-on: ${{ matrix.os }}
