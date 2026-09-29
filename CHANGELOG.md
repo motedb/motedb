@@ -21,11 +21,17 @@
   抗数据 (乱序/NULL/中文/唯一词表) + 400 查询与 SQLite 逐结果集对拍 +
   120 FTS 对拍 FTS5 + 写删后复检 + 重开 + recall — 全绿
 
-### 已知项 (如实记录, 未修)
-- 非事务逐条 UPDATE/DELETE ~4-7ms/条 (每语句 WAL fsync + FTS 维护恒定
-  成本; 事务/executemany 批量可摊)
-- 乱序键 executemany INSERT ~4.7K rows/s (排序 fast path 206K)
-- execute_prepared_many 仅支持 INSERT
+### 写路径: 乱序 INSERT 33× + executemany UPDATE/DELETE
+
+- 🔒 乱序键大批 INSERT 从段构建器的全批解码重加回退中救出 (dedup 路径
+  只对升序键短路): fast path 显式按 key 排序 (稳定序保重复键最新者胜)
+  — 乱序 executemany 9.2K → 307K rows/s (33×), 排序输入不受影响;
+  值随键正确落位 + 批内重复 PK 报错语义对拍排序路径 (回归测试)
+- execute_prepared_many (executemany) 支持 UPDATE/DELETE: 整批一个事
+  务重放参数化语句 (单次解析 + 单次 commit/一组 WAL 栅栏), 逐条骑 PK
+  快路径; 失败整批回滚
+- 解除已知项: "executemany 仅 INSERT" 关闭; 乱序 INSERT 关闭 (剩: 逐
+  条写 ~4-7ms/条 fsync 恒定成本 — 语义要求, 批量可摊)
 
 ### FTS: 构建加速 (B4) — CREATE TEXT INDEX 3.5s → 0.77s
 

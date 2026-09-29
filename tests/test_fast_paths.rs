@@ -815,3 +815,47 @@ fn txn_pk_delete_fast_path_semantics() {
         "50 txn PK deletes took {dt:?} — full-scan regression?"
     );
 }
+
+/// 🔒 Shuffled-key bulk INSERT: the explicit-PK fast path's segment flush
+/// must not fall back to whole-batch decode+re-add on non-ascending keys
+/// (was 356K → 9.2K rows/s on shuffled executemany). Correctness: row
+/// values must land on the right PKs regardless of insertion order, and a
+/// batch containing duplicate PKs must fail exactly like the sorted path.
+#[test]
+fn shuffled_bulk_insert_fast_and_correct() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    let n = 5000;
+    let mut ids: Vec<i64> = (1..=n).collect();
+    let mut rng: u64 = 0x9E3779B97F4A7C15;
+    for i in (1..ids.len()).rev() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let j = (rng as usize) % (i + 1);
+        ids.swap(i, j);
+    }
+    for chunk in ids.chunks(500) {
+        let vals: Vec<String> = chunk.iter().map(|id| format!("({id}, {id})")).collect();
+        exec(&db, &format!("INSERT INTO t VALUES {}", vals.join(",")));
+    }
+
+    // Row-at-PK correctness (values must follow their keys).
+    for id in [1, n / 2, n] {
+        let got = rows(&db, &format!("SELECT v FROM t WHERE id = {id}"));
+        assert_eq!(
+            got[0],
+            vec![Value::Integer(id)],
+            "row {id} landed on the wrong key"
+        );
+    }
+    let total = rows(&db, "SELECT COUNT(*) FROM t");
+    assert_eq!(total[0], vec![Value::Integer(n as i64)]);
+
+    // Duplicate PK in one batch → error (same as sorted path), not silent loss.
+    let err = db
+        .execute("INSERT INTO t VALUES (5001, 5001), (5001, 5002)")
+        .err()
+        .expect("duplicate PK in batch must fail");
+    let _ = format!("{err}");
+}

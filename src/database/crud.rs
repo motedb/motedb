@@ -3468,7 +3468,7 @@ impl MoteDB {
 
         // Build store rows: (key, timestamp, values).
         // Use Vec::with_capacity + drain to avoid cloning the rows Vec.
-        let store_rows: Vec<(u64, u64, Row)> = rows
+        let mut store_rows: Vec<(u64, u64, Row)> = rows
             .into_iter()
             .enumerate()
             .map(|(i, row)| {
@@ -3476,6 +3476,13 @@ impl MoteDB {
                 (key, base_ts + i as u64, row)
             })
             .collect();
+        // 🔑 Ascending key order for the segment builder: its dedup path
+        // short-circuits ONLY on already-sorted keys, otherwise it decodes
+        // every row of the whole batch and re-adds them (35× slower flush on
+        // shuffled executemany: 356K → 9.2K rows/s). Stable sort preserves
+        // duplicate-key append order (newest-last wins), and within one
+        // base_ts allocation timestamps stay order-consistent with keys.
+        store_rows.sort_by_key(|(k, _, _)| *k);
         // 🔑 pending_updates 信号: checkpoint_impl 在 pending==0 且 WAL 空
         // 时整体早退 (什么都不做) — fast path 不写 WAL, 不置位则段永远不
         // 合并 (WAL-less 加载的 auto-checkpoint 同样从不触发)。慢路径在

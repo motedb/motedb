@@ -784,11 +784,62 @@ impl Database {
             }
         };
 
+        // 🔑 UPDATE / DELETE batches: wrap the whole batch in ONE transaction
+        // and replay execute_prepared per row. Single parse, single commit
+        // (one WAL group barrier + one durability fsync for the entire
+        // batch), and each statement rides the PK fast path (txn-safe since
+        // the in-txn DELETE/PK fix). The old API rejected these outright —
+        // Python users had to fall back to per-row execute(), paying parse
+        // + fsync per row.
+        if matches!(
+            statement.as_ref(),
+            Statement::Update(_) | Statement::Delete(_)
+        ) {
+            let tx_id = self.begin_transaction()?;
+            let mut affected: u64 = 0;
+            let mut committed = false;
+            let result = (|| -> Result<()> {
+                for params in &batch {
+                    let r = self.execute_prepared(sql, params.clone())?;
+                    if let StreamingQueryResult::Modification { affected_rows } = r {
+                        affected += affected_rows as u64;
+                    }
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    self.commit_transaction(tx_id)?;
+                    committed = true;
+                    Ok(affected)
+                }
+                Err(e) => {
+                    let _ = self.rollback_transaction(tx_id);
+                    Err(e)
+                }
+            }
+            .map(|affected| {
+                let _ = committed;
+                affected
+            })
+        } else {
+            self.execute_prepared_many_insert(statement, batch)
+        }
+    }
+
+    /// INSERT-only body of execute_prepared_many (multi-row VALUES rewrite
+    /// into one batched statement).
+    fn execute_prepared_many_insert(
+        &self,
+        statement: Arc<Statement>,
+        batch: Vec<Vec<Value>>,
+    ) -> Result<u64> {
         let insert = match statement.as_ref() {
-            Statement::Insert(stmt) => stmt,
+            Statement::Insert(stmt) => stmt.clone(),
             _ => {
                 return Err(crate::error::MoteDBError::InvalidArgument(
-                    "execute_prepared_many only supports INSERT statements".to_string(),
+                    "execute_prepared_many only supports INSERT/UPDATE/DELETE statements"
+                        .to_string(),
                 ))
             }
         };
