@@ -2,6 +2,19 @@
 
 ## [0.12.0] — 未发布
 
+### FTS: 构建加速 (B4) — CREATE TEXT INDEX 3.5s → 0.77s
+
+- 🔒 flush 的 shard 计数从 discover 的 range 扫描改为顺序点探测: 大批
+  量回填时树上已有全部前序词, 每 term 扫全树且 range 物化 posting 值
+  → 词表级二次方 (单批 100K 文档/101K 词实测 477s → 3.4s, 140×)
+- 🔒 shard 写入批量化: 旧循环每 term 调 btree.insert, 每次插入整页
+  clone+serialize+追加写盘 (~8KB) — 100K 词 × 2 (posting+位置) ≈ 3.2GB
+  页写放大 (占构建 85%); 改为收集→按键排序→insert_batch_sorted, 每个
+  触及的叶页只写一次 (flush 3.66s→207ms, 构建 3.47s→0.77s @100K 文档)
+- 惰性 consolidation (≥5 shard) 顺延到批量插入后 (合并读需见新 shard)
+- 验证: 单词/AND/OR/重开精确, text_eval 真实语料 precision/recall
+  1.0000 + 删除/更新/ngram 全对
+
 ### 存储: 大段读去锁 (pread 替换 seek+read)
 
 - 🔒 ColumnarSSTable 的共享读句柄从 `Mutex<File>` + seek+read 改为

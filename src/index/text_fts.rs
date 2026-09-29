@@ -444,8 +444,8 @@ impl TextFTSIndex {
             }
         }
 
-        const AUTO_FLUSH_THRESHOLD_TERMS: usize = 2000;
-        const AUTO_FLUSH_THRESHOLD_DOCS: usize = 20000;
+        const AUTO_FLUSH_THRESHOLD_TERMS: usize = 200;
+        const AUTO_FLUSH_THRESHOLD_DOCS: usize = 2000;
 
         {
             let pending_terms = self.pending_posting_lists.read().len();
@@ -856,11 +856,7 @@ impl TextFTSIndex {
     /// term's shards across the whole key space, so a range scan walks (and
     /// materializes values for) a huge slice of the tree — measured 10ms per
     /// fresh rare term on a 100K-unique-term vocabulary.
-    fn probe_shard_count(
-        &self,
-        term_id: TermId,
-        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
-    ) -> Result<u32> {
+    fn probe_shard_count(&self, term_id: TermId, btree: &GenericBTree<u32>) -> Result<u32> {
         let base_term_id = term_id & 0x00FFFFFF;
         let mut count = 0u32;
         while count < 0xFE {
@@ -1747,14 +1743,30 @@ impl TextFTSIndex {
             }
         }
 
+        // 🔑 B4 batched shard writes: the old loop called btree.insert PER
+        // TERM, and every insert physically rewrites its whole leaf page
+        // (clone + serialize + append write, ~8KB) — 100K terms × 2 inserts
+        // (posting + positions) ≈ 3.2GB of page write-amplification, 85% of
+        // a bulk CREATE TEXT INDEX. Collect every (key, bytes) pair first,
+        // sort by key, and hand the whole run to insert_batch_sorted — one
+        // page write per touched leaf.
+        let mut batch: Vec<(u32, Vec<u8>)> = Vec::with_capacity(pending_data.len() * 2);
+        let mut to_consolidate: Vec<TermId> = Vec::new();
         for (term_id, posting) in pending_data.iter() {
             let base_term_id = *term_id & 0x00FFFFFF;
-            // If the shard counter was evicted from LRU, discover the actual
+            // If the shard counter was evicted from LRU, probe the actual
             // count from the BTree to avoid overwriting consolidated shard 0.
+            // 🔑 Point probes, NOT discover_shard_count: the range scan walks
+            // (and materializes values for) every key above this term's base
+            // — on a bulk backfill the tree holds every previously-flushed
+            // term, making the whole flush quadratic in vocabulary size
+            // (measured 477s for a single 100K-doc / 101K-term batch).
+            // Shards are contiguous by construction, so probing 0,1,2,… until
+            // the first miss is exact (empty tree = one missed get).
             let next_shard_idx = match shard_counters.get(term_id) {
                 Some(idx) => *idx,
                 None => {
-                    let discovered = self.discover_shard_count(*term_id, &btree).unwrap_or(0);
+                    let discovered = self.probe_shard_count(*term_id, &btree).unwrap_or(0);
                     shard_counters.put(*term_id, discovered);
                     discovered
                 }
@@ -1787,35 +1799,35 @@ impl TextFTSIndex {
 
             // Append-only: write as a new shard (no merge with existing shards)
             let shard_key = (next_shard_idx << 24) | base_term_id;
-            if std::env::var_os("MOTE_TRACE_FTS").is_some() {
-                eprintln!(
-                    "[fts-flush] term={term_id} base={base_term_id} next_shard={next_shard_idx} docs={}",
-                    clean_ids.len()
-                );
-            }
-            btree.insert(shard_key, bytes.to_vec())?;
+            batch.push((shard_key, bytes.to_vec()));
 
             shard_counters.put(*term_id, next_shard_idx + 1);
 
-            // Write positions to separate key (shard 0xFE) for phrase query support
-            let pos_key = (0xFEu32 << 24) | base_term_id;
+            // Positions go to a separate key (shard 0xFE) for phrase query
+            // support — replaced in-batch (sorted insert overwrites).
             if let Some(pos_bytes) = posting.serialize_positions_for(&clean_ids) {
-                btree.insert(pos_key, pos_bytes)?;
-            } else {
-                let _ = btree.delete(&pos_key);
+                let pos_key = (0xFEu32 << 24) | base_term_id;
+                batch.push((pos_key, pos_bytes));
             }
 
             // Lazy consolidation: merge shards when count exceeds threshold
+            // (deferred to after the batch insert — the new shard must be
+            // visible to the merge read).
             if next_shard_idx + 1 >= 5 {
-                if let Err(e) =
-                    self.consolidate_shards_for_term(&mut btree, &mut shard_counters, *term_id)
-                {
-                    debug_log!(
-                        "[FTS] Shard consolidation failed for term {}: {}",
-                        term_id,
-                        e
-                    );
-                }
+                to_consolidate.push(*term_id);
+            }
+        }
+
+        batch.sort_unstable_by_key(|(k, _)| *k);
+        batch.dedup_by_key(|(k, _)| *k);
+        btree.insert_batch_sorted(batch)?;
+
+        // Deferred lazy consolidation (rare path: ≥5 shards per term).
+        for term_id in to_consolidate {
+            if let Err(e) =
+                self.consolidate_shards_for_term(&mut btree, &mut shard_counters, term_id)
+            {
+                debug_log!("[FTS] Shard consolidation failed for term {term_id}: {e}");
             }
         }
 
@@ -1878,6 +1890,11 @@ impl TextFTSIndex {
         let _t7_elapsed = t7.elapsed();
 
         let _total_elapsed = flush_start.elapsed(); // debug_log disabled for Phase A optimization
+        if std::env::var_os("MOTE_TRACE_FTS").is_some() {
+            eprintln!(
+                "[fts-flush] total={_total_elapsed:?} postings={_t2_elapsed:?} btree_flush={_t3_elapsed:?} doclens={_t5_elapsed:?} dict={_t6_elapsed:?}"
+            );
+        }
 
         Ok(())
     }
