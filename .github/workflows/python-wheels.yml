@@ -70,7 +70,12 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Install built wheel
-        run: pip install dist/${{ matrix.wheel-pattern }}.whl
+        run: |
+          set -x
+          ls -la dist/ || true
+          python -V
+          python -m pip -V
+          python -m pip install -v dist/${{ matrix.wheel-pattern }}.whl
       - name: Import + version smoke
         run: python -c "import motedb; print('motedb', motedb.__version__)"
       # 🔑 e2e 的 errors/cli 套件需要 motedb-cli 二进制 — 本地构建并经
