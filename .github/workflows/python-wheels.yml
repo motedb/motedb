@@ -71,11 +71,21 @@ jobs:
           merge-multiple: true
       - name: Install built wheel
         run: |
-          set -x
-          ls -la dist/ || true
-          python -V
-          python -m pip -V
-          python -m pip install -v dist/${{ matrix.wheel-pattern }}.whl
+          set +e
+          {
+            echo "python: $(python -V 2>&1)"; echo "pip: $(python -m pip -V 2>&1)"
+            echo "--- dist contents ---"; ls -la dist/ 2>&1
+            echo "--- install (verbose tail below) ---"
+            python -m pip install -v "dist/${{ matrix.wheel-pattern }}.whl" 2>&1
+            echo "PIP_RC=$?"
+          } > /tmp/install_diag.txt 2>&1
+          RC=$(grep -o 'PIP_RC=[0-9]*' /tmp/install_diag.txt | tail -1 | cut -d= -f2)
+          if [ "${RC:-1}" != "0" ]; then
+            DIAG=$(tail -c 700 /tmp/install_diag.txt | tr '\n' ' ' | tr -cd '\11\12\40-\176' )
+            echo "::error::wheel install failed rc=$RC :: $DIAG"
+            cat /tmp/install_diag.txt
+            exit 1
+          fi
       - name: Import + version smoke
         run: python -c "import motedb; print('motedb', motedb.__version__)"
       # 🔑 e2e 的 errors/cli 套件需要 motedb-cli 二进制 — 本地构建并经
