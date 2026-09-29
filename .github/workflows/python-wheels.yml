@@ -71,7 +71,6 @@ jobs:
           merge-multiple: true
       - name: Install built wheel
         run: |
-          set -e
           # 🔑 Shell-expand the pattern into an array (pip ≥22 does NOT glob
           # file arguments itself: it saw the literal `dist/*x86_64*.whl` and
           # failed with "Invalid wheel filename" — the v0.11/v0.12 ubuntu
@@ -84,7 +83,15 @@ jobs:
             exit 1
           fi
           echo "installing: ${wheels[*]}"
-          python -m pip install "${wheels[@]}"
+          set +e
+          python -m pip install "${wheels[@]}" 2>&1 | tee /tmp/pipinstall.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" != "0" ]; then
+            TAIL=$(tail -c 600 /tmp/pipinstall.log | tr '\n' ' ' | tr -cd '\11\12\40-\176')
+            echo "::error::pip install failed rc=$RC :: $TAIL"
+            exit 1
+          fi
       - name: Import + version smoke
         run: python -c "import motedb; print('motedb', motedb.__version__)"
       # 🔑 e2e 的 errors/cli 套件需要 motedb-cli 二进制 — 本地构建并经
