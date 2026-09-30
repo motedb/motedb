@@ -1908,6 +1908,13 @@ pub struct QueryExecutor {
 // so each thread independently tracks its own active transaction.
 thread_local! {
     static CURRENT_TXN_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// 🔒 Rollback ww-guard bookkeeping: (table, row_id) → the NEW row this
+    /// executor last wrote via a transactional in-place UPDATE. The undo
+    /// replay consults it to tell "storage still holds MY write" (safe to
+    /// restore old) from "a concurrent committer overwrote me" (keep theirs).
+    /// Cleared when the txn context is cleared.
+    static TXN_WROTE: std::cell::RefCell<std::collections::HashMap<(String, u64), Vec<Arc<Row>>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     /// Per-statement memo of ST_KNN_3D result sets, keyed by
     /// "index|x|y|z|k" (see the StKnn3D arm of the row evaluator).
     static SPATIAL_KNN_MEMO: std::cell::RefCell<
@@ -2128,13 +2135,58 @@ impl QueryExecutor {
                     let old_row =
                         std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
                     if let Ok(schema) = self.db.get_table_schema(&table_name) {
-                        let _ = self.db.update_row_in_table_with_schema(
-                            &table_name,
-                            row_id,
-                            old_row.clone(),
-                            old_row,
-                            &schema,
-                        );
+                        // 🔒 Write-write conflict guard: restore the old row
+                        // ONLY when storage still holds exactly what this txn
+                        // read (current == old means nobody else committed an
+                        // update after our snapshot). A concurrent committed
+                        // UPDATE between our snapshot and our rollback must
+                        // survive — blind restore clobbered it back to the
+                        // pre-txn value (adversarial harness: t1 sets v=1,
+                        // t2 sets v=2 + commits, t1 rolls back → v reverted
+                        // to 100 instead of staying 2).
+                        let current = self.db.get_table_row(&table_name, row_id).ok().flatten();
+                        let mine = TXN_WROTE
+                            .with(|m| m.borrow().get(&(table_name.clone(), row_id)).cloned());
+                        // Restore when storage holds either our snapshot (nobody
+                        // wrote since) or OUR OWN last write (the common
+                        // rollback case). Anything else is a concurrent
+                        // committer's value — it must survive.
+                        let untouched = match (&current, &mine) {
+                            (Some(cur), Some(writes)) => {
+                                let snapshot: &Row = old_row.as_ref();
+                                cur == snapshot || writes.iter().any(|w| cur == w.as_ref())
+                            }
+                            (Some(cur), None) => {
+                                let snapshot: &Row = old_row.as_ref();
+                                cur == snapshot
+                            }
+                            _ => false,
+                        };
+                        if untouched {
+                            let _ = self.db.update_row_in_table_with_schema(
+                                &table_name,
+                                row_id,
+                                old_row.clone(),
+                                old_row.clone(),
+                                &schema,
+                            );
+                        }
+                        // Keep tracking: record the restored row as the
+                        // value "we" are responsible for now, so a NESTED
+                        // rollback replaying an earlier delta still recognizes
+                        // storage as ours (writes chain: 42 → 1 → 2; rolling
+                        // back to the outer savepoint restores 42 through the
+                        // intermediate 2 and 1 — removing the entry here would
+                        // strand the next delta unrecognized).
+                        TXN_WROTE.with(|m| {
+                            m.borrow_mut()
+                                .entry((table_name.clone(), row_id))
+                                .or_default()
+                                .push(Arc::new(old_row))
+                        });
+                        // current != old (or row gone): a concurrent committer
+                        // won — keep their value (first-committer-wins on the
+                        // read side; the txn being rolled back simply loses).
                     }
                 }
                 crate::txn::coordinator::DeltaOperation::Delete(_row_id, table_name, old_value) => {
@@ -17439,8 +17491,21 @@ impl QueryExecutor {
                 }
             }
 
-            self.db
-                .update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, schema)?;
+            self.db.update_row_in_table_with_schema(
+                &stmt.table,
+                row_id,
+                row,
+                new_row.clone(),
+                schema,
+            )?;
+            if in_txn {
+                TXN_WROTE.with(|m| {
+                    m.borrow_mut()
+                        .entry((stmt.table.clone(), row_id))
+                        .or_default()
+                        .push(Arc::new(new_row))
+                });
+            }
             affected_rows += 1;
         }
 
@@ -18477,13 +18542,58 @@ impl QueryExecutor {
                     let old_row =
                         std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
                     if let Ok(schema) = self.db.get_table_schema(&table_name) {
-                        let _ = self.db.update_row_in_table_with_schema(
-                            &table_name,
-                            row_id,
-                            old_row.clone(),
-                            old_row,
-                            &schema,
-                        );
+                        // 🔒 Write-write conflict guard: restore the old row
+                        // ONLY when storage still holds exactly what this txn
+                        // read (current == old means nobody else committed an
+                        // update after our snapshot). A concurrent committed
+                        // UPDATE between our snapshot and our rollback must
+                        // survive — blind restore clobbered it back to the
+                        // pre-txn value (adversarial harness: t1 sets v=1,
+                        // t2 sets v=2 + commits, t1 rolls back → v reverted
+                        // to 100 instead of staying 2).
+                        let current = self.db.get_table_row(&table_name, row_id).ok().flatten();
+                        let mine = TXN_WROTE
+                            .with(|m| m.borrow().get(&(table_name.clone(), row_id)).cloned());
+                        // Restore when storage holds either our snapshot (nobody
+                        // wrote since) or OUR OWN last write (the common
+                        // rollback case). Anything else is a concurrent
+                        // committer's value — it must survive.
+                        let untouched = match (&current, &mine) {
+                            (Some(cur), Some(writes)) => {
+                                let snapshot: &Row = old_row.as_ref();
+                                cur == snapshot || writes.iter().any(|w| cur == w.as_ref())
+                            }
+                            (Some(cur), None) => {
+                                let snapshot: &Row = old_row.as_ref();
+                                cur == snapshot
+                            }
+                            _ => false,
+                        };
+                        if untouched {
+                            let _ = self.db.update_row_in_table_with_schema(
+                                &table_name,
+                                row_id,
+                                old_row.clone(),
+                                old_row.clone(),
+                                &schema,
+                            );
+                        }
+                        // Keep tracking: record the restored row as the
+                        // value "we" are responsible for now, so a NESTED
+                        // rollback replaying an earlier delta still recognizes
+                        // storage as ours (writes chain: 42 → 1 → 2; rolling
+                        // back to the outer savepoint restores 42 through the
+                        // intermediate 2 and 1 — removing the entry here would
+                        // strand the next delta unrecognized).
+                        TXN_WROTE.with(|m| {
+                            m.borrow_mut()
+                                .entry((table_name.clone(), row_id))
+                                .or_default()
+                                .push(Arc::new(old_row))
+                        });
+                        // current != old (or row gone): a concurrent committer
+                        // won — keep their value (first-committer-wins on the
+                        // read side; the txn being rolled back simply loses).
                     }
                 }
                 _ => {}

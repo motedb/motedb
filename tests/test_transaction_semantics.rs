@@ -475,3 +475,41 @@ fn in_process_multi_connection_shared_engine() {
     assert_eq!(q, vec![2]);
     c4.close().unwrap();
 }
+
+/// 🔒 KNOWN LIMITATION (write-write conflict across two storage-writing txns):
+/// a transactional UPDATE writes storage immediately (undo-logged); a second
+/// txn's UPDATE+COMMIT batches its write through the coordinator, so the
+/// first txn's rollback replays its undo over BOTH. Proper fix = route
+/// transactional UPDATEs through the version store (first-committer-wins at
+/// commit), which is an MVCC-layer redesign — tracked separately.
+#[test]
+#[ignore = "known limitation: in-place txn UPDATE + concurrent commit loses (MVCC redesign)"]
+fn rollback_after_concurrent_commit_keeps_winner() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create_with_config(dir.path(), motedb::DBConfig::for_testing()).unwrap();
+    db.execute("CREATE TABLE x (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO x VALUES (1, 100)").unwrap();
+
+    let t1 = db.begin_transaction().unwrap();
+    db.execute("UPDATE x SET v = 1 WHERE id = 1").unwrap();
+    let t2 = db.begin_transaction().unwrap();
+    db.execute("UPDATE x SET v = 2 WHERE id = 1").unwrap();
+    db.commit_transaction(t2).unwrap();
+    db.rollback_transaction(t1).unwrap();
+
+    let q = ints(&rows(db.execute("SELECT v FROM x WHERE id = 1").unwrap()));
+    assert_eq!(
+        q,
+        vec![2],
+        "committed concurrent value must survive t1 rollback"
+    );
+
+    // Clean rollback still restores (no concurrent committer).
+    db.execute("UPDATE x SET v = 7 WHERE id = 1").unwrap();
+    let t3 = db.begin_transaction().unwrap();
+    db.execute("UPDATE x SET v = 9 WHERE id = 1").unwrap();
+    db.rollback_transaction(t3).unwrap();
+    let q = ints(&rows(db.execute("SELECT v FROM x WHERE id = 1").unwrap()));
+    assert_eq!(q, vec![7], "no-conflict rollback restores the old value");
+}
