@@ -29,6 +29,12 @@ pub enum DeltaOperation {
     /// replay against storage: an uncommitted row has no storage version,
     /// and a storage write would materialize a phantom.
     UpdateBuffered(RowId, String, Arc<Row>), // old_value
+    /// 🔒 M1: snapshot of a pending_updates entry's PRIOR state, recorded
+    /// when a transactional UPDATE of a storage-resident row is buffered.
+    /// Savepoint rollback restores the entry to this prior state (or removes
+    /// it when None); full rollback drops the whole map. Never replayed
+    /// against storage — the storage was never touched.
+    PendingUpdateSnapshot(RowId, String, Option<(Row, Row)>),
 }
 
 /// Savepoint representation (Delta Snapshot optimized)
@@ -90,6 +96,15 @@ pub struct TransactionContext {
     /// other, silently losing transactional writes.
     pub write_set: RwLock<HashMap<(String, RowId), Row>>,
 
+    /// 🔒 M1 buffered UPDATEs of STORAGE-RESIDENT rows: (table, row_id) →
+    /// (old_row, new_row). The transaction never writes storage for these —
+    /// COMMIT applies the new versions (newest-wins append + index delta
+    /// old→new), ROLLBACK/savepoint undo simply drops the entry. This
+    /// replaces the old "in-place write + undo-log replay" model whose
+    /// rollback clobbered concurrently committed values and whose WAL
+    /// records (txn_id=0) were replayed as committed on crash recovery.
+    pub pending_updates: RwLock<HashMap<(String, RowId), (Row, Row)>>,
+
     /// Read set (for conflict detection in Serializable)
     pub read_set: RwLock<HashSet<RowId>>,
 
@@ -145,6 +160,7 @@ impl TransactionCoordinator {
             isolation_level,
             state: AtomicU8::new(TransactionState::Active as u8),
             write_set: RwLock::new(HashMap::new()),
+            pending_updates: RwLock::new(HashMap::new()),
             read_set: RwLock::new(HashSet::new()),
             undo_log: RwLock::new(Vec::new()),
             snapshot,
@@ -220,8 +236,10 @@ impl TransactionCoordinator {
         // before calling this method. Clear the undo log here for cleanliness.
         ctx.undo_log.write().clear();
 
-        // Clear write set
+        // Clear write set + buffered pending updates (M1: storage was never
+        // touched by them — dropping the map IS the undo).
         ctx.write_set.write().clear();
+        ctx.pending_updates.write().clear();
 
         // Mark as aborted
         ctx.state
@@ -323,6 +341,137 @@ impl TransactionCoordinator {
             Ok(false)
         }
     }
+    /// 🔒 M1: buffer a transactional UPDATE of a STORAGE-RESIDENT row.
+    /// Returns the prior pending entry (if the row was already pending —
+    /// chained updates keep the FIRST old_row so the commit-time index
+    /// delta spans the true pre-transaction value). The caller passes the
+    /// prior snapshot into the savepoint via PendingUpdateSnapshot.
+    #[allow(clippy::type_complexity)]
+    pub fn record_pending_update(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        row_id: RowId,
+        old_row: Row,
+        new_row: Row,
+    ) -> Result<Option<(Row, Row)>> {
+        let ctx = self.get_context(txn_id)?;
+        let mut pending = ctx.pending_updates.write();
+        let key = (table_name.to_string(), row_id);
+        let prior = pending.insert(key, (old_row, new_row));
+        Ok(prior)
+    }
+
+    /// Chain a new value onto an existing pending update (second UPDATE of
+    /// the same row in one txn): keeps the original old_row. Returns false
+    /// when the row has no pending entry (caller falls back to a fresh
+    /// record or write_set handling).
+    pub fn update_pending_row(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        row_id: RowId,
+        new_row: Row,
+    ) -> Result<bool> {
+        let ctx = self.get_context(txn_id)?;
+        let mut pending = ctx.pending_updates.write();
+        let key = (table_name.to_string(), row_id);
+        if let Some(entry) = pending.get_mut(&key) {
+            entry.1 = new_row;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// First (pre-transaction) old_row of a pending update entry.
+    pub fn get_pending_old(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        row_id: RowId,
+    ) -> Result<Option<Row>> {
+        let ctx = self.get_context(txn_id)?;
+        let pending = ctx.pending_updates.read();
+        Ok(pending
+            .get(&(table_name.to_string(), row_id))
+            .map(|(old, _)| old.clone()))
+    }
+
+    /// Drop a pending update (e.g. the row is being DELETEd in this txn).
+    /// Returns the dropped entry so the caller can fold it into its own
+    /// bookkeeping.
+    pub fn remove_pending_update(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        row_id: RowId,
+    ) -> Result<Option<(Row, Row)>> {
+        let ctx = self.get_context(txn_id)?;
+        let mut pending = ctx.pending_updates.write();
+        Ok(pending.remove(&(table_name.to_string(), row_id)))
+    }
+
+    /// Look up a pending (buffered, uncommitted) update's current new value.
+    pub fn get_pending_row(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        row_id: RowId,
+    ) -> Result<Option<Row>> {
+        let ctx = self.get_context(txn_id)?;
+        let pending = ctx.pending_updates.read();
+        Ok(pending
+            .get(&(table_name.to_string(), row_id))
+            .map(|(_, new)| new.clone()))
+    }
+
+    /// Take the whole pending_updates map (COMMIT apply / full rollback
+    /// discard both drain it exactly once).
+    #[allow(clippy::type_complexity)]
+    pub fn take_pending_updates(
+        &self,
+        txn_id: TransactionId,
+    ) -> Result<HashMap<(String, RowId), (Row, Row)>> {
+        let ctx = self.get_context(txn_id)?;
+        let mut pending = ctx.pending_updates.write();
+        Ok(std::mem::take(&mut *pending))
+    }
+
+    /// All pending-updated rows of one table (scan/agg fold sites mirror
+    /// txn_write_set_rows).
+    pub fn pending_updates_for_table(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+    ) -> Result<Vec<(RowId, Row)>> {
+        let ctx = self.get_context(txn_id)?;
+        let pending = ctx.pending_updates.read();
+        Ok(pending
+            .iter()
+            .filter(|((t, _), _)| t == table_name)
+            .map(|((_, rid), (_, new))| (*rid, new.clone()))
+            .collect())
+    }
+
+    /// Record the savepoint snapshot for a just-buffered pending update.
+    pub fn record_pending_snapshot(
+        &self,
+        txn_id: TransactionId,
+        row_id: RowId,
+        table_name: &str,
+        prior: Option<(Row, Row)>,
+    ) -> Result<()> {
+        let ctx = self.get_context(txn_id)?;
+        let delta = DeltaOperation::PendingUpdateSnapshot(row_id, table_name.to_string(), prior);
+        ctx.undo_log.write().push(delta.clone());
+        let mut savepoints = ctx.savepoints.write();
+        if let Some(last) = savepoints.last_mut() {
+            last.write_deltas.push(delta);
+        }
+        Ok(())
+    }
+
     /// Relocate a buffered write_set row to a new row_id — the PK of an
     /// uncommitted INSERT changed. Keeps the row_id == Integer-PK invariant
     /// that PK point queries (fast_col_segment_pk_select / RowMap binary
@@ -444,6 +593,7 @@ impl TransactionCoordinator {
         let mut applied: Vec<DeltaOperation> = Vec::new();
         let mut write_set = ctx.write_set.write();
         let mut read_set = ctx.read_set.write();
+        let mut pending_updates = ctx.pending_updates.write();
 
         let mut undo_count = 0;
         for delta in all_deltas {
@@ -451,6 +601,21 @@ impl TransactionCoordinator {
                 DeltaOperation::Insert(row_id, table_name, _new_value) => {
                     // Undo insert: remove from write_set
                     write_set.remove(&(table_name, row_id));
+                    undo_count += 1;
+                }
+                DeltaOperation::PendingUpdateSnapshot(row_id, table_name, prior) => {
+                    // 🔒 M1: restore the pending_updates entry to its
+                    // pre-savepoint state (or remove it). Storage was never
+                    // touched — nothing to replay.
+                    let key = (table_name.clone(), row_id);
+                    match prior {
+                        Some(p) => {
+                            pending_updates.insert(key, p);
+                        }
+                        None => {
+                            pending_updates.remove(&key);
+                        }
+                    }
                     undo_count += 1;
                 }
                 DeltaOperation::Update(row_id, table_name, old_value) => {

@@ -1291,7 +1291,36 @@ impl Database {
                 }))
             }
             _ => {
-                // SELECT. C1: non-star queries read ONLY the projected
+                // SELECT. 🔒 M1 read-your-writes: inside a transaction the
+                // row may be buffered (write_set INSERT / pending UPDATE) or
+                // deleted in-txn — the storage read below must not leak the
+                // pre-transaction state.
+                if self.query_executor.is_in_transaction() {
+                    if let Some(txn_row) = self
+                        .query_executor
+                        .txn_lookup_row_pub(&meta.table_name, row_id)
+                    {
+                        let result_vec: Vec<Vec<Value>> = match txn_row {
+                            Some(row) => {
+                                if meta.is_star {
+                                    vec![row]
+                                } else {
+                                    vec![meta
+                                        .select_col_positions
+                                        .iter()
+                                        .map(|&pos| row.get(pos).cloned().unwrap_or(Value::Null))
+                                        .collect()]
+                                }
+                            }
+                            None => vec![],
+                        };
+                        return Ok(Some(StreamingQueryResult::SelectReady {
+                            columns: (*meta.column_names).clone(),
+                            rows: result_vec,
+                        }));
+                    }
+                }
+                // C1: non-star queries read ONLY the projected
                 // columns straight from the store (one row-location resolve,
                 // one decode per requested column) — the old path decoded
                 // EVERY column of the row, including 1.5KB vectors and text,
@@ -2049,6 +2078,12 @@ impl Database {
         let ws = ctx.write_set.read();
         if let Some(row) = ws.get(&(table.to_string(), row_id)) {
             return Some(Some(row.clone()));
+        }
+        drop(ws);
+        // 🔒 M1: buffered pending UPDATE — the new value is current in-txn.
+        let pending = ctx.pending_updates.read();
+        if let Some((_, new)) = pending.get(&(table.to_string(), row_id)) {
+            return Some(Some(new.clone()));
         }
         if deleted {
             return Some(None);

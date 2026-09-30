@@ -237,7 +237,11 @@ impl MoteDB {
         };
         // ctx dropped here — DashMap read guard released.
 
-        if write_set.is_empty() {
+        // 🔒 M1: drain buffered pending UPDATEs FIRST — the early-return
+        // below (empty write_set) must still apply them (a txn of only
+        // UPDATEs has no write_set rows).
+        let pending = self.txn_coordinator.take_pending_updates(txn_id)?;
+        if write_set.is_empty() && pending.is_empty() {
             // Nothing to commit — still finalize
             self.txn_coordinator.commit(txn_id)?;
             return Ok(());
@@ -359,6 +363,65 @@ impl MoteDB {
                 if let Ok(schema) = self.table_registry.get_table(table_name) {
                     self.batch_update_secondary_indexes(table_name, &schema, &row_ids, &rows);
                 }
+            }
+        }
+
+        // 6. 🔒 M1 buffered pending UPDATEs of storage-resident rows: apply
+        // the new versions now (newest-wins append), maintain indexes via the
+        // shared old→new delta helper, and log proper WAL Update records
+        // carrying the REAL txn_id so crash recovery honors the Commit
+        // marker (the old in-place path logged txn_id=0 — uncommitted
+        // transactional writes were replayed as committed).
+        if !pending.is_empty() {
+            use std::collections::HashMap;
+            let mut by_partition: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
+            for ((table_name, row_id), (old_row, new_row)) in &pending {
+                let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+                by_partition
+                    .entry(partition)
+                    .or_default()
+                    .push(WALRecord::Update {
+                        table_name: table_name.clone(),
+                        row_id: *row_id,
+                        partition,
+                        old_data: old_row.clone(),
+                        new_data: new_row.clone(),
+                        txn_id,
+                    });
+            }
+            for (partition, records) in by_partition {
+                self.wal.batch_append(partition, records)?;
+            }
+
+            for ((table_name, row_id), (old_row, new_row)) in &pending {
+                // Storage: append the new version at the same composite key
+                // (newest-version-wins — same semantics as the autocommit
+                // in-place path, minus the per-statement fsync).
+                let tbl_schema = self.table_registry.get_table(table_name)?;
+                let col_types = tbl_schema.col_types();
+                let store = self
+                    .get_or_create_col_segment_store(table_name, col_types)
+                    .ok();
+                if let Some(store) = store {
+                    let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+                    let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                    let ts = self
+                        .write_lsn
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    store.note_overlapping_write();
+                    let _ = store.append_rows(&[(key, ts, new_row.clone())]);
+                }
+                // Cache + index delta.
+                self.row_cache
+                    .put(table_name.to_string(), *row_id, new_row.clone());
+                self.update_indexes_for_row(
+                    table_name,
+                    &tbl_schema,
+                    *row_id,
+                    *row_id, // no PK relocation in the buffered path
+                    old_row,
+                    new_row,
+                );
             }
         }
 

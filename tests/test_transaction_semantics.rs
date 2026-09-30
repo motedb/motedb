@@ -476,14 +476,11 @@ fn in_process_multi_connection_shared_engine() {
     c4.close().unwrap();
 }
 
-/// 🔒 KNOWN LIMITATION (write-write conflict across two storage-writing txns):
-/// a transactional UPDATE writes storage immediately (undo-logged); a second
-/// txn's UPDATE+COMMIT batches its write through the coordinator, so the
-/// first txn's rollback replays its undo over BOTH. Proper fix = route
-/// transactional UPDATEs through the version store (first-committer-wins at
-/// commit), which is an MVCC-layer redesign — tracked separately.
+/// 🔒 M1: transactional UPDATEs of storage rows are BUFFERED (pending_updates)
+/// and applied at COMMIT — a concurrent committer's value can no longer be
+/// clobbered by another txn's ROLLBACK (storage is untouched until commit).
+/// This was the known-limitation test (in-place writes + undo replay).
 #[test]
-#[ignore = "known limitation: in-place txn UPDATE + concurrent commit loses (MVCC redesign)"]
 fn rollback_after_concurrent_commit_keeps_winner() {
     let dir = TempDir::new().unwrap();
     let db = Database::create_with_config(dir.path(), motedb::DBConfig::for_testing()).unwrap();

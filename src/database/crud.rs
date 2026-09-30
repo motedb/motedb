@@ -863,6 +863,262 @@ impl MoteDB {
         Ok(n)
     }
 
+    /// 🔁 Per-column secondary index maintenance for a row UPDATE
+    /// (column/vector/text/spatial indexes + pk_cache relocation). Shared by
+    /// the autocommit in-place update path and the transactional COMMIT
+    /// apply of buffered pending updates. `eff_rid` is the row's effective
+    /// row_id after any PK relocation.
+    pub(crate) fn update_indexes_for_row(
+        &self,
+        table_name: &str,
+        schema: &crate::types::TableSchema,
+        row_id: RowId,
+        eff_rid: RowId,
+        old_row: &Row,
+        new_row: &Row,
+    ) {
+        let rid_changed = eff_rid != row_id;
+        let mut index_errors = Vec::new();
+
+        // Reusable index key buffer
+        let mut index_key_buf = String::with_capacity(table_name.len() + 1 + 16);
+
+        for col_def in &schema.columns {
+            let col_name = &col_def.name;
+            let old_value = old_row.get(col_def.position);
+            let new_value = new_row.get(col_def.position);
+
+            // Skip unchanged columns (unless the row moved — index entries
+            // must be re-keyed to the new row_id)
+            if old_value == new_value && !rid_changed {
+                continue;
+            }
+
+            // 6.1 Column Index — reuse key buffer
+            {
+                index_key_buf.clear();
+                index_key_buf.push_str(table_name);
+                index_key_buf.push('.');
+                index_key_buf.push_str(col_name);
+            }
+            if let Some(index_ref) = self.column_indexes.get(&index_key_buf) {
+                let index = index_ref.value();
+                let old_is_null = old_value.is_none() || matches!(old_value, Some(Value::Null));
+                let new_is_null = new_value.is_none() || matches!(new_value, Some(Value::Null));
+
+                if rid_changed {
+                    // Row moved: unconditionally re-key (value may be identical)
+                    if !old_is_null {
+                        if let Some(old_val) = old_value {
+                            if let Err(_e) = index.delete(old_val, row_id) {
+                                debug_log!(
+                                    "[update_row] Failed to delete column index '{}': {}",
+                                    col_name,
+                                    _e
+                                );
+                                index_errors.push(index_key_buf.clone());
+                            }
+                        }
+                    }
+                    if !new_is_null {
+                        if let Some(new_val) = new_value {
+                            if let Err(_e) = index.insert(new_val, eff_rid) {
+                                debug_log!(
+                                    "[update_row] Failed to insert column index '{}': {}",
+                                    col_name,
+                                    _e
+                                );
+                                index_errors.push(index_key_buf.clone());
+                            }
+                        }
+                    }
+                } else if !old_is_null && !new_is_null {
+                    if let (Some(old_val), Some(new_val)) = (old_value, new_value) {
+                        if let Err(_e) = index.update(old_val, new_val, row_id) {
+                            debug_log!(
+                                "[update_row] Failed to update column index '{}': {}",
+                                col_name,
+                                _e
+                            );
+                            index_errors.push(index_key_buf.clone());
+                        }
+                    }
+                } else if !old_is_null && new_is_null {
+                    if let Some(old_val) = old_value {
+                        if let Err(_e) = index.delete(old_val, row_id) {
+                            debug_log!(
+                                "[update_row] Failed to delete column index '{}': {}",
+                                col_name,
+                                _e
+                            );
+                            index_errors.push(index_key_buf.clone());
+                        }
+                    }
+                } else if old_is_null && !new_is_null {
+                    if let Some(new_val) = new_value {
+                        if let Err(_e) = index.insert(new_val, eff_rid) {
+                            debug_log!(
+                                "[update_row] Failed to insert column index '{}': {}",
+                                col_name,
+                                _e
+                            );
+                            index_errors.push(index_key_buf.clone());
+                        }
+                    }
+                }
+                // NULL -> NULL: no index change needed
+            }
+
+            // 6.2 Vector Index
+            if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Vector,
+                ) {
+                    let mut failed = false;
+                    if let Err(_e) = self.delete_vector(row_id, &index_name) {
+                        debug_log!(
+                            "[update_row] Failed to delete old vector '{}': {}",
+                            index_name,
+                            _e
+                        );
+                        failed = true;
+                    }
+
+                    if let Some(new_vec) = new_value.and_then(|v| match v {
+                        crate::types::Value::Vector(vec) => Some(vec.as_slice().to_vec()),
+                        crate::types::Value::Tensor(tensor) => Some(tensor.to_f32()),
+                        _ => None,
+                    }) {
+                        if let Err(_e) = self.update_vector(eff_rid, &index_name, &new_vec) {
+                            debug_log!(
+                                "[update_row] Failed to update vector index '{}': {}",
+                                index_name,
+                                _e
+                            );
+                            failed = true;
+                        }
+                    }
+                    if failed {
+                        index_errors.push(index_name.clone());
+                    }
+                }
+            }
+
+            // 6.3 Text Index
+            if matches!(col_def.col_type, crate::types::ColumnType::Text) {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Text,
+                ) {
+                    if let (
+                        Some(crate::types::Value::Text(old_text)),
+                        Some(crate::types::Value::Text(new_text)),
+                    ) = (old_value, new_value)
+                    {
+                        if rid_changed {
+                            // 行搬移：旧文档按 row_id 摘除，新文档挂 eff_rid
+                            if let Err(_e) = self.delete_text(row_id, &index_name, old_text) {
+                                debug_log!(
+                                    "[update_row] Failed to delete text index '{}': {}",
+                                    index_name,
+                                    _e
+                                );
+                                index_errors.push(index_name.clone());
+                            }
+                            if let Err(_e) = self.insert_text(eff_rid, &index_name, new_text) {
+                                debug_log!(
+                                    "[update_row] Failed to insert text index '{}': {}",
+                                    index_name,
+                                    _e
+                                );
+                                index_errors.push(index_name.clone());
+                            }
+                        } else if let Err(_e) =
+                            self.update_text(row_id, &index_name, old_text, new_text)
+                        {
+                            debug_log!(
+                                "[update_row] Failed to update text index '{}': {}",
+                                index_name,
+                                _e
+                            );
+                            index_errors.push(index_name.clone());
+                        }
+                    }
+                }
+            }
+
+            // 6.4 i-Octree Index (3D point cloud)
+            if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
+                if let Some(octree_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Octree,
+                ) {
+                    let mut failed = false;
+                    if let Err(_e) = self.delete_ioctree_point(row_id, &octree_name) {
+                        debug_log!(
+                            "[update_row] Failed to delete old ioctree point '{}': {}",
+                            octree_name,
+                            _e
+                        );
+                        failed = true;
+                    }
+                    if let Some(crate::types::Value::Spatial(new_geom)) = new_value {
+                        if let Err(_e) = self.insert_ioctree_point(eff_rid, &octree_name, new_geom)
+                        {
+                            debug_log!(
+                                "[update_row] Failed to update ioctree index '{}': {}",
+                                octree_name,
+                                _e
+                            );
+                            failed = true;
+                        }
+                    }
+                    if failed {
+                        index_errors.push(octree_name.clone());
+                    }
+                }
+            }
+        }
+
+        // 7. Update PK lookup cache if primary key value changed
+        if let Some(pk_name) = schema.primary_key() {
+            if !schema.is_primary_key_auto_increment() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    let old_pk = old_row.get(pk_col.position);
+                    let new_pk = new_row.get(pk_col.position);
+                    if old_pk != new_pk {
+                        if let Some(pk_lookup) = self.pk_lookup.get(table_name) {
+                            if let Some(old_val) = old_pk {
+                                let old_key = crate::database::pk_cache::PkKey::from_value(old_val);
+                                pk_lookup.remove_pk(&old_key);
+                            }
+                            if let Some(new_val) = new_pk {
+                                let new_key = crate::database::pk_cache::PkKey::from_value(new_val);
+                                pk_lookup.insert(new_key, eff_rid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If any index update failed, mark ALL indexes for this table stale
+        if !index_errors.is_empty() {
+            debug_log!(
+                "[update_row] {} index updates failed for table '{}', marking all stale",
+                index_errors.len(),
+                table_name
+            );
+            for meta in self.index_registry.list_table_indexes(table_name) {
+                self.index_registry.mark_stale(&meta.name);
+            }
+        }
+    }
+
     fn update_row_with_schema_impl(
         &self,
         table_name: &str,
@@ -1105,251 +1361,10 @@ impl MoteDB {
             }
         }
 
-        // 6. Update indexes. Collect failures, then mark ALL stale consistently.
-        // 🔑 PK 改值时行物理搬到了新 row_id（上面的 tombstone+append）——
-        // 所有次级索引的新条目必须挂到 eff_rid，旧条目按 row_id 摘除；
-        // pk_cache 的新映射也指向 eff_rid。否则行从这些索引里"消失"。
+        // 6. Update indexes (shared helper — also used by the transactional
+        // commit apply for buffered pending updates).
         let eff_rid: RowId = cache_relocate_rid.unwrap_or(row_id);
-        let rid_changed = cache_relocate_rid.is_some();
-        let mut index_errors = Vec::new();
-
-        // Reusable index key buffer
-        let mut index_key_buf = String::with_capacity(table_name.len() + 1 + 16);
-
-        for col_def in &schema.columns {
-            let col_name = &col_def.name;
-            let old_value = old_row.get(col_def.position);
-            let new_value = new_row.get(col_def.position);
-
-            // Skip unchanged columns (unless the row moved — index entries
-            // must be re-keyed to the new row_id)
-            if old_value == new_value && !rid_changed {
-                continue;
-            }
-
-            // 6.1 Column Index — reuse key buffer
-            {
-                index_key_buf.clear();
-                index_key_buf.push_str(table_name);
-                index_key_buf.push('.');
-                index_key_buf.push_str(col_name);
-            }
-            if let Some(index_ref) = self.column_indexes.get(&index_key_buf) {
-                let index = index_ref.value();
-                let old_is_null = old_value.is_none() || matches!(old_value, Some(Value::Null));
-                let new_is_null = new_value.is_none() || matches!(new_value, Some(Value::Null));
-
-                if rid_changed {
-                    // Row moved: unconditionally re-key (value may be identical)
-                    if !old_is_null {
-                        if let Some(old_val) = old_value {
-                            if let Err(_e) = index.delete(old_val, row_id) {
-                                debug_log!(
-                                    "[update_row] Failed to delete column index '{}': {}",
-                                    col_name,
-                                    _e
-                                );
-                                index_errors.push(index_key_buf.clone());
-                            }
-                        }
-                    }
-                    if !new_is_null {
-                        if let Some(new_val) = new_value {
-                            if let Err(_e) = index.insert(new_val, eff_rid) {
-                                debug_log!(
-                                    "[update_row] Failed to insert column index '{}': {}",
-                                    col_name,
-                                    _e
-                                );
-                                index_errors.push(index_key_buf.clone());
-                            }
-                        }
-                    }
-                } else if !old_is_null && !new_is_null {
-                    if let (Some(old_val), Some(new_val)) = (old_value, new_value) {
-                        if let Err(_e) = index.update(old_val, new_val, row_id) {
-                            debug_log!(
-                                "[update_row] Failed to update column index '{}': {}",
-                                col_name,
-                                _e
-                            );
-                            index_errors.push(index_key_buf.clone());
-                        }
-                    }
-                } else if !old_is_null && new_is_null {
-                    if let Some(old_val) = old_value {
-                        if let Err(_e) = index.delete(old_val, row_id) {
-                            debug_log!(
-                                "[update_row] Failed to delete column index '{}': {}",
-                                col_name,
-                                _e
-                            );
-                            index_errors.push(index_key_buf.clone());
-                        }
-                    }
-                } else if old_is_null && !new_is_null {
-                    if let Some(new_val) = new_value {
-                        if let Err(_e) = index.insert(new_val, eff_rid) {
-                            debug_log!(
-                                "[update_row] Failed to insert column index '{}': {}",
-                                col_name,
-                                _e
-                            );
-                            index_errors.push(index_key_buf.clone());
-                        }
-                    }
-                }
-                // NULL -> NULL: no index change needed
-            }
-
-            // 6.2 Vector Index
-            if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                if let Some(index_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Vector,
-                ) {
-                    let mut failed = false;
-                    if let Err(_e) = self.delete_vector(row_id, &index_name) {
-                        debug_log!(
-                            "[update_row] Failed to delete old vector '{}': {}",
-                            index_name,
-                            _e
-                        );
-                        failed = true;
-                    }
-
-                    if let Some(new_vec) = new_value.and_then(|v| match v {
-                        crate::types::Value::Vector(vec) => Some(vec.as_slice().to_vec()),
-                        crate::types::Value::Tensor(tensor) => Some(tensor.to_f32()),
-                        _ => None,
-                    }) {
-                        if let Err(_e) = self.update_vector(eff_rid, &index_name, &new_vec) {
-                            debug_log!(
-                                "[update_row] Failed to update vector index '{}': {}",
-                                index_name,
-                                _e
-                            );
-                            failed = true;
-                        }
-                    }
-                    if failed {
-                        index_errors.push(index_name.clone());
-                    }
-                }
-            }
-
-            // 6.3 Text Index
-            if matches!(col_def.col_type, crate::types::ColumnType::Text) {
-                if let Some(index_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Text,
-                ) {
-                    if let (
-                        Some(crate::types::Value::Text(old_text)),
-                        Some(crate::types::Value::Text(new_text)),
-                    ) = (old_value, new_value)
-                    {
-                        if rid_changed {
-                            // 行搬移：旧文档按 row_id 摘除，新文档挂 eff_rid
-                            if let Err(_e) = self.delete_text(row_id, &index_name, old_text) {
-                                debug_log!(
-                                    "[update_row] Failed to delete text index '{}': {}",
-                                    index_name,
-                                    _e
-                                );
-                                index_errors.push(index_name.clone());
-                            }
-                            if let Err(_e) = self.insert_text(eff_rid, &index_name, new_text) {
-                                debug_log!(
-                                    "[update_row] Failed to insert text index '{}': {}",
-                                    index_name,
-                                    _e
-                                );
-                                index_errors.push(index_name.clone());
-                            }
-                        } else if let Err(_e) =
-                            self.update_text(row_id, &index_name, old_text, new_text)
-                        {
-                            debug_log!(
-                                "[update_row] Failed to update text index '{}': {}",
-                                index_name,
-                                _e
-                            );
-                            index_errors.push(index_name.clone());
-                        }
-                    }
-                }
-            }
-
-            // 6.4 i-Octree Index (3D point cloud)
-            if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                if let Some(octree_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Octree,
-                ) {
-                    let mut failed = false;
-                    if let Err(_e) = self.delete_ioctree_point(row_id, &octree_name) {
-                        debug_log!(
-                            "[update_row] Failed to delete old ioctree point '{}': {}",
-                            octree_name,
-                            _e
-                        );
-                        failed = true;
-                    }
-                    if let Some(crate::types::Value::Spatial(new_geom)) = new_value {
-                        if let Err(_e) = self.insert_ioctree_point(eff_rid, &octree_name, new_geom)
-                        {
-                            debug_log!(
-                                "[update_row] Failed to update ioctree index '{}': {}",
-                                octree_name,
-                                _e
-                            );
-                            failed = true;
-                        }
-                    }
-                    if failed {
-                        index_errors.push(octree_name.clone());
-                    }
-                }
-            }
-        }
-
-        // 7. Update PK lookup cache if primary key value changed
-        if let Some(pk_name) = schema.primary_key() {
-            if !schema.is_primary_key_auto_increment() {
-                if let Some(pk_col) = schema.get_column(pk_name) {
-                    let old_pk = old_row.get(pk_col.position);
-                    let new_pk = new_row.get(pk_col.position);
-                    if old_pk != new_pk {
-                        if let Some(pk_lookup) = self.pk_lookup.get(table_name) {
-                            if let Some(old_val) = old_pk {
-                                let old_key = crate::database::pk_cache::PkKey::from_value(old_val);
-                                pk_lookup.remove_pk(&old_key);
-                            }
-                            if let Some(new_val) = new_pk {
-                                let new_key = crate::database::pk_cache::PkKey::from_value(new_val);
-                                pk_lookup.insert(new_key, eff_rid);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // If any index update failed, mark ALL indexes for this table stale
-        if !index_errors.is_empty() {
-            debug_log!(
-                "[update_row] {} index updates failed for table '{}', marking all stale",
-                index_errors.len(),
-                table_name
-            );
-            for meta in self.index_registry.list_table_indexes(table_name) {
-                self.index_registry.mark_stale(&meta.name);
-            }
-        }
+        self.update_indexes_for_row(table_name, schema, row_id, eff_rid, old_row, &new_row);
 
         Ok(())
     }

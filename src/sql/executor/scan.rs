@@ -157,9 +157,11 @@ impl QueryExecutor {
                 if self.is_in_transaction() {
                     let ws = self.txn_write_set_rows(table);
                     let del = self.txn_deleted_row_ids(table);
-                    if !ws.is_empty() || !del.is_empty() {
-                        return self
-                            .execute_full_scan_txn_merge(stmt, table, &schema, &store, ws, del);
+                    let pend = self.txn_pending_rows(table);
+                    if !ws.is_empty() || !del.is_empty() || !pend.is_empty() {
+                        return self.execute_full_scan_txn_merge(
+                            stmt, table, &schema, &store, ws, del, pend,
+                        );
                     }
                 }
                 return self.execute_full_scan_via_col_segment(stmt, table, &schema, &store);
@@ -801,9 +803,11 @@ impl QueryExecutor {
         if self.is_in_transaction() {
             let ws_rows = self.txn_write_set_rows(table);
             let deleted = self.txn_deleted_row_ids(table);
+            let pending = self.txn_pending_rows(table);
             if !ws_rows.is_empty() || !deleted.is_empty() {
-                return self
-                    .execute_full_scan_txn_merge(stmt, table, schema, store, ws_rows, deleted);
+                return self.execute_full_scan_txn_merge(
+                    stmt, table, schema, store, ws_rows, deleted, pending,
+                );
             }
         }
         let col_types = schema.col_types().to_vec();
@@ -2088,6 +2092,7 @@ impl QueryExecutor {
     /// apply WHERE/LIMIT/OFFSET/project. Correctness over speed: transactions
     /// are not the hot path for full scans.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_full_scan_txn_merge(
         &self,
         stmt: &SelectStmt,
@@ -2096,6 +2101,7 @@ impl QueryExecutor {
         store: &crate::storage::col_segment::ColSegmentStore,
         ws_rows: Vec<(RowId, Row)>,
         deleted: std::collections::HashSet<RowId>,
+        pending: Vec<(RowId, Row)>,
     ) -> Result<StreamingQueryResult> {
         use crate::sql::ast::SelectColumn;
         let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema)?;
@@ -2119,6 +2125,12 @@ impl QueryExecutor {
             ws_rows.iter().map(|(rid, _)| *rid).collect();
         all_rows.retain(|(rid, _)| !ws_ids.contains(rid));
         all_rows.extend(ws_rows);
+        // 🔒 M1: buffered pending UPDATEs — their new value overrides the
+        // segment row (the segment still holds the pre-txn version).
+        let pending_ids: std::collections::HashSet<RowId> =
+            pending.iter().map(|(rid, _)| *rid).collect();
+        all_rows.retain(|(rid, _)| !pending_ids.contains(rid));
+        all_rows.extend(pending);
         all_rows.sort_by_key(|(rid, _)| *rid);
 
         // Apply WHERE filter + projection.

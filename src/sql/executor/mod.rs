@@ -2197,6 +2197,10 @@ impl QueryExecutor {
                 crate::txn::coordinator::DeltaOperation::Insert(_, _, _) => {
                     // INSERT undo: write_set INSERT was never committed to store.
                 }
+                crate::txn::coordinator::DeltaOperation::PendingUpdateSnapshot(..) => {
+                    // 🔒 M1: full rollback drains pending_updates wholesale
+                    // (storage was never touched) — no per-delta action.
+                }
                 crate::txn::coordinator::DeltaOperation::UpdateBuffered(_, _, _) => {
                     // write_set-level undo (handled by the coordinator) —
                     // never replay against storage (uncommitted row).
@@ -2234,6 +2238,19 @@ impl QueryExecutor {
 
     /// Returns the set of row_ids the active transaction has DELETEd from
     /// `table` (recorded in the undo_log). Empty when not in a transaction.
+    /// 🔒 M1: buffered pending UPDATEs of one table — (row_id, NEW value)
+    /// pairs for the scan/agg fold sites.
+    pub fn txn_pending_rows(&self, table: &str) -> Vec<(RowId, Row)> {
+        let txn_id = match self.current_txn_id() {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        self.db
+            .txn_coordinator
+            .pending_updates_for_table(txn_id, table)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn txn_deleted_row_ids(&self, table: &str) -> std::collections::HashSet<RowId> {
         let txn_id = match self.current_txn_id() {
             Some(t) => t,
@@ -2259,6 +2276,11 @@ impl QueryExecutor {
     /// - `Some(Some(row))` — row is in the write_set (uncommitted INSERT).
     /// - `Some(None)` — row was DELETEd by this transaction (tombstone).
     /// - `None` — no transactional info; caller should consult storage.
+    /// Public wrapper for the api layer's fast-PK SELECT read-your-writes.
+    pub fn txn_lookup_row_pub(&self, table: &str, row_id: RowId) -> Option<Option<Row>> {
+        self.txn_lookup_row(table, row_id)
+    }
+
     pub(crate) fn txn_lookup_row(&self, table: &str, row_id: RowId) -> Option<Option<Row>> {
         let txn_id = self.current_txn_id()?;
         let ctx = self.db.txn_coordinator.get_context(txn_id).ok()?;
@@ -2276,6 +2298,14 @@ impl QueryExecutor {
         if let Some(row) = ws.get(&(table.to_string(), row_id)) {
             return Some(Some(row.clone()));
         }
+        drop(ws);
+        // 🔒 M1: buffered (uncommitted) UPDATE of a storage row — the pending
+        // new value IS the row's current state inside this txn.
+        let pending = ctx.pending_updates.read();
+        if let Some((_, new)) = pending.get(&(table.to_string(), row_id)) {
+            return Some(Some(new.clone()));
+        }
+        drop(pending);
         if deleted {
             return Some(None);
         }
@@ -2508,6 +2538,12 @@ impl QueryExecutor {
                                 }
                                 crate::txn::coordinator::DeltaOperation::Insert(_, _, _) => {
                                     // INSERT undo: write_set INSERT was never committed to store.
+                                }
+                                crate::txn::coordinator::DeltaOperation::PendingUpdateSnapshot(
+                                    ..,
+                                ) => {
+                                    // 🔒 M1: pending_updates drained wholesale on
+                                    // full rollback — no per-delta action.
                                 }
                                 crate::txn::coordinator::DeltaOperation::UpdateBuffered(
                                     _,
@@ -16893,27 +16929,42 @@ impl QueryExecutor {
                 }
             }
 
-            // 🔑 Record undo delta for transactional UPDATE (so ROLLBACK can restore).
+            // 🔒 M1: inside a transaction, buffer the update — storage is
+            // written once at COMMIT. The scan yields STORAGE rows here;
+            // rows already carrying a pending update are overlaid by the
+            // scan's txn fold (their buffered new value reaches this loop),
+            // so a chained SET v = v + 1 evaluates against the pending value.
             let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
-                // 🔑 If row was INSERTed in this txn, update write_set (prevents
-                // COMMIT overwriting the UPDATE with the stale INSERT value).
-                let updated = self.db.txn_coordinator.update_write_set_row(
-                    tid,
-                    &stmt.table,
-                    row_id,
-                    new_row.clone(),
-                )?;
-                if !updated {
-                    let _ = self.db.txn_coordinator.record_write_delta(
+                let pk_changed = Self::txn_update_changes_pk(&schema, &row, &new_row);
+                if !pk_changed {
+                    let prior = self.db.txn_coordinator.record_pending_update(
                         tid,
-                        crate::txn::coordinator::DeltaOperation::Update(
-                            row_id,
-                            stmt.table.clone(),
-                            Arc::new(row.clone()),
-                        ),
-                    );
+                        &stmt.table,
+                        row_id,
+                        row.clone(),
+                        new_row,
+                    )?;
+                    self.db.txn_coordinator.record_pending_snapshot(
+                        tid,
+                        row_id,
+                        &stmt.table,
+                        prior,
+                    )?;
+                    affected_rows += 1;
+                    continue;
                 }
+                // PK change fallback (rare): legacy in-place + undo delta.
+                let _ = self.db.txn_coordinator.record_write_delta(
+                    tid,
+                    crate::txn::coordinator::DeltaOperation::Update(
+                        row_id,
+                        stmt.table.clone(),
+                        Arc::new(row.clone()),
+                    ),
+                );
+                pending_updates.push((row_id, row.clone(), new_row));
+                continue;
             }
 
             // 🔑 收集后批量提交: WAL 全部 deferred, 语句级一次组提交栅栏。
@@ -17280,6 +17331,136 @@ impl QueryExecutor {
     /// records the savepoint delta. Storage is not touched — the row isn't
     /// committed yet. Shared by the scan path's write_set loop and the
     /// transaction-aware PK fast path.
+    /// Whether a transactional UPDATE changes the PK (fallback-to-in-place
+    /// detector; only Integer PKs participate in the row_id==PK invariant).
+    fn txn_update_changes_pk(
+        schema: &crate::types::TableSchema,
+        old_row: &Row,
+        new_row: &Row,
+    ) -> bool {
+        if schema.is_primary_key_auto_increment() {
+            return false;
+        }
+        schema
+            .primary_key()
+            .and_then(|n| schema.get_column(n))
+            .map(|c| c.position)
+            .is_some_and(|pos| old_row.get(pos) != new_row.get(pos))
+    }
+
+    /// 🔒 M1: UPDATE a row that lives in a txn buffer (write_set INSERT or a
+    /// pending buffered update of a storage row). Evaluates SET against the
+    /// buffered version, then updates the owning buffer in place — storage
+    /// is never touched.
+    fn apply_txn_update_to_buffered(
+        &self,
+        stmt: &UpdateStmt,
+        schema: &crate::types::TableSchema,
+        row_id: RowId,
+        buffered: &Row,
+    ) -> Result<()> {
+        let tid = self
+            .current_txn_id()
+            .ok_or_else(|| MoteDBError::Query("buffered update outside txn".into()))?;
+        // write_set rows (uncommitted INSERTs, incl. relocated ones) keep
+        // their dedicated path — it handles PK relocation + savepoint undo.
+        let updated = self.db.txn_coordinator.update_write_set_row(
+            tid,
+            &stmt.table,
+            row_id,
+            buffered.clone(),
+        )?;
+        if updated {
+            // apply_update_to_write_set_row re-evaluates and writes back.
+            return self.apply_update_to_write_set_row(stmt, schema, row_id, buffered);
+        }
+        // Pending (buffered update of a storage row): evaluate SET against
+        // the pending new value, then chain it (old_row stays the first
+        // pre-txn snapshot for the commit-time index delta).
+        let mut new_row = buffered.clone();
+        for (col_name, expr) in &stmt.assignments {
+            if let Some(cd) = schema.get_column(col_name) {
+                let new_val = if let Expr::Literal(v) = expr {
+                    v.clone()
+                } else if Self::expr_contains_subquery(expr) {
+                    let materialized = self.materialize_subqueries(expr)?;
+                    if let Expr::Literal(v) = materialized {
+                        v
+                    } else {
+                        Self::eval_expr_on_row(&materialized, buffered, schema)
+                            .unwrap_or(Value::Null)
+                    }
+                } else {
+                    Self::eval_expr_on_row(expr, buffered, schema)?
+                };
+                while new_row.len() <= cd.position {
+                    new_row.push(Value::Null);
+                }
+                new_row[cd.position] = new_val;
+            }
+        }
+        // 🔒 PK change on a pending row: not bufferable — but we can't bail
+        // mid-statement either. Snapshot the prior pending entry, drop it
+        // (the caller's storage path will re-read the ORIGINAL storage row
+        // and take the in-place PK-change fallback... which we no longer
+        // route to here). For M1, reject loudly: PK-changing updates of
+        // already-pending rows are an exotic shape; erroring preserves
+        // correctness over silent wrongness.
+        if Self::txn_update_changes_pk(schema, buffered, &new_row) {
+            // Restore nothing — the pending entry is untouched; surface an
+            // explicit error so the user splits the statement.
+            return Err(MoteDBError::Query(
+                "PK-changing UPDATE of a row already updated in this transaction is not                  supported; update the row once, or change the PK in a separate statement"
+                    .into(),
+            ));
+        }
+        // Chain: keep the FIRST old_row (pre-txn snapshot) for the commit-time
+        // index delta; replace only the new value. update_pending_row does
+        // exactly that; the prior it returns is None here only when the map
+        // entry vanished concurrently — then insert fresh with buffered as old.
+        let chained = self.db.txn_coordinator.update_pending_row(
+            tid,
+            &stmt.table,
+            row_id,
+            new_row.clone(),
+        )?;
+        let prior = if chained {
+            // snapshot of the state BEFORE this statement: reconstruct as
+            // (old, buffered) — old stays untouched by the chain.
+            let old = self
+                .db
+                .txn_coordinator
+                .get_pending_old(tid, &stmt.table, row_id)?
+                .unwrap_or_else(|| buffered.clone());
+            Some((old, buffered.clone()))
+        } else {
+            None
+        };
+        if !chained {
+            // Fresh entry (row had no pending update): old = the STORAGE row
+            // this buffered value was derived from. txn_lookup_row gave us the
+            // buffered version; the true old is recoverable from the entry we
+            // are about to create — record (buffered_old_from_storage…).
+            // Simplest correct old: re-read storage (the pre-txn version is
+            // still there — nothing wrote it).
+            let storage_old = self
+                .db
+                .get_table_row(&stmt.table, row_id)?
+                .unwrap_or_else(|| buffered.clone());
+            self.db.txn_coordinator.record_pending_update(
+                tid,
+                &stmt.table,
+                row_id,
+                storage_old,
+                new_row,
+            )?;
+        }
+        self.db
+            .txn_coordinator
+            .record_pending_snapshot(tid, row_id, &stmt.table, prior)?;
+        Ok(())
+    }
+
     fn apply_update_to_write_set_row(
         &self,
         stmt: &UpdateStmt,
@@ -17420,13 +17601,20 @@ impl QueryExecutor {
 
         for row_id in row_ids {
             // 🔑 Transaction visibility: a row DELETEd in this txn must not
-            // be resurrected; a row still buffered in the write_set is
-            // updated in the buffer by the write_set pass below (updating
-            // storage here would materialize an uncommitted INSERT).
+            // be resurrected; a row buffered in the write_set OR carrying a
+            // pending (buffered) update is handled by the in-txn branches
+            // below — storage is never written inside the transaction.
             if in_txn {
                 match self.txn_lookup_row(&stmt.table, row_id) {
-                    Some(_) => continue, // tombstone or buffered row
-                    None => {}
+                    Some(None) => continue, // deleted in this txn
+                    Some(Some(buffered)) => {
+                        // write_set INSERT or pending update: evaluate against
+                        // the buffered version and update the buffer in place.
+                        self.apply_txn_update_to_buffered(stmt, schema, row_id, &buffered)?;
+                        affected_rows += 1;
+                        continue;
+                    }
+                    None => {} // plain storage row → buffered below
                 }
             }
             let row = match self.db.get_table_row(&stmt.table, row_id)? {
@@ -17468,43 +17656,62 @@ impl QueryExecutor {
                 new_row[*pos] = val.clone();
             }
 
-            // 🔑 Record undo delta for transactional UPDATE (PK/index fast path).
-            let txn_id = self.current_txn_id();
-            if let Some(tid) = txn_id {
-                // 🔑 If row was INSERTed in this txn, update write_set (prevents
-                // COMMIT overwriting the UPDATE with the stale INSERT value).
-                let updated = self.db.txn_coordinator.update_write_set_row(
+            if in_txn {
+                // 🔒 M1: PK-changing transactional UPDATEs fall back to the
+                // in-place path (relocation semantics — tombstone old key +
+                // append at new — are entangled with storage-level PK
+                // invariants; buffering them is M-scope follow-up).
+                let pk_changed = Self::txn_update_changes_pk(schema, &row, &new_row);
+                if !pk_changed {
+                    let tid = self.current_txn_id().expect("in_txn");
+                    let prior = self.db.txn_coordinator.record_pending_update(
+                        tid,
+                        &stmt.table,
+                        row_id,
+                        row.clone(),
+                        new_row,
+                    )?;
+                    self.db.txn_coordinator.record_pending_snapshot(
+                        tid,
+                        row_id,
+                        &stmt.table,
+                        prior,
+                    )?;
+                    affected_rows += 1;
+                    continue;
+                }
+                // PK-change fallback: undo delta + in-place write (legacy path).
+                let tid = self.current_txn_id().expect("in_txn");
+                let _ = self.db.txn_coordinator.record_write_delta(
                     tid,
+                    crate::txn::coordinator::DeltaOperation::Update(
+                        row_id,
+                        stmt.table.clone(),
+                        Arc::new(row.clone()),
+                    ),
+                );
+                self.db.update_row_in_table_with_schema(
                     &stmt.table,
                     row_id,
+                    row,
                     new_row.clone(),
+                    schema,
                 )?;
-                if !updated {
-                    let _ = self.db.txn_coordinator.record_write_delta(
-                        tid,
-                        crate::txn::coordinator::DeltaOperation::Update(
-                            row_id,
-                            stmt.table.clone(),
-                            Arc::new(row.clone()),
-                        ),
-                    );
-                }
-            }
-
-            self.db.update_row_in_table_with_schema(
-                &stmt.table,
-                row_id,
-                row,
-                new_row.clone(),
-                schema,
-            )?;
-            if in_txn {
                 TXN_WROTE.with(|m| {
                     m.borrow_mut()
                         .entry((stmt.table.clone(), row_id))
                         .or_default()
                         .push(Arc::new(new_row))
                 });
+            } else {
+                // Autocommit: in-place write (unchanged fast behavior).
+                self.db.update_row_in_table_with_schema(
+                    &stmt.table,
+                    row_id,
+                    row,
+                    new_row,
+                    schema,
+                )?;
             }
             affected_rows += 1;
         }
@@ -17545,6 +17752,18 @@ impl QueryExecutor {
 
         // Stored rows (may be empty — the row could live only in write_set).
         for row_id in row_ids {
+            // 🔒 M1/M2 boundary: a DELETE of a row carrying a pending
+            // buffered UPDATE must DROP that pending entry — otherwise
+            // COMMIT appends the updated version after the tombstone and
+            // newest-wins resurrects the deleted row.
+            if in_txn {
+                if let Some(tid) = self.current_txn_id() {
+                    let _ = self
+                        .db
+                        .txn_coordinator
+                        .remove_pending_update(tid, &stmt.table, row_id);
+                }
+            }
             // 🔑 Transaction visibility: a row deleted earlier in this txn
             // must not be resurrected, and a write_set-buffered version is
             // handled by the write_set pass below (same contract as
