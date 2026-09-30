@@ -267,6 +267,11 @@ impl QueryExecutor {
                     Some(n) => n as i64,
                     None => store.count_live_rows() as i64,
                 };
+                // 🔒 M2 read-your-writes: subtract rows this txn has
+                // buffered-DELETEd (storage is tombstoned only at COMMIT).
+                if self.is_in_transaction() {
+                    count -= self.txn_pending_delete_ids(table_name).len() as i64;
+                }
             }
             // 🔑 Read-your-writes: adjust count for uncommitted transactional
             // INSERTs. write_set INSERTs were never written to storage, so the

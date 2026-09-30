@@ -237,11 +237,15 @@ impl MoteDB {
         };
         // ctx dropped here — DashMap read guard released.
 
-        // 🔒 M1: drain buffered pending UPDATEs FIRST — the early-return
-        // below (empty write_set) must still apply them (a txn of only
-        // UPDATEs has no write_set rows).
+        // 🔒 M1/M2: drain buffered pending UPDATEs and DELETEs BEFORE
+        // coordinator.commit — commit removes the context from active_txns,
+        // so any get_context AFTER it fails with "Transaction not found"
+        // (both drains are get_context callers). The early-return below
+        // (empty write_set) must still apply pending writes (a txn of only
+        // UPDATEs/DELETEs has no write_set rows).
         let pending = self.txn_coordinator.take_pending_updates(txn_id)?;
-        if write_set.is_empty() && pending.is_empty() {
+        let pending_deletes = self.txn_coordinator.take_pending_deletes(txn_id)?;
+        if write_set.is_empty() && pending.is_empty() && pending_deletes.is_empty() {
             // Nothing to commit — still finalize
             self.txn_coordinator.commit(txn_id)?;
             return Ok(());
@@ -422,6 +426,56 @@ impl MoteDB {
                     old_row,
                     new_row,
                 );
+            }
+        }
+
+        // 7. 🔒 M2 buffered pending DELETEs: tombstone in the store + proper
+        // WAL Delete records with the REAL txn_id + secondary index removal.
+        if !pending_deletes.is_empty() {
+            use std::collections::HashMap;
+            let mut by_partition: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
+            for ((table_name, row_id), old_row) in &pending_deletes {
+                let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+                by_partition
+                    .entry(partition)
+                    .or_default()
+                    .push(WALRecord::Delete {
+                        table_name: table_name.clone(),
+                        row_id: *row_id,
+                        partition,
+                        old_data: old_row.clone(),
+                        timestamp: 0,
+                        txn_id,
+                    });
+            }
+            for (partition, records) in by_partition {
+                self.wal.batch_append(partition, records)?;
+            }
+
+            for ((table_name, row_id), old_row) in &pending_deletes {
+                let tbl_schema = self.table_registry.get_table(table_name)?;
+                if let Some(store) = self.get_col_segment_store(table_name) {
+                    let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+                    let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                    let ts = self
+                        .write_lsn
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    store.note_overlapping_write();
+                    let _ = store.append_tombstone(key, ts);
+                }
+                // Cache + index removal (reuse the update helper with the new
+                // row = all-NULL? No — a NULL row would try re-inserting into
+                // indexes. Use the delete-specific removal: point each index
+                // at the old values for removal.)
+                self.remove_row_from_indexes(table_name, &tbl_schema, *row_id, old_row);
+                self.row_cache.invalidate(table_name, *row_id);
+                if let Some(counter) = self.table_row_count.get(table_name) {
+                    let _ = counter.fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |c| c.saturating_sub(1).into(),
+                    );
+                }
             }
         }
 

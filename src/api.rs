@@ -2066,15 +2066,10 @@ impl Database {
     fn txn_lookup_row_api(&self, table: &str, row_id: u64) -> Option<Option<Vec<Value>>> {
         let txn_id = self.query_executor.current_txn_id()?;
         let ctx = self.inner.txn_coordinator.get_context(txn_id).ok()?;
-        // DELETE tombstone check.
-        let undo = ctx.undo_log.read();
-        let deleted = undo.iter().any(|d| match d {
-            crate::txn::coordinator::DeltaOperation::Delete(rid, tbl, _) => {
-                *rid == row_id && tbl == table
-            }
-            _ => false,
-        });
-        drop(undo);
+        // 🔒 M2 buffered DELETE check first.
+        let deletes = ctx.pending_deletes.read();
+        let deleted = deletes.contains_key(&(table.to_string(), row_id));
+        drop(deletes);
         let ws = ctx.write_set.read();
         if let Some(row) = ws.get(&(table.to_string(), row_id)) {
             return Some(Some(row.clone()));

@@ -2201,6 +2201,9 @@ impl QueryExecutor {
                     // 🔒 M1: full rollback drains pending_updates wholesale
                     // (storage was never touched) — no per-delta action.
                 }
+                crate::txn::coordinator::DeltaOperation::PendingDeleteSnapshot(..) => {
+                    // 🔒 M2: full rollback drains pending_deletes wholesale.
+                }
                 crate::txn::coordinator::DeltaOperation::UpdateBuffered(_, _, _) => {
                     // write_set-level undo (handled by the coordinator) —
                     // never replay against storage (uncommitted row).
@@ -2238,6 +2241,21 @@ impl QueryExecutor {
 
     /// Returns the set of row_ids the active transaction has DELETEd from
     /// `table` (recorded in the undo_log). Empty when not in a transaction.
+    /// 🔒 M2: row_ids carrying a buffered DELETE in this txn.
+    pub fn txn_pending_delete_ids(&self, table: &str) -> std::collections::HashSet<RowId> {
+        let txn_id = match self.current_txn_id() {
+            Some(t) => t,
+            None => return Default::default(),
+        };
+        self.db
+            .txn_coordinator
+            .pending_deletes_for_table(txn_id, table)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .collect()
+    }
+
     /// 🔒 M1: buffered pending UPDATEs of one table — (row_id, NEW value)
     /// pairs for the scan/agg fold sites.
     pub fn txn_pending_rows(&self, table: &str) -> Vec<(RowId, Row)> {
@@ -2252,22 +2270,18 @@ impl QueryExecutor {
     }
 
     pub(crate) fn txn_deleted_row_ids(&self, table: &str) -> std::collections::HashSet<RowId> {
+        // 🔒 M2: buffered DELETEs (replaces the old undo-log scan — storage
+        // is never touched in-txn anymore).
         let txn_id = match self.current_txn_id() {
             Some(t) => t,
             None => return std::collections::HashSet::new(),
         };
-        let ctx = match self.db.txn_coordinator.get_context(txn_id) {
-            Ok(c) => c,
-            Err(_) => return std::collections::HashSet::new(),
-        };
-        let undo = ctx.undo_log.read();
-        undo.iter()
-            .filter_map(|delta| match delta {
-                crate::txn::coordinator::DeltaOperation::Delete(rid, tbl, _) if tbl == table => {
-                    Some(*rid)
-                }
-                _ => None,
-            })
+        self.db
+            .txn_coordinator
+            .pending_deletes_for_table(txn_id, table)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(rid, _)| rid)
             .collect()
     }
 
@@ -2284,16 +2298,11 @@ impl QueryExecutor {
     pub(crate) fn txn_lookup_row(&self, table: &str, row_id: RowId) -> Option<Option<Row>> {
         let txn_id = self.current_txn_id()?;
         let ctx = self.db.txn_coordinator.get_context(txn_id).ok()?;
-        // DELETE tombstone check first (a row could be deleted then re-inserted;
-        // write_set wins for re-inserts, so check it after).
-        let undo = ctx.undo_log.read();
-        let deleted = undo.iter().any(|d| match d {
-            crate::txn::coordinator::DeltaOperation::Delete(rid, tbl, _) => {
-                *rid == row_id && tbl == table
-            }
-            _ => false,
-        });
-        drop(undo);
+        // 🔒 M2 buffered DELETE first (a row could be deleted then
+        // re-inserted; write_set wins for re-inserts, so check it after).
+        let deletes = ctx.pending_deletes.read();
+        let deleted = deletes.contains_key(&(table.to_string(), row_id));
+        drop(deletes);
         let ws = ctx.write_set.read();
         if let Some(row) = ws.get(&(table.to_string(), row_id)) {
             return Some(Some(row.clone()));
@@ -2544,6 +2553,11 @@ impl QueryExecutor {
                                 ) => {
                                     // 🔒 M1: pending_updates drained wholesale on
                                     // full rollback — no per-delta action.
+                                }
+                                crate::txn::coordinator::DeltaOperation::PendingDeleteSnapshot(
+                                    ..,
+                                ) => {
+                                    // 🔒 M2: pending_deletes drained wholesale.
                                 }
                                 crate::txn::coordinator::DeltaOperation::UpdateBuffered(
                                     _,
@@ -10463,7 +10477,11 @@ impl QueryExecutor {
                 } = from
                 {
                     let count = if let Some(counter) = self.db.table_row_count.get(table_name) {
-                        counter.load(std::sync::atomic::Ordering::Relaxed) as i64
+                        // 🔒 M2: subtract rows this txn has buffered-DELETEd —
+                        // storage is untouched until COMMIT, but COUNT(*) must
+                        // be read-your-writes.
+                        let del = self.txn_pending_delete_ids(table_name).len() as i64;
+                        counter.load(std::sync::atomic::Ordering::Relaxed) as i64 - del
                     } else {
                         // Fallback: streaming scan if counter not initialized
                         let row_iter = self.db.scan_table_rows_streaming(table_name)?;
@@ -16844,6 +16862,21 @@ impl QueryExecutor {
         // 🚀 Use真正的流式扫描 (O(1) memory)
         let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
 
+        // 🔒 M1: same overlay as DELETE — skip rows already buffered-deleted
+        // in this txn; rows with a buffered UPDATE are evaluated against
+        // their pending NEW value (chained SET arithmetic correctness).
+        let pending_delete_ids_u: std::collections::HashSet<RowId> = if self.is_in_transaction() {
+            self.txn_pending_delete_ids(&stmt.table)
+        } else {
+            Default::default()
+        };
+        let pending_update_rows_u: std::collections::HashMap<RowId, Row> =
+            if self.is_in_transaction() {
+                self.txn_pending_rows(&stmt.table).into_iter().collect()
+            } else {
+                Default::default()
+            };
+
         // 🔑 Materialize subqueries in WHERE (e.g. `WHERE id IN (SELECT ...)`)
         // BEFORE the per-row eval. Without this, eval_expr_on_row sees a raw
         // Subquery node in the WHERE clause and returns NULL for every row
@@ -16881,7 +16914,13 @@ impl QueryExecutor {
         };
 
         for result in row_iter {
-            let (row_id, row) = result?;
+            let (mut row_id, mut row) = result?;
+            if pending_delete_ids_u.contains(&row_id) {
+                continue;
+            }
+            if let Some(pending_new) = pending_update_rows_u.get(&row_id) {
+                row = pending_new.clone();
+            }
 
             // WHERE filter using positional evaluation (no HashMap)
             let should_update = if let Some(ref where_clause) = resolved_where {
@@ -17138,6 +17177,20 @@ impl QueryExecutor {
         let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
 
         let mut affected_rows = 0;
+        // 🔒 M2 overlay: rows already buffered-deleted in this txn are
+        // skipped; rows with a buffered UPDATE are seen at their pending NEW
+        // value (a chained `DELETE WHERE v > …` matches on the new value).
+        let pending_delete_ids: std::collections::HashSet<RowId> = if self.is_in_transaction() {
+            self.txn_pending_delete_ids(&stmt.table)
+        } else {
+            Default::default()
+        };
+        let pending_update_rows: std::collections::HashMap<RowId, Row> = if self.is_in_transaction()
+        {
+            self.txn_pending_rows(&stmt.table).into_iter().collect()
+        } else {
+            Default::default()
+        };
 
         // 🔑 In transaction mode, also process write_set rows (same as execute_update).
         let txn_rows = if self.is_in_transaction() {
@@ -17148,7 +17201,15 @@ impl QueryExecutor {
 
         let mut pending_deletes: Vec<(crate::types::RowId, Vec<Value>)> = Vec::new();
         for result in row_iter {
-            let (row_id, row) = result?;
+            let (mut row_id, mut row) = result?;
+            // 🔒 M2 overlay: skip rows already buffered-deleted in this txn;
+            // rows with a buffered UPDATE are seen at their pending NEW value.
+            if pending_delete_ids.contains(&row_id) {
+                continue;
+            }
+            if let Some(pending_new) = pending_update_rows.get(&row_id) {
+                row = pending_new.clone();
+            }
             let sql_row = row_to_sql_row(&row, &schema)?;
 
             // Filter rows (WHERE clause)
@@ -17165,17 +17226,20 @@ impl QueryExecutor {
                 continue;
             }
 
-            // 🔑 Record undo delta for transactional DELETE (so ROLLBACK can restore).
-            let txn_id = self.current_txn_id();
-            if let Some(tid) = txn_id {
-                let _ = self.db.txn_coordinator.record_write_delta(
-                    tid,
-                    crate::txn::coordinator::DeltaOperation::Delete(
-                        row_id,
-                        stmt.table.clone(),
-                        Arc::new(row.clone()),
-                    ),
-                );
+            // 🔒 M2: inside a transaction, buffer the DELETE (drop any
+            // pending UPDATE for the row — DELETE subsumes it) — storage is
+            // tombstoned once at COMMIT.
+            if let Some(tid) = self.current_txn_id() {
+                let _ = self
+                    .db
+                    .txn_coordinator
+                    .remove_pending_update(tid, &stmt.table, row_id);
+                let _ =
+                    self.db
+                        .txn_coordinator
+                        .record_pending_delete(tid, &stmt.table, row_id, row)?;
+                affected_rows += 1;
+                continue;
             }
 
             // Delete row - 底层已实现增量索引维护，传入 old_row 避免重复加载
@@ -17784,16 +17848,18 @@ impl QueryExecutor {
                 }
             };
 
-            // 🔑 Record undo delta for transactional DELETE (PK fast path).
-            if let Some(tid) = self.current_txn_id() {
-                let _ = self.db.txn_coordinator.record_write_delta(
+            if in_txn {
+                // 🔒 M2: buffer the DELETE — storage (tombstone + index
+                // removal + WAL) happens once at COMMIT.
+                let tid = self.current_txn_id().expect("in_txn");
+                let _ = self.db.txn_coordinator.record_pending_delete(
                     tid,
-                    crate::txn::coordinator::DeltaOperation::Delete(
-                        row_id,
-                        stmt.table.clone(),
-                        Arc::new(row.clone()),
-                    ),
+                    &stmt.table,
+                    row_id,
+                    row.clone(),
                 );
+                affected_rows += 1;
+                continue;
             }
 
             self.db.delete_row_from_table(&stmt.table, row_id, row)?;

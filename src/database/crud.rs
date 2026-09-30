@@ -1119,6 +1119,102 @@ impl MoteDB {
         }
     }
 
+    /// 🔁 Secondary index removal for a DELETEd row (column/vector/text/
+    /// spatial). Shared by the autocommit delete path and the transactional
+    /// COMMIT apply of buffered pending deletes.
+    pub(crate) fn remove_row_from_indexes(
+        &self,
+        table_name: &str,
+        schema: &crate::types::TableSchema,
+        row_id: RowId,
+        old_row: &Row,
+    ) {
+        let mut index_key_buf = String::with_capacity(table_name.len() + 1 + 16);
+
+        // DashMap direct lookup for indexed columns
+        let prefix_len = table_name.len() + 1;
+
+        for col_def in &schema.columns {
+            let col_name = &col_def.name;
+            let col_value = old_row.get(col_def.position);
+
+            let Some(col_value) = col_value else {
+                continue;
+            };
+
+            // Column Index — single DashMap lookup
+            let mut col_index_key = String::with_capacity(prefix_len + col_name.len());
+            col_index_key.push_str(table_name);
+            col_index_key.push('.');
+            col_index_key.push_str(col_name);
+            if let Some(index_ref) = self.column_indexes.get(&col_index_key) {
+                if let Err(_e) = index_ref.value().delete(col_value, row_id) {
+                    debug_log!(
+                        "[delete_row] Failed to delete from column index '{}': {}",
+                        col_name,
+                        _e
+                    );
+                    self.index_registry.mark_stale(&col_index_key);
+                }
+            }
+
+            // Vector Index
+            if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Vector,
+                ) {
+                    if let Err(_e) = self.delete_vector(row_id, &index_name) {
+                        debug_log!(
+                            "[delete_row] Failed to delete from vector index '{}': {}",
+                            index_name,
+                            _e
+                        );
+                        self.index_registry.mark_stale(&index_name);
+                    }
+                }
+            }
+
+            // Text Index
+            if matches!(col_def.col_type, crate::types::ColumnType::Text) {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Text,
+                ) {
+                    if let crate::types::Value::Text(text) = col_value {
+                        if let Err(_e) = self.delete_text(row_id, &index_name, text) {
+                            debug_log!(
+                                "[delete_row] Failed to delete from text index '{}': {}",
+                                index_name,
+                                _e
+                            );
+                            self.index_registry.mark_stale(&index_name);
+                        }
+                    }
+                }
+            }
+
+            // i-Octree Index (3D point cloud)
+            if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
+                if let Some(octree_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Octree,
+                ) {
+                    if let Err(_e) = self.delete_ioctree_point(row_id, &octree_name) {
+                        debug_log!(
+                            "[delete_row] Failed to delete from ioctree index '{}': {}",
+                            octree_name,
+                            _e
+                        );
+                        self.index_registry.mark_stale(&octree_name);
+                    }
+                }
+            }
+        }
+    }
     fn update_row_with_schema_impl(
         &self,
         table_name: &str,
@@ -1535,93 +1631,9 @@ impl MoteDB {
             }
         }
 
-        // 8. Update indexes (after data is durable).
-        //    If an index deletion fails, the index is marked stale and can be
-        //    rebuilt later. Since indexes are derived data, this is safe.
-
-        // DashMap direct lookup for indexed columns
-        let prefix_len = table_name.len() + 1;
-
-        for col_def in &schema.columns {
-            let col_name = &col_def.name;
-            let col_value = old_row.get(col_def.position);
-
-            let Some(col_value) = col_value else {
-                continue;
-            };
-
-            // Column Index — single DashMap lookup
-            let mut col_index_key = String::with_capacity(prefix_len + col_name.len());
-            col_index_key.push_str(table_name);
-            col_index_key.push('.');
-            col_index_key.push_str(col_name);
-            if let Some(index_ref) = self.column_indexes.get(&col_index_key) {
-                if let Err(_e) = index_ref.value().delete(col_value, row_id) {
-                    debug_log!(
-                        "[delete_row] Failed to delete from column index '{}': {}",
-                        col_name,
-                        _e
-                    );
-                    self.index_registry.mark_stale(&col_index_key);
-                }
-            }
-
-            // Vector Index
-            if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                if let Some(index_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Vector,
-                ) {
-                    if let Err(_e) = self.delete_vector(row_id, &index_name) {
-                        debug_log!(
-                            "[delete_row] Failed to delete from vector index '{}': {}",
-                            index_name,
-                            _e
-                        );
-                        self.index_registry.mark_stale(&index_name);
-                    }
-                }
-            }
-
-            // Text Index
-            if matches!(col_def.col_type, crate::types::ColumnType::Text) {
-                if let Some(index_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Text,
-                ) {
-                    if let crate::types::Value::Text(text) = col_value {
-                        if let Err(_e) = self.delete_text(row_id, &index_name, text) {
-                            debug_log!(
-                                "[delete_row] Failed to delete from text index '{}': {}",
-                                index_name,
-                                _e
-                            );
-                            self.index_registry.mark_stale(&index_name);
-                        }
-                    }
-                }
-            }
-
-            // i-Octree Index (3D point cloud)
-            if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                if let Some(octree_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Octree,
-                ) {
-                    if let Err(_e) = self.delete_ioctree_point(row_id, &octree_name) {
-                        debug_log!(
-                            "[delete_row] Failed to delete from ioctree index '{}': {}",
-                            octree_name,
-                            _e
-                        );
-                        self.index_registry.mark_stale(&octree_name);
-                    }
-                }
-            }
-        }
+        // 8. Secondary index removal (shared with the transactional COMMIT
+        // apply of buffered pending deletes).
+        self.remove_row_from_indexes(table_name, &schema, row_id, &old_row);
 
         Ok(())
     }

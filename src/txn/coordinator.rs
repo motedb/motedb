@@ -35,6 +35,9 @@ pub enum DeltaOperation {
     /// it when None); full rollback drops the whole map. Never replayed
     /// against storage — the storage was never touched.
     PendingUpdateSnapshot(RowId, String, Option<(Row, Row)>),
+    /// 🔒 M2: a buffered DELETE was recorded after this savepoint — undo
+    /// removes it from pending_deletes (storage never touched).
+    PendingDeleteSnapshot(RowId, String),
 }
 
 /// Savepoint representation (Delta Snapshot optimized)
@@ -105,6 +108,12 @@ pub struct TransactionContext {
     /// records (txn_id=0) were replayed as committed on crash recovery.
     pub pending_updates: RwLock<HashMap<(String, RowId), (Row, Row)>>,
 
+    /// 🔒 M2 buffered DELETEs of STORAGE-RESIDENT rows: (table, row_id) →
+    /// old_row (kept for the commit-time WAL record / index removal).
+    /// Storage is never touched in-txn; COMMIT applies tombstones, ROLLBACK
+    /// drops the map.
+    pub pending_deletes: RwLock<HashMap<(String, RowId), Row>>,
+
     /// Read set (for conflict detection in Serializable)
     pub read_set: RwLock<HashSet<RowId>>,
 
@@ -161,6 +170,7 @@ impl TransactionCoordinator {
             state: AtomicU8::new(TransactionState::Active as u8),
             write_set: RwLock::new(HashMap::new()),
             pending_updates: RwLock::new(HashMap::new()),
+            pending_deletes: RwLock::new(HashMap::new()),
             read_set: RwLock::new(HashSet::new()),
             undo_log: RwLock::new(Vec::new()),
             snapshot,
@@ -236,10 +246,11 @@ impl TransactionCoordinator {
         // before calling this method. Clear the undo log here for cleanliness.
         ctx.undo_log.write().clear();
 
-        // Clear write set + buffered pending updates (M1: storage was never
-        // touched by them — dropping the map IS the undo).
+        // Clear write set + buffered pending updates/deletes (M1/M2: storage
+        // was never touched by them — dropping the maps IS the undo).
         ctx.write_set.write().clear();
         ctx.pending_updates.write().clear();
+        ctx.pending_deletes.write().clear();
 
         // Mark as aborted
         ctx.state
@@ -426,6 +437,93 @@ impl TransactionCoordinator {
             .map(|(_, new)| new.clone()))
     }
 
+    /// 🔒 M2: buffer a transactional DELETE of a STORAGE-RESIDENT row.
+    /// Returns the prior pending_updates entry for the row if one existed
+    /// (a DELETE of an already-UPDATEd row subsumes it — the caller drops
+    /// it so COMMIT doesn't resurrect).
+    pub fn record_pending_delete(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        row_id: RowId,
+        old_row: Row,
+    ) -> Result<Option<(Row, Row)>> {
+        let ctx = self.get_context(txn_id)?;
+        let mut pending = ctx.pending_updates.write();
+        let subsumed = pending.remove(&(table_name.to_string(), row_id));
+        ctx.pending_deletes
+            .write()
+            .insert((table_name.to_string(), row_id), old_row);
+        let delta = DeltaOperation::PendingDeleteSnapshot(row_id, table_name.to_string());
+        ctx.undo_log.write().push(delta.clone());
+        let mut savepoints = ctx.savepoints.write();
+        if let Some(last) = savepoints.last_mut() {
+            last.write_deltas.push(delta);
+        }
+        Ok(subsumed)
+    }
+
+    /// Whether a row carries a buffered (uncommitted) DELETE.
+    pub fn has_pending_delete(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        row_id: RowId,
+    ) -> Result<bool> {
+        let ctx = self.get_context(txn_id)?;
+        let deletes = ctx.pending_deletes.read();
+        Ok(deletes.contains_key(&(table_name.to_string(), row_id)))
+    }
+
+    /// Buffered DELETEs of one table: (row_id, old_row) pairs for the
+    /// scan/agg fold sites and commit apply.
+    pub fn pending_deletes_for_table(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+    ) -> Result<Vec<(RowId, Row)>> {
+        let ctx = self.get_context(txn_id)?;
+        let deletes = ctx.pending_deletes.read();
+        Ok(deletes
+            .iter()
+            .filter(|((t, _), _)| t == table_name)
+            .map(|((_, rid), old)| (*rid, old.clone()))
+            .collect())
+    }
+
+    /// Take the whole pending_deletes map (COMMIT apply / rollback drain).
+    pub fn take_pending_deletes(
+        &self,
+        txn_id: TransactionId,
+    ) -> Result<HashMap<(String, RowId), Row>> {
+        let ctx = self.get_context(txn_id)?;
+        let mut deletes = ctx.pending_deletes.write();
+        Ok(std::mem::take(&mut *deletes))
+    }
+
+    /// Rollback-to-savepoint: restore pending_deletes entries to their
+    /// pre-savepoint state.
+    pub fn restore_pending_deletes(
+        &self,
+        txn_id: TransactionId,
+        restores: Vec<(String, RowId, Option<Row>)>,
+    ) -> Result<()> {
+        let ctx = self.get_context(txn_id)?;
+        let mut deletes = ctx.pending_deletes.write();
+        for (table, rid, prior) in restores {
+            let key = (table, rid);
+            match prior {
+                Some(old) => {
+                    deletes.insert(key, old);
+                }
+                None => {
+                    deletes.remove(&key);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Take the whole pending_updates map (COMMIT apply / full rollback
     /// discard both drain it exactly once).
     #[allow(clippy::type_complexity)]
@@ -594,6 +692,7 @@ impl TransactionCoordinator {
         let mut write_set = ctx.write_set.write();
         let mut read_set = ctx.read_set.write();
         let mut pending_updates = ctx.pending_updates.write();
+        let mut pending_deletes = ctx.pending_deletes.write();
 
         let mut undo_count = 0;
         for delta in all_deltas {
@@ -601,6 +700,10 @@ impl TransactionCoordinator {
                 DeltaOperation::Insert(row_id, table_name, _new_value) => {
                     // Undo insert: remove from write_set
                     write_set.remove(&(table_name, row_id));
+                    undo_count += 1;
+                }
+                DeltaOperation::PendingDeleteSnapshot(row_id, table_name) => {
+                    pending_deletes.remove(&(table_name, row_id));
                     undo_count += 1;
                 }
                 DeltaOperation::PendingUpdateSnapshot(row_id, table_name, prior) => {
