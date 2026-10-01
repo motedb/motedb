@@ -140,6 +140,14 @@ def bench_mote(tmp):
     db.commit(tx)
     th("t_executemany_upd_rows_s", round(1000 / (time.perf_counter() - t0), 1))
 
+    # W1 批量内核形状（SET 全参数/字面量 — 表达式形式走逐行回退）
+    tx = db.begin()
+    t0 = time.perf_counter()
+    db.executemany("UPDATE ev SET val = ? WHERE id = ?",
+                   [[float(i % 99), i] for i in range(20_000)])
+    db.commit(tx)
+    th("t_executemany_upd_param_rows_s", round(20_000 / (time.perf_counter() - t0), 1))
+
     # C. 并发：8 线程并行点读
     def pread(_i):
         db.query("SELECT val FROM ev WHERE id = ?", params=[int(_i % N)])
@@ -256,6 +264,12 @@ def bench_sqlite(tmp):
     con.executemany("UPDATE ev SET val = val + 1 WHERE id = ?", [(i,) for i in range(1000)])
     con.execute("COMMIT")
     th("t_executemany_upd_rows_s", round(1000 / (time.perf_counter() - t0), 1))
+
+    con.execute("BEGIN")
+    t0 = time.perf_counter()
+    con.executemany("UPDATE ev SET val = ? WHERE id = ?", [(float(i % 99), i) for i in range(20_000)])
+    con.execute("COMMIT")
+    th("t_executemany_upd_param_rows_s", round(20_000 / (time.perf_counter() - t0), 1))
 
     # C. 并行点读（sqlite 同连接多线程串行 — 用 check_same_thread=False 仍受 GIL+锁限制，
     #    这是 SQLite python 内嵌的公平口径）
@@ -400,6 +414,12 @@ def bench_duckdb(tmp):
     con.executemany("UPDATE ev SET val = val + 1 WHERE id = ?", [(i,) for i in range(1000)])
     con.execute("COMMIT")
     th("t_executemany_upd_rows_s", round(1000 / (time.perf_counter() - t0), 1))
+
+    con.execute("BEGIN")
+    t0 = time.perf_counter()
+    con.executemany("UPDATE ev SET val = ? WHERE id = ?", [(float(i % 99), i) for i in range(20_000)])
+    con.execute("COMMIT")
+    th("t_executemany_upd_param_rows_s", round(20_000 / (time.perf_counter() - t0), 1))
 
     _tls = __import__("threading").local()
 

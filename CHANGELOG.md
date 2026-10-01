@@ -2,6 +2,23 @@
 
 ## [0.12.0] — 未发布
 
+### 🚀 W1 批量写过桥: executemany UPDATE/DELETE 批内核 3.8× (54K→205K rows/s)
+
+- 🚀 execute_prepared_many 的 UPDATE/DELETE 批新增缓冲批内核
+  (executemany_fast_pk_buffered): 语句机制 (bind/dispatch/结果物化) 每批
+  一次, 每行只剩 pk→row_id 解析 + 单行读 + pending 缓冲记录 — 与 executor
+  M1/M2 事务分支调同一组 coordinator API。实测 20K 行批 54,222 →
+  **205,396 rows/s (3.8×)**, 对 SQLite executemany (894K, 纯 C 循环) 差距
+  从 19× 收窄到 4.4×, 反超 DuckDB (11K) 18×
+- 🔒 语义零漂移: 内核只接管 `WHERE pk = ?` + SET 全参数/字面量且不触碰
+  PK 的形状; write_set 重叠 / 已缓冲行 (链式) / PK 缓存 miss 等异形逐行
+  回退 executor 全路径; SET 表达式形式 (val = val + 1) 整批回退
+- pk→row_id 解析抽共享助手 resolve_fast_pk_row_id (FastPkRowId 三态:
+  Resolved/Absent/Defer), 单语句快路径与批内核共用
+- 差分测试 executemany_batch_kernel_matches_per_row_executor: 同负载双库
+  对拍 (链式终值 2009/43、删已更新行、重复删、不存在行、外层事务
+  ROLLBACK、批内读己之写、write_set 行批更新回退)
+
 ### 🔒 事务原子性: fast-PK 写路径与 executemany 纳入显式事务
 
 - 🔒 `WHERE pk = ?` **参数形式**的 UPDATE/DELETE 走 api 层 fast-PK 捷径

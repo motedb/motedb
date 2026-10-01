@@ -19,6 +19,18 @@ use crate::{DBConfig, Result};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Outcome of fast-PK value → row_id resolution (shared by the single-
+/// statement fast path and the executemany batch kernel).
+enum FastPkRowId {
+    /// Deterministic or cache-resolved row_id.
+    Resolved(RowId),
+    /// Definitively no such row (e.g. negative/odd value on an AUTO_INCREMENT
+    /// PK) — the statement matches 0 rows.
+    Absent,
+    /// PK cache miss — not proof of absence; the full executor must run.
+    Defer,
+}
+
 /// Pre-computed metadata for fast PK SELECT execution.
 struct FastPkMeta {
     /// "select", "update", or "delete"
@@ -806,8 +818,26 @@ impl Database {
             } else {
                 Some(self.begin_transaction()?)
             };
+            let tid = if outer_txn {
+                self.query_executor
+                    .current_txn_id()
+                    .expect("outer_txn implies an active txn id")
+            } else {
+                tx_id.expect("private txn just begun")
+            };
             let mut affected: u64 = 0;
             let result = (|| -> Result<()> {
+                // 🚀 W1: buffered batch kernel — statement machinery (bind/
+                // dispatch/result) once per BATCH; per row only pk→row_id +
+                // row read + pending-record. Exotic per-row states fall back
+                // to the executor inside the kernel, so semantics cannot
+                // drift from the per-row loop below.
+                if let Some(lean) =
+                    self.executemany_fast_pk_buffered(&statement, sql, &batch, tid)?
+                {
+                    affected = lean;
+                    return Ok(());
+                }
                 for params in &batch {
                     let r = self.execute_prepared(sql, params.clone())?;
                     if let StreamingQueryResult::Modification { affected_rows } = r {
@@ -1206,54 +1236,15 @@ impl Database {
             }
         };
 
-        // Resolve PK → row_id.
-        // For AUTO_INCREMENT PKs the value IS the row_id, so we can always
-        // resolve. For non-AUTO_INCREMENT PKs we depend on the pk_lookup cache,
-        // which is lazily populated and may be empty after recovery (open) — a
-        // cache miss does NOT mean the row doesn't exist. In that case return
-        // None so the caller falls back to the full executor path (which scans
-        // the columnar store) instead of returning a wrong-typed/empty result.
-        let row_id = if meta.is_auto_increment {
-            match pk_value {
-                Value::Integer(id) if *id >= 0 => *id as RowId,
-                _ => {
-                    return Ok(Some(StreamingQueryResult::Modification {
-                        affected_rows: 0,
-                    }))
-                }
+        // Resolve PK → row_id (shared with the executemany batch kernel).
+        let row_id = match Self::resolve_fast_pk_row_id(self, meta, pk_value) {
+            FastPkRowId::Resolved(rid) => rid,
+            FastPkRowId::Absent => {
+                return Ok(Some(StreamingQueryResult::Modification {
+                    affected_rows: 0,
+                }))
             }
-        } else {
-            match pk_value {
-                // 🔑 Integer PKs have a deterministic row_id mapping (see the
-                // insert path in crud.rs): row_id = pk for ≥ 0, and negatives
-                // map to the high-u32 range. The raw-SQL fast path
-                // (fast_col_segment_pk_select) already relies on this — the
-                // prepared path previously required the lazily-populated
-                // pk_lookup cache and, on miss, fell back to a FULL TABLE SCAN
-                // (1.4ms at 100K rows vs ~1µs).
-                Value::Integer(id) => {
-                    if *id >= 0 {
-                        *id as RowId
-                    } else {
-                        0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF)
-                    }
-                }
-                // Non-Integer PKs need the pk_lookup cache; a miss does NOT
-                // mean absence — return None so the caller falls back to the
-                // full executor path.
-                _ => {
-                    let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
-                    match self
-                        .inner
-                        .pk_lookup
-                        .get(&meta.table_name)
-                        .and_then(|lookup| lookup.get_pk(&pk_key))
-                    {
-                        Some(rid) => rid,
-                        None => return Ok(None), // PK cache miss — fall back to full path
-                    }
-                }
-            }
+            FastPkRowId::Defer => return Ok(None), // PK cache miss — fall back to full path
         };
 
         match meta.stmt_type {
@@ -1385,6 +1376,210 @@ impl Database {
                     rows: result_vec,
                 }))
             }
+        }
+    }
+
+    /// PK value → row_id resolution shared by the single-statement fast path
+    /// and the executemany batch kernel. Integer PKs have a deterministic
+    /// row_id mapping (see the insert path in crud.rs): row_id = pk for ≥ 0,
+    /// negatives map to the high-u32 range. Non-Integer PKs need the
+    /// lazily-populated pk_lookup cache; a miss does NOT mean absence — the
+    /// caller must fall back to the full executor (which scans the columnar
+    /// store) instead of returning a wrong-typed/empty result.
+    fn resolve_fast_pk_row_id(&self, meta: &FastPkMeta, pk_value: &Value) -> FastPkRowId {
+        if meta.is_auto_increment {
+            match pk_value {
+                Value::Integer(id) if *id >= 0 => FastPkRowId::Resolved(*id as RowId),
+                _ => FastPkRowId::Absent,
+            }
+        } else {
+            match pk_value {
+                Value::Integer(id) => {
+                    if *id >= 0 {
+                        FastPkRowId::Resolved(*id as RowId)
+                    } else {
+                        FastPkRowId::Resolved(0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF))
+                    }
+                }
+                _ => {
+                    let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
+                    match self
+                        .inner
+                        .pk_lookup
+                        .get(&meta.table_name)
+                        .and_then(|lookup| lookup.get_pk(&pk_key))
+                    {
+                        Some(rid) => FastPkRowId::Resolved(rid),
+                        None => FastPkRowId::Defer,
+                    }
+                }
+            }
+        }
+    }
+
+    /// 🚀 W1: buffered batch kernel for executemany UPDATE/DELETE. The
+    /// statement machinery (bind_params / executor dispatch / result
+    /// materialization) runs ONCE per batch in the caller; per row this does
+    /// only pk→row_id + one row read + pending-map recording — the same
+    /// coordinator calls the executor's M1/M2 txn branches make.
+    ///
+    /// Semantics are mirrored from execute_update_pk / execute_delete_pk for
+    /// the `WHERE pk = ?` + all-absolute-SET shape; ANY row in a state the
+    /// kernel doesn't cover (write_set overlap, already-pending/buffered,
+    /// PK-cache miss) is delegated to the per-row executor, so behavior
+    /// cannot drift. Returns None when the statement itself doesn't qualify
+    /// (caller uses the per-row loop for the whole batch).
+    fn executemany_fast_pk_buffered(
+        &self,
+        statement: &Statement,
+        sql: &str,
+        batch: &[Vec<Value>],
+        tid: u64,
+    ) -> Result<Option<u64>> {
+        let (stmt_type, table) = match statement {
+            Statement::Update(s) => ("update", s.table.as_str()),
+            Statement::Delete(s) => ("delete", s.table.as_str()),
+            _ => return Ok(None),
+        };
+        let meta = match Self::detect_fast_pk_pattern(statement, &self.inner)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let schema = &meta.schema;
+        let pk_pos = match schema.primary_key().and_then(|n| schema.get_column(n)) {
+            Some(cd) => cd.position,
+            None => return Ok(None),
+        };
+        // A SET that assigns the PK can't be buffered (key relocation is the
+        // executor's in-place fallback) — defer the whole batch.
+        if stmt_type == "update"
+            && (meta
+                .set_param_positions
+                .iter()
+                .any(|&(pos, _)| pos == pk_pos)
+                || meta
+                    .set_literal_positions
+                    .iter()
+                    .any(|&(pos, _)| pos == pk_pos))
+        {
+            return Ok(None);
+        }
+        // Params must cover every index the kernel reads; otherwise defer so
+        // the per-row path surfaces the proper error message.
+        let max_idx = meta
+            .set_param_positions
+            .iter()
+            .map(|&(_, idx)| idx)
+            .chain(std::iter::once(meta.param_idx))
+            .max()
+            .unwrap_or(0);
+        if batch.iter().any(|p| p.len() < max_idx) {
+            return Ok(None);
+        }
+
+        // Uncommitted INSERTs of this txn are invisible to pk resolution —
+        // pre-collect their PK values once and defer those rows to the
+        // executor's write_set pass (O(1) membership per row).
+        let ctx = self.inner.txn_coordinator.get_context(tid)?;
+        let ws_pks: std::collections::HashSet<crate::database::pk_cache::PkKey> = ctx
+            .write_set
+            .read()
+            .iter()
+            .filter(|((t, _), _)| t == table)
+            .filter_map(|(_, row)| {
+                row.get(pk_pos)
+                    .map(|v| crate::database::pk_cache::PkKey::from_value(v))
+            })
+            .collect();
+
+        let mut affected: u64 = 0;
+        macro_rules! fallback {
+            ($n:expr) => {{
+                affected += $n;
+            }};
+        }
+        for params in batch {
+            let pk_value = &params[meta.param_idx - 1];
+            let row_id = match Self::resolve_fast_pk_row_id(self, &meta, pk_value) {
+                FastPkRowId::Resolved(rid) => rid,
+                FastPkRowId::Absent => continue,
+                FastPkRowId::Defer => {
+                    fallback!(self.fallback_row_prepared(sql, params)?);
+                    continue;
+                }
+            };
+            if ws_pks.contains(&crate::database::pk_cache::PkKey::from_value(pk_value)) {
+                fallback!(self.fallback_row_prepared(sql, params)?);
+                continue;
+            }
+            match stmt_type {
+                "update" => match self.query_executor.txn_lookup_row_pub(table, row_id) {
+                    // deleted earlier in this txn → matches 0 rows
+                    Some(None) => {}
+                    // write_set row or already-pending update → executor
+                    // chains/relocates with full statement semantics
+                    Some(Some(_)) => {
+                        fallback!(self.fallback_row_prepared(sql, params)?);
+                    }
+                    None => {
+                        let row = match self.inner.get_table_row(table, row_id)? {
+                            Some(r) => r,
+                            None => continue, // no such row → 0 affected
+                        };
+                        let mut new_row = row.clone();
+                        for &(pos, pidx) in &meta.set_param_positions {
+                            new_row[pos] = params[pidx - 1].clone();
+                        }
+                        for &(pos, ref lit) in &meta.set_literal_positions {
+                            new_row[pos] = lit.clone();
+                        }
+                        MoteDB::coerce_row_to_schema(schema, &mut new_row);
+                        let prior = self
+                            .inner
+                            .txn_coordinator
+                            .record_pending_update(tid, table, row_id, row, new_row)?;
+                        self.inner
+                            .txn_coordinator
+                            .record_pending_snapshot(tid, row_id, table, prior)?;
+                        affected += 1;
+                    }
+                },
+                "delete" => {
+                    // Mirror execute_delete_pk: drop a pending UPDATE first so
+                    // COMMIT can't resurrect the row via newest-wins.
+                    let _ = self
+                        .inner
+                        .txn_coordinator
+                        .remove_pending_update(tid, table, row_id);
+                    match self.query_executor.txn_lookup_row_pub(table, row_id) {
+                        Some(None) => {}
+                        Some(Some(_)) => {
+                            fallback!(self.fallback_row_prepared(sql, params)?);
+                        }
+                        None => match self.inner.get_table_row(table, row_id)? {
+                            None => {}
+                            Some(row) => {
+                                self.inner
+                                    .txn_coordinator
+                                    .record_pending_delete(tid, table, row_id, row)?;
+                                affected += 1;
+                            }
+                        },
+                    }
+                }
+                _ => unreachable!("stmt_type constrained above"),
+            }
+        }
+        Ok(Some(affected))
+    }
+
+    /// One row of an executemany batch the batch kernel deferred: run the
+    /// normal per-statement path (txn-aware; in-txn it buffers exactly as a
+    /// standalone statement would).
+    fn fallback_row_prepared(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        match self.execute_prepared(sql, params.to_vec())? {
+            StreamingQueryResult::Modification { affected_rows } => Ok(affected_rows as u64),
+            _ => Ok(0),
         }
     }
 

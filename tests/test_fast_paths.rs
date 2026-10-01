@@ -1054,3 +1054,158 @@ fn fast_pk_update_expression_set_defers_to_executor() {
         vec![vec![Value::Float(16.0)]]
     );
 }
+
+// 🔒 W1 batch kernel differential: executemany UPDATE/DELETE must produce
+// exactly the same state and affected counts as the per-row executor loop,
+// across the shapes the kernel handles inline AND the shapes it defers
+// (same-row-twice chains, delete-of-updated, write_set overlap, absent rows).
+#[test]
+fn executemany_batch_kernel_matches_per_row_executor() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+
+    // Two independent databases, identical starting data.
+    let dir2 = TempDir::new().unwrap();
+    let db2 = Database::create(dir2.path()).unwrap();
+    exec(&db2, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    let seed: Vec<String> = (0..50).map(|i| format!("({}, {})", i, i)).collect();
+    let seed_sql = format!("INSERT INTO t VALUES {}", seed.join(","));
+    exec(&db, &seed_sql);
+    exec(&db2, &seed_sql);
+
+    // Batch: updates (incl. rows updated multiple times — chained), deletes
+    // (incl. a row that was just updated, a duplicate delete, an absent id).
+    let mut batch: Vec<Vec<Value>> = Vec::new();
+    for i in 0..30 {
+        batch.push(vec![Value::Integer(1000 + i), Value::Integer(i)]);
+    }
+    for i in 0..10 {
+        batch.push(vec![Value::Integer(2000 + i), Value::Integer(5)]); // row 5 chained ×10
+    }
+    // row 2 chained onto its first update — final value must be 43.
+    batch.push(vec![Value::Integer(42), Value::Integer(2)]);
+    batch.push(vec![Value::Integer(43), Value::Integer(2)]);
+    for i in 40..45 {
+        batch.push(vec![Value::Integer(i)]);
+    }
+    batch.push(vec![Value::Integer(5)]); // delete an updated row
+    batch.push(vec![Value::Integer(5)]); // duplicate delete → 0
+    batch.push(vec![Value::Integer(999_999)]); // absent → 0
+
+    let got_batch = db
+        .execute_prepared_many("UPDATE t SET v = ? WHERE id = ?", batch[..42].to_vec())
+        .unwrap();
+    assert_eq!(got_batch, 42, "update rows: 30 + 10 + 2 chained");
+    // Separate batch for the delete shape (one statement per executemany).
+    let del_batch: Vec<Vec<Value>> = batch[42..].iter().map(|p| vec![p[0].clone()]).collect();
+    let got_dels = db
+        .execute_prepared_many("DELETE FROM t WHERE id = ?", del_batch)
+        .unwrap();
+    assert_eq!(
+        got_dels, 6,
+        "5 range deletes + 1 updated-row delete; dupes/absent = 0"
+    );
+
+    // Per-row oracle on db2.
+    let mut expected_state: Vec<(i64, i64)> = (0..50).map(|i| (i, i)).collect();
+    for (id, v) in expected_state.iter_mut() {
+        if *id < 30 {
+            *v = 1000 + *id;
+        }
+    }
+    // chained rows keep the LAST value in the chain
+    for (id, v) in expected_state.iter_mut() {
+        if *id == 5 {
+            *v = 2009; // row 5: ten chained updates
+        }
+        if *id == 2 {
+            *v = 43; // row 2: chained onto its 1002 update
+        }
+    }
+    expected_state.retain(|(id, _)| !(40..45).contains(id));
+    // deleted row 5 (was updated earlier — tombstone subsumes the update)
+    expected_state.retain(|(id, _)| *id != 5);
+
+    let mut state: Vec<(i64, i64)> = rows(&db, "SELECT id, v FROM t ORDER BY id")
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::Integer(a), Value::Integer(b)) => (*a, *b),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    state.sort();
+    assert_eq!(state, expected_state, "batch kernel state diverged");
+
+    // Per-row loop on db2 produces the same final state.
+    for p in &batch[..42] {
+        let _ = db2.execute_prepared("UPDATE t SET v = ? WHERE id = ?", p.clone());
+    }
+    for p in &batch[42..] {
+        let _ = db2.execute_prepared("DELETE FROM t WHERE id = ?", vec![p[0].clone()]);
+    }
+    let mut state2: Vec<(i64, i64)> = rows(&db2, "SELECT id, v FROM t ORDER BY id")
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::Integer(a), Value::Integer(b)) => (*a, *b),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    state2.sort();
+    assert_eq!(state, state2, "batch vs per-row oracle diverged");
+
+    // Rollback of a whole batch (outer txn JOIN) still exact.
+    let tx = db.begin_transaction().unwrap();
+    let b2: Vec<Vec<Value>> = (60..70)
+        .map(|i| vec![Value::Integer(7), Value::Integer(i)])
+        .collect();
+    let n = db
+        .execute_prepared_many("UPDATE t SET v = ? WHERE id = ?", b2)
+        .unwrap();
+    assert_eq!(n, 0, "absent ids affect nothing");
+    let b3: Vec<Vec<Value>> = (0..3).map(|i| vec![Value::Integer(50 + i)]).collect();
+    let _ = db
+        .execute_prepared_many("DELETE FROM t WHERE id = ?", b3)
+        .unwrap();
+    db.rollback_transaction(tx).unwrap();
+    let count = rows(&db, "SELECT COUNT(*) FROM t");
+    assert_eq!(count[0], vec![Value::Integer(state.len() as i64)]);
+
+    // In-txn read-your-writes on a batch: visible inside, committed after.
+    let tx = db.begin_transaction().unwrap();
+    let b4: Vec<Vec<Value>> = (10..13)
+        .map(|i| vec![Value::Integer(777), Value::Integer(i)])
+        .collect();
+    let n = db
+        .execute_prepared_many("UPDATE t SET v = ? WHERE id = ?", b4)
+        .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 11"),
+        vec![vec![Value::Integer(777)]]
+    );
+    db.commit_transaction(tx).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 12"),
+        vec![vec![Value::Integer(777)]]
+    );
+
+    // write_set overlap defers to the executor: insert then batch-update the
+    // fresh rows in the same txn.
+    let tx = db.begin_transaction().unwrap();
+    exec(&db, "INSERT INTO t VALUES (500, 5), (501, 6)");
+    let b5: Vec<Vec<Value>> = vec![
+        vec![Value::Integer(5000), Value::Integer(500)],
+        vec![Value::Integer(5001), Value::Integer(501)],
+    ];
+    let n = db
+        .execute_prepared_many("UPDATE t SET v = ? WHERE id = ?", b5)
+        .unwrap();
+    assert_eq!(n, 2, "write_set rows must be updated via the fallback");
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 501"),
+        vec![vec![Value::Integer(5001)]]
+    );
+    db.rollback_transaction(tx).unwrap();
+    assert!(rows(&db, "SELECT v FROM t WHERE id = 500").is_empty());
+    let _ = dir2; // keep alive
+}
