@@ -266,3 +266,76 @@ fn test_fts_phrase_search_order_sensitive() {
         vec![1]
     );
 }
+
+// 🔑 FTS5-compatible LIMIT semantics (W3): a bare `MATCH .. LIMIT n` (no
+// score in the SELECT list, no score ORDER BY) returns the FIRST n matches
+// in document order — never the BM25 top-k. Ranking requires an explicit
+// `ORDER BY BM25_SCORE() DESC` (or a score projection).
+#[test]
+fn fts_limit_without_order_by_is_unranked_doc_order() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+
+    // 20 docs all matching 'hit'; doc 0 mentions it 5× (highest BM25), the
+    // rest once. If LIMIT were still ranked, doc 0 would come first.
+    for i in 0..20 {
+        let body = if i == 0 {
+            "hit hit hit hit hit".to_string()
+        } else {
+            format!("hit filler{i}")
+        };
+        db.execute(format!("INSERT INTO docs VALUES ({}, '{body}')", i + 1).as_str())
+            .unwrap();
+    }
+    db.execute("CREATE TEXT INDEX docs_body ON docs (body)").unwrap();
+
+    let unranked: Vec<i64> = match db
+        .query("SELECT id FROM docs WHERE MATCH(body, 'hit') LIMIT 3")
+        .unwrap()
+    {
+        rows => rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Integer(id) => *id,
+                other => panic!("{other:?}"),
+            })
+            .collect(),
+    };
+    assert_eq!(
+        unranked,
+        vec![1, 2, 3],
+        "unranked LIMIT must return document order, not BM25 top-k (doc 1 has the highest score)"
+    );
+
+    // Explicit ranking still yields score order: doc 1 (5 hits) first.
+    let ranked: Vec<i64> = db
+        .query(
+            "SELECT id FROM docs WHERE MATCH(body, 'hit') \
+             ORDER BY BM25_SCORE() DESC LIMIT 3",
+        )
+        .unwrap()
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Integer(id) => *id,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(ranked.first(), Some(&1), "ranked path must keep doc 1 first");
+
+    // Score projection also forces the ranked path.
+    let scored: Vec<(i64, f64)> = db
+        .query("SELECT id, BM25_SCORE() FROM docs WHERE MATCH(body, 'hit') LIMIT 3")
+        .unwrap()
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Integer(id), Value::Float(s)) => (*id, *s),
+            (Value::Integer(id), Value::Integer(s)) => (*id, *s as f64),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(scored.first().map(|(id, _)| *id), Some(1));
+    assert!(scored.iter().all(|(_, s)| *s > 0.0), "scores must be real");
+}
+

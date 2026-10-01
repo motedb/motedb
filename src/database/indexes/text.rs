@@ -255,13 +255,28 @@ impl MoteDB {
     /// let doc_ids = db.text_search("articles_content", "rust database")?;
     /// ```
     pub fn text_search(&self, index_name: &str, query: &str) -> Result<Vec<RowId>> {
+        self.text_search_limited(index_name, query, None)
+    }
+
+    /// Unranked search with early exit after `max_docs` matches — the
+    /// `MATCH .. LIMIT n` engine for the executor's FTS5-compatible
+    /// unranked LIMIT semantics.
+    pub fn text_search_limited(
+        &self,
+        index_name: &str,
+        query: &str,
+        max_docs: Option<usize>,
+    ) -> Result<Vec<RowId>> {
         ensure_open!(self);
         let index_ref = self
             .text_indexes
             .get(index_name)
             .ok_or_else(|| StorageError::Index(format!("Text index '{}' not found", index_name)))?;
 
-        let results = index_ref.value().read().search(query)?;
+        let results = index_ref
+            .value()
+            .read()
+            .search_limited(query, max_docs)?;
         Ok(results)
     }
 

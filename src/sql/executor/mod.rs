@@ -19525,10 +19525,35 @@ impl QueryExecutor {
             };
             ids.into_iter().map(|id| (id, 1.0)).collect()
         } else if let Some(l) = stmt.limit {
-            // Ranked top-(limit + offset); offset is skipped below.
-            match self.db.text_search_ranked(&index_name, &query, l + offset) {
-                Ok(r) => r,
-                Err(_) => return Ok(None),
+            // 🔑 FTS5-compatible LIMIT semantics: LIMIT alone does NOT imply
+            // ranking. Without an explicit score ORDER BY (or a score in the
+            // SELECT list) the first (limit + offset) matches in document
+            // order are returned — same contract as the no-LIMIT branch
+            // below (which has always been unranked). The old behavior ran
+            // the BM25 top-k heap for every bare `MATCH .. LIMIT n` (6×
+            // slower than SQLite FTS5's unranked posting walk at 100K docs).
+            let wants_scores = stmt.columns.iter().any(|c| match c {
+                SelectColumn::Expr(Expr::Match { .. }, _) => true,
+                SelectColumn::Expr(Expr::FunctionCall { name, .. }, _) => {
+                    name.eq_ignore_ascii_case("BM25_SCORE")
+                }
+                _ => false,
+            });
+            let orders_by_score = stmt.order_by.as_ref().is_some_and(|ob| {
+                ob.len() == 1
+                    && matches!(&ob[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
+            });
+            if !wants_scores && !orders_by_score {
+                match self.db.text_search_limited(&index_name, &query, Some(l + offset)) {
+                    Ok(ids) => ids.into_iter().map(|id| (id, 0.0)).collect(),
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                // Ranked top-(limit + offset); offset is skipped below.
+                match self.db.text_search_ranked(&index_name, &query, l + offset) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
+                }
             }
         } else {
             // No LIMIT: every matching row. The ranked search is a top-k

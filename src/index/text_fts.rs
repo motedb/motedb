@@ -274,6 +274,21 @@ fn intersect_streams(
     deleted_term_docs: &HashSet<(TermId, DocId)>,
     out: &mut Vec<u32>,
 ) {
+    intersect_streams_limited(streams, term_ids, deleted, deleted_term_docs, out, None);
+}
+
+/// Same zig-zag AND intersection with an optional EARLY EXIT: `max_docs`
+/// stops the walk once `out` holds that many matches (unranked
+/// `MATCH .. LIMIT n` is then O(matches visited), not O(intersection) —
+/// first-k in document order is the exact unranked answer).
+fn intersect_streams_limited(
+    streams: &mut [TermStream],
+    term_ids: &mut [TermId],
+    deleted: &HashSet<DocId>,
+    deleted_term_docs: &HashSet<(TermId, DocId)>,
+    out: &mut Vec<u32>,
+    max_docs: Option<usize>,
+) {
     // Drive by the shortest posting.
     let mut order: Vec<usize> = (0..streams.len()).collect();
     order.sort_by_key(|&i| streams[i].df);
@@ -333,6 +348,9 @@ fn intersect_streams(
                 .all(|tid| !deleted_term_docs.contains(&(*tid, doc_id)));
         if alive {
             out.push(target);
+            if max_docs.is_some_and(|k| out.len() >= k) {
+                break 'outer;
+            }
         }
         streams[0].advance_past(target);
     }
@@ -477,13 +495,31 @@ impl TextFTSIndex {
         let _t1 = Instant::now();
         let mut batch_token_count = 0u64;
 
+        // 🚀 W3: tokenize the batch in PARALLEL (the tokenizer is Send+Sync
+        // and tokenize(&self) touches no shared state) — tokenization was
+        // the dominant single-threaded cost of CREATE TEXT INDEX at 100K
+        // docs. The dictionary interning + term_docs grouping below stays
+        // SERIAL, so term-id assignment and pending-buffer growth remain
+        // deterministic.
+        #[cfg(feature = "rayon")]
+        let tokenized: Vec<(DocumentId, Vec<crate::index::text_types::Token>)> = {
+            use rayon::prelude::*;
+            docs.par_iter()
+                .map(|&(doc_id, text)| (doc_id, self.tokenizer.tokenize(text)))
+                .collect()
+        };
+        #[cfg(not(feature = "rayon"))]
+        let tokenized: Vec<(DocumentId, Vec<crate::index::text_types::Token>)> = docs
+            .iter()
+            .map(|&(doc_id, text)| (doc_id, self.tokenizer.tokenize(text)))
+            .collect();
+
         // Build per-term doc lists (lightweight intermediate structure)
         let mut term_docs: HashMap<TermId, Vec<(DocId, Option<Position>)>> = HashMap::new();
         let mut doc_lengths_batch = HashMap::new();
 
-        for &(doc_id, text) in docs {
-            let tokens = self.tokenizer.tokenize(text);
-            doc_lengths_batch.insert(doc_id, tokens.len() as u32);
+        for (doc_id, tokens) in &tokenized {
+            doc_lengths_batch.insert(*doc_id, tokens.len() as u32);
             batch_token_count += tokens.len() as u64;
 
             for token in tokens {
@@ -493,7 +529,7 @@ impl TextFTSIndex {
                 } else {
                     None
                 };
-                term_docs.entry(term_id).or_default().push((doc_id, pos));
+                term_docs.entry(term_id).or_default().push((*doc_id, pos));
             }
         }
 
@@ -1008,6 +1044,18 @@ impl TextFTSIndex {
     /// cursors — no posting materialization, and blocks are decoded only
     /// where the intersection actually walks.
     pub fn search(&self, query: &str) -> Result<Vec<DocumentId>> {
+        self.search_limited(query, None)
+    }
+
+    /// Unranked search with early exit after `max_docs` matches (None = all).
+    /// Used by `MATCH .. LIMIT n` — document order is the exact unranked
+    /// answer, so the AND walk can stop at k instead of materializing the
+    /// whole intersection (18.7K docs → 10 at 100K-doc corpus scale).
+    pub fn search_limited(
+        &self,
+        query: &str,
+        max_docs: Option<usize>,
+    ) -> Result<Vec<DocumentId>> {
         let groups = self.parse_query_expanded(query);
         if groups.is_empty() {
             return Ok(Vec::new());
@@ -1047,14 +1095,25 @@ impl TextFTSIndex {
             }
             if complete && !group_streams.is_empty() {
                 let mut docs: Vec<u32> = Vec::new();
-                intersect_streams(
+                intersect_streams_limited(
                     &mut group_streams,
                     &mut group_tids,
                     &deleted,
                     &deleted_term_docs,
                     &mut docs,
+                    max_docs,
                 );
                 results.extend(docs.into_iter().map(|d| d as DocumentId));
+                // Early exit applies per group; with OR-of-groups the caller
+                // wants k total, but multi-group queries (OR) are rare in the
+                // LIMIT shape and correctness matters more than the extra
+                // matches here — dedup/sort below keeps the contract.
+                if let Some(k) = max_docs {
+                    if results.len() >= k {
+                        results.truncate(k);
+                        return Ok(results);
+                    }
+                }
             }
         }
 

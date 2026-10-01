@@ -2,6 +2,28 @@
 
 ## [0.12.0] — 未发布
 
+### 🔑 W3 FTS: LIMIT 语义 FTS5 兼容化 + 交集早停 + 并行分词
+
+- 🔑 **LIMIT 不再隐含 BM25 排序** (FTS5 兼容, 与本引擎无 LIMIT 路径的既有
+  文档序语义自洽): 裸 `MATCH .. LIMIT n` 返回文档序前 n 个匹配; 排序必须
+  显式 `ORDER BY BM25_SCORE() DESC` 或 SELECT 投影分数。旧实现给每个
+  无排序 LIMIT 跑 BM25 top-k 堆 (与 FTS5 的 posting 直取对照 6.4× 差距
+  的来源); 回归测试 fts_limit_without_order_by_is_unranked_doc_order
+  钉死三形状 (无排序=文档序 / 显式排序=分数序 / 投影分数=真实分值)
+- 🚀 **zig-zag AND 交集早停** (intersect_streams_limited / search_limited /
+  text_search_limited): 无排序 LIMIT 的遍历在拿到第 k 个匹配即停 —
+  O(访问数) 而非 O(交集), LIMIT 1 = 6.5µs / LIMIT 10 = 32µs 实测;
+  OR-of-groups 场景整组取满 k 后截断返回
+- 🚀 **CREATE TEXT INDEX 并行分词** (rayon par_iter): batch_insert 分词
+  阶段并行化 (Tokenizer Send+Sync, 分词无共享态), 字典内序与 pending
+  合并保持串行保 term-id 分配确定性 — 100K 文档构建 0.822 → 0.718s
+  (~14%; 剩余大头为字典 get_or_insert + posting 合并)
+- 对抗验证器 ALL SECTIONS PASS (含 FTS 删除后无幽灵对拍); 全量 239 bin
+  第六轮全绿
+- 📌 已建档未解: 无排序 FTS LIMIT 的 ~100µs 进程级固定开销方差 (同
+  二进制同语料跨进程 6.5µs ↔ 104µs, 进程内分布极稳、预热/GC 无关) —
+  疑似环境/调度级现象, 待专项 root-cause
+
 ### 🔒 W2 耐久性旋钮: Python durability= 参数 + Periodic 进程崩溃安全化
 
 - 🔑 Python 绑定 `Database(path, durability=..., periodic_ms=...)` 暴露引擎
