@@ -48,6 +48,11 @@ def th(name, v):
 def make_mote(path):
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     import motedb
+    dur = os.environ.get("MOTE_DURABILITY")  # e.g. MOTE_DURABILITY=periodic
+    if dur:
+        pms = os.environ.get("MOTE_PERIODIC_MS")
+        return motedb.Database(path, preset="general", durability=dur,
+                               periodic_ms=int(pms) if pms else None), motedb
     return motedb.Database(path, preset="general"), motedb
 
 

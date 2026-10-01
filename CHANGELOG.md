@@ -2,6 +2,30 @@
 
 ## [0.12.0] — 未发布
 
+### 🔒 W2 耐久性旋钮: Python durability= 参数 + Periodic 进程崩溃安全化
+
+- 🔑 Python 绑定 `Database(path, durability=..., periodic_ms=...)` 暴露引擎
+  既有的四档 WAL 耐久级别 (SQLite `PRAGMA synchronous` 对齐物):
+  - `synchronous` / `group_commit` (默认): 每提交 fsync, 100% 持久,
+    单写者 autocommit ~260 rows/s (批 API 才是吞吐路径)
+  - `periodic` (+periodic_ms, 默认 100): 每提交 write() 进 OS 页缓存 +
+    周期 fsync — 实测 autocommit INSERT **185K / UPDATE-PK 176K /
+    DELETE-PK 246K rows/s** (对默认 260/s 为 700-1000×; SQLite
+    WAL+NORMAL 同口径 47-147K, 反超 1.2-5.4×)
+  - `nosync`: 仅测试
+- 🔒 **Periodic 语义升级 — 进程崩溃安全** (SQLite synchronous=NORMAL /
+  MySQL binlog level-2 契约): 此前 Periodic 把已提交记录留在用户态
+  BufWriter, 进程退出即丢 (实测 os._exit 后 443/500); 现在 append/批量
+  append/raw 快路径 (insert/update/delete ref) 每提交 flush() 进 OS 页
+  缓存, 仅 fsync 保持周期 — 进程崩溃零丢失 (os._exit 复测 500/500),
+  掉电最多丢一个 fsync 窗口。吞吐代价 ~30% (write() 系统调用),
+  换取进程级耐久
+- 判别探针 (tests/durability_probe.rs): 语句路径本身 32µs/条
+  (NoSync 31K rows/s), fsync 策略贡献全部 autocommit 差距 —
+  旋钮暴露即是完整修复
+- E2E (bindings/python/e2e/test_durability_kwarg.py): 非法档位拒绝、
+  periodic_ms 依赖检查、500 行 autocommit 重开存活、synchronous 往返
+
 ### 🚀 W1 批量写过桥: executemany UPDATE/DELETE 批内核 3.8× (54K→205K rows/s)
 
 - 🚀 execute_prepared_many 的 UPDATE/DELETE 批新增缓冲批内核

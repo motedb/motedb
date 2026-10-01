@@ -28,7 +28,8 @@ impl std::hash::Hasher for FxHasher {
         for chunk in bytes.chunks(8) {
             let mut buf = [0u8; 8];
             buf[..chunk.len()].copy_from_slice(chunk);
-            self.hash = (self.hash.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(0x517cc1b727220a95);
+            self.hash = (self.hash.rotate_left(5) ^ u64::from_le_bytes(buf))
+                .wrapping_mul(0x517cc1b727220a95);
         }
     }
     fn write_u8(&mut self, i: u8) {
@@ -126,7 +127,9 @@ fn mote_to_py(v: &MValue) -> PyObject {
 
 /// 列值提取: numpy 数组 (buffer 协议) → 类型化切片; 2D float32 → 向量列;
 /// 其它 (str 列表/标量列表) → 逐对象 py_to_mote。
-fn extract_column_values(obj: &Bound<'_, pyo3::types::PyAny>) -> PyResult<Vec<motedb_core::types::Value>> {
+fn extract_column_values(
+    obj: &Bound<'_, pyo3::types::PyAny>,
+) -> PyResult<Vec<motedb_core::types::Value>> {
     use motedb_core::types::Value as MValue;
     use pyo3::types::PyAnyMethods as _;
 
@@ -134,10 +137,7 @@ fn extract_column_values(obj: &Bound<'_, pyo3::types::PyAny>) -> PyResult<Vec<mo
     //    buffer 协议 — PyBuffer 需要完整 API), dtype/shape 自省解码。
     //    仍是零逐元素 Python 对象。
     if obj.hasattr("tobytes")? && obj.hasattr("dtype")? {
-        let dtype: String = obj
-            .getattr("dtype")?
-            .getattr("str")?
-            .extract()?;
+        let dtype: String = obj.getattr("dtype")?.getattr("str")?.extract()?;
         let shape: Vec<usize> = obj.getattr("shape")?.extract()?;
         // 🔑 bytes 对象必须 downcast 成 PyBytes 用 as_bytes() 借切片 —
         // extract::<Vec<u8>> 走通用序列提取, 每字节建一个 PyLong (100K×384
@@ -145,9 +145,7 @@ fn extract_column_values(obj: &Bound<'_, pyo3::types::PyAny>) -> PyResult<Vec<mo
         let bytes_obj = obj.call_method0("tobytes")?;
         let bytes_bound = bytes_obj
             .downcast::<pyo3::types::PyBytes>()
-            .map_err(|_| {
-                PyValueError::new_err("tobytes() did not return a bytes object")
-            })?;
+            .map_err(|_| PyValueError::new_err("tobytes() did not return a bytes object"))?;
         return decode_array_bytes(&dtype, &shape, bytes_bound.as_bytes());
     }
     // 2) 同构列表快路径: 单次批量 C-API 提取 — 逐对象 py_to_mote (每次
@@ -185,9 +183,9 @@ fn decode_array_bytes(
     // numpy unicode ('<U7'): UTF-32LE 定宽、尾部 \0 填充 — tobytes 后按
     // itemsize 步长切行, 逐 u32 码点解码 (跳过逐 str 的 C-API 提取)。
     if let Some(nstr) = code.strip_prefix('U') {
-        let chars_per_item: usize = nstr.parse().map_err(|_| {
-            PyValueError::new_err(format!("bad unicode dtype: {}", dtype))
-        })?;
+        let chars_per_item: usize = nstr
+            .parse()
+            .map_err(|_| PyValueError::new_err(format!("bad unicode dtype: {}", dtype)))?;
         if shape.len() != 1 {
             return Err(PyValueError::new_err("unicode array must be 1-D"));
         }
@@ -269,9 +267,7 @@ fn frombuffer_or_bytes(
             return arr.into_any().unbind();
         }
     }
-    pyo3::types::PyBytes::new_bound(py, buf)
-        .into_any()
-        .unbind()
+    pyo3::types::PyBytes::new_bound(py, buf).into_any().unbind()
 }
 
 fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
@@ -287,9 +283,7 @@ fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
         let shape: Vec<usize> = v.getattr("shape")?.extract()?;
         if shape.len() == 1 {
             let n = shape[0];
-            let code = dtype
-                .replace(['<', '=', '|', '>'], "")
-                .to_ascii_lowercase();
+            let code = dtype.replace(['<', '=', '|', '>'], "").to_ascii_lowercase();
             let bytes_obj = v.call_method0("tobytes")?;
             if let Ok(b) = bytes_obj.downcast::<pyo3::types::PyBytes>() {
                 let raw = b.as_bytes();
@@ -370,7 +364,10 @@ fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
                         .get("points")
                         .and_then(|v| v.extract::<Vec<(f64, f64)>>().ok())
                         .map(|tuples| {
-                            tuples.into_iter().map(|(x, y)| vec![x, y]).collect::<Vec<_>>()
+                            tuples
+                                .into_iter()
+                                .map(|(x, y)| vec![x, y])
+                                .collect::<Vec<_>>()
                         })
                         .or_else(|| {
                             dict.get("points")
@@ -437,7 +434,12 @@ fn py_err(e: motedb_core::StorageError) -> PyErr {
     }
 }
 
-fn config_for_preset(preset: Option<&str>, path: &str) -> PyResult<DBConfig> {
+fn config_for_preset(
+    preset: Option<&str>,
+    durability: Option<&str>,
+    periodic_ms: Option<u64>,
+    path: &str,
+) -> PyResult<DBConfig> {
     let mut config = match preset {
         None => DBConfig::for_general(),
         Some("general") => DBConfig::for_general(),
@@ -450,9 +452,37 @@ fn config_for_preset(preset: Option<&str>, path: &str) -> PyResult<DBConfig> {
             )))
         }
     };
+    // 🔑 W2 durability knob (SQLite `PRAGMA synchronous` analogue). The
+    // engine has always had the four WAL durability levels; this exposes
+    // them. Measured autocommit INSERT throughput, single writer:
+    //   synchronous / group_commit  ~300 rows/s (fsync per commit, 100%
+    //     durable — matches SQLite synchronous=FULL)
+    //   periodic(100)               ~31K rows/s (crash loses ≤100ms of
+    //     commits — the WAL itself is still written, so PROCESS crashes
+    //     lose nothing; only OS/power loss can)
+    //   nosync                      ~31K rows/s, unsafe — tests only
+    if let Some(d) = durability {
+        use motedb_core::config::DurabilityLevel;
+        config.wal_config.durability_level = match d {
+            "synchronous" => DurabilityLevel::Synchronous,
+            "group_commit" => DurabilityLevel::group_commit(),
+            "periodic" => DurabilityLevel::Periodic {
+                interval_ms: periodic_ms.unwrap_or(100),
+            },
+            "nosync" => DurabilityLevel::NoSync,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown durability {other:?} (use synchronous|group_commit|periodic|nosync)"
+                )))
+            }
+        };
+    } else if periodic_ms.is_some() {
+        return Err(PyValueError::new_err(
+            "periodic_ms requires durability=\"periodic\"",
+        ));
+    }
     // The Python layer is for applications, not benchmarks: keep the
     // background auto-checkpoint (durability) enabled with default cadence.
-    let _ = &mut config;
     let _ = path;
     Ok(config)
 }
@@ -470,11 +500,21 @@ struct PyDatabase {
 
 #[pymethods]
 impl PyDatabase {
-    /// Database(path, preset=None, create=True)
+    /// Database(path, preset=None, create=True, durability=None, periodic_ms=None)
+    ///
+    /// durability: WAL fsync policy — "synchronous" | "group_commit" |
+    /// "periodic" (+ periodic_ms, default 100) | "nosync". Overrides the
+    /// preset's level. See README for the durability/throughput tradeoffs.
     #[new]
-    #[pyo3(signature = (path, preset=None, create=true))]
-    fn new(path: &str, preset: Option<&str>, create: bool) -> PyResult<Self> {
-        let config = config_for_preset(preset, path)?;
+    #[pyo3(signature = (path, preset=None, create=true, durability=None, periodic_ms=None))]
+    fn new(
+        path: &str,
+        preset: Option<&str>,
+        create: bool,
+        durability: Option<&str>,
+        periodic_ms: Option<u64>,
+    ) -> PyResult<Self> {
+        let config = config_for_preset(preset, durability, periodic_ms, path)?;
         let db = if create {
             if std::path::Path::new(path).exists() {
                 Database::open_with_config(path, config).map_err(py_err)?
@@ -490,7 +530,12 @@ impl PyDatabase {
     /// Execute a statement. SELECT returns a list of row dicts;
     /// INSERT/UPDATE/DELETE returns the affected-row count; DDL returns None.
     #[pyo3(signature = (sql, params=None))]
-    fn execute(&self, py: Python<'_>, sql: &str, params: Option<Bound<'_, PyAny>>) -> PyResult<PyObject> {
+    fn execute(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
         let result = self.run(py, sql, params)?;
         Python::with_gil(|py| -> PyResult<PyObject> {
             use pyo3::types::PyAnyMethods as _;
@@ -527,7 +572,12 @@ impl PyDatabase {
     /// Execute a SELECT and return (columns, list-of-row-tuples).
     /// For large results this is materially cheaper than dicts.
     #[pyo3(signature = (sql, params=None))]
-    fn query(&self, py: Python<'_>, sql: &str, params: Option<Bound<'_, PyAny>>) -> PyResult<PyObject> {
+    fn query(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
         let result = self.run(py, sql, params)?;
         Python::with_gil(|py| -> PyResult<PyObject> {
             use pyo3::types::PyAnyMethods as _;
@@ -567,7 +617,12 @@ impl PyDatabase {
     /// SPATIAL 列 → 逐值 Python 对象列表 (None 表示 NULL)。
     /// 大结果集比 execute() 的逐行 dict 拼装快一个数量级。
     #[pyo3(signature = (sql, params=None))]
-    fn fetch_arrays(&self, py: Python<'_>, sql: &str, params: Option<Bound<'_, pyo3::types::PyAny>>) -> PyResult<PyObject> {
+    fn fetch_arrays(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<Bound<'_, pyo3::types::PyAny>>,
+    ) -> PyResult<PyObject> {
         let result = self.run(py, sql, params)?;
         match result {
             motedb_core::QueryResult::Select { columns, rows } => {
@@ -659,7 +714,8 @@ impl PyDatabase {
                 }
                 let _ = ncols;
                 let cols_list: PyObject = columns.into_py(py);
-                let t = pyo3::types::PyTuple::new_bound(py, vec![cols_list, dict.into_any().unbind()]);
+                let t =
+                    pyo3::types::PyTuple::new_bound(py, vec![cols_list, dict.into_any().unbind()]);
                 Ok(t.into_any().unbind())
             }
             _ => Err(PyValueError::new_err(
@@ -671,7 +727,9 @@ impl PyDatabase {
     /// Per-table budget (bytes) for decoded VECTOR columns — edge presets cap
     /// this so vector top-k cannot exceed the device's memory ceiling.
     fn set_vector_cache_budget(&self, table: &str, bytes: usize) -> PyResult<()> {
-        self.db.set_vector_cache_budget(table, bytes).map_err(py_err)
+        self.db
+            .set_vector_cache_budget(table, bytes)
+            .map_err(py_err)
     }
 
     /// Current per-table decoded-VECTOR cache budget (bytes).
@@ -693,17 +751,19 @@ impl PyDatabase {
     /// str 列表。跳过 SQL 解析、参数绑定与逐行 Python 对象构造 — 100K×384
     /// 导入的 Python 侧成本从 ~0.8s (.tolist() 每 384 浮点建列表) 降到 ~0。
     #[pyo3(signature = (table, columns))]
-    fn insert_arrays(&self, py: Python<'_>, table: &str, columns: Bound<'_, pyo3::types::PyDict>) -> PyResult<u64> {
-        use pyo3::types::PyAnyMethods as _;
+    fn insert_arrays(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        columns: Bound<'_, pyo3::types::PyDict>,
+    ) -> PyResult<u64> {
         use motedb_core::types::Value as MValue;
+        use pyo3::types::PyAnyMethods as _;
 
         // 🔑 按 schema 位置放置列值。旧实现按字典序转置 — 字典序 ≠ schema
         // 序时值静默落错列 (TEXT 列收到 Float 被清成空串), 省略前导自增 PK
         // 时 row[0] 被 auto id 覆盖, 100 行数据全毁且无报错。
-        let schema_cols = self
-            .db
-            .table_columns(table)
-            .map_err(py_err)?;
+        let schema_cols = self.db.table_columns(table).map_err(py_err)?;
         let mut by_pos: Vec<Option<Vec<MValue>>> = vec![None; schema_cols.len()];
         for key in columns.keys() {
             let name = key
@@ -742,7 +802,9 @@ impl PyDatabase {
                 if vals.len() != nrows {
                     return Err(PyValueError::new_err(format!(
                         "column '{}' has {} rows, expected {}",
-                        schema_cols[i], vals.len(), nrows
+                        schema_cols[i],
+                        vals.len(),
+                        nrows
                     )));
                 }
             }

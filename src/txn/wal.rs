@@ -821,7 +821,17 @@ impl PartitionWAL {
                 // Flush BufWriter to OS buffers; group commit thread handles fsync
                 self.file.flush()?;
             }
-            DurabilityLevel::Periodic { .. } | DurabilityLevel::NoSync => {}
+            DurabilityLevel::Periodic { .. } => {
+                // 🔑 Process-crash safety (SQLite synchronous=NORMAL / MySQL
+                // binlog level-2 semantics): every committed record reaches
+                // the OS page cache via write(); only fsync stays periodic,
+                // so a PROCESS crash loses nothing and an OS/power crash
+                // loses at most the fsync window. The old behavior kept
+                // records in the userspace BufWriter — a mere process exit
+                // could drop committed transactions.
+                self.file.flush()?;
+            }
+            DurabilityLevel::NoSync => {}
         }
 
         Ok(lsn)
@@ -880,8 +890,13 @@ impl PartitionWAL {
 
         self.file.write_all(&write_buf)?;
 
-        if self.config.durability_level == DurabilityLevel::Synchronous {
-            self.sync_flush()?;
+        match self.config.durability_level {
+            DurabilityLevel::Synchronous => self.sync_flush()?,
+            // Process-crash safety: committed bytes reach the OS page cache
+            // now; fsync stays on the periodic thread (SQLite
+            // synchronous=NORMAL semantics).
+            DurabilityLevel::Periodic { .. } => self.file.flush()?,
+            _ => {}
         }
 
         Ok(lsn)
@@ -932,8 +947,13 @@ impl PartitionWAL {
 
         self.file.write_all(&write_buf)?;
 
-        if self.config.durability_level == DurabilityLevel::Synchronous {
-            self.sync_flush()?;
+        match self.config.durability_level {
+            DurabilityLevel::Synchronous => self.sync_flush()?,
+            // Process-crash safety: committed bytes reach the OS page cache
+            // now; fsync stays on the periodic thread (SQLite
+            // synchronous=NORMAL semantics).
+            DurabilityLevel::Periodic { .. } => self.file.flush()?,
+            _ => {}
         }
 
         Ok(lsn)
@@ -1060,7 +1080,9 @@ impl PartitionWAL {
                 self.sync_flush()?;
             }
             DurabilityLevel::Periodic { .. } => {
-                // BufWriter buffers; periodic flush thread calls sync_flush
+                // Same process-crash contract as append(): records reach the
+                // OS page cache now; fsync stays on the periodic thread.
+                self.file.flush()?;
             }
             DurabilityLevel::NoSync => {}
         }
