@@ -75,6 +75,17 @@ pub struct TextFTSIndex {
     /// Invalidated on insert/update/delete, rebuilt on next search.
     doc_length_cache: DocLengthCache,
 
+    /// 🔒 Raw (u32 token-count) doc lengths, lazy loaded ONCE for the
+    /// delete() path's total_tokens accounting. Pending is checked first
+    /// (always freshest — insert/update write it), so this disk snapshot
+    /// never needs invalidation: a stale entry for a doc that was later
+    /// updated is unreachable (pending hits first), and a deleted doc's
+    /// entry is harmless (deleted_docs filters it at query time).
+    /// The old code called load_doc_lengths() — the FULL persisted map — on
+    /// every pending miss, i.e. per COMMIT-applied delete: 1000 tombstones
+    /// × a 100K-entry load = 3.9s (adversarial harness).
+    raw_doc_lengths: Arc<RwLock<Option<Arc<HashMap<DocId, u32>>>>>,
+
     /// Deleted documents (tombstones)
     deleted_docs: Arc<RwLock<HashSet<DocId>>>,
 
@@ -411,6 +422,7 @@ impl TextFTSIndex {
             avg_doc_length,
             pending_doc_lengths: Arc::new(RwLock::new(HashMap::new())),
             doc_length_cache: Arc::new(RwLock::new(None)),
+            raw_doc_lengths: Arc::new(RwLock::new(None)),
             deleted_docs: Arc::new(RwLock::new(deleted_docs)),
             deleted_term_docs: Arc::new(RwLock::new(deleted_term_docs)),
             posting_cache: Arc::new(RwLock::new(LruCache::new(
@@ -589,13 +601,9 @@ impl TextFTSIndex {
 
             // Remove from pending doc_lengths
             self.pending_doc_lengths.write().remove(&doc_id);
-        } else {
-            // Try to get from persisted doc_lengths
-            let doc_lengths = self.load_doc_lengths()?;
-            if let Some(len) = doc_lengths.get(&doc_id) {
-                if self.total_tokens >= *len as u64 {
-                    self.total_tokens -= *len as u64;
-                }
+        } else if let Some(len) = self.raw_doc_len(doc_id)? {
+            if self.total_tokens >= len as u64 {
+                self.total_tokens -= len as u64;
             }
         }
 
@@ -1636,6 +1644,22 @@ impl TextFTSIndex {
         }
 
         Ok(results)
+    }
+
+    /// One doc's raw token count: pending first (freshest), then the
+    /// once-loaded disk snapshot (see `raw_doc_lengths`).
+    fn raw_doc_len(&self, doc_id: DocId) -> Result<Option<u32>> {
+        {
+            let pending = self.pending_doc_lengths.read();
+            if let Some(&len) = pending.get(&doc_id) {
+                return Ok(Some(len));
+            }
+        }
+        let mut guard = self.raw_doc_lengths.write();
+        if guard.is_none() {
+            *guard = Some(Arc::new(self.load_doc_lengths()?));
+        }
+        Ok(guard.as_ref().and_then(|m| m.get(&doc_id).copied()))
     }
 
     /// Get doc_lengths with caching (fieldnorm encoded).
