@@ -277,6 +277,21 @@ impl MoteDB {
         Ok(results)
     }
 
+    /// 🔒 RYW matcher (W4b): evaluate `query` against raw text under the
+    /// index's own tokenizer + OR-of-AND-group semantics — the transactional
+    /// FTS overlay uses this for rows that are not indexed yet (write_set
+    /// inserts / pending-update new values).
+    pub fn text_matches(&self, index_name: &str, query: &str, text: &str) -> Result<bool> {
+        ensure_open!(self);
+        let index_ref = self
+            .text_indexes
+            .get(index_name)
+            .ok_or_else(|| StorageError::Index(format!("Text index '{}' not found", index_name)))?;
+
+        let hit = index_ref.value().read().text_matches(query, text);
+        Ok(hit)
+    }
+
     /// Search with BM25 ranking (returns top-k results sorted by relevance)
     ///
     /// # Example

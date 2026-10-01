@@ -1436,46 +1436,173 @@ impl Database {
         batch: &[Vec<Value>],
         tid: u64,
     ) -> Result<Option<u64>> {
-        let (stmt_type, table) = match statement {
-            Statement::Update(s) => ("update", s.table.as_str()),
-            Statement::Delete(s) => ("delete", s.table.as_str()),
+        // 🚀 W1/B: inline plan extraction (NOT detect_fast_pk_pattern — that
+        // rejects expression SETs, and the kernel now evaluates them). Any
+        // shape the kernel can't represent defers the WHOLE batch to the
+        // per-row executor, so semantics can't drift.
+        enum Plan<'a> {
+            Update {
+                set_params: Vec<(usize, usize)>,   // (col_pos, param_idx)
+                set_literals: Vec<(usize, Value)>, // (col_pos, value)
+                set_exprs: Vec<(usize, &'a crate::sql::ast::Expr)>, // no subqueries
+            },
+            Delete,
+        }
+        let (table, pk_param_idx, plan) = match statement {
+            Statement::Update(su) => {
+                // WHERE must be exactly `pk = ?N` (either operand order).
+                let pk_param_idx = match su.where_clause.as_ref() {
+                    Some(crate::sql::ast::Expr::BinaryOp {
+                        left,
+                        op: crate::sql::ast::BinaryOperator::Eq,
+                        right,
+                    }) => match (left.as_ref(), right.as_ref()) {
+                        (
+                            crate::sql::ast::Expr::Column(c),
+                            crate::sql::ast::Expr::Parameter(idx),
+                        )
+                        | (
+                            crate::sql::ast::Expr::Parameter(idx),
+                            crate::sql::ast::Expr::Column(c),
+                        ) => {
+                            let schema = self.inner.table_registry.get_table(&su.table)?;
+                            let is_pk = schema
+                                .primary_key()
+                                .map(|pk| {
+                                    let bare = pk.rsplit('.').next().unwrap_or(pk);
+                                    bare == c.as_str() || pk == c.as_str()
+                                })
+                                .unwrap_or(false);
+                            if !is_pk {
+                                return Ok(None);
+                            }
+                            *idx
+                        }
+                        _ => return Ok(None),
+                    },
+                    _ => return Ok(None),
+                };
+                let schema = self.inner.table_registry.get_table(&su.table)?;
+                let pk_pos = match schema.primary_key().and_then(|n| schema.get_column(n)) {
+                    Some(cd) => cd.position,
+                    None => return Ok(None),
+                };
+                let mut set_params = Vec::new();
+                let mut set_literals = Vec::new();
+                let mut set_exprs = Vec::new();
+                for (col_name, expr) in &su.assignments {
+                    let pos = match schema.get_column_position(col_name) {
+                        Some(p) => p,
+                        None => return Ok(None), // unknown column → executor errors properly
+                    };
+                    if pos == pk_pos {
+                        return Ok(None); // PK relocation is the executor's job
+                    }
+                    match expr {
+                        crate::sql::ast::Expr::Parameter(idx) => set_params.push((pos, *idx)),
+                        crate::sql::ast::Expr::Literal(v) => set_literals.push((pos, v.clone())),
+                        crate::sql::ast::Expr::UnaryOp {
+                            op: crate::sql::ast::UnaryOperator::Minus,
+                            expr: inner,
+                        } => match inner.as_ref() {
+                            crate::sql::ast::Expr::Literal(crate::types::Value::Integer(i)) => {
+                                set_literals.push((pos, Value::Integer(-*i)))
+                            }
+                            crate::sql::ast::Expr::Literal(crate::types::Value::Float(f)) => {
+                                set_literals.push((pos, Value::Float(-*f)))
+                            }
+                            _ => return Ok(None),
+                        },
+                        other => {
+                            // Expression SET (v = v + ?, v = other_col, …).
+                            // Subqueries need per-row materialization machinery
+                            // — defer those (rare).
+                            if crate::sql::executor::QueryExecutor::expr_contains_subquery(other) {
+                                return Ok(None);
+                            }
+                            set_exprs.push((pos, other));
+                        }
+                    }
+                }
+                let max_idx = set_params
+                    .iter()
+                    .map(|&(_, idx)| idx)
+                    .chain(std::iter::once(pk_param_idx))
+                    .max()
+                    .unwrap_or(0);
+                if batch.iter().any(|p| p.len() < max_idx) {
+                    return Ok(None);
+                }
+                (
+                    su.table.as_str(),
+                    pk_param_idx,
+                    Plan::Update {
+                        set_params,
+                        set_literals,
+                        set_exprs,
+                    },
+                )
+            }
+            Statement::Delete(sd) => {
+                let pk_param_idx = match sd.where_clause.as_ref() {
+                    Some(crate::sql::ast::Expr::BinaryOp {
+                        left,
+                        op: crate::sql::ast::BinaryOperator::Eq,
+                        right,
+                    }) => match (left.as_ref(), right.as_ref()) {
+                        (
+                            crate::sql::ast::Expr::Column(c),
+                            crate::sql::ast::Expr::Parameter(idx),
+                        )
+                        | (
+                            crate::sql::ast::Expr::Parameter(idx),
+                            crate::sql::ast::Expr::Column(c),
+                        ) => {
+                            let schema = self.inner.table_registry.get_table(&sd.table)?;
+                            let is_pk = schema
+                                .primary_key()
+                                .map(|pk| {
+                                    let bare = pk.rsplit('.').next().unwrap_or(pk);
+                                    bare == c.as_str() || pk == c.as_str()
+                                })
+                                .unwrap_or(false);
+                            if !is_pk {
+                                return Ok(None);
+                            }
+                            *idx
+                        }
+                        _ => return Ok(None),
+                    },
+                    _ => return Ok(None),
+                };
+                if batch.iter().any(|p| p.len() < pk_param_idx) {
+                    return Ok(None);
+                }
+                (sd.table.as_str(), pk_param_idx, Plan::Delete)
+            }
             _ => return Ok(None),
         };
-        let meta = match Self::detect_fast_pk_pattern(statement, &self.inner)? {
-            Some(m) => m,
-            None => return Ok(None),
-        };
-        let schema = &meta.schema;
+        let schema = self.inner.table_registry.get_table(table)?;
         let pk_pos = match schema.primary_key().and_then(|n| schema.get_column(n)) {
             Some(cd) => cd.position,
             None => return Ok(None),
         };
-        // A SET that assigns the PK can't be buffered (key relocation is the
-        // executor's in-place fallback) — defer the whole batch.
-        if stmt_type == "update"
-            && (meta
-                .set_param_positions
-                .iter()
-                .any(|&(pos, _)| pos == pk_pos)
-                || meta
-                    .set_literal_positions
-                    .iter()
-                    .any(|&(pos, _)| pos == pk_pos))
-        {
-            return Ok(None);
-        }
-        // Params must cover every index the kernel reads; otherwise defer so
-        // the per-row path surfaces the proper error message.
-        let max_idx = meta
-            .set_param_positions
-            .iter()
-            .map(|&(_, idx)| idx)
-            .chain(std::iter::once(meta.param_idx))
-            .max()
-            .unwrap_or(0);
-        if batch.iter().any(|p| p.len() < max_idx) {
-            return Ok(None);
-        }
+        // A paramless FastPkMeta view of THIS statement, only so the shared
+        // pk→row_id resolution helper can be reused.
+        let is_update = matches!(plan, Plan::Update { .. });
+        let meta = FastPkMeta {
+            stmt_type: if is_update { "update" } else { "delete" },
+            table_name: table.to_string(),
+            table_id: self.inner.table_registry.get_table_id(table).unwrap_or(0) as u64,
+            param_idx: pk_param_idx,
+            is_star: false,
+            select_col_positions: Vec::new(),
+            set_param_positions: Vec::new(),
+            set_literal_positions: Vec::new(),
+            is_auto_increment: schema.is_primary_key_auto_increment(),
+            column_names: schema.column_names_arc(),
+            schema: schema.clone(),
+        };
 
         // Uncommitted INSERTs of this txn are invisible to pk resolution —
         // pre-collect their PK values once and defer those rows to the
@@ -1499,7 +1626,7 @@ impl Database {
             }};
         }
         for params in batch {
-            let pk_value = &params[meta.param_idx - 1];
+            let pk_value = &params[pk_param_idx - 1];
             let row_id = match Self::resolve_fast_pk_row_id(self, &meta, pk_value) {
                 FastPkRowId::Resolved(rid) => rid,
                 FastPkRowId::Absent => continue,
@@ -1512,39 +1639,59 @@ impl Database {
                 fallback!(self.fallback_row_prepared(sql, params)?);
                 continue;
             }
-            match stmt_type {
-                "update" => match self.query_executor.txn_lookup_row_pub(table, row_id) {
-                    // deleted earlier in this txn → matches 0 rows
-                    Some(None) => {}
-                    // write_set row or already-pending update → executor
-                    // chains/relocates with full statement semantics
-                    Some(Some(_)) => {
-                        fallback!(self.fallback_row_prepared(sql, params)?);
-                    }
-                    None => {
-                        let row = match self.inner.get_table_row(table, row_id)? {
-                            Some(r) => r,
-                            None => continue, // no such row → 0 affected
-                        };
-                        let mut new_row = row.clone();
-                        for &(pos, pidx) in &meta.set_param_positions {
-                            new_row[pos] = params[pidx - 1].clone();
+            match &plan {
+                Plan::Update {
+                    set_params,
+                    set_literals,
+                    set_exprs,
+                } => {
+                    match self.query_executor.txn_lookup_row_pub(table, row_id) {
+                        // deleted earlier in this txn → matches 0 rows
+                        Some(None) => {}
+                        // write_set row or already-pending update → executor
+                        // chains/relocates with full statement semantics
+                        Some(Some(_)) => {
+                            fallback!(self.fallback_row_prepared(sql, params)?);
                         }
-                        for &(pos, ref lit) in &meta.set_literal_positions {
-                            new_row[pos] = lit.clone();
+                        None => {
+                            let row = match self.inner.get_table_row(table, row_id)? {
+                                Some(r) => r,
+                                None => continue, // no such row → 0 affected
+                            };
+                            let mut new_row = row.clone();
+                            for &(pos, pidx) in set_params {
+                                new_row[pos] = params[pidx - 1].clone();
+                            }
+                            for &(pos, ref lit) in set_literals {
+                                new_row[pos] = lit.clone();
+                            }
+                            for &(pos, expr) in set_exprs {
+                                // B: expression SET evaluated against THIS row
+                                // with THIS row's params substituted (mirrors
+                                // execute_streaming_ref's UPDATE substitution
+                                // + execute_update_pk's per-row eval).
+                                let resolved =
+                                    crate::sql::executor::QueryExecutor::substitute_expr(
+                                        expr, params,
+                                    )?;
+                                let v = crate::sql::executor::QueryExecutor::eval_expr_on_row(
+                                    &resolved, &row, &schema,
+                                )?;
+                                new_row[pos] = v;
+                            }
+                            MoteDB::coerce_row_to_schema(&schema, &mut new_row);
+                            let prior = self
+                                .inner
+                                .txn_coordinator
+                                .record_pending_update(tid, table, row_id, row, new_row)?;
+                            self.inner
+                                .txn_coordinator
+                                .record_pending_snapshot(tid, row_id, table, prior)?;
+                            affected += 1;
                         }
-                        MoteDB::coerce_row_to_schema(schema, &mut new_row);
-                        let prior = self
-                            .inner
-                            .txn_coordinator
-                            .record_pending_update(tid, table, row_id, row, new_row)?;
-                        self.inner
-                            .txn_coordinator
-                            .record_pending_snapshot(tid, row_id, table, prior)?;
-                        affected += 1;
                     }
-                },
-                "delete" => {
+                }
+                Plan::Delete => {
                     // Mirror execute_delete_pk: drop a pending UPDATE first so
                     // COMMIT can't resurrect the row via newest-wins.
                     let _ = self
@@ -1567,7 +1714,6 @@ impl Database {
                         },
                     }
                 }
-                _ => unreachable!("stmt_type constrained above"),
             }
         }
         Ok(Some(affected))

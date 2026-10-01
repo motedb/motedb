@@ -4379,7 +4379,7 @@ impl QueryExecutor {
     }
 
     /// Check if an expression tree contains any Subquery node.
-    fn expr_contains_subquery(expr: &Expr) -> bool {
+    pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
         match expr {
             Expr::Subquery(_) => true,
             Expr::Exists(_) => true,
@@ -9357,7 +9357,7 @@ impl QueryExecutor {
     }
 
     /// Recursively substitute Parameter nodes in an expression tree.
-    fn substitute_expr(expr: &Expr, params: &[Value]) -> Result<Expr> {
+    pub(crate) fn substitute_expr(expr: &Expr, params: &[Value]) -> Result<Expr> {
         match expr {
             Expr::Parameter(idx) => {
                 if *idx == 0 {
@@ -9511,7 +9511,11 @@ impl QueryExecutor {
 
     /// Evaluate expression directly on Vec<Value> using schema positions.
     /// Bypasses HashMap creation entirely.
-    fn eval_expr_on_row(expr: &Expr, row: &[Value], schema: &TableSchema) -> Result<Value> {
+    pub(crate) fn eval_expr_on_row(
+        expr: &Expr,
+        row: &[Value],
+        schema: &TableSchema,
+    ) -> Result<Value> {
         match expr {
             Expr::BinaryOp { left, op, right } => {
                 let lv = Self::eval_expr_on_row(left, row, schema)?;
@@ -19453,6 +19457,15 @@ impl QueryExecutor {
             return Ok(None);
         }
         let ids = self.db.text_search(&index_name, &query)?;
+        // 🔒 W4b RYW: inside a transaction the count must reflect buffered
+        // writes (uncommitted inserts visible, deletes hidden, text updates
+        // re-evaluated) — same overlay as the SELECT fast path.
+        let count = if self.is_in_transaction() {
+            self.txn_fts_overlay(&table, &index_name, &column, &query, ids)
+                .len()
+        } else {
+            ids.len()
+        };
         let col_name = match &stmt.columns[0] {
             SelectColumn::Expr(e, Some(alias)) => alias.clone(),
             SelectColumn::Expr(e, None) => Self::expr_to_column_name(e),
@@ -19460,8 +19473,90 @@ impl QueryExecutor {
         };
         Ok(Some(QueryResult::Select {
             columns: vec![col_name],
-            rows: vec![vec![Value::Integer(ids.len() as i64)]],
+            rows: vec![vec![Value::Integer(count as i64)]],
         }))
+    }
+
+    /// Upper bound on how many index candidates this transaction's buffered
+    /// writes can invalidate (pending deletes + pending updates) — used to
+    /// over-fetch before the RYW overlay.
+    fn txn_fts_dirty_bound(&self, table_name: &str) -> usize {
+        self.txn_pending_delete_ids(table_name).len() + self.txn_pending_rows(table_name).len()
+    }
+
+    /// 🔒 W4b transactional FTS overlay: reconcile index candidates with the
+    /// transaction's buffered writes so the unranked MATCH result is exactly
+    /// what the query will return after COMMIT.
+    ///   - pending DELETE → candidate dropped (tombstone)
+    ///   - pending UPDATE → membership tracks the NEW text (old text is what
+    ///     the index knows): matched-new kept, unmatched-new dropped
+    ///   - write_set INSERTs (and pending updates whose old text didn't
+    ///     match) whose NEW text matches → appended
+    /// Merged in ascending row_id (document order — the unranked contract).
+    fn txn_fts_overlay(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        column: &str,
+        query: &str,
+        candidates: Vec<u64>,
+    ) -> Vec<u64> {
+        let deleted = self.txn_pending_delete_ids(table_name);
+        let pending = self.txn_pending_rows(table_name); // (rid, NEW row)
+                                                         // NOTE: no early exit here — write_set INSERTs must be appended even
+                                                         // when no deletes/updates are buffered.
+        let schema = match self.db.get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) => return candidates,
+        };
+        let text_pos = match schema.get_column_position(column) {
+            Some(p) => p,
+            None => return candidates,
+        };
+        let matches_new = |row: &Row| -> bool {
+            match row.get(text_pos) {
+                Some(Value::Text(t)) => self.db.text_matches(index_name, query, t).unwrap_or(false),
+                _ => false,
+            }
+        };
+
+        let mut keep: Vec<u64> = Vec::with_capacity(candidates.len());
+        let mut in_candidates: std::collections::HashSet<u64> =
+            candidates.iter().copied().collect();
+        for id in candidates {
+            if deleted.contains(&id) {
+                continue;
+            }
+            if let Some((_, new_row)) = pending.iter().find(|(rid, _)| *rid == id) {
+                if matches_new(new_row) {
+                    keep.push(id);
+                }
+                continue;
+            }
+            keep.push(id);
+        }
+
+        // New matches the index can't know about yet.
+        let mut appended: Vec<u64> = Vec::new();
+        for (rid, new_row) in &pending {
+            if in_candidates.contains(rid) || deleted.contains(rid) {
+                continue;
+            }
+            if matches_new(new_row) {
+                appended.push(*rid);
+            }
+        }
+        for (rid, ws_row) in self.txn_write_set_rows(table_name) {
+            if matches_new(&ws_row) {
+                appended.push(rid);
+            }
+        }
+
+        let mut merged = keep;
+        merged.extend(appended);
+        merged.sort_unstable();
+        merged.dedup();
+        merged
     }
 
     fn try_text_search_fast_path(
@@ -19511,6 +19606,29 @@ impl QueryExecutor {
         // rows.
         let offset = stmt.offset.unwrap_or(0);
 
+        // 🔒 RYW (W4b): inside a transaction the index only knows COMMITTED
+        // text. Shapes whose output depends on BM25 scores or phrase
+        // positions can't be overlaid cheaply (stale scores / no positions
+        // for buffered text) — fall back to the general pipeline, which
+        // evaluates MATCH per row against the row's CURRENT text (the
+        // buffered value) and is therefore already read-your-writes
+        // correct. The plain unranked shapes below get a precise overlay.
+        let in_txn = self.is_in_transaction();
+        let wants_scores = stmt.columns.iter().any(|c| match c {
+            SelectColumn::Expr(Expr::Match { .. }, _) => true,
+            SelectColumn::Expr(Expr::FunctionCall { name, .. }, _) => {
+                name.eq_ignore_ascii_case("BM25_SCORE")
+            }
+            _ => false,
+        });
+        let orders_by_score = stmt.order_by.as_ref().is_some_and(|ob| {
+            ob.len() == 1
+                && matches!(&ob[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
+        });
+        if in_txn && (phrase || wants_scores || orders_by_score) {
+            return Ok(None);
+        }
+
         // Phrase search or ranked search depending on query type
         // 🚀 Carry (row_id, score) through — don't discard BM25 scores and
         // hardcode 1.0 (was executor.rs:17590). Keeps ORDER BY score correct.
@@ -19532,18 +19650,13 @@ impl QueryExecutor {
             // below (which has always been unranked). The old behavior ran
             // the BM25 top-k heap for every bare `MATCH .. LIMIT n` (6×
             // slower than SQLite FTS5's unranked posting walk at 100K docs).
-            let wants_scores = stmt.columns.iter().any(|c| match c {
-                SelectColumn::Expr(Expr::Match { .. }, _) => true,
-                SelectColumn::Expr(Expr::FunctionCall { name, .. }, _) => {
-                    name.eq_ignore_ascii_case("BM25_SCORE")
+            if !in_txn && (wants_scores || orders_by_score) {
+                // Ranked top-(limit + offset); offset is skipped below.
+                match self.db.text_search_ranked(&index_name, &query, l + offset) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
                 }
-                _ => false,
-            });
-            let orders_by_score = stmt.order_by.as_ref().is_some_and(|ob| {
-                ob.len() == 1
-                    && matches!(&ob[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
-            });
-            if !wants_scores && !orders_by_score {
+            } else if !in_txn {
                 match self
                     .db
                     .text_search_limited(&index_name, &query, Some(l + offset))
@@ -19552,9 +19665,19 @@ impl QueryExecutor {
                     Err(_) => return Ok(None),
                 }
             } else {
-                // Ranked top-(limit + offset); offset is skipped below.
-                match self.db.text_search_ranked(&index_name, &query, l + offset) {
-                    Ok(r) => r,
+                // In-txn: over-fetch by the number of buffered rows that
+                // could invalidate index candidates, then overlay (below).
+                let drop_bound = self.txn_fts_dirty_bound(table_name);
+                match self.db.text_search_limited(
+                    &index_name,
+                    &query,
+                    Some(l + offset + drop_bound),
+                ) {
+                    Ok(ids) => {
+                        let overlaid =
+                            self.txn_fts_overlay(table_name, &index_name, &column, &query, ids);
+                        overlaid.into_iter().map(|id| (id, 0.0)).collect()
+                    }
                     Err(_) => return Ok(None),
                 }
             }
@@ -19564,19 +19687,17 @@ impl QueryExecutor {
             // unranked id set with zero scores — EXCEPT when the SELECT list
             // asks for scores (`MATCH(..) AS s` / `BM25_SCORE(col, q)`):
             // rank over the full match count then.
-            let wants_scores = stmt.columns.iter().any(|c| match c {
-                SelectColumn::Expr(Expr::Match { .. }, _) => true,
-                SelectColumn::Expr(Expr::FunctionCall { name, .. }, _) => {
-                    name.eq_ignore_ascii_case("BM25_SCORE")
-                }
-                _ => false,
-            });
             match self.db.text_search(&index_name, &query) {
                 Ok(ids) if wants_scores => {
                     match self.db.text_search_ranked(&index_name, &query, ids.len()) {
                         Ok(r) => r,
                         Err(_) => ids.into_iter().map(|id| (id, 0.0)).collect(),
                     }
+                }
+                Ok(ids) if in_txn => {
+                    let overlaid =
+                        self.txn_fts_overlay(table_name, &index_name, &column, &query, ids);
+                    overlaid.into_iter().map(|id| (id, 0.0)).collect()
                 }
                 Ok(ids) => ids.into_iter().map(|id| (id, 0.0)).collect(),
                 Err(_) => return Ok(None),
@@ -19610,9 +19731,29 @@ impl QueryExecutor {
         let schema = self.db.get_table_schema(table_name)?;
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
 
-        // 🚀 Batch-fetch rows and project directly via project_row_direct
-        // (no SqlRow HashMap build/teardown — was 2× HashMap alloc per row).
-        let batch_rows = self.db.get_table_rows_batch(table_name, &row_ids)?;
+        // 🔒 RYW (W4b): inside a transaction the projection must read the
+        // row's CURRENT (buffered) values — a pending UPDATE changed the
+        // text the index still holds; a write_set INSERT has no storage
+        // row at all. txn_lookup_row_pub folds write_set / pending-new /
+        // tombstone states; rows with no txn state batch-fetch from
+        // storage. Some(None) = deleted in-txn → no row emitted.
+        let batch_rows: Vec<(u64, Option<Row>)> = if in_txn {
+            let mut rows: Vec<(u64, Option<Row>)> = Vec::with_capacity(row_ids.len());
+            let mut storage_ids: Vec<u64> = Vec::new();
+            for &rid in &row_ids {
+                match self.txn_lookup_row_pub(table_name, rid as RowId) {
+                    Some(Some(row)) => rows.push((rid, Some(row))),
+                    Some(None) => {}
+                    None => storage_ids.push(rid),
+                }
+            }
+            if !storage_ids.is_empty() {
+                rows.extend(self.db.get_table_rows_batch(table_name, &storage_ids)?);
+            }
+            rows
+        } else {
+            self.db.get_table_rows_batch(table_name, &row_ids)?
+        };
         // Build a row_id → row lookup so we preserve BM25-sorted order.
         let mut row_lookup: std::collections::HashMap<u64, &Row> =
             std::collections::HashMap::with_capacity(batch_rows.len());

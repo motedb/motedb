@@ -1209,3 +1209,92 @@ fn executemany_batch_kernel_matches_per_row_executor() {
     assert!(rows(&db, "SELECT v FROM t WHERE id = 500").is_empty());
     let _ = dir2; // keep alive
 }
+
+// 🔒 B regression: expression SETs (`v = v + ?`, column-to-column, …) in an
+// executemany batch are now evaluated IN the batch kernel (per row, with the
+// row's params substituted) instead of deferring to the per-row executor.
+// Same differential contract as the W1 test: batch == per-row oracle.
+#[test]
+fn executemany_expression_set_batch_kernel() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT, w FLOAT)");
+    let seed: Vec<String> = (0..20)
+        .map(|i| format!("({}, {}.0, {}.0)", i, i, i * 2))
+        .collect();
+    exec(&db, &format!("INSERT INTO t VALUES {}", seed.join(",")));
+
+    // Batch: arithmetic with param, column-to-column, mixed literal+expr.
+    let batch: Vec<Vec<Value>> = (0..20)
+        .map(|i| vec![Value::Float(100.0 + i as f64), Value::Integer(i)])
+        .collect();
+    let n = db
+        .execute_prepared_many("UPDATE t SET v = v + ? WHERE id = ?", batch)
+        .unwrap();
+    assert_eq!(n, 20);
+    // row 0: 0 + 100; row 5: 5 + 105
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 0"),
+        vec![vec![Value::Float(100.0)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 5"),
+        vec![vec![Value::Float(110.0)]] // 5 + 105
+    );
+
+    // column-to-column: w = v (both from the row)
+    let batch: Vec<Vec<Value>> = (0..20).map(|i| vec![Value::Integer(i)]).collect();
+    let n = db
+        .execute_prepared_many("UPDATE t SET w = v WHERE id = ?", batch)
+        .unwrap();
+    assert_eq!(n, 20);
+    assert_eq!(
+        rows(&db, "SELECT w FROM t WHERE id = 5"),
+        vec![vec![Value::Float(110.0)]]
+    );
+
+    // mixed literal + expression in one statement
+    let batch: Vec<Vec<Value>> = (0..20)
+        .map(|i| vec![Value::Float(1000.0), Value::Float(1.0), Value::Integer(i)])
+        .collect();
+    let n = db
+        .execute_prepared_many("UPDATE t SET w = ?, v = v + ? WHERE id = ?", batch)
+        .unwrap();
+    assert_eq!(n, 20);
+    assert_eq!(
+        rows(&db, "SELECT w, v FROM t WHERE id = 7"),
+        vec![vec![Value::Float(1000.0), Value::Float(115.0)]] // 14+100 then +1
+    );
+
+    // chained executemany on the same row (pending chaining with exprs)
+    let batch: Vec<Vec<Value>> = vec![
+        vec![Value::Float(10.0), Value::Integer(3)],
+        vec![Value::Float(20.0), Value::Integer(3)],
+    ];
+    let n = db
+        .execute_prepared_many("UPDATE t SET v = v + ? WHERE id = ?", batch)
+        .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 3"),
+        vec![vec![Value::Float(137.0)]], // 103 then +10, +20
+    );
+
+    // in-txn batch with expression SETs: visible inside, rollback exact.
+    let tx = db.begin_transaction().unwrap();
+    let batch: Vec<Vec<Value>> = (0..3)
+        .map(|i| vec![Value::Float(5000.0 + i as f64), Value::Integer(i)])
+        .collect();
+    let n = db
+        .execute_prepared_many("UPDATE t SET v = v + ? WHERE id = ?", batch)
+        .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Float(5104.0)]] // 103 + 5001 (i=1)
+    );
+    db.rollback_transaction(tx).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Float(103.0)]], // 2*1+100 then +1
+    );
+}

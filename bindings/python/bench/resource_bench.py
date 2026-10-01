@@ -103,7 +103,16 @@ RNG = np.random.default_rng(42)
 root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 cli = os.path.join(root, "target", "release", "motedb-cli")
 so_candidates = []
-for rel in ("target/release/libmotedb.dylib", "target/release/libmotedb.a"):
+# 🎯 measure the artifact users actually load: the INSTALLED wheel .so —
+# workspace build dirs hold unstripped intermediates (libmotedb.a was 88.5MB,
+# 10× the shipped binary) that made this metric meaningless.
+import site
+for sp in site.getsitepackages() + [site.getusersitepackages()]:
+    for rel in ("motedb/motedb.abi3.so", "motedb/motedb.so"):
+        p = os.path.join(sp, rel)
+        if os.path.exists(p):
+            so_candidates.append(p)
+for rel in ("target/release/libmotedb.dylib",):
     p = os.path.join(root, rel)
     if os.path.exists(p):
         so_candidates.append(p)

@@ -581,3 +581,114 @@ fn txn_delete_commit_allows_same_pk_reinsert() {
     let dup = db.execute("INSERT INTO t VALUES (10, 999)");
     assert!(dup.is_err(), "true duplicate must still be rejected");
 }
+
+// 🔒 W4b regression: transactional MATCH read-your-writes. The FTS fast
+// path answers from the index (committed text only) — inside a transaction
+// it must overlay buffered writes so the result is exactly what COMMIT
+// would make the index return:
+//   - uncommitted INSERT (write_set) → VISIBLE to MATCH
+//   - uncommitted DELETE (tombstone)  → HIDDEN from MATCH
+//   - uncommitted text UPDATE         → old terms gone, new terms searchable
+//   - projection reads buffered values; ROLLBACK restores exactly.
+#[test]
+fn match_ryw_inside_transaction() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    for i in 1..=50 {
+        db.execute(format!("INSERT INTO docs VALUES ({i}, 'alpha doc{i} number{i}')").as_str())
+            .unwrap();
+    }
+    db.execute("CREATE TEXT INDEX docs_body ON docs (body)")
+        .unwrap();
+
+    let count_alpha = |db: &Database| -> usize {
+        let rows = db
+            .execute("SELECT id FROM docs WHERE MATCH(body, 'alpha')")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        match rows {
+            motedb::QueryResult::Select { rows, .. } => rows.len(),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    // Baseline outside txn.
+    assert_eq!(count_alpha(&db), 50);
+
+    // 1. Uncommitted INSERT is visible; COUNT via MATCH too.
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO docs VALUES (500, 'alpha bravo fresh')")
+        .unwrap();
+    assert_eq!(
+        count_alpha(&db),
+        51,
+        "uncommitted INSERT must be visible to MATCH"
+    );
+    assert_eq!(
+        ints(&rows(
+            db.execute("SELECT COUNT(*) FROM docs WHERE MATCH(body, 'alpha')")
+                .unwrap()
+        )),
+        [51]
+    );
+    // 2. Uncommitted DELETE hides the row.
+    db.execute("DELETE FROM docs WHERE id = 7").unwrap();
+    assert_eq!(
+        count_alpha(&db),
+        50,
+        "uncommitted DELETE must hide from MATCH"
+    );
+    // 3. Uncommitted text UPDATE: old term gone, new term searchable, and
+    //    the projection reads the BUFFERED text.
+    db.execute("UPDATE docs SET body = 'gamma replaced' WHERE id = 10")
+        .unwrap();
+    assert_eq!(count_alpha(&db), 49);
+    assert_eq!(
+        ints(&rows(
+            db.execute("SELECT COUNT(*) FROM docs WHERE MATCH(body, 'gamma')")
+                .unwrap()
+        )),
+        [1]
+    );
+    let text = rows(db.execute("SELECT body FROM docs WHERE id = 10").unwrap());
+    assert_eq!(text[0][0], Value::Text("gamma replaced".into()));
+    // 4. LIMIT shape inside the txn (overlay + early exit).
+    let limited = rows(
+        db.execute("SELECT id FROM docs WHERE MATCH(body, 'alpha') LIMIT 3")
+            .unwrap(),
+    );
+    assert_eq!(limited.len(), 3);
+    // 5. ROLLBACK restores everything exactly.
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(count_alpha(&db), 50);
+    let text = rows(db.execute("SELECT body FROM docs WHERE id = 10").unwrap());
+    assert_eq!(text[0][0], Value::Text("alpha doc10 number10".into()));
+
+    // 6. COMMIT makes the overlaid view durable: insert visible, deleted
+    //    gone, updated text reindexed.
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO docs VALUES (600, 'alpha delta committed')")
+        .unwrap();
+    db.execute("DELETE FROM docs WHERE id = 8").unwrap();
+    db.execute("UPDATE docs SET body = 'epsilon committed' WHERE id = 9")
+        .unwrap();
+    db.execute("COMMIT").unwrap();
+    assert_eq!(count_alpha(&db), 49); // 50 - deleted 8 - updated-away 9 + insert 600
+    assert_eq!(
+        ints(&rows(
+            db.execute("SELECT COUNT(*) FROM docs WHERE MATCH(body, 'delta')")
+                .unwrap()
+        )),
+        [1]
+    );
+    assert_eq!(
+        ints(&rows(
+            db.execute("SELECT COUNT(*) FROM docs WHERE MATCH(body, 'epsilon')")
+                .unwrap()
+        )),
+        [1]
+    );
+}

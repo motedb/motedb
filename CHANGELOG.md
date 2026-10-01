@@ -2,6 +2,30 @@
 
 ## [0.12.0] — 未发布
 
+### 🔒 W4b 事务内 MATCH 读己之写 + 🚀 executemany 表达式 SET 批量求值
+
+- 🔒 **事务内 MATCH RYW** (M 战役读路径最后一块): FTS SELECT 快路径
+  (try_text_search_fast_path) 此前直接从索引应答 — 事务内未提交 INSERT
+  对 MATCH 不可见、未提交 DELETE 不隐藏、未提交文本 UPDATE 不重算。
+  新增 txn_fts_overlay: 索引候选按缓冲写折叠 (墓碑删除 / pending 新值
+  重判 / write_set 行按索引同语义 (该索引 tokenizer + OR-of-AND 组)
+  本地求值后追加), 按行号升序保持文档序契约; LIMIT 形状按脏行数超额
+  取候选保早停正确性; 投影经 txn_lookup_row 读缓冲值。COUNT(*) MATCH
+  快路径同 overlay。phrase/BM25_SCORE/ORDER BY score 形状事务内回退
+  通用路径 (其对行文本求值天然 RYW 正确)。回归测试
+  match_ryw_inside_transaction (七形状: 插入可见/删除隐藏/更新重算/
+  投影读缓冲值/LIMIT/ROLLBACK 精确恢复/COMMIT 落定)
+- 🚀 **executemany 表达式 SET 批量求值** (W1 内核补全): `SET v = v + ?`、
+  列间赋值等表达式形式此前整批回退逐行 executor (41K rows/s)。内核
+  内联提取 UPDATE 计划 (不再依赖 detect_fast_pk_pattern), 每行参数代入
+  (substitute_expr) + 行上求值 (eval_expr_on_row) 后缓冲 — 干净表实测
+  **230K rows/s (5.6×)**, 与参数形式 (297K) 同级; 含子查询的 SET 仍整批
+  回退。差分测试 executemany_expression_set_batch_kernel (算术参数/
+  列间/混合字面量/同行链式/事务内可见与回滚)
+- 基准口径修复: resource_bench 的 python_so 工件指标改测实际安装的
+  wheel .so (此前误取 workspace 未 strip 静态库 88.5MB, 失真 10×)
+- 对抗验证 ALL SECTIONS PASS; 全量 239 bin 第九轮全绿
+
 ### 🚀 W4a FTS 派生视图缓存: 修刚建索引 ~100µs/查询税 (root-cause 实锤)
 
 - 🚀 **根因** (采样热栈实锤, 非猜测): `term_stream` 对 pending posting 每

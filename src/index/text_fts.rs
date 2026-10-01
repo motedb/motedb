@@ -1138,6 +1138,27 @@ impl TextFTSIndex {
         )
     }
 
+    /// 🔒 RYW matcher (W4b): does `text` match `query` under THIS index's
+    /// exact semantics (its tokenizer + OR-of-AND-groups)? Used by the
+    /// executor's transactional FTS overlay to evaluate write_set /
+    /// pending-update rows whose text never reached the index — the same
+    /// decision `search()` would make once the row is committed and indexed.
+    pub fn text_matches(&self, query: &str, text: &str) -> bool {
+        let groups = self.parse_query_expanded(query);
+        if groups.is_empty() {
+            return false;
+        }
+        let tokens: std::collections::HashSet<String> = self
+            .tokenizer
+            .tokenize(text)
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        groups
+            .iter()
+            .any(|g| g.iter().all(|term| tokens.contains(term)))
+    }
+
     /// Search for documents containing an exact phrase (consecutive token positions).
     ///
     /// E.g., search_phrase("machine learning") returns only docs where "machine"
