@@ -859,3 +859,198 @@ fn shuffled_bulk_insert_fast_and_correct() {
         .expect("duplicate PK in batch must fail");
     let _ = format!("{err}");
 }
+
+// 🔒 Regression (benchmark-prep probe): the api-layer fast PK shortcut
+// (execute_fast_pk_with_meta) applied UPDATE/DELETE straight to storage even
+// inside an explicit transaction — ROLLBACK could not revert `WHERE id = ?`
+// writes (the literal form `WHERE id = 42` took the executor path and was
+// already fixed; the PARAMETER form took this shortcut and silently broke
+// atomicity). The write branches must defer to the executor's txn-aware
+// paths while a transaction is active.
+#[test]
+fn fast_pk_update_rollback_via_prepared() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    exec(&db, "INSERT INTO t VALUES (1, 5), (2, 7)");
+
+    // SQL-BEGIN entry point + parameterized PK UPDATE + ROLLBACK.
+    exec(&db, "BEGIN");
+    let affected = db
+        .execute_prepared("UPDATE t SET v = 9 WHERE id = ?", vec![Value::Integer(1)])
+        .unwrap()
+        .materialize()
+        .unwrap();
+    match affected {
+        motedb::sql::QueryResult::Modification { affected_rows } => {
+            assert_eq!(affected_rows, 1);
+        }
+        other => panic!("expected Modification, got {other:?}"),
+    }
+    // Read-your-write inside the txn.
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Integer(9)]]
+    );
+    exec(&db, "ROLLBACK");
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Integer(5)]],
+        "rollback must revert a parameterized fast-PK UPDATE"
+    );
+
+    // begin_transaction() API entry point, same guarantee.
+    let tx = db.begin_transaction().unwrap();
+    db.execute_prepared("UPDATE t SET v = 42 WHERE id = ?", vec![Value::Integer(2)])
+        .unwrap()
+        .materialize()
+        .unwrap();
+    db.rollback_transaction(tx).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 2"),
+        vec![vec![Value::Integer(7)]]
+    );
+
+    // COMMIT persists.
+    let tx = db.begin_transaction().unwrap();
+    db.execute_prepared("UPDATE t SET v = 11 WHERE id = ?", vec![Value::Integer(1)])
+        .unwrap()
+        .materialize()
+        .unwrap();
+    db.commit_transaction(tx).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Integer(11)]]
+    );
+}
+
+#[test]
+fn fast_pk_delete_rollback_via_prepared() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    exec(&db, "INSERT INTO t VALUES (1, 5), (2, 7)");
+
+    exec(&db, "BEGIN");
+    let affected = db
+        .execute_prepared("DELETE FROM t WHERE id = ?", vec![Value::Integer(1)])
+        .unwrap()
+        .materialize()
+        .unwrap();
+    match affected {
+        motedb::sql::QueryResult::Modification { affected_rows } => {
+            assert_eq!(affected_rows, 1);
+        }
+        other => panic!("expected Modification, got {other:?}"),
+    }
+    assert!(rows(&db, "SELECT v FROM t WHERE id = 1").is_empty());
+    exec(&db, "ROLLBACK");
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Integer(5)]],
+        "rollback must revert a parameterized fast-PK DELETE"
+    );
+}
+
+// 🔒 Regression: executemany (execute_prepared_many) on UPDATE/DELETE used
+// to open its OWN transaction unconditionally — inside a caller's explicit
+// transaction the outer ROLLBACK could not undo the batch. It must join the
+// enclosing transaction (SQLite semantics).
+#[test]
+fn executemany_update_joins_outer_txn() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    exec(&db, "INSERT INTO t VALUES (1, 5), (2, 7), (3, 9)");
+    let batch: Vec<Vec<Value>> = (1..=3)
+        .map(|i| vec![Value::Integer(100 + i), Value::Integer(i)])
+        .collect();
+
+    let tx = db.begin_transaction().unwrap();
+    let affected = db
+        .execute_prepared_many("UPDATE t SET v = ? WHERE id = ?", batch)
+        .unwrap();
+    assert_eq!(affected, 3);
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Integer(101)]],
+        "batch writes must be visible inside the outer txn"
+    );
+    db.rollback_transaction(tx).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::Integer(1), Value::Integer(5)],
+            vec![Value::Integer(2), Value::Integer(7)],
+            vec![Value::Integer(3), Value::Integer(9)],
+        ],
+        "outer rollback must undo the whole batch"
+    );
+
+    // Without an outer transaction the batch still self-wraps and commits.
+    let batch: Vec<Vec<Value>> = (1..=3)
+        .map(|i| vec![Value::Integer(200 + i), Value::Integer(i)])
+        .collect();
+    let affected = db
+        .execute_prepared_many("UPDATE t SET v = ? WHERE id = ?", batch)
+        .unwrap();
+    assert_eq!(affected, 3);
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 3"),
+        vec![vec![Value::Integer(203)]]
+    );
+}
+
+// 🔒 Regression (benchmark-prep probe): `SET v = v + 1 WHERE id = ?` matched
+// the fast PK pattern but the expression form of the SET fell into the
+// catch-all "ignore" arm — the fast path wrote the OLD row back and reported
+// affected=1 while silently dropping the assignment. Any SET the fast path
+// cannot represent as a raw value must defer to the executor.
+#[test]
+fn fast_pk_update_expression_set_defers_to_executor() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");
+    exec(&db, "INSERT INTO t VALUES (1, 2.5), (2, 4.0)");
+
+    let affected = db
+        .execute_prepared(
+            "UPDATE t SET v = v + 1 WHERE id = ?",
+            vec![Value::Integer(1)],
+        )
+        .unwrap()
+        .materialize()
+        .unwrap();
+    match affected {
+        motedb::sql::QueryResult::Modification { affected_rows } => {
+            assert_eq!(affected_rows, 1);
+        }
+        other => panic!("expected Modification, got {other:?}"),
+    }
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Float(3.5)]],
+        "v = v + 1 must actually apply (affected=1 with unchanged data was the bug)"
+    );
+
+    // autocommit execute() with a literal PK rides the same deferral rules.
+    let _ = db
+        .execute("UPDATE t SET v = v * 2 WHERE id = 2")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 2"),
+        vec![vec![Value::Float(8.0)]]
+    );
+
+    // column-to-column assignment also defers correctly.
+    let _ = db
+        .execute_prepared(
+            "UPDATE t SET v = v * 2 WHERE id = ?",
+            vec![Value::Integer(2)],
+        )
+        .unwrap()
+        .materialize()
+        .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 2"),
+        vec![vec![Value::Float(16.0)]]
+    );
+}

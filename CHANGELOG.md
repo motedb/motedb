@@ -2,6 +2,28 @@
 
 ## [0.12.0] — 未发布
 
+### 🔒 事务原子性: fast-PK 写路径与 executemany 纳入显式事务
+
+- 🔒 `WHERE pk = ?` **参数形式**的 UPDATE/DELETE 走 api 层 fast-PK 捷径
+  (execute_fast_pk_with_meta), 该捷径的写分支无视活动事务直接 autocommit
+  写存储 — `BEGIN; UPDATE ... WHERE id = ?; ROLLBACK` 静默保留修改 (字面量
+  形式 `WHERE id = 42` 走 executor 路径已修复, 参数形式漏网; SELECT 分支
+  的 M1 读己之写处理已在, 写分支缺对称守卫)。修复: 事务内 fast-PK 写让位
+  executor 的 M1/M2 缓冲路径 (Ok(None) fall-through), 事务外 autocommit
+  快路径不变
+- 🔒 executemany (execute_prepared_many) 的 UPDATE/DELETE 批此前无条件
+  自建私有事务 — 外层显式事务的 ROLLBACK 无法撤销整批。修复: 已在事务内
+  则整批 JOIN 外层事务 (SQLite 语义), 由外层 COMMIT/ROLLBACK 决定去留;
+  无外层事务时保持单批单事务单 fsync
+- 🔒 **SET 表达式静默丢弃** (数据正确性): `UPDATE t SET v = v + 1 WHERE id = ?`
+  匹配 fast-PK 模式后, 表达式形式的 SET 落入 catch-all 忽略臂 — 旧行原样
+  写回且 affected=1 (赋值静默丢失, autocommit 同样中招; 字面量形式的 BUG
+  #45 早已修, 表达式形式漏网)。修复: fast 路径无法以原始值表达的赋值
+  (算术/列间赋值/函数/未知列) 一律 `Ok(None)` 让位 executor 求值
+- 回归测试 ×4 (fast_pk_update_rollback_via_prepared /
+  fast_pk_delete_rollback_via_prepared / executemany_update_joins_outer_txn /
+  fast_pk_update_expression_set_defers_to_executor)
+
 ### MVCC 写缓冲化 (M1-M3): 事务内零存储写 + GROUP BY 对齐 DuckDB (G)
 
 - 🔒 M1 事务 UPDATE 缓冲化: pending_updates (old,new) 三写路径 (PK 快路

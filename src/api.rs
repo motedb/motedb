@@ -791,13 +791,22 @@ impl Database {
         // the in-txn DELETE/PK fix). The old API rejected these outright —
         // Python users had to fall back to per-row execute(), paying parse
         // + fsync per row.
+        //
+        // 🔒 SQLite semantics: when the caller is ALREADY inside an explicit
+        // transaction, the batch must JOIN it (the outer COMMIT/ROLLBACK
+        // covers every row) instead of opening a private one the outer
+        // rollback cannot undo.
         if matches!(
             statement.as_ref(),
             Statement::Update(_) | Statement::Delete(_)
         ) {
-            let tx_id = self.begin_transaction()?;
+            let outer_txn = self.query_executor.is_in_transaction();
+            let tx_id = if outer_txn {
+                None
+            } else {
+                Some(self.begin_transaction()?)
+            };
             let mut affected: u64 = 0;
-            let mut committed = false;
             let result = (|| -> Result<()> {
                 for params in &batch {
                     let r = self.execute_prepared(sql, params.clone())?;
@@ -809,19 +818,20 @@ impl Database {
             })();
             match result {
                 Ok(()) => {
-                    self.commit_transaction(tx_id)?;
-                    committed = true;
+                    if let Some(tx_id) = tx_id {
+                        self.commit_transaction(tx_id)?;
+                    }
                     Ok(affected)
                 }
                 Err(e) => {
-                    let _ = self.rollback_transaction(tx_id);
+                    if let Some(tx_id) = tx_id {
+                        let _ = self.rollback_transaction(tx_id);
+                    }
+                    // Inside an outer transaction the error propagates and the
+                    // CALLER decides whether to roll back (SQLite behavior).
                     Err(e)
                 }
             }
-            .map(|affected| {
-                let _ = committed;
-                affected
-            })
         } else {
             self.execute_prepared_many_insert(statement, batch)
         }
@@ -1111,36 +1121,39 @@ impl Database {
                 let mut params_out: Vec<(usize, usize)> = Vec::new();
                 let mut literals_out: Vec<(usize, crate::types::Value)> = Vec::new();
                 for (col_name, expr) in &s.assignments {
+                    // 🔒 An assignment the fast path cannot represent as a raw
+                    // value (`SET v = v + 1`, `SET v = other_col`, functions,
+                    // …) must REJECT the fast path. Writing the old row back
+                    // unmodified used to report affected=1 while silently
+                    // dropping the SET (BUG #45 was the literal form; this is
+                    // the expression form). Unknown columns likewise defer so
+                    // the executor errors properly.
+                    let pos = match schema.get_column_position(col_name) {
+                        Some(p) => p,
+                        None => return Ok(None),
+                    };
                     match expr {
                         Expr::Parameter(idx) => {
-                            if let Some(pos) = schema.get_column_position(col_name) {
-                                params_out.push((pos, *idx));
-                            }
+                            params_out.push((pos, *idx));
                         }
                         // 🔑 字面量（含负号折叠 UnaryOp(Minus, Literal)）也要
                         // 应用 —— 否则 fast 路径丢 SET（BUG #45）
                         Expr::Literal(v) => {
-                            if let Some(pos) = schema.get_column_position(col_name) {
-                                literals_out.push((pos, v.clone()));
-                            }
+                            literals_out.push((pos, v.clone()));
                         }
                         Expr::UnaryOp {
                             op: crate::sql::ast::UnaryOperator::Minus,
                             expr: inner,
-                        } => {
-                            if let (Some(pos), Expr::Literal(crate::types::Value::Integer(i))) =
-                                (schema.get_column_position(col_name), inner.as_ref())
-                            {
+                        } => match inner.as_ref() {
+                            Expr::Literal(crate::types::Value::Integer(i)) => {
                                 literals_out.push((pos, crate::types::Value::Integer(-*i)));
-                            } else if let (
-                                Some(pos),
-                                Expr::Literal(crate::types::Value::Float(f)),
-                            ) = (schema.get_column_position(col_name), inner.as_ref())
-                            {
+                            }
+                            Expr::Literal(crate::types::Value::Float(f)) => {
                                 literals_out.push((pos, crate::types::Value::Float(-*f)));
                             }
-                        }
-                        _ => {}
+                            _ => return Ok(None),
+                        },
+                        _ => return Ok(None),
                     }
                 }
                 (params_out, literals_out)
@@ -1173,6 +1186,16 @@ impl Database {
         meta: &FastPkMeta,
         params: &[Value],
     ) -> Result<Option<StreamingQueryResult>> {
+        // 🔒 M1/M2 guard: the fast PK write paths below apply straight to
+        // storage (autocommit semantics). Inside an explicit transaction that
+        // breaks buffered-write semantics — ROLLBACK could not revert the
+        // change and other connections would see uncommitted rows — so defer
+        // to the executor's txn-aware UPDATE/DELETE paths (Ok(None) =
+        // fall through to the full executor).
+        if matches!(meta.stmt_type, "update" | "delete") && self.query_executor.is_in_transaction()
+        {
+            return Ok(None);
+        }
         let pk_value = match params.get(meta.param_idx - 1) {
             Some(v) => v,
             None => {
