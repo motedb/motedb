@@ -19,6 +19,9 @@
   行的 Integer→Float 强转 (RELEASE keeps changes 抓出 i64 位模式落
   FLOAT 列读回 0.0)
 - M3: acid 30 个 ignored 测试本地全绿 (4.03s)
+- 对抗验证器全绿 + 写路径实测: 事务内逐条 UPDATE 258 → **66,303 rows/s
+  (257×)**, DELETE 131 → 290 rows/s (含 commit 应用 1000 墓碑+索引移除);
+  查询 RSS Δ ≤1.1MB / steady 3.3MB 无回归
 - 🚀 G GROUP BY 0.76→0.57ms (DuckDB 0.56 同级): 两阶段 &str 内核
   morsel 并行 (字节键 FxHash 免 per-row UTF-8 校验/SipHash; 列段 Arc
   共享免 cache-clone 8MB 拷贝/query; 串行预热) + 大脏表让位 VEC M2 +
