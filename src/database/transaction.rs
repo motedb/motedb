@@ -469,6 +469,23 @@ impl MoteDB {
                 // at the old values for removal.)
                 self.remove_row_from_indexes(table_name, &tbl_schema, *row_id, old_row);
                 self.row_cache.invalidate(table_name, *row_id);
+                // 🔒 PK cache removal — delete_row_impl (autocommit) does this
+                // at its step 7.2; the buffered commit apply must too, or a
+                // re-INSERT of the same PK hits a stale insert_if_absent
+                // reservation and fails with a bogus "Duplicate primary key".
+                if !tbl_schema.is_primary_key_auto_increment() {
+                    if let Some(pk_name) = tbl_schema.primary_key() {
+                        if let Some(pk_col) = tbl_schema.get_column(pk_name) {
+                            if let Some(pk_value) = old_row.get(pk_col.position) {
+                                if let Some(lookup) = self.pk_lookup.get(table_name) {
+                                    lookup.remove_pk(
+                                        &crate::database::pk_cache::PkKey::from_value(pk_value),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(counter) = self.table_row_count.get(table_name) {
                     let _ = counter.fetch_update(
                         std::sync::atomic::Ordering::AcqRel,

@@ -93,7 +93,8 @@ def faiss_recall(idx, queries, gt, nprobe=None, ef=None):
         t0 = time.perf_counter()
         _, I[i] = idx.search(queries[i][None, :], K)
         times.append(time.perf_counter() - t0)
-        hits += len(set(I[i].tolist()) & set(gt[i].tolist()))
+        # FAISS ids 0-based; gt 1-based (mote 表 id) — 统一 0 基比较
+        hits += len(set(I[i].tolist()) & {int(x) - 1 for x in gt[i].tolist()})
     a = np.asarray(times) * 1e3
     return hits, a
 

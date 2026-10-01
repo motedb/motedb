@@ -510,3 +510,74 @@ fn rollback_after_concurrent_commit_keeps_winner() {
     let q = ints(&rows(db.execute("SELECT v FROM x WHERE id = 1").unwrap()));
     assert_eq!(q, vec![7], "no-conflict rollback restores the old value");
 }
+
+// 🔒 Regression: the COMMIT apply of buffered pending deletes removed the row
+// (tombstone + indexes + row cache) but NOT the pk_lookup cache entry — a
+// re-INSERT of the same PK then failed with a bogus "Duplicate primary key".
+// The autocommit delete path (delete_row_impl step 7.2) has always cleaned
+// the cache; the buffered path must too. All DELETE forms (literal SQL,
+// parameterized fast-PK deferral, executemany) share the commit apply, so
+// one test with all three forms covers it.
+#[test]
+fn txn_delete_commit_allows_same_pk_reinsert() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+
+    for id in [10, 20, 30] {
+        db.execute(format!("INSERT INTO t VALUES ({id}, {id})").as_str())
+            .unwrap();
+    }
+
+    // literal form
+    db.execute("BEGIN").unwrap();
+    db.execute("DELETE FROM t WHERE id = 10").unwrap();
+    db.execute("COMMIT").unwrap();
+    // parameterized form (rides the api fast-PK deferral into the executor)
+    db.execute("BEGIN").unwrap();
+    let _ = db
+        .execute_prepared("DELETE FROM t WHERE id = ?", vec![Value::Integer(20)])
+        .unwrap()
+        .materialize()
+        .unwrap();
+    db.execute("COMMIT").unwrap();
+    // executemany form
+    db.execute("BEGIN").unwrap();
+    let _ = db
+        .execute_prepared_many("DELETE FROM t WHERE id = ?", vec![vec![Value::Integer(30)]])
+        .unwrap();
+    db.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        ints(&rows(db.execute("SELECT COUNT(*) FROM t").unwrap())),
+        [0]
+    );
+
+    // Re-insert every deleted PK — all must succeed and read back.
+    for (id, v) in [(10, 100), (20, 200), (30, 300)] {
+        db.execute(format!("INSERT INTO t VALUES ({id}, {v})").as_str())
+            .unwrap_or_else(|e| panic!("re-insert of deleted PK {id} failed: {e}"));
+    }
+    assert_eq!(
+        ints(&rows(db.execute("SELECT id FROM t ORDER BY id").unwrap())),
+        [10, 20, 30]
+    );
+    assert_eq!(
+        ints(&rows(db.execute("SELECT v FROM t WHERE id = 20").unwrap())),
+        [200]
+    );
+
+    // Rollback variant: an UNCOMMITTED delete restores the live row — the
+    // original row reads back with its value, and a duplicate INSERT of the
+    // same PK is (correctly) still rejected.
+    db.execute("BEGIN").unwrap();
+    db.execute("DELETE FROM t WHERE id = 10").unwrap();
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        ints(&rows(db.execute("SELECT v FROM t WHERE id = 10").unwrap())),
+        [100]
+    );
+    let dup = db.execute("INSERT INTO t VALUES (10, 999)");
+    assert!(dup.is_err(), "true duplicate must still be rejected");
+}

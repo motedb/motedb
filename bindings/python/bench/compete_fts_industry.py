@@ -86,7 +86,7 @@ def bench_sqlite(tmp, R):
     con.execute("INSERT INTO ev_fts(rowid, note) SELECT id, note FROM ev")
     build = time.perf_counter() - t0
     R.append({"engine": "sqlite_fts5", "build_s": round(build, 3),
-              "disk_mb": du_mb(os.path.join(tmp, "f.db")),
+              "disk_mb": du_mb(tmp),
               "match_top10": lat(lambda: con.execute(
                   "SELECT rowid FROM ev_fts WHERE ev_fts MATCH 'charlie delta' LIMIT 10").fetchall(), 50),
               "match_top10_rank": lat(lambda: con.execute(

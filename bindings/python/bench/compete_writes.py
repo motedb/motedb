@@ -130,7 +130,7 @@ def bench_mote(tmp):
     db.rollback(tx)
     th("t_rollback_300_ms", round((time.perf_counter() - t0) * 1e3, 3))
     got = db.query("SELECT val FROM ev WHERE id = 1")[1][0][0]
-    assert abs(got - float(1 % 997) / 7.0 + 2) < 1e-6, f"rollback data wrong: {got}"
+    assert abs(got - (float(1 % 997) / 7.0 + 2.0)) < 1e-6, f"rollback data wrong: {got}"
 
     # executemany 批语义（in-txn）
     tx = db.begin()
@@ -180,7 +180,7 @@ def bench_mote(tmp):
 def bench_sqlite(tmp):
     import sqlite3
     p = os.path.join(tmp, "w.db")
-    con = sqlite3.connect(p, isolation_level=None)  # autocommit; explicit BEGIN via execute
+    con = sqlite3.connect(p, isolation_level=None, check_same_thread=False)  # autocommit; pool threads share the conn
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     con.execute("CREATE TABLE ev (id INT PRIMARY KEY, ts INT, device TEXT, val REAL, note TEXT)")
@@ -249,7 +249,7 @@ def bench_sqlite(tmp):
     con.execute("ROLLBACK")
     th("t_rollback_300_ms", round((time.perf_counter() - t0) * 1e3, 3))
     got = con.execute("SELECT val FROM ev WHERE id = 1").fetchone()[0]
-    assert abs(got - float(1 % 997) / 7.0 + 2) < 1e-6, f"rollback data wrong: {got}"
+    assert abs(got - (float(1 % 997) / 7.0 + 2.0)) < 1e-6, f"rollback data wrong: {got}"
 
     con.execute("BEGIN")
     t0 = time.perf_counter()
@@ -259,9 +259,22 @@ def bench_sqlite(tmp):
 
     # C. 并行点读（sqlite 同连接多线程串行 — 用 check_same_thread=False 仍受 GIL+锁限制，
     #    这是 SQLite python 内嵌的公平口径）
-    def pread(_i):
-        con.execute("SELECT val FROM ev WHERE id = ?", (_i % N,)).fetchone()
     ids = list(range(800))
+    # WAL 多读者: 每线程独立连接 (同一连接跨线程并发 execute 会段错误 —
+    # python sqlite3 的连接不是线程安全的; 每线程一连接也是 sqlite 的
+    # 标准最佳实践, 对它最公平)
+    tls = __import__("threading").local()
+
+    def tcon():
+        c = getattr(tls, "con", None)
+        if c is None:
+            c = sqlite3.connect(p, isolation_level=None)
+            c.execute("PRAGMA journal_mode=WAL")
+            tls.con = c
+        return c
+
+    def pread(_i):
+        tcon().execute("SELECT val FROM ev WHERE id = ?", (_i % N,)).fetchone()
     t0 = time.perf_counter()
     with ThreadPoolExecutor(8) as ex:
         list(ex.map(pread, ids))
@@ -380,7 +393,7 @@ def bench_duckdb(tmp):
     con.execute("ROLLBACK")
     th("t_rollback_300_ms", round((time.perf_counter() - t0) * 1e3, 3))
     got = con.execute("SELECT val FROM ev WHERE id = 1").fetchone()[0]
-    assert abs(got - float(1 % 997) / 7.0 + 2) < 1e-6, f"rollback data wrong: {got}"
+    assert abs(got - (float(1 % 997) / 7.0 + 2.0)) < 1e-6, f"rollback data wrong: {got}"
 
     con.execute("BEGIN")
     t0 = time.perf_counter()
@@ -388,8 +401,16 @@ def bench_duckdb(tmp):
     con.execute("COMMIT")
     th("t_executemany_upd_rows_s", round(1000 / (time.perf_counter() - t0), 1))
 
+    _tls = __import__("threading").local()
+
     def pread(_i):
-        con.execute("SELECT val FROM ev WHERE id = ?", [_i % N]).fetchone()
+        # duckdb 连接同样不能跨线程并发 execute — cursor() 复制同库连接
+        # (duckdb 官方并发用法), 每线程缓存一个
+        c = getattr(_tls, "cur", None)
+        if c is None:
+            c = con.cursor()
+            _tls.cur = c
+        c.execute("SELECT val FROM ev WHERE id = ?", [_i % N]).fetchone()
     ids = list(range(800))
     t0 = time.perf_counter()
     with ThreadPoolExecutor(8) as ex:
@@ -466,15 +487,15 @@ def open_child(engine, path):
     t0 = time.perf_counter()
     if engine == "mote":
         db, _ = make_mote(path)
-        db.query("SELECT val FROM ev WHERE id = ?", params=[7])
+        db.query("SELECT v FROM ev WHERE id = ?", params=[7])
     elif engine == "sqlite":
         import sqlite3
         con = sqlite3.connect(path)
-        con.execute("SELECT val FROM ev WHERE id = 7").fetchone()
+        con.execute("SELECT v FROM ev WHERE id = 7").fetchone()
     else:
         import duckdb
         con = duckdb.connect(path)
-        con.execute("SELECT val FROM ev WHERE id = 7").fetchone()
+        con.execute("SELECT v FROM ev WHERE id = 7").fetchone()
     open_s = time.perf_counter() - t0
     print("JSON " + json.dumps({"open_first_query_s": round(open_s, 4)}))
 
@@ -496,18 +517,21 @@ def bench_crash_and_open(engine, tmp):
         n = db.query("SELECT COUNT(*) FROM ev")[1][0][0]
         ids = [r[0] for r in db.query("SELECT id FROM ev WHERE id >= ? ORDER BY id LIMIT 5",
                                       params=[CRASH_COMMIT])[1]]
+        db.close()  # 释放文件锁 — open-child 子进程要独立打开
     elif engine == "sqlite":
         import sqlite3
         con = sqlite3.connect(path)
         n = con.execute("SELECT COUNT(*) FROM ev").fetchone()[0]
         ids = [r[0] for r in con.execute(
             "SELECT id FROM ev WHERE id >= ? ORDER BY id LIMIT 5", (CRASH_COMMIT,)).fetchall()]
+        con.close()
     else:
         import duckdb
         con = duckdb.connect(path)
         n = con.execute("SELECT COUNT(*) FROM ev").fetchone()[0]
         ids = [r[0] for r in con.execute(
             "SELECT id FROM ev WHERE id >= ? ORDER BY id LIMIT 5", [CRASH_COMMIT]).fetchall()]
+        con.close()  # duckdb 同样单进程独占
     reopen_s = time.perf_counter() - t0
     th("x_reopen_s", round(reopen_s, 4))
     th("x_rows_visible", int(n))

@@ -20,9 +20,15 @@
   写回且 affected=1 (赋值静默丢失, autocommit 同样中招; 字面量形式的 BUG
   #45 早已修, 表达式形式漏网)。修复: fast 路径无法以原始值表达的赋值
   (算术/列间赋值/函数/未知列) 一律 `Ok(None)` 让位 executor 求值
-- 回归测试 ×4 (fast_pk_update_rollback_via_prepared /
+- 🔒 **事务 DELETE COMMIT 后同 PK 重插报假重复** (M2 回归, 数据正确性):
+  缓冲墓碑的 COMMIT 应用端 (transaction.rs) 做了墓碑+索引+行缓存清理,
+  但漏了 pk_lookup 缓存移除 (autocommit 路径 delete_row_impl 7.2 步一直
+  有) — 事务删除提交后重插同主键报 "Duplicate primary key"。所有
+  DELETE 形式 (字面量/参数化/executemany) 共享该应用端, 一并修复
+- 回归测试 ×5 (fast_pk_update_rollback_via_prepared /
   fast_pk_delete_rollback_via_prepared / executemany_update_joins_outer_txn /
-  fast_pk_update_expression_set_defers_to_executor)
+  fast_pk_update_expression_set_defers_to_executor /
+  txn_delete_commit_allows_same_pk_reinsert)
 
 ### MVCC 写缓冲化 (M1-M3): 事务内零存储写 + GROUP BY 对齐 DuckDB (G)
 

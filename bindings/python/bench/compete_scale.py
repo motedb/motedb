@@ -104,10 +104,14 @@ def run(engine, n, tmp):
         R["q_groupby"] = lat(lambda: con.execute("SELECT device, COUNT(*), AVG(val) FROM ev GROUP BY device").fetchall(), 20)
         R["q_topk"] = lat(lambda: con.execute("SELECT id FROM ev ORDER BY val ASC LIMIT 10").fetchall(), 50)
         # sqlite 无向量 — numpy 全扫口径（与 compete_bench 一致）
+        # |x|² 与查询平方在循环外预计算（1M 行每迭代重算是 O(n²) 级浪费）
+        emb64 = emb.astype(np.float64)
+        cn = (emb64 * emb64).sum(1)
         def knn(i=[0]):
             i[0] = (i[0] + 1) % 30
-            D = ((emb.astype(np.float64) ** 2).sum(1)[:, None] - 2.0 * (emb @ qs[i[0]].astype(np.float64)) + (qs[i[0]].astype(np.float64) ** 2))
-            np.argpartition(D.ravel(), 10)[:10]
+            q = qs[i[0]].astype(np.float64)
+            D = cn - 2.0 * (emb64 @ q) + float(q @ q)
+            np.argpartition(D, 10)[:10]
         R["q_knn10"] = lat(knn, 30)
         R["q_fts"] = lat(lambda: con.execute("SELECT rowid FROM ev_fts WHERE ev_fts MATCH 'charlie delta' LIMIT 10").fetchall(), 50)
         con.close()
@@ -119,9 +123,10 @@ def run(engine, n, tmp):
         t0 = time.perf_counter()
         try:
             import pyarrow as pa
+            emb_col = pa.FixedSizeListArray.from_arrays(pa.array(emb.reshape(-1)), DIMS)
             tbl = pa.table({"id": np.arange(n, dtype="int32"), "ts": ts.astype("int64"),
                             "device": list(map(str, dev)), "val": val.astype("float64"),
-                            "note": notes, "emb": emb})
+                            "note": notes, "emb": emb_col})
             con.register("t_arrow", tbl)
             con.execute("INSERT INTO ev SELECT * FROM t_arrow")
             con.unregister("t_arrow")
