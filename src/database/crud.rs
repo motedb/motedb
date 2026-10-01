@@ -868,6 +868,41 @@ impl MoteDB {
     /// the autocommit in-place update path and the transactional COMMIT
     /// apply of buffered pending updates. `eff_rid` is the row's effective
     /// row_id after any PK relocation.
+
+    /// 🔁 Schema coercion for a row about to be written: Float→Integer/
+    /// Timestamp whole-number promotion (with precise i64 range check) and
+    /// Integer→Float promotion for FLOAT columns. Shared by the in-place
+    /// update path and the M1 buffered pending-update paths (the buffered
+    /// path skips validate_row, and an uncoerced Integer(42) landing in a
+    /// FLOAT column stored the i64 bit pattern → read back as 0.0; E2E
+    /// "RELEASE keeps changes" caught it).
+    pub(crate) fn coerce_row_to_schema(schema: &crate::types::TableSchema, row: &mut Row) {
+        for (i, ct) in schema.col_types().iter().enumerate() {
+            if matches!(
+                ct,
+                crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp
+            ) {
+                if let Some(crate::types::Value::Float(f)) = row.get(i) {
+                    // 🔑 Check f64 fits in i64 precisely. `i64::MAX as f64` rounds
+                    // UP to 2^63 (the next representable f64), so a direct `<=`
+                    // comparison lets 2^63 through (which overflows `as i64`).
+                    if f.is_finite()
+                        && f.fract() == 0.0
+                        && *f < 9223372036854775808.0
+                        && *f > -9223372036854775809.0
+                    {
+                        row[i] = crate::types::Value::Integer(*f as i64);
+                    }
+                }
+            }
+            if matches!(ct, crate::types::ColumnType::Float) {
+                if let Some(crate::types::Value::Integer(v)) = row.get(i) {
+                    row[i] = crate::types::Value::Float(*v as f64);
+                }
+            }
+        }
+    }
+
     pub(crate) fn update_indexes_for_row(
         &self,
         table_name: &str,
@@ -1233,36 +1268,7 @@ impl MoteDB {
         // silently truncating values > i64::MAX back to i64::MAX. Values
         // outside i64 range are kept as Float (the column is Integer, so this
         // will fail validation below with a clear error).
-        let col_types = schema.col_types();
-        for (i, ct) in col_types.iter().enumerate() {
-            if matches!(
-                ct,
-                crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp
-            ) {
-                if let Some(crate::types::Value::Float(f)) = new_row.get(i) {
-                    // 🔑 Check f64 fits in i64 precisely. `i64::MAX as f64` rounds
-                    // UP to 2^63 (the next representable f64), so a direct `<=`
-                    // comparison lets 2^63 through (which overflows `as i64`).
-                    // Use checked conversion: try_cast via the f64 → i64 path.
-                    if f.is_finite()
-                        && f.fract() == 0.0
-                        && *f < 9223372036854775808.0
-                        && *f > -9223372036854775809.0
-                    {
-                        new_row[i] = crate::types::Value::Integer(*f as i64);
-                    }
-                }
-            }
-            // 🔑 Symmetric promotion: Integer → Float for FLOAT columns.
-            // `UPDATE t SET x = 55` on a FLOAT column evaluates the literal as
-            // Integer(55); storing that bit pattern into the f64 column
-            // produced 0.0 (INSERT coerces, UPDATE didn't).
-            if matches!(ct, crate::types::ColumnType::Float) {
-                if let Some(crate::types::Value::Integer(v)) = new_row.get(i) {
-                    new_row[i] = crate::types::Value::Float(*v as f64);
-                }
-            }
-        }
+        Self::coerce_row_to_schema(schema, &mut new_row);
         // 🔑 Validate the new row against schema (same as INSERT/batch INSERT).
         // Without this, UPDATE t SET int_col = 3.5 bypasses type checking
         // and stores a Float bit pattern as Integer → garbage on read.

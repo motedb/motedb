@@ -2,6 +2,28 @@
 
 ## [0.12.0] — 未发布
 
+### MVCC 写缓冲化 (M1-M3): 事务内零存储写 + GROUP BY 对齐 DuckDB (G)
+
+- 🔒 M1 事务 UPDATE 缓冲化: pending_updates (old,new) 三写路径 (PK 快路
+  径/scan/链式) 全部不再就地写存储 — COMMIT 一次性应用 (段 append
+  newest-wins + 抽取共享 update_indexes_for_row 索引差量 + WAL Update
+  带真实 txn_id, 修复崩溃恢复把未提交事务写当已提交重放的耐久性 bug);
+  savepoint 经 PendingUpdateSnapshot; 事务内逐条 UPDATE 免每语句 WAL/
+  存储写
+- 🔒 M2 事务 DELETE 缓冲化: pending_deletes 同构 (commit 应用墓碑 +
+  remove_row_from_indexes + WAL Delete 带 txn_id); undo-log 重放与
+  TXN_WROTE thread_local 退役; COUNT 快径减缓冲删除数
+- 🔒 读己之写全路径覆盖 (5 处遗漏逐个补齐, 每处都有测试实抓): 快径
+  SELECT / api raw-SQL 索引探测 / ORDER BY scan+sort / 列索引点查 /
+  聚合 (txn_aggregate_overlaid 折入 storage+pending+write_set); 缓冲
+  行的 Integer→Float 强转 (RELEASE keeps changes 抓出 i64 位模式落
+  FLOAT 列读回 0.0)
+- M3: acid 30 个 ignored 测试本地全绿 (4.03s)
+- 🚀 G GROUP BY 0.76→0.57ms (DuckDB 0.56 同级): 两阶段 &str 内核
+  morsel 并行 (字节键 FxHash 免 per-row UTF-8 校验/SipHash; 列段 Arc
+  共享免 cache-clone 8MB 拷贝/query; 串行预热) + 大脏表让位 VEC M2 +
+  派发顺序倒换 (列存下压优先)
+
 ### 对抗验证修复: 参数化 MATCH + 事务 DELETE 快路径
 
 - 🔒 `MATCH(col, ?)` / `MATCH(col) AGAINST (?)` 参数化查询支持 (此前解析

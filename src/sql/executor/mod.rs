@@ -2256,6 +2256,97 @@ impl QueryExecutor {
             .collect()
     }
 
+    /// 🔒 M1/M2 read-your-writes aggregates: `SELECT SUM/COUNT/… FROM t` with
+    /// buffered pending writes for this table. Materializes the OVERLAID row
+    /// set (storage, minus buffered deletes, with pending new values) and
+    /// runs the standard aggregate pipeline on it. Small-txn path — pending
+    /// sets are bounded by the transaction.
+    fn txn_aggregate_overlaid(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        store: &crate::storage::col_segment::ColSegmentStore,
+        schema: &TableSchema,
+        pend: Vec<(RowId, Row)>,
+        dels: std::collections::HashSet<RowId>,
+    ) -> Result<Option<StreamingQueryResult>> {
+        // Build the overlaid row set (same fold as execute_full_scan_txn_merge).
+        let pend_map: std::collections::HashMap<RowId, Row> = pend.into_iter().collect();
+        let mut all_rows: Vec<Row> = Vec::new();
+        for (_key, _ts, row) in store.scan() {
+            let rid = _key as u32 as RowId;
+            if dels.contains(&rid) {
+                continue;
+            }
+            all_rows.push(pend_map.get(&rid).cloned().unwrap_or(row));
+        }
+        // 🔑 Fold write_set INSERTs (uncommitted rows live only here — the
+        // raw-storage scan never sees them; missing them under-counted
+        // COUNT(*) after INSERT+DELETE+UPDATE mixes, acid_audit caught it).
+        for (_rid, ws_row) in self.txn_write_set_rows(table_name) {
+            all_rows.push(ws_row);
+        }
+
+        // Group-less aggregates only (GROUP BY shapes with pending writes are
+        // rare; fall back to the materialized pipeline via None → caller's
+        // legacy path which flushes + syncs — pending visibility there is
+        // handled by txn_write_set_rows folding in the streaming scan).
+        if stmt.group_by.is_some() {
+            return Ok(None);
+        }
+
+        // Evaluate each SELECT aggregate against the overlaid rows using the
+        // standard positional evaluator (COUNT/SUM/AVG/MIN/MAX, DISTINCT, NULL
+        // semantics all shared with the generic path).
+        let mut agg_infos = Vec::new();
+        for col in &stmt.columns {
+            if let SelectColumn::Expr(
+                Expr::FunctionCall {
+                    name,
+                    args,
+                    distinct,
+                    ..
+                },
+                _,
+            ) = col
+            {
+                let col_pos = args.first().and_then(|a| match a {
+                    Expr::Column(c) => schema.get_column_position(c),
+                    _ => None,
+                });
+                agg_infos.push(AggregateInfo {
+                    func: name.to_uppercase(),
+                    col_pos,
+                    distinct: *distinct,
+                    extra: None,
+                });
+            }
+        }
+        if agg_infos.is_empty() || agg_infos.len() != stmt.columns.len() {
+            return Ok(None);
+        }
+        let row_refs: Vec<&Row> = all_rows.iter().collect();
+        let mut out_row: Vec<Value> = Vec::with_capacity(agg_infos.len());
+        for (agg, col) in agg_infos.iter().zip(stmt.columns.iter()) {
+            let v = self.compute_aggregate_positional(agg, &row_refs)?;
+            out_row.push(v);
+        }
+        let columns: Vec<String> = stmt
+            .columns
+            .iter()
+            .map(|c| match c {
+                SelectColumn::Expr(Expr::FunctionCall { name, .. }, Some(a)) => a.clone(),
+                SelectColumn::Expr(Expr::FunctionCall { name, .. }, None) => name.clone(),
+                SelectColumn::Column(n) => n.clone(),
+                _ => "expr".to_string(),
+            })
+            .collect();
+        Ok(Some(StreamingQueryResult::SelectReady {
+            columns,
+            rows: vec![out_row],
+        }))
+    }
+
     /// 🔒 M1: buffered pending UPDATEs of one table — (row_id, NEW value)
     /// pairs for the scan/agg fold sites.
     pub fn txn_pending_rows(&self, table: &str) -> Vec<(RowId, Row)> {
@@ -3785,6 +3876,11 @@ impl QueryExecutor {
                             && !self.has_aggregates(&stmt.columns)
                             && stmt.group_by.is_none()
                             && stmt.having.is_none()
+                            // 🔒 M1/M2 read-your-writes: this scan+sort path
+                            // reads raw storage — skip with buffered pending
+                            // writes (the txn merge path folds them).
+                            && self.txn_pending_rows(table_name).is_empty()
+                            && self.txn_pending_delete_ids(table_name).is_empty()
                         {
                             let schema = self.db.get_table_schema(table_name)?;
                             // 🔑 Only take the scan+projected-sort fast path when
@@ -3925,23 +4021,26 @@ impl QueryExecutor {
                 if self.db.has_col_segment_store(table_name) {
                     if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
                         let _ = store.prepare_for_query();
-                        if let Ok(schema) = self.db.get_table_schema(table_name) {
-                            if let Some(outcome) =
-                                crate::sql::vector_exec::try_vec_group_by(&store, &schema, stmt)?
-                            {
-                                return Ok(StreamingQueryResult::SelectReady {
-                                    columns: outcome.columns,
-                                    rows: outcome.rows,
-                                });
-                            }
-                        }
-                        // Try the columnar GROUP BY pushdown (much faster).
+                        // 🚀 G1: columnar GROUP BY pushdown FIRST — its
+                        // two-phase &str kernel now runs morsel-parallel on
+                        // large clean tables (100K rows: 0.80ms M2 Arc-churn
+                        // vs parallel raw-byte fold). It declines shapes it
+                        // can't handle (ORDER/LIMIT/expression keys/
+                        // big-dirty), which fall through to VEC M2 below.
                         let schema = self.db.get_table_schema(table_name)?;
                         if let Some(result) =
                             self.col_segment_group_by(stmt, table_name, &store, &schema)?
                         {
                             store.release_pages_only();
                             return Ok(result);
+                        }
+                        if let Some(outcome) =
+                            crate::sql::vector_exec::try_vec_group_by(&store, &schema, stmt)?
+                        {
+                            return Ok(StreamingQueryResult::SelectReady {
+                                columns: outcome.columns,
+                                rows: outcome.rows,
+                            });
                         }
                     }
                 }
@@ -4022,9 +4121,28 @@ impl QueryExecutor {
                                 }
                             }
                         }
-                        if let Some(result) =
-                            self.col_segment_aggregate(stmt, table_name, &store)?
-                        {
+                        // 🔒 M1/M2 read-your-writes: with buffered pending
+                        // writes for this table, col_segment_aggregate (raw
+                        // storage) would miss them — compute over the OVERLAID
+                        // row set instead.
+                        let schema_agg = self.db.get_table_schema(table_name)?;
+                        let pend_agg = self.txn_pending_rows(table_name);
+                        let dels_agg = self.txn_pending_delete_ids(table_name);
+                        if pend_agg.is_empty() && dels_agg.is_empty() {
+                            if let Some(result) =
+                                self.col_segment_aggregate(stmt, table_name, &store)?
+                            {
+                                store.release_pages_only();
+                                return Ok(result);
+                            }
+                        } else if let Some(result) = self.txn_aggregate_overlaid(
+                            stmt,
+                            table_name,
+                            &store,
+                            &schema_agg,
+                            pend_agg,
+                            dels_agg,
+                        )? {
                             store.release_pages_only();
                             return Ok(result);
                         }
@@ -4048,9 +4166,22 @@ impl QueryExecutor {
                             }
                         }
                         if stmt.group_by.is_none() {
-                            if let Some(result) =
-                                self.col_segment_multi_aggregate(stmt, table_name, &store, &schema)?
-                            {
+                            // 🔒 M1/M2 read-your-writes: with buffered pending
+                            // writes for this table, the raw-storage aggregate
+                            // would miss them — compute over the OVERLAID row
+                            // set instead (storage + pending fold).
+                            let pend = self.txn_pending_rows(table_name);
+                            let dels = self.txn_pending_delete_ids(table_name);
+                            if pend.is_empty() && dels.is_empty() {
+                                if let Some(result) = self.col_segment_multi_aggregate(
+                                    stmt, table_name, &store, &schema,
+                                )? {
+                                    store.release_pages_only();
+                                    return Ok(result);
+                                }
+                            } else if let Some(result) = self.txn_aggregate_overlaid(
+                                stmt, table_name, &store, &schema, pend, dels,
+                            )? {
                                 store.release_pages_only();
                                 return Ok(result);
                             }
@@ -4470,6 +4601,17 @@ impl QueryExecutor {
             // CREATE TABLE time for non-AUTO_INCREMENT PKs). Falls back to
             // PK-column scan if index isn't built yet (async pipeline).
             let index_name = format!("{}.{}", table, column);
+            // 🔒 M1/M2 read-your-writes: the column index holds COMMITTED
+            // state only. With buffered pending writes for this table, the
+            // index probe would miss pending-matched rows — route through
+            // the txn merge scan instead.
+            if self.is_in_transaction() {
+                let pend = self.txn_pending_rows(table);
+                let dels = self.txn_pending_delete_ids(table);
+                if !pend.is_empty() || !dels.is_empty() {
+                    return self.execute_full_scan_streaming(stmt, table);
+                }
+            }
             if let Some(index) = self.db.column_indexes.get(&index_name) {
                 let __t0 = std::time::Instant::now();
                 let row_ids = index
@@ -4858,6 +5000,17 @@ impl QueryExecutor {
         let index_name = format!("{}.{}", table, column);
         if !self.db.column_indexes.contains_key(&index_name) {
             return self.execute_full_scan_streaming(stmt, table);
+        }
+        // 🔒 M1/M2 read-your-writes: the column index reflects COMMITTED
+        // state only (buffered pending writes update it at COMMIT). With
+        // pending writes for this table, route through the txn merge scan
+        // which overlays pending new values / skips buffered deletes.
+        if self.is_in_transaction() {
+            let pend = self.txn_pending_rows(table);
+            let dels = self.txn_pending_delete_ids(table);
+            if !pend.is_empty() || !dels.is_empty() {
+                return self.execute_full_scan_streaming(stmt, table);
+            }
         }
         let row_ids = self.db.query_by_column(table, column, value)?;
 
@@ -16977,6 +17130,7 @@ impl QueryExecutor {
             if let Some(tid) = txn_id {
                 let pk_changed = Self::txn_update_changes_pk(&schema, &row, &new_row);
                 if !pk_changed {
+                    MoteDB::coerce_row_to_schema(&schema, &mut new_row);
                     let prior = self.db.txn_coordinator.record_pending_update(
                         tid,
                         &stmt.table,
@@ -17482,6 +17636,7 @@ impl QueryExecutor {
         // index delta; replace only the new value. update_pending_row does
         // exactly that; the prior it returns is None here only when the map
         // entry vanished concurrently — then insert fresh with buffered as old.
+        MoteDB::coerce_row_to_schema(schema, &mut new_row);
         let chained = self.db.txn_coordinator.update_pending_row(
             tid,
             &stmt.table,
@@ -17728,6 +17883,7 @@ impl QueryExecutor {
                 let pk_changed = Self::txn_update_changes_pk(schema, &row, &new_row);
                 if !pk_changed {
                     let tid = self.current_txn_id().expect("in_txn");
+                    MoteDB::coerce_row_to_schema(schema, &mut new_row);
                     let prior = self.db.txn_coordinator.record_pending_update(
                         tid,
                         &stmt.table,

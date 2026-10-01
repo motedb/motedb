@@ -17,6 +17,32 @@ impl QueryExecutor {
             return self.materialize_as_streaming(stmt);
         }
 
+        // 🔒 M1/M2 read-your-writes: with buffered pending writes for this
+        // table, the raw-storage scan below misses them — route through the
+        // txn merge (storage + pending fold + write_set) like the
+        // execute_select site does.
+        if self.is_in_transaction() {
+            let has_col_seg = self.db.has_col_segment_store(table);
+            let pend = self.txn_pending_rows(table);
+            let dels = self.txn_pending_delete_ids(table);
+            if !pend.is_empty() || !dels.is_empty() {
+                if has_col_seg {
+                    if let Ok(store) = self
+                        .db
+                        .get_or_create_col_segment_store(table, &schema.col_types().to_vec())
+                    {
+                        let ws = self.txn_write_set_rows(table);
+                        return self.execute_full_scan_txn_merge(
+                            stmt, table, &schema, &store, ws, dels, pend,
+                        );
+                    }
+                }
+                // No ColSegmentStore: fall to materialize (write_set fold +
+                // pending handled by the materialized path's txn hooks).
+                return self.materialize_as_streaming(stmt);
+            }
+        }
+
         // 🔑 TimeSeries tables: authoritative data lives in the
         // ColumnarStore. scan_table_rows_streaming routes them there
         // (Materialized branch); the ColSegmentStore/LSM paths below hold

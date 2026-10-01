@@ -1830,71 +1830,541 @@ impl QueryExecutor {
             // double-counts deleted rows (they still appear in the old segment).
             // was hardcoded false — caused GROUP BY to count deleted rows.
             let need_dedup = segs.len() > 1 || store.may_have_duplicate_keys();
+            // 🔒 G1: BIG but DIRTY shapes (dedup / NULLs / deletions) go to
+            // VEC M2's morsel path — the serial loop here was 3× slower at
+            // 1M rows. The parallel kernel (below) only takes clean tables.
+            {
+                let total_rows: usize = segs.iter().map(|s| s.sst.num_rows).sum();
+                #[cfg(feature = "rayon")]
+                if total_rows >= crate::sql::vector_exec::PARALLEL_MIN_ROWS {
+                    let clean = segs.iter().all(|seg| {
+                        seg.sst.num_rows == 0
+                            || (group_pos < seg.sst.column_tags.len()
+                                && match seg.read_text_cached(group_pos) {
+                                    Some(t) => {
+                                        !t.has_any_null() && !seg.sst.row_map.has_any_deleted()
+                                    }
+                                    None => false,
+                                })
+                    });
+                    if !clean || need_dedup {
+                        return Ok(None);
+                    }
+                }
+                let _ = total_rows;
+            }
             let mut seen: std::collections::HashSet<u64> = if need_dedup {
                 std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
             } else {
                 std::collections::HashSet::new()
             };
 
-            for seg in segs.iter().rev() {
-                let n = seg.sst.num_rows;
-                if group_pos >= seg.sst.column_tags.len() {
-                    continue;
-                }
-                // 🔑 慢路径 dedup 用 row_map.key(i) — keys 未加载时它回退到
-                // 栅栏键 (每 fence_interval≈2048 行一个), 每 2048 行被当成同
-                // key, seen 集合把首行之外的行全部"去重"掉: 100K 行 GROUP BY
-                // 只剩 50 行 32 组 (静默错果, 对拍抓出)。必须先 load_full_keys。
-                if need_dedup {
-                    let _ = seg.sst.load_full_keys();
-                }
-                let ftext = match seg.read_text_cached(group_pos) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let has_nulls = ftext.has_any_null();
-                let has_deletions = seg.sst.row_map.has_any_deleted();
+            // 🚀 G1: morsel-parallel two-phase kernel for LARGE CLEAN tables
+            // (single-ish segment, no NULLs/deletions/dedup). The serial loop
+            // below stays for small tables (zero setup cost) and dirty shapes.
+            // Same accumulators as the serial path → shared output code.
+            #[cfg(feature = "rayon")]
+            let parallel_done = {
+                let total_rows: usize = segs.iter().map(|s| s.sst.num_rows).sum();
+                let all_clean = !need_dedup
+                    && segs.iter().all(|seg| {
+                        seg.sst.num_rows == 0
+                            || (group_pos < seg.sst.column_tags.len()
+                                && match seg.read_text_cached(group_pos) {
+                                    Some(t) => {
+                                        !t.has_any_null() && !seg.sst.row_map.has_any_deleted()
+                                    }
+                                    None => false,
+                                })
+                    });
+                if all_clean && total_rows >= crate::sql::vector_exec::PARALLEL_MIN_ROWS {
+                    use rayon::prelude::*;
 
-                if !has_nulls && !has_deletions && !need_dedup {
-                    // 🚀 Two-phase with raw-byte text decode (avoids get_str_fast's
-                    // 3× SegData::slice() overhead per row).
-                    // Phase 1: text scan → group index per row via raw bytes.
-                    // Phase 2: for each agg column, vectorized raw slice fold.
-                    let off_bytes = ftext.offsets_bytes();
-                    let str_bytes = ftext.strings_bytes();
-                    // 🔑 u32: 组索引曾用 u16 — 超 65535 个不同组时静默截断错组。
-                    let mut row_groups: Vec<u32> = Vec::with_capacity(n);
-                    const LINEAR_THRESHOLD: usize = 16;
-                    let mut use_hash = group_keys.len() >= LINEAR_THRESHOLD;
-                    for i in 0..n {
-                        // 🚀 Direct raw-byte offset decode (no get_str_fast overhead).
-                        let ob = i * 4;
-                        let start = u32::from_le_bytes([
-                            off_bytes[ob],
-                            off_bytes[ob + 1],
-                            off_bytes[ob + 2],
-                            off_bytes[ob + 3],
-                        ]) as usize;
-                        let end = u32::from_le_bytes([
-                            off_bytes[ob + 4],
-                            off_bytes[ob + 5],
-                            off_bytes[ob + 6],
-                            off_bytes[ob + 7],
-                        ]) as usize;
-                        // 🚨 Corruption guard (disk-corruption fuzzing): offsets
-                        // come straight off disk — a flipped bit can produce
-                        // start > end or end > len. Degrade to an empty key
-                        // instead of panicking.
-                        let key_bytes = str_bytes.get(start..end).unwrap_or(&[]);
+                    // 🔑 Read column segments ONCE per segment and share via
+                    // Arc: read_*_cached decodes the whole column on miss AND
+                    // the cache-hit path clones the segment (Owned SegData =
+                    // full memcpy). Per-morsel clones were 8MB of copies per
+                    // query (10 morsels × 800KB fixed col).
+                    let mut seg_texts: Vec<
+                        Option<Arc<crate::storage::lsm::columnar::TextSegment>>,
+                    > = Vec::with_capacity(segs.len());
+                    let mut seg_fixed: Vec<
+                        Vec<Option<Arc<crate::storage::lsm::columnar::FixedSegment>>>,
+                    > = Vec::with_capacity(segs.len());
+                    for seg in segs.iter() {
+                        if seg.sst.num_rows == 0 || group_pos >= seg.sst.column_tags.len() {
+                            seg_texts.push(None);
+                            seg_fixed.push(Vec::new());
+                            continue;
+                        }
+                        seg_texts.push(seg.read_text_cached(group_pos).map(Arc::new));
+                        seg_fixed.push(
+                            gb_aggs
+                                .iter()
+                                .map(|agg| {
+                                    agg.col.and_then(|c| {
+                                        if c < seg.sst.column_tags.len()
+                                            && seg.sst.column_tags[c].is_fixed()
+                                        {
+                                            seg.read_fixed_cached(c).map(Arc::new)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .collect(),
+                        );
+                    }
 
-                        let idx = if use_hash {
-                            if let Some(&idx) =
-                                key_index.get(std::str::from_utf8(key_bytes).unwrap_or(""))
+                    // Work items: (seg_idx, row_start, row_end) — morsels of
+                    // ~rows/threads per segment.
+                    let nthreads = rayon::current_num_threads().clamp(1, 16);
+                    let mut work: Vec<(usize, usize, usize)> = Vec::new();
+                    for (si, seg) in segs.iter().enumerate() {
+                        let n = seg.sst.num_rows;
+                        if n == 0 || group_pos >= seg.sst.column_tags.len() {
+                            continue;
+                        }
+                        let chunk = n.div_ceil(nthreads).max(1);
+                        let mut start = 0usize;
+                        while start < n {
+                            let end = (start + chunk).min(n);
+                            work.push((si, start, end));
+                            start = end;
+                        }
+                    }
+
+                    struct PartialGb {
+                        keys: Vec<Box<str>>,
+                        counts: Vec<i64>,
+                        sums: Vec<Vec<f64>>,
+                        mins: Vec<Vec<f64>>,
+                        maxs: Vec<Vec<f64>>,
+                        nn: Vec<Vec<i64>>,
+                    }
+
+                    let partials: Vec<PartialGb> = work
+                        .into_par_iter()
+                        .map(|(si, r0, r1)| {
+                            let seg = &segs[si];
+                            let n_seg = seg.sst.num_rows;
+                            let mut p = PartialGb {
+                                keys: Vec::with_capacity(16),
+                                counts: Vec::with_capacity(16),
+                                sums: (0..n_aggs).map(|_| Vec::with_capacity(16)).collect(),
+                                mins: (0..n_aggs).map(|_| Vec::with_capacity(16)).collect(),
+                                maxs: (0..n_aggs).map(|_| Vec::with_capacity(16)).collect(),
+                                nn: (0..n_aggs).map(|_| Vec::with_capacity(16)).collect(),
+                            };
+                            // 🚀 G2: byte-keyed FxHash group index — no
+                            // per-row UTF-8 validation (from_utf8 was ~10ns/
+                            // row); the key is validated once when a NEW
+                            // group is created (≤cardinality times).
+                            let mut index: HashMap<
+                                Vec<u8>,
+                                usize,
+                                std::hash::BuildHasherDefault<
+                                    crate::storage::lsm::columnar::FxHasher,
+                                >,
+                            > = HashMap::with_capacity_and_hasher(16, Default::default());
+                            let Some(ftext) = &seg_texts[si] else {
+                                return p;
+                            };
+                            let off_bytes = ftext.offsets_bytes();
+                            let str_bytes = ftext.strings_bytes();
+                            // Phase 1: raw-byte group index for this chunk.
+                            let mut row_groups: Vec<u32> = Vec::with_capacity(r1 - r0);
+                            for i in r0..r1 {
+                                let ob = i * 4;
+                                let start = u32::from_le_bytes([
+                                    off_bytes[ob],
+                                    off_bytes[ob + 1],
+                                    off_bytes[ob + 2],
+                                    off_bytes[ob + 3],
+                                ]) as usize;
+                                let end = u32::from_le_bytes([
+                                    off_bytes[ob + 4],
+                                    off_bytes[ob + 5],
+                                    off_bytes[ob + 6],
+                                    off_bytes[ob + 7],
+                                ]) as usize;
+                                let key_bytes = str_bytes.get(start..end).unwrap_or(&[]);
+                                let idx = match index.get(key_bytes) {
+                                    Some(&ix) => ix,
+                                    None => {
+                                        let ix = p.keys.len();
+                                        // Validate once per distinct group.
+                                        let key = String::from_utf8_lossy(key_bytes).into();
+                                        p.keys.push(key);
+                                        p.counts.push(0);
+                                        for ai in 0..n_aggs {
+                                            p.sums[ai].push(0.0);
+                                            p.mins[ai].push(f64::INFINITY);
+                                            p.maxs[ai].push(f64::NEG_INFINITY);
+                                            p.nn[ai].push(0);
+                                        }
+                                        index.insert(key_bytes.to_vec(), ix);
+                                        ix
+                                    }
+                                };
+                                p.counts[idx] += 1;
+                                row_groups.push(idx as u32);
+                            }
+                            // Phase 2: typed raw-slice fold for this chunk.
+                            for (ai, agg) in gb_aggs.iter().enumerate() {
+                                let Some(fs) = &seg_fixed[si][ai] else {
+                                    continue;
+                                };
+                                let need_minmax = agg.func == "MIN" || agg.func == "MAX";
+                                if agg_is_float[ai] {
+                                    let raw = fs.raw_f64_typed_slice();
+                                    for (li, i) in (r0..r1).enumerate() {
+                                        let v = raw[i];
+                                        if v.is_nan() {
+                                            continue;
+                                        }
+                                        let gi = row_groups[li] as usize;
+                                        p.sums[ai][gi] += v;
+                                        p.nn[ai][gi] += 1;
+                                        if need_minmax && v < p.mins[ai][gi] {
+                                            p.mins[ai][gi] = v;
+                                        }
+                                        if need_minmax && v > p.maxs[ai][gi] {
+                                            p.maxs[ai][gi] = v;
+                                        }
+                                    }
+                                } else {
+                                    let raw = fs.raw_i64_slice();
+                                    for (li, i) in (r0..r1).enumerate() {
+                                        let v = raw[i];
+                                        if v == i64::MIN {
+                                            continue;
+                                        }
+                                        let gi = row_groups[li] as usize;
+                                        let vf = v as f64;
+                                        p.sums[ai][gi] += vf;
+                                        p.nn[ai][gi] += 1;
+                                        if need_minmax && vf < p.mins[ai][gi] {
+                                            p.mins[ai][gi] = vf;
+                                        }
+                                        if need_minmax && vf > p.maxs[ai][gi] {
+                                            p.maxs[ai][gi] = vf;
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = n_seg;
+                            p
+                        })
+                        .collect();
+
+                    // Merge partials into the shared accumulators (O(groups ×
+                    // aggs) per partial — 64 groups × 10 threads is noise).
+                    let mut global: HashMap<
+                        Box<str>,
+                        usize,
+                        std::hash::BuildHasherDefault<crate::storage::lsm::columnar::FxHasher>,
+                    > = HashMap::with_capacity_and_hasher(
+                        group_keys.len() + 64,
+                        Default::default(),
+                    );
+                    for (gi, k) in group_keys.iter().enumerate() {
+                        global.insert(k.clone(), gi);
+                    }
+                    for p in partials {
+                        for (li, key) in p.keys.iter().enumerate() {
+                            let gi = match global.get(key.as_ref()) {
+                                Some(&g) => g,
+                                None => {
+                                    let g = group_keys.len();
+                                    group_keys.push(key.clone());
+                                    group_counts.push(0);
+                                    for ai in 0..n_aggs {
+                                        group_sums[ai].push(0.0);
+                                        group_mins[ai].push(f64::INFINITY);
+                                        group_maxs[ai].push(f64::NEG_INFINITY);
+                                        group_nn_counts[ai].push(0);
+                                    }
+                                    global.insert(key.clone(), g);
+                                    g
+                                }
+                            };
+                            group_counts[gi] += p.counts[li];
+                            for ai in 0..n_aggs {
+                                group_sums[ai][gi] += p.sums[ai][li];
+                                if p.mins[ai][li] < group_mins[ai][gi] {
+                                    group_mins[ai][gi] = p.mins[ai][li];
+                                }
+                                if p.maxs[ai][li] > group_maxs[ai][gi] {
+                                    group_maxs[ai][gi] = p.maxs[ai][li];
+                                }
+                                group_nn_counts[ai][gi] += p.nn[ai][li];
+                            }
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            let parallel_done = false;
+            let _ = parallel_done;
+
+            if !parallel_done {
+                for seg in segs.iter().rev() {
+                    let n = seg.sst.num_rows;
+                    if group_pos >= seg.sst.column_tags.len() {
+                        continue;
+                    }
+                    // 🔑 慢路径 dedup 用 row_map.key(i) — keys 未加载时它回退到
+                    // 栅栏键 (每 fence_interval≈2048 行一个), 每 2048 行被当成同
+                    // key, seen 集合把首行之外的行全部"去重"掉: 100K 行 GROUP BY
+                    // 只剩 50 行 32 组 (静默错果, 对拍抓出)。必须先 load_full_keys。
+                    if need_dedup {
+                        let _ = seg.sst.load_full_keys();
+                    }
+                    let ftext = match seg.read_text_cached(group_pos) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    let has_nulls = ftext.has_any_null();
+                    let has_deletions = seg.sst.row_map.has_any_deleted();
+
+                    if !has_nulls && !has_deletions && !need_dedup {
+                        // 🚀 Two-phase with raw-byte text decode (avoids get_str_fast's
+                        // 3× SegData::slice() overhead per row).
+                        // Phase 1: text scan → group index per row via raw bytes.
+                        // Phase 2: for each agg column, vectorized raw slice fold.
+                        let off_bytes = ftext.offsets_bytes();
+                        let str_bytes = ftext.strings_bytes();
+                        // 🔑 u32: 组索引曾用 u16 — 超 65535 个不同组时静默截断错组。
+                        let mut row_groups: Vec<u32> = Vec::with_capacity(n);
+                        const LINEAR_THRESHOLD: usize = 16;
+                        let mut use_hash = group_keys.len() >= LINEAR_THRESHOLD;
+                        for i in 0..n {
+                            // 🚀 Direct raw-byte offset decode (no get_str_fast overhead).
+                            let ob = i * 4;
+                            let start = u32::from_le_bytes([
+                                off_bytes[ob],
+                                off_bytes[ob + 1],
+                                off_bytes[ob + 2],
+                                off_bytes[ob + 3],
+                            ]) as usize;
+                            let end = u32::from_le_bytes([
+                                off_bytes[ob + 4],
+                                off_bytes[ob + 5],
+                                off_bytes[ob + 6],
+                                off_bytes[ob + 7],
+                            ]) as usize;
+                            // 🚨 Corruption guard (disk-corruption fuzzing): offsets
+                            // come straight off disk — a flipped bit can produce
+                            // start > end or end > len. Degrade to an empty key
+                            // instead of panicking.
+                            let key_bytes = str_bytes.get(start..end).unwrap_or(&[]);
+
+                            let idx = if use_hash {
+                                if let Some(&idx) =
+                                    key_index.get(std::str::from_utf8(key_bytes).unwrap_or(""))
+                                {
+                                    idx
+                                } else {
+                                    let boxed: Box<str> =
+                                        std::str::from_utf8(key_bytes).unwrap_or("").into();
+                                    let idx = group_keys.len();
+                                    group_keys.push(boxed.clone());
+                                    group_counts.push(0);
+                                    for ai in 0..n_aggs {
+                                        group_sums[ai].push(0.0);
+                                        group_mins[ai].push(f64::INFINITY);
+                                        group_maxs[ai].push(f64::NEG_INFINITY);
+                                        group_nn_counts[ai].push(0);
+                                    }
+                                    key_index.insert(boxed, idx);
+                                    idx
+                                }
+                            } else {
+                                let mut found: Option<usize> = None;
+                                for (gi, k) in group_keys.iter().enumerate() {
+                                    if k.as_bytes() == key_bytes {
+                                        found = Some(gi);
+                                        break;
+                                    }
+                                }
+                                match found {
+                                    Some(idx) => idx,
+                                    None => {
+                                        let idx = group_keys.len();
+                                        group_keys.push(
+                                            std::str::from_utf8(key_bytes).unwrap_or("").into(),
+                                        );
+                                        group_counts.push(0);
+                                        for ai in 0..n_aggs {
+                                            group_sums[ai].push(0.0);
+                                            group_mins[ai].push(f64::INFINITY);
+                                            group_maxs[ai].push(f64::NEG_INFINITY);
+                                            group_nn_counts[ai].push(0);
+                                        }
+                                        if group_keys.len() >= LINEAR_THRESHOLD {
+                                            use_hash = true;
+                                            for (gi, k) in group_keys.iter().enumerate() {
+                                                key_index.insert(k.clone(), gi);
+                                            }
+                                        }
+                                        idx
+                                    }
+                                }
+                            };
+                            group_counts[idx] += 1;
+                            row_groups.push(idx as u32);
+                        }
+                        // Phase 2: vectorized agg fold per column.
+                        for (ai, agg) in gb_aggs.iter().enumerate() {
+                            let Some(c) = agg.col else {
+                                continue;
+                            };
+                            if c >= seg.sst.column_tags.len() || !seg.sst.column_tags[c].is_fixed()
                             {
+                                continue;
+                            }
+                            let Some(fs) = seg.read_fixed_cached(c) else {
+                                continue;
+                            };
+                            // 🔑 Always track min (cheap) even for SUM/AVG, because the
+                            // output stage uses group_mins == INFINITY as the "all values
+                            // were NULL" sentinel for SUM. Previously need_minmax=false
+                            // skipped this, making every SUM wrongly return NULL.
+                            let need_minmax = agg.func == "MIN" || agg.func == "MAX";
+                            if agg_is_float[ai] {
+                                let raw = fs.raw_f64_typed_slice();
+                                if need_minmax {
+                                    for (i, &v) in raw.iter().enumerate().take(n) {
+                                        if v.is_nan() {
+                                            continue;
+                                        } // NULL sentinel
+                                        let gi = row_groups[i] as usize;
+                                        group_sums[ai][gi] += v;
+                                        group_nn_counts[ai][gi] += 1;
+                                        if v < group_mins[ai][gi] {
+                                            group_mins[ai][gi] = v;
+                                        }
+                                        if v > group_maxs[ai][gi] {
+                                            group_maxs[ai][gi] = v;
+                                        }
+                                    }
+                                } else {
+                                    for (i, &v) in raw.iter().enumerate().take(n) {
+                                        if v.is_nan() {
+                                            continue;
+                                        } // NULL sentinel
+                                        let gi = row_groups[i] as usize;
+                                        group_sums[ai][gi] += v;
+                                        group_nn_counts[ai][gi] += 1;
+                                        if v < group_mins[ai][gi] {
+                                            group_mins[ai][gi] = v;
+                                        }
+                                    }
+                                }
+                            } else {
+                                let raw = fs.raw_i64_slice();
+                                if need_minmax {
+                                    for (i, &v) in raw.iter().enumerate().take(n) {
+                                        if v == i64::MIN {
+                                            continue;
+                                        } // NULL sentinel
+                                        let gi = row_groups[i] as usize;
+                                        let vf = v as f64;
+                                        group_sums[ai][gi] += vf;
+                                        group_nn_counts[ai][gi] += 1;
+                                        if vf < group_mins[ai][gi] {
+                                            group_mins[ai][gi] = vf;
+                                        }
+                                        if vf > group_maxs[ai][gi] {
+                                            group_maxs[ai][gi] = vf;
+                                        }
+                                    }
+                                } else {
+                                    for (i, &v) in raw.iter().enumerate().take(n) {
+                                        if v == i64::MIN {
+                                            continue;
+                                        } // NULL sentinel
+                                        let gi = row_groups[i] as usize;
+                                        let vf = v as f64;
+                                        group_sums[ai][gi] += vf;
+                                        group_nn_counts[ai][gi] += 1;
+                                        if vf < group_mins[ai][gi] {
+                                            group_mins[ai][gi] = vf;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Slow path: nulls/deletions present.
+                        let agg_segs: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
+                            gb_aggs
+                                .iter()
+                                .map(|a| {
+                                    a.col.and_then(|c| {
+                                        if c < seg.sst.column_tags.len()
+                                            && seg.sst.column_tags[c].is_fixed()
+                                        {
+                                            seg.read_fixed_cached(c)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .collect();
+                        for i in 0..n {
+                            if need_dedup {
+                                let key = seg.sst.row_map.key(i);
+                                if !seen.insert(key) {
+                                    continue;
+                                }
+                            }
+                            if has_deletions && seg.sst.row_map.is_deleted(i) {
+                                continue;
+                            }
+                            if has_nulls && ftext.is_null(i) {
+                                // 🔑 NULL group key — accumulate into the null-group
+                                // accumulators (not just count). Previously this only
+                                // did null_count += 1 and skipped aggregation, so
+                                // SUM/MIN/MAX/AVG over NULL-key rows returned NULL/0.
+                                null_count += 1;
+                                for (ai, _agg) in gb_aggs.iter().enumerate() {
+                                    if let Some(ref fs) = agg_segs[ai] {
+                                        if agg_is_float[ai] {
+                                            if let Some(v) = fs.get_f64(i) {
+                                                null_sum[ai] += v;
+                                                null_nn[ai] += 1;
+                                                if v < null_min[ai] {
+                                                    null_min[ai] = v;
+                                                }
+                                                if v > null_max[ai] {
+                                                    null_max[ai] = v;
+                                                }
+                                            }
+                                        } else if let Some(v) = fs.get_i64(i) {
+                                            let vf = v as f64;
+                                            null_sum[ai] += vf;
+                                            null_nn[ai] += 1;
+                                            if vf < null_min[ai] {
+                                                null_min[ai] = vf;
+                                            }
+                                            if vf > null_max[ai] {
+                                                null_max[ai] = vf;
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            let s = ftext.get_str_fast(i);
+                            let idx = if let Some(&idx) = key_index.get(s) {
                                 idx
                             } else {
-                                let boxed: Box<str> =
-                                    std::str::from_utf8(key_bytes).unwrap_or("").into();
+                                let boxed: Box<str> = s.into();
                                 let idx = group_keys.len();
                                 group_keys.push(boxed.clone());
                                 group_counts.push(0);
@@ -1906,229 +2376,38 @@ impl QueryExecutor {
                                 }
                                 key_index.insert(boxed, idx);
                                 idx
-                            }
-                        } else {
-                            let mut found: Option<usize> = None;
-                            for (gi, k) in group_keys.iter().enumerate() {
-                                if k.as_bytes() == key_bytes {
-                                    found = Some(gi);
-                                    break;
-                                }
-                            }
-                            match found {
-                                Some(idx) => idx,
-                                None => {
-                                    let idx = group_keys.len();
-                                    group_keys
-                                        .push(std::str::from_utf8(key_bytes).unwrap_or("").into());
-                                    group_counts.push(0);
-                                    for ai in 0..n_aggs {
-                                        group_sums[ai].push(0.0);
-                                        group_mins[ai].push(f64::INFINITY);
-                                        group_maxs[ai].push(f64::NEG_INFINITY);
-                                        group_nn_counts[ai].push(0);
-                                    }
-                                    if group_keys.len() >= LINEAR_THRESHOLD {
-                                        use_hash = true;
-                                        for (gi, k) in group_keys.iter().enumerate() {
-                                            key_index.insert(k.clone(), gi);
-                                        }
-                                    }
-                                    idx
-                                }
-                            }
-                        };
-                        group_counts[idx] += 1;
-                        row_groups.push(idx as u32);
-                    }
-                    // Phase 2: vectorized agg fold per column.
-                    for (ai, agg) in gb_aggs.iter().enumerate() {
-                        let Some(c) = agg.col else {
-                            continue;
-                        };
-                        if c >= seg.sst.column_tags.len() || !seg.sst.column_tags[c].is_fixed() {
-                            continue;
-                        }
-                        let Some(fs) = seg.read_fixed_cached(c) else {
-                            continue;
-                        };
-                        // 🔑 Always track min (cheap) even for SUM/AVG, because the
-                        // output stage uses group_mins == INFINITY as the "all values
-                        // were NULL" sentinel for SUM. Previously need_minmax=false
-                        // skipped this, making every SUM wrongly return NULL.
-                        let need_minmax = agg.func == "MIN" || agg.func == "MAX";
-                        if agg_is_float[ai] {
-                            let raw = fs.raw_f64_typed_slice();
-                            if need_minmax {
-                                for (i, &v) in raw.iter().enumerate().take(n) {
-                                    if v.is_nan() {
-                                        continue;
-                                    } // NULL sentinel
-                                    let gi = row_groups[i] as usize;
-                                    group_sums[ai][gi] += v;
-                                    group_nn_counts[ai][gi] += 1;
-                                    if v < group_mins[ai][gi] {
-                                        group_mins[ai][gi] = v;
-                                    }
-                                    if v > group_maxs[ai][gi] {
-                                        group_maxs[ai][gi] = v;
-                                    }
-                                }
-                            } else {
-                                for (i, &v) in raw.iter().enumerate().take(n) {
-                                    if v.is_nan() {
-                                        continue;
-                                    } // NULL sentinel
-                                    let gi = row_groups[i] as usize;
-                                    group_sums[ai][gi] += v;
-                                    group_nn_counts[ai][gi] += 1;
-                                    if v < group_mins[ai][gi] {
-                                        group_mins[ai][gi] = v;
-                                    }
-                                }
-                            }
-                        } else {
-                            let raw = fs.raw_i64_slice();
-                            if need_minmax {
-                                for (i, &v) in raw.iter().enumerate().take(n) {
-                                    if v == i64::MIN {
-                                        continue;
-                                    } // NULL sentinel
-                                    let gi = row_groups[i] as usize;
-                                    let vf = v as f64;
-                                    group_sums[ai][gi] += vf;
-                                    group_nn_counts[ai][gi] += 1;
-                                    if vf < group_mins[ai][gi] {
-                                        group_mins[ai][gi] = vf;
-                                    }
-                                    if vf > group_maxs[ai][gi] {
-                                        group_maxs[ai][gi] = vf;
-                                    }
-                                }
-                            } else {
-                                for (i, &v) in raw.iter().enumerate().take(n) {
-                                    if v == i64::MIN {
-                                        continue;
-                                    } // NULL sentinel
-                                    let gi = row_groups[i] as usize;
-                                    let vf = v as f64;
-                                    group_sums[ai][gi] += vf;
-                                    group_nn_counts[ai][gi] += 1;
-                                    if vf < group_mins[ai][gi] {
-                                        group_mins[ai][gi] = vf;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Slow path: nulls/deletions present.
-                    let agg_segs: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
-                        gb_aggs
-                            .iter()
-                            .map(|a| {
-                                a.col.and_then(|c| {
-                                    if c < seg.sst.column_tags.len()
-                                        && seg.sst.column_tags[c].is_fixed()
-                                    {
-                                        seg.read_fixed_cached(c)
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                            .collect();
-                    for i in 0..n {
-                        if need_dedup {
-                            let key = seg.sst.row_map.key(i);
-                            if !seen.insert(key) {
-                                continue;
-                            }
-                        }
-                        if has_deletions && seg.sst.row_map.is_deleted(i) {
-                            continue;
-                        }
-                        if has_nulls && ftext.is_null(i) {
-                            // 🔑 NULL group key — accumulate into the null-group
-                            // accumulators (not just count). Previously this only
-                            // did null_count += 1 and skipped aggregation, so
-                            // SUM/MIN/MAX/AVG over NULL-key rows returned NULL/0.
-                            null_count += 1;
+                            };
+                            group_counts[idx] += 1;
                             for (ai, _agg) in gb_aggs.iter().enumerate() {
                                 if let Some(ref fs) = agg_segs[ai] {
                                     if agg_is_float[ai] {
                                         if let Some(v) = fs.get_f64(i) {
-                                            null_sum[ai] += v;
-                                            null_nn[ai] += 1;
-                                            if v < null_min[ai] {
-                                                null_min[ai] = v;
+                                            group_sums[ai][idx] += v;
+                                            group_nn_counts[ai][idx] += 1;
+                                            if v < group_mins[ai][idx] {
+                                                group_mins[ai][idx] = v;
                                             }
-                                            if v > null_max[ai] {
-                                                null_max[ai] = v;
+                                            if v > group_maxs[ai][idx] {
+                                                group_maxs[ai][idx] = v;
                                             }
                                         }
                                     } else if let Some(v) = fs.get_i64(i) {
                                         let vf = v as f64;
-                                        null_sum[ai] += vf;
-                                        null_nn[ai] += 1;
-                                        if vf < null_min[ai] {
-                                            null_min[ai] = vf;
-                                        }
-                                        if vf > null_max[ai] {
-                                            null_max[ai] = vf;
-                                        }
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        let s = ftext.get_str_fast(i);
-                        let idx = if let Some(&idx) = key_index.get(s) {
-                            idx
-                        } else {
-                            let boxed: Box<str> = s.into();
-                            let idx = group_keys.len();
-                            group_keys.push(boxed.clone());
-                            group_counts.push(0);
-                            for ai in 0..n_aggs {
-                                group_sums[ai].push(0.0);
-                                group_mins[ai].push(f64::INFINITY);
-                                group_maxs[ai].push(f64::NEG_INFINITY);
-                                group_nn_counts[ai].push(0);
-                            }
-                            key_index.insert(boxed, idx);
-                            idx
-                        };
-                        group_counts[idx] += 1;
-                        for (ai, _agg) in gb_aggs.iter().enumerate() {
-                            if let Some(ref fs) = agg_segs[ai] {
-                                if agg_is_float[ai] {
-                                    if let Some(v) = fs.get_f64(i) {
-                                        group_sums[ai][idx] += v;
+                                        group_sums[ai][idx] += vf;
                                         group_nn_counts[ai][idx] += 1;
-                                        if v < group_mins[ai][idx] {
-                                            group_mins[ai][idx] = v;
+                                        if vf < group_mins[ai][idx] {
+                                            group_mins[ai][idx] = vf;
                                         }
-                                        if v > group_maxs[ai][idx] {
-                                            group_maxs[ai][idx] = v;
+                                        if vf > group_maxs[ai][idx] {
+                                            group_maxs[ai][idx] = vf;
                                         }
-                                    }
-                                } else if let Some(v) = fs.get_i64(i) {
-                                    let vf = v as f64;
-                                    group_sums[ai][idx] += vf;
-                                    group_nn_counts[ai][idx] += 1;
-                                    if vf < group_mins[ai][idx] {
-                                        group_mins[ai][idx] = vf;
-                                    }
-                                    if vf > group_maxs[ai][idx] {
-                                        group_maxs[ai][idx] = vf;
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
+            } // !parallel_done
 
             // Build output — iterate SELECT columns to match output order.
             let columns: Vec<String> = stmt

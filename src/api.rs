@@ -1833,6 +1833,20 @@ impl Database {
                 )
                 .unwrap_or_else(|| format!("{}.{}", table_name, col_name));
             if let Some(index_ref) = self.inner.column_indexes.get(&index_name) {
+                // 🔒 M1/M2 read-your-writes: the column index holds COMMITTED
+                // state only. With buffered pending writes for this table,
+                // skip the fast path — the parsed path folds pending state
+                // (txn merge scan).
+                if self.query_executor.is_in_transaction() {
+                    let has_pending = !self.query_executor.txn_pending_rows(table_name).is_empty()
+                        || !self
+                            .query_executor
+                            .txn_pending_delete_ids(table_name)
+                            .is_empty();
+                    if has_pending {
+                        return Ok(None);
+                    }
+                }
                 let row_ids_arc = index_ref.value().get_arc(&value)?;
 
                 // 🚀 High-cardinality redirect: for ColSegmentStore tables, when
