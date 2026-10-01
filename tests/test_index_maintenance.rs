@@ -289,7 +289,8 @@ fn fts_limit_without_order_by_is_unranked_doc_order() {
         db.execute(format!("INSERT INTO docs VALUES ({}, '{body}')", i + 1).as_str())
             .unwrap();
     }
-    db.execute("CREATE TEXT INDEX docs_body ON docs (body)").unwrap();
+    db.execute("CREATE TEXT INDEX docs_body ON docs (body)")
+        .unwrap();
 
     let unranked: Vec<i64> = match db
         .query("SELECT id FROM docs WHERE MATCH(body, 'hit') LIMIT 3")
@@ -322,7 +323,11 @@ fn fts_limit_without_order_by_is_unranked_doc_order() {
             other => panic!("{other:?}"),
         })
         .collect();
-    assert_eq!(ranked.first(), Some(&1), "ranked path must keep doc 1 first");
+    assert_eq!(
+        ranked.first(),
+        Some(&1),
+        "ranked path must keep doc 1 first"
+    );
 
     // Score projection also forces the ranked path.
     let scored: Vec<(i64, f64)> = db
@@ -339,3 +344,54 @@ fn fts_limit_without_order_by_is_unranked_doc_order() {
     assert!(scored.iter().all(|(_, s)| *s > 0.0), "scores must be real");
 }
 
+// 🔒 W4a regression: the derived-pairs cache (pairs + suffix-max + max tf,
+// Arc-shared across queries) must be invalidated by every posting mutation.
+// A search after an insert/delete/update must observe the new state — a
+// stale cache would keep serving the pre-mutation snapshot forever.
+#[test]
+fn derived_pairs_cache_invalidated_on_mutation() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    db.execute("CREATE TEXT INDEX docs_body ON docs (body)")
+        .unwrap();
+    for i in 1..=100 {
+        db.execute(format!("INSERT INTO docs VALUES ({i}, 'target filler{i}')").as_str())
+            .unwrap();
+    }
+
+    let q = |db: &Database, term: &str| -> usize {
+        db.text_search_ranked("docs_body", term, 1000)
+            .unwrap()
+            .len()
+    };
+
+    // Populate the cache with repeated searches.
+    for _ in 0..3 {
+        assert_eq!(q(&db, "target"), 100);
+    }
+
+    // INSERT → immediately visible (add invalidates).
+    db.execute("INSERT INTO docs VALUES (500, 'target plus zebra')")
+        .unwrap();
+    assert_eq!(q(&db, "target"), 101, "stale cache after INSERT");
+    assert_eq!(q(&db, "zebra"), 1);
+
+    // DELETE → immediately invisible.
+    db.execute("DELETE FROM docs WHERE id = 500").unwrap();
+    assert_eq!(q(&db, "target"), 100, "stale cache after DELETE");
+    assert_eq!(q(&db, "zebra"), 0);
+
+    // UPDATE → old term gone, new term searchable.
+    db.execute("UPDATE docs SET body = 'quokka words' WHERE id = 1")
+        .unwrap();
+    assert_eq!(q(&db, "target"), 99, "stale cache after UPDATE");
+    assert_eq!(q(&db, "quokka"), 1);
+
+    // Repeated queries still consistent (cache repopulated, not corrupted).
+    for _ in 0..3 {
+        assert_eq!(q(&db, "target"), 99);
+        assert_eq!(q(&db, "quokka"), 1);
+    }
+}

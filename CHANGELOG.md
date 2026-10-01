@@ -2,6 +2,30 @@
 
 ## [0.12.0] — 未发布
 
+### 🚀 W4a FTS 派生视图缓存: 修刚建索引 ~100µs/查询税 (root-cause 实锤)
+
+- 🚀 **根因** (采样热栈实锤, 非猜测): `term_stream` 对 pending posting 每
+  查询调用非缓存的 `iter_doc_tf()` — 全量物化 (roaring 迭代 + 每 doc 一次
+  SipHash positions 查找) + max_tf/suffix-max 两次全扫 + boxed 拷贝。
+  刚建完索引 (最后一批 postings 留在 pending, 未过 flush 阈值) 时每查询
+  ~105µs; 关库重开后 pending 为空走磁盘 posting 缓存故 12µs — 这就是
+  "跨进程 6.5µs ↔ 104µs" 之谜的全部真相
+- 🚀 **修复**: PostingList 新增 DerivedPairs 缓存 (pairs + suffix-max +
+  max_tf 一次构建, Arc 跨查询共享, TermStream.pairs_suffix 同步 Arc 化
+  免逐查询 O(n) 拷贝)。刚建索引态实测 105µs → **9.4µs (11×)**, 与重开态
+  (12µs) 持平略优; 行业基准无排序 top10 0.135 → 0.031ms (与 FTS5 差距
+  6.4× → 4×)
+- 🔒 **四个变更点全部补失效**: add 原有; add_with_freq / remove / merge
+  此前缺失效 (潜在过期快照隐患 — remove 后缓存仍含已删 doc, 靠查询侧
+  deleted_docs 过滤兜底)。回归测试
+  derived_pairs_cache_invalidated_on_mutation (插入/删除/更新后立即可见性
+  ×反复查询一致性)
+- 📌 已知限制建档 (先在行为, 非本次回归): FTS MATCH 快路径从索引应答,
+  事务内未提交 INSERT (write_set 缓冲行) 不折入 — MATCH 的读己之写待
+  后续战役 (冷启动探针证实与缓存无关)
+- 判别链: 10 重开进程全 10.8µs 无方差 → 同进程关开对照 105→12µs →
+  sample 热栈定位 iter_doc_tf 物化 → 修复后 9.4µs
+
 ### 🔑 W3 FTS: LIMIT 语义 FTS5 兼容化 + 交集早停 + 并行分词
 
 - 🔑 **LIMIT 不再隐含 BM25 排序** (FTS5 兼容, 与本引擎无 LIMIT 路径的既有

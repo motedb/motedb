@@ -167,6 +167,18 @@ impl Default for BM25Config {
 
 /// Posting list for a term (memory-optimized)
 #[derive(Debug)]
+/// 🚀 W4a: query-ready derived view cached inside PostingList — see
+/// `PostingList::derived_pairs()`. Shared by Arc so queries after the
+/// first are zero-copy.
+pub struct DerivedPairs {
+    /// Ascending (doc_id, tf) pairs (snapshot at build time).
+    pub pairs: std::sync::Arc<[(u32, u16)]>,
+    /// Suffix-max tf skip array, one entry longer than `pairs` (trailing 0).
+    pub suffix_max: std::sync::Arc<[u16]>,
+    /// Max tf across `pairs`.
+    pub max_tf: u16,
+}
+
 pub struct PostingList {
     /// Document IDs (Roaring Bitmap for 90%+ compression)
     doc_ids: RoaringBitmap,
@@ -181,7 +193,7 @@ pub struct PostingList {
 
     /// 🚀 Cached decoded pairs: (doc_id, tf) sorted by doc_id.
     /// Built lazily on first search, then reused. NOT included in Clone.
-    cached_pairs: parking_lot::Mutex<Option<Vec<(u32, u16)>>>,
+    cached_pairs: parking_lot::Mutex<Option<std::sync::Arc<DerivedPairs>>>,
 }
 
 impl Clone for PostingList {
@@ -404,6 +416,7 @@ impl PostingList {
     /// Add a document with a known term frequency (used when converting from block format).
     /// Ensures doc_freqs array stays in sync.
     pub fn add_with_freq(&mut self, doc_id: DocId, _position: Option<Position>, tf: u16) {
+        *self.cached_pairs.lock() = None;
         let is_new = !self.doc_ids.contains(doc_id as u32);
         self.doc_ids.insert(doc_id as u32);
         if is_new {
@@ -429,6 +442,7 @@ impl PostingList {
 
     /// Merge another posting list into this one
     pub fn merge(&mut self, other: &PostingList) {
+        *self.cached_pairs.lock() = None;
         // Build temporary HashMap for easier merging
         let mut freq_map: HashMap<u64, u16> = self
             .doc_ids
@@ -547,15 +561,36 @@ impl PostingList {
     }
 
     /// 🚀 Cached iteration: builds (doc_id, tf) pairs once, then returns
-    /// a reference slice on subsequent calls (zero-copy). The caller must
-    /// not hold the lock across mutation operations.
+    /// a clone of the shared snapshot on subsequent calls.
     pub fn iter_doc_tf_cached_ref(&self) -> Vec<(u32, u16)> {
+        self.derived_pairs().pairs.to_vec()
+    }
+
+    /// 🚀 W4a: query-ready derived view of the posting list — materialized
+    /// ascending (doc, tf) pairs + the suffix-max-tf skip array + max tf
+    /// that TermStream/WAND need. Built ONCE on first query after a
+    /// mutation and Arc-shared thereafter (the old path re-materialized
+    /// and re-scanned the pending list on EVERY query — with a SipHash
+    /// positions lookup per doc this was the entire ~100µs/query tax on a
+    /// freshly built index). Every mutation invalidates the cache.
+    pub fn derived_pairs(&self) -> std::sync::Arc<DerivedPairs> {
         let mut guard = self.cached_pairs.lock();
-        if guard.is_none() {
-            *guard = Some(self.iter_doc_tf());
+        if let Some(a) = guard.as_ref() {
+            return std::sync::Arc::clone(a);
         }
-        // Return clone — fast since pairs are small (6 bytes each).
-        guard.as_ref().unwrap().clone()
+        let pairs: Vec<(u32, u16)> = self.iter_doc_tf();
+        let max_tf = pairs.iter().map(|&(_, t)| t).max().unwrap_or(0);
+        let mut suffix = vec![0u16; pairs.len() + 1];
+        for i in (0..pairs.len()).rev() {
+            suffix[i] = suffix[i + 1].max(pairs[i].1);
+        }
+        let derived = std::sync::Arc::new(DerivedPairs {
+            pairs: std::sync::Arc::from(pairs.into_boxed_slice()),
+            suffix_max: std::sync::Arc::from(suffix.into_boxed_slice()),
+            max_tf,
+        });
+        *guard = Some(std::sync::Arc::clone(&derived));
+        derived
     }
 
     pub fn get_positions(&self, doc_id: DocId) -> Option<&[Position]> {
@@ -564,6 +599,8 @@ impl PostingList {
 
     /// Remove a document from the posting list
     pub fn remove(&mut self, doc_id: DocId) {
+        // Invalidate cached pairs on mutation.
+        *self.cached_pairs.lock() = None;
         if !self.doc_ids.contains(doc_id as u32) {
             return;
         }

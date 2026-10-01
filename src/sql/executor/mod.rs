@@ -19544,7 +19544,10 @@ impl QueryExecutor {
                     && matches!(&ob[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
             });
             if !wants_scores && !orders_by_score {
-                match self.db.text_search_limited(&index_name, &query, Some(l + offset)) {
+                match self
+                    .db
+                    .text_search_limited(&index_name, &query, Some(l + offset))
+                {
                     Ok(ids) => ids.into_iter().map(|id| (id, 0.0)).collect(),
                     Err(_) => return Ok(None),
                 }

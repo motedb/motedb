@@ -273,10 +273,7 @@ impl MoteDB {
             .get(index_name)
             .ok_or_else(|| StorageError::Index(format!("Text index '{}' not found", index_name)))?;
 
-        let results = index_ref
-            .value()
-            .read()
-            .search_limited(query, max_docs)?;
+        let results = index_ref.value().read().search_limited(query, max_docs)?;
         Ok(results)
     }
 

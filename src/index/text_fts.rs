@@ -167,7 +167,7 @@ struct TermStream {
     /// `blocks_suffix[j][b]` = max tf of block source j from block `b` on
     /// (skip tables — no decode). One entry longer than the source
     /// (trailing 0) so an exhausted position reads 0.
-    pairs_suffix: Vec<Vec<u16>>,
+    pairs_suffix: Vec<std::sync::Arc<[u16]>>,
     blocks_suffix: Vec<Vec<u16>>,
 }
 
@@ -982,14 +982,16 @@ impl TextFTSIndex {
     ) -> Result<Option<TermStream>> {
         let mut stream = TermStream::empty();
         if let Some(pend) = pending.get(&term_id) {
-            let pairs = pend.iter_doc_tf(); // ascending (Roaring iteration)
-            stream.df += pairs.len() as u64;
-            stream.max_tf = stream
-                .max_tf
-                .max(pairs.iter().map(|&(_, t)| t).max().unwrap_or(0));
-            stream.pairs_suffix.push(pairs_suffix_max(&pairs));
+            // 🚀 W4a: derived view (pairs + suffix-max + max tf) is cached in
+            // the PostingList and Arc-shared — the old path re-materialized
+            // the whole pending list (SipHash positions lookup per doc +
+            // two full scans + a boxed-slice copy) on EVERY query.
+            let d = pend.derived_pairs();
+            stream.df += d.pairs.len() as u64;
+            stream.max_tf = stream.max_tf.max(d.max_tf);
+            stream.pairs_suffix.push(Arc::clone(&d.suffix_max));
             stream.pair_pos.push(0);
-            stream.pairs.push(Arc::from(pairs.into_boxed_slice()));
+            stream.pairs.push(Arc::clone(&d.pairs));
         }
         match self.load_disk_sources(term_id, btree)? {
             Some(sources) => {
@@ -1006,7 +1008,7 @@ impl TextFTSIndex {
                             stream.max_tf = stream
                                 .max_tf
                                 .max(p.iter().map(|&(_, t)| t).max().unwrap_or(0));
-                            stream.pairs_suffix.push(pairs_suffix_max(&p));
+                            stream.pairs_suffix.push(pairs_suffix_max(&p).into());
                             stream.pair_pos.push(0);
                             stream.pairs.push(p);
                         }
@@ -1051,11 +1053,7 @@ impl TextFTSIndex {
     /// Used by `MATCH .. LIMIT n` — document order is the exact unranked
     /// answer, so the AND walk can stop at k instead of materializing the
     /// whole intersection (18.7K docs → 10 at 100K-doc corpus scale).
-    pub fn search_limited(
-        &self,
-        query: &str,
-        max_docs: Option<usize>,
-    ) -> Result<Vec<DocumentId>> {
+    pub fn search_limited(&self, query: &str, max_docs: Option<usize>) -> Result<Vec<DocumentId>> {
         let groups = self.parse_query_expanded(query);
         if groups.is_empty() {
             return Ok(Vec::new());
