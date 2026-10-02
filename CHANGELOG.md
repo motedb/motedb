@@ -2,6 +2,25 @@
 
 ## [0.12.0] — 未发布
 
+### 📋 I1 调研建档: 1M GROUP BY / range 剩余差距的结构性归因 (未改动代码)
+
+- 🔍 **GROUP BY 4.0ms vs DuckDB 1.33ms (3×)**: 采样证实 G1 并行内核正常
+  运行 (主线程等 rayon 栅栏, worker 在字节键 fold); 剩余是内核每行 CPU
+  (~30ns vs DuckDB ~10ns)。已识别的下一战役: 文本列**字典编码聚合** —
+  device 列仅 64 个不同值, 每段一次构建 (缓存) u16 码表后, 热循环变
+  纯整型数组下标累加 (免逐行哈希)
+- 🔍 **range 1.2ms vs DuckDB 0.52ms (2.3×)**: 变体计时证明任何单列扫描
+  地板 ≈1.3ms (1.3ns/行, 内存带宽级), text 谓词仅 +0.3ms。DuckDB 的
+  优势是 **zone map** (ts 有序 → 段级 min/max 跳过 90% 数据)。已识别
+  下一战役: 段级列 min/max 统计 (flush 时构建) + 扫描路径谓词剪枝
+- 🔍 **混合负载缓存预算抖动 (先在, 建档)**: GROUP BY (text 段缓存
+  ~16MB) 与 range (text 列批 Vec<Arc<str>> ~40MB) 交替时超 64MB 预算
+  → 全清式 trim → 重建循环 (采样: read_text_cached insert/truncate/drop
+  占 GROUP BY ~26%)。尝试 largest-first 增量逐出实测更糟 (大条目重建
+  成本主导, 交替 53ms/对) 已回退。根治 = range 谓词不物化 text 列批
+  (原始 TextSegment 字节比较, 同 C1 precheck), 与字典编码战役同宗
+- 单一负载各自无抖动 (groupby 4.0 / range 1.2ms 稳定)
+
 ### 🚀 H1 1M TopK: 并行 morsel top-k + 列缓存 Arc 化 (9.2→1.5ms, 6.2×, 追平 DuckDB)
 
 - 🔍 **归因链** (两轮采样): (a) 旧快路径把整列物化成 entries Vec
