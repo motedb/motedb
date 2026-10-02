@@ -429,6 +429,13 @@ impl DiskGraph {
         Ok(count)
     }
 
+    /// 🔑 F1: same as SQ8Vectors::warm_page_cache, for the adjacency file.
+    pub fn warm_page_cache(&self) {
+        if let Some(m) = self.mmap.read().as_ref() {
+            let _ = m.advise(memmap2::Advice::WillNeed);
+        }
+    }
+
     /// Look up file offset: tombstone check → LRU → mmap binary search →
     /// sidecar file fallback
     /// Look up a node's file offset — O(1) from the complete authoritative

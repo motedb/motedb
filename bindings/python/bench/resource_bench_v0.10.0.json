@@ -1,66 +1,66 @@
 {
  "artifact_mb": {
   "motedb_cli": 7.5,
-  "python_so": 88.5
+  "python_so": 9.1
  },
- "open_fresh_rss_mb": 2.4,
+ "open_fresh_rss_mb": 2.5,
  "load": {
-  "rows_per_s": 93691,
-  "python_conv_s": 0.94,
-  "load_s": 1.07,
+  "rows_per_s": 107841,
+  "python_conv_s": 0.91,
+  "load_s": 0.93,
   "driver_arrays_mb": 160.6,
-  "load_peak_rss_delta_mb": 185.2,
+  "load_peak_rss_delta_mb": -0.1,
   "disk_wal_pre_cp_mb": 162.0,
-  "checkpoint_s": 0.46,
+  "checkpoint_s": 0.31,
   "disk_after_cp_mb": 162.0
  },
  "index_fts": {
-  "build_s": 0.93,
-  "rss_delta_mb": 21.6,
+  "build_s": 0.98,
+  "rss_delta_mb": 21.9,
   "disk_mb": 175.8
  },
  "query_rss_delta_mb": {
-  "point": 0.1,
+  "point": 0.0,
   "range_agg_fused": 0.0,
   "range_agg_between_80pct": 0.0,
   "groupby": -0.0,
   "topk": 0.0,
-  "join": 0.1,
-  "fts_match": 0.0,
-  "vector_knn10": 0.0,
-  "full_scan_project": 0.1
+  "join": 0.0,
+  "fts_match": 0.1,
+  "vector_knn10": 0.2,
+  "full_scan_project": 0.6
  },
- "steady_state_rss_delta_mb": -6.6,
+ "steady_state_rss_delta_mb": -4.3,
  "latency_ms": {
   "point": 0.0,
-  "range_agg_fused": 0.27,
+  "range_agg_fused": 0.28,
   "range_agg_between_80pct": 0.24,
-  "groupby": 0.66,
-  "knn10": 9.61
+  "groupby": 0.64,
+  "knn10": 9.88
  },
  "reopen": {
-  "open_s": 0.018,
-  "rss_delta_mb": 0.4
+  "open_s": 0.022,
+  "rss_delta_mb": 0.6
  },
  "crash_recovery": {
-  "reopen_s": 0.008,
+  "reopen_s": 0.007,
   "rows_visible": 1300,
   "expected": 1300
  },
  "edge_preset": {
-  "load_s": 1.53,
+  "load_s": 1.59,
   "disk_pre_cp_mb": 157.3,
   "checkpoint_s": 0.3,
   "disk_mb": 157.3,
-  "knn_first_query_rss_mb": -0.2,
-  "knn_p50_ms": 8.88
+  "knn_first_query_rss_mb": 1.3,
+  "knn_p50_ms": 9.52
  },
  "sqlite_ref": {
   "load_s": 0.04,
-  "load_rss_delta_mb": 6.9,
+  "load_rss_delta_mb": 0.0,
   "disk_mb": 12.8,
   "point_rss": -0.0,
   "range_agg_rss": -0.0,
-  "groupby_rss": 2.1
+  "groupby_rss": 1.9
  }
 }

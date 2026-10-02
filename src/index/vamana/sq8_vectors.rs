@@ -381,6 +381,18 @@ impl SQ8Vectors {
         Some(arc_vec)
     }
 
+    /// 🔑 F1: advise the kernel to read the SQ8 backing file into page cache
+    /// now (MADV_WILLNEED — advisory, async readahead). The first few
+    /// queries after open otherwise pay hard page faults spread over the
+    /// walk (measured 66-337ms on the first query at 220K×384 vs 1.4ms
+    /// steady-state). Pages are file-backed and reclaimable — this prepones
+    /// cost the steady state pays anyway, it does not grow the ceiling.
+    pub fn warm_page_cache(&self) {
+        if let Some(m) = self.data_mmap.read().as_ref() {
+            let _ = m.advise(memmap2::Advice::WillNeed);
+        }
+    }
+
     pub fn read_guard(&self) -> SQ8ReadGuard<'_> {
         SQ8ReadGuard {
             tomb: self.tombstones.lock(),

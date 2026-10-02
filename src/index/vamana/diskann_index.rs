@@ -413,6 +413,14 @@ impl DiskANNIndex {
             graph.pin_high_degree_nodes(100);
         }
 
+        // 🔑 F1: kick off page-cache readahead for the SQ8 + adjacency
+        // backing files — without it the first queries after open pay hard
+        // page faults mid-walk (66-337ms on query #1 at 220K×384 vs 1.4ms
+        // steady state). Advisory and async; file-backed pages remain
+        /// reclaimable under memory pressure.
+        vectors.vectors.warm_page_cache();
+        graph.warm_page_cache();
+
         Ok(Self {
             dimension,
             vectors,
