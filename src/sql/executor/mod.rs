@@ -1322,6 +1322,17 @@ struct AggregateInfo {
 /// For simple comparisons (Eq, Lt, etc.), evaluation is a single Vec index
 /// + direct Value comparison — no recursion, no string ops, no HashMap.
 #[allow(dead_code)]
+enum ColScanCol {
+    Text(std::sync::Arc<crate::storage::lsm::columnar::TextSegment>),
+    /// Fixed-width column + its SCHEMA type — the accessor must follow the
+    /// schema (get_bool happily returns Some for ANY 8-byte value, so
+    /// probing accessors in order silently decodes Integer columns as Bool).
+    Fixed(
+        std::sync::Arc<crate::storage::lsm::columnar::FixedSegment>,
+        crate::types::ColumnType,
+    ),
+}
+
 enum CompiledWhere {
     Eq(usize, Value), // col[pos] == value
     Ne(usize, Value), // col[pos] != value
@@ -16948,6 +16959,155 @@ impl QueryExecutor {
     }
 
     /// Execute UPDATE statement
+
+    /// Collect every schema column position a compiled predicate references.
+    fn compiled_where_positions(cw: &CompiledWhere, out: &mut Vec<usize>) {
+        match cw {
+            CompiledWhere::Eq(p, _)
+            | CompiledWhere::Ne(p, _)
+            | CompiledWhere::Lt(p, _)
+            | CompiledWhere::Le(p, _)
+            | CompiledWhere::Gt(p, _)
+            | CompiledWhere::Ge(p, _) => out.push(*p),
+            CompiledWhere::And(v) | CompiledWhere::Or(v) => {
+                for c in v {
+                    Self::compiled_where_positions(c, out);
+                }
+            }
+            CompiledWhere::InHash(p, _, _, _) => out.push(*p),
+            CompiledWhere::Like(p, _, _) => out.push(*p),
+            CompiledWhere::IsNull(p, _) => out.push(*p),
+            CompiledWhere::Not(inner) => Self::compiled_where_positions(inner, out),
+        }
+    }
+
+    /// 🚀 C1 scan-UPDATE/DELETE predicate pushdown: evaluate the WHERE
+    /// predicate against COLUMN SEGMENTS directly (decode only the columns
+    /// the predicate references + row ids), returning the matching row_ids.
+    /// The generic path decodes a full row per scanned row (~1.7µs/row at 5
+    /// columns); this decodes 1-2 columns and never materializes unmatched
+    /// rows. Newest-version-wins across segments (newest→oldest walk with a
+    /// seen-set; tombstoned keys count as seen and never match). Falls back
+    /// (None) when the table isn't column-store-backed or the predicate
+    /// touches a column type this can't decode positionally.
+    fn try_colscan_predicate_row_ids(
+        &self,
+        table: &str,
+        schema: &crate::types::TableSchema,
+        compiled: &CompiledWhere,
+    ) -> Option<Vec<RowId>> {
+        let store = self.db.get_col_segment_store(table)?;
+        let _ = store.flush_buffer();
+        let segs = store.segments_snapshot();
+        let ncols = schema.col_types().len();
+        let mut positions: Vec<usize> = Vec::new();
+        Self::compiled_where_positions(compiled, &mut positions);
+        positions.sort_unstable();
+        positions.dedup();
+        // Only decodable types: text + the fixed-width scalars. Timestamp/
+        // vector/geometry fall back to the generic row scan (their decoded
+        // Value reprs differ from raw i64 and correctness comes first).
+        for &pos in &positions {
+            match schema.col_types().get(pos) {
+                Some(crate::types::ColumnType::Text) => {}
+                Some(crate::types::ColumnType::Integer) => {}
+                Some(crate::types::ColumnType::Float) => {}
+                Some(crate::types::ColumnType::Boolean) => {}
+                _ => return None,
+            }
+        }
+        let table_id = self.db.table_registry.get_table_id(table).unwrap_or(0) as u64;
+
+        let mut matched: Vec<RowId> = Vec::new();
+        // Single-segment, no duplicate keys: every row_id appears exactly
+        // once — the dedup set is pure overhead (an insert per scanned row).
+        let use_seen = segs.len() > 1 || store.may_have_duplicate_keys();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut buf: Vec<Value> = vec![Value::Null; ncols];
+        for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            if n == 0 {
+                continue;
+            }
+            let has_del = seg.sst.row_map.has_any_deleted();
+            let _ = seg.sst.load_full_keys();
+            // Decode each referenced column once per segment.
+            let mut cols: Vec<(usize, ColScanCol)> = Vec::with_capacity(positions.len());
+            for &pos in &positions {
+                if pos >= seg.sst.column_tags.len() {
+                    return None; // segment layout older than schema → bail
+                }
+                if seg.sst.column_tags[pos].is_fixed() {
+                    let ty = schema.col_types().get(pos)?.clone();
+                    match seg.read_fixed_cached(pos) {
+                        Some(f) => cols.push((pos, ColScanCol::Fixed(std::sync::Arc::new(f), ty))),
+                        None => return None,
+                    }
+                } else {
+                    match seg.read_text_cached(pos) {
+                        Some(t) => cols.push((pos, ColScanCol::Text(std::sync::Arc::new(t)))),
+                        None => return None,
+                    }
+                }
+            }
+            let text_has_null: Vec<bool> = cols
+                .iter()
+                .map(|(_, c)| matches!(c, ColScanCol::Text(t) if t.has_any_null()))
+                .collect();
+            for i in 0..n {
+                let row_id = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                if use_seen {
+                    let key = (table_id << 32) | row_id;
+                    if !seen.insert(key) {
+                        continue; // a newer version already decided
+                    }
+                }
+                if has_del && seg.sst.row_map.is_deleted(i) {
+                    continue; // tombstoned in a newer segment position
+                }
+                // Fill only the referenced positions (the predicate reads
+                // nothing else; the rest stays Null).
+                for (ci, (pos, colref)) in cols.iter().enumerate() {
+                    let v = match colref {
+                        ColScanCol::Fixed(f, ty) => match ty {
+                            crate::types::ColumnType::Boolean => {
+                                f.get_bool(i).map(Value::Bool).unwrap_or(Value::Null)
+                            }
+                            crate::types::ColumnType::Float => {
+                                f.get_f64(i).map(Value::Float).unwrap_or(Value::Null)
+                            }
+                            // Integer (Timestamp etc. never reach here — the
+                            // type filter above already declined them).
+                            _ => f.get_i64(i).map(Value::Integer).unwrap_or(Value::Null),
+                        },
+                        ColScanCol::Text(t) => {
+                            let st = if text_has_null[ci] {
+                                t.get_str(i).map(|x| x as &str)
+                            } else {
+                                Some(t.get_str_fast(i) as &str)
+                            };
+                            match st {
+                                Some(st) => {
+                                    Value::Text(crate::types::ArcString(std::sync::Arc::from(st)))
+                                }
+                                None => Value::Null,
+                            }
+                        }
+                    };
+                    buf[*pos] = v;
+                }
+                if compiled.eval(&buf) == Some(true) {
+                    matched.push(row_id);
+                }
+                // Reset the touched slots for the next row (cheap — few).
+                for &(pos, _) in &cols {
+                    buf[pos] = Value::Null;
+                }
+            }
+        }
+        Some(matched)
+    }
+
     fn execute_update(&self, stmt: UpdateStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
 
@@ -17016,9 +17176,6 @@ impl QueryExecutor {
             }
         }
 
-        // 🚀 Use真正的流式扫描 (O(1) memory)
-        let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
-
         // 🔒 M1: same overlay as DELETE — skip rows already buffered-deleted
         // in this txn; rows with a buffered UPDATE are evaluated against
         // their pending NEW value (chained SET arithmetic correctness).
@@ -17058,6 +17215,42 @@ impl QueryExecutor {
         let compiled_where: Option<CompiledWhere> = resolved_where
             .as_ref()
             .and_then(|wc| Self::compile_where(wc, &schema));
+
+        // 🚀 C1: predicate pushdown — when WHERE compiles and the table is
+        // column-store-backed, evaluate the predicate against COLUMN
+        // SEGMENTS (only the referenced columns decode; unmatched rows never
+        // materialize) and fetch full rows for the matches only. Falls back
+        // to the streaming full-row scan otherwise. Pending rows whose
+        // buffered NEW value newly matches (storage text didn't) are
+        // appended — the loop re-checks every match against the overlaid
+        // row, so both directions stay exact.
+        let row_iter: Box<dyn Iterator<Item = Result<(RowId, Row)>>> =
+            match resolved_where.as_ref().zip(compiled_where.as_ref()) {
+                Some((wc, cw)) => {
+                    match self.try_colscan_predicate_row_ids(&stmt.table, &schema, cw) {
+                        Some(mut ids) => {
+                            // Newly-matching buffered values the storage scan
+                            // can't see (device changed INTO the predicate).
+                            for (rid, new_row) in pending_update_rows_u.iter() {
+                                if ids.contains(rid) {
+                                    continue; // re-checked by the loop anyway
+                                }
+                                if Self::compiled_or_eval_row(Some(cw), wc, new_row, &schema) {
+                                    ids.push(*rid);
+                                }
+                            }
+                            let fetched = self.db.get_table_rows_batch(&stmt.table, &ids)?;
+                            Box::new(
+                                fetched
+                                    .into_iter()
+                                    .filter_map(|(rid, opt)| opt.map(|row| Ok((rid, row)))),
+                            )
+                        }
+                        None => Box::new(self.db.scan_table_rows_streaming(&stmt.table)?),
+                    }
+                }
+                None => Box::new(self.db.scan_table_rows_streaming(&stmt.table)?),
+            };
 
         // 🔑 In transaction mode, also process rows from the write_set
         // (uncommitted INSERTs). These rows are NOT in storage yet, so the

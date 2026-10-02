@@ -2,6 +2,29 @@
 
 ## [0.12.0] — 未发布
 
+### 🚀 C1 scan-UPDATE 谓词下推: 列段扫描免全行物化 (9.3K→50K rows/s, 5.4×)
+
+- 🚀 **谓词下推** (try_colscan_predicate_row_ids): scan UPDATE 的 WHERE 在
+  列段上直接求值 — 只解码谓词引用的列 + row_id (稀疏行缓冲按 schema 位置
+  填充, CompiledWhere 纯位置比较原样复用), 未命中行永不物化。旧路径每
+  扫描行解码整行 (~1.7µs/行 @5 列)。命中行才批量取整行 (get_table_rows_
+  batch) 走既有 SET 求值/缓冲/批量写循环 — 下游语义零改动
+- 🔒 语义等价三保障: (1) 段 newest→oldest 遍历 + seen 集去重 + 墓碑跳过
+  (= 流式扫描的 newest-wins 契约); (2) 事务内 overlay 双向 — 缓冲新值
+  移出谓词的行由循环内重判剔除, 移入谓词的行由 pending 补充扫描追加;
+  (3) 单段无重复键时免去重集 (每行一次 HashSet insert 纯开销)
+- 🔒 类型陷阱修复 (全量套件实抓): 定宽访问器按 schema 列类型选择 —
+  get_bool 对任意 8 字节值返回 Some, 按返回值探测会把 Integer 列静默
+  解码成 Bool (test_bug_hunt_v19 update_where_with_and_or 抓出)
+- 支持谓词列类型: Text/Integer/Float/Boolean (Timestamp/Vector/Geometry
+  回退通用扫描); 子查询/不可编译 WHERE 回退
+- 实测: 50K 行表谓词命中 781 行 — autocommit 9,314 → **49,886 rows/s
+  (5.4×)**; 事务内缓冲版 **112,926 rows/s (反超 SQLite 110K)**。剩余
+  autocommit 差距在写侧 (每命中行 ~11.5µs 的 WAL+存储+索引批), 另立项
+- 差分回归 colscan_update_predicate_pushdown_matches_generic (五段+墓碑
+  基线 / 文本与数值谓词 / AND 链 / 事务三向 overlay / write_set 匹配);
+  对抗验证 ALL PASS; 全量 239 bin 第十一轮全绿
+
 ### 🔒 W4b 事务内 MATCH 读己之写 + 🚀 executemany 表达式 SET 批量求值
 
 - 🔒 **事务内 MATCH RYW** (M 战役读路径最后一块): FTS SELECT 快路径

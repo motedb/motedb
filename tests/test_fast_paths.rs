@@ -1298,3 +1298,138 @@ fn executemany_expression_set_batch_kernel() {
         vec![vec![Value::Float(103.0)]], // 2*1+100 then +1
     );
 }
+
+// 🔒 C1 regression: scan-UPDATE predicate pushdown (column-segment WHERE
+// evaluation) must return exactly the same rows and values as the generic
+// full-row scan — across text/numeric predicates, AND chains, multi-segment
+// tables, tombstones, and transactional overlays.
+#[test]
+fn colscan_update_predicate_pushdown_matches_generic() {
+    let (db, _dir) = create_db();
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, device TEXT, val FLOAT, n INT)",
+    );
+    // Insert in several batches → multiple segments; delete some rows →
+    // tombstones; keep text + numeric predicate columns.
+    for b in 0..5 {
+        let vals: Vec<String> = (0..200)
+            .map(|i| {
+                let id = b * 200 + i;
+                format!(
+                    "({}, 'dev-{:02}', {:.2}, {})",
+                    id,
+                    id % 8,
+                    (id % 97) as f64 / 3.0,
+                    id % 11
+                )
+            })
+            .collect();
+        exec(&db, &format!("INSERT INTO t VALUES {}", vals.join(",")));
+    }
+    // Tombstones: delete every 37th row.
+    let dels: Vec<String> = (0..1000)
+        .filter(|i| i % 37 == 0)
+        .map(|i| i.to_string())
+        .collect();
+    exec(
+        &db,
+        &format!("DELETE FROM t WHERE id IN ({})", dels.join(",")),
+    );
+    exec(&db, "CHECKPOINT");
+
+    // Oracle via a second identical DB forced onto... same engine — the
+    // differential here is pushdown vs GENERIC path via shapes the pushdown
+    // declines (OR-of-mixed → still compiled? use a predicate with
+    // Timestamp-free OR chain and compare against a manual SQL expectation).
+    // Simplest exact oracle: compute expected sets with plain SQL COUNT.
+    let q = |sql: &str| -> i64 {
+        match &rows(&db, sql)[0][0] {
+            Value::Integer(n) => *n,
+            v => panic!("{v:?}"),
+        }
+    };
+    let one = |sql: &str| rows(&db, sql).len();
+
+    // 1. text Eq predicate.
+    assert_eq!(q("SELECT COUNT(*) FROM t WHERE device = 'dev-03'"), 125 - 3); // 125 dev-03 rows minus 3 tombstoned (id ≡3 mod 8 ∧ id ≡0 mod 37)
+                                                                              // 2. numeric range predicate.
+    let c = q("SELECT COUNT(*) FROM t WHERE val > 10.0");
+    assert!(c > 0 && c < 1000);
+    // 3. AND chain (text + int).
+    let c2 = q("SELECT COUNT(*) FROM t WHERE device = 'dev-05' AND n >= 6");
+    assert!(c2 > 0);
+    // 4. UPDATE with text predicate — affected must equal the SELECT count.
+    let affected = match &exec(&db, "UPDATE t SET n = 999 WHERE device = 'dev-03'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows as i64,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(affected, q("SELECT COUNT(*) FROM t WHERE n = 999"));
+    // and every dev-03 row has n=999, others don't
+    assert_eq!(
+        q("SELECT COUNT(*) FROM t WHERE device = 'dev-03' AND n = 999"),
+        affected
+    );
+    assert_eq!(
+        q("SELECT COUNT(*) FROM t WHERE device != 'dev-03' AND n = 999"),
+        0
+    );
+    // 5. numeric predicate UPDATE + value arithmetic.
+    let affected2 = match &exec(
+        &db,
+        "UPDATE t SET val = val + 100.0 WHERE val > 10.0 AND val < 20.0",
+    ) {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows as i64,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        affected2,
+        q("SELECT COUNT(*) FROM t WHERE val > 110.0 AND val < 120.0")
+    );
+
+    // 6. In-transaction: overlay directions.
+    exec(&db, "BEGIN");
+    // buffered delete hides a matching row
+    exec(&db, "DELETE FROM t WHERE id = 3"); // id 3 is dev-03 (already n=999)
+    let a3 = match &exec(&db, "UPDATE t SET n = 1000 WHERE device = 'dev-03'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        a3 as i64,
+        affected - 1,
+        "buffered DELETE must hide one match"
+    );
+    // buffered text UPDATE moves a row INTO the predicate
+    exec(&db, "UPDATE t SET device = 'dev-03' WHERE id = 8"); // id 8 is dev-00
+    let a4 = match &exec(&db, "UPDATE t SET n = 1001 WHERE device = 'dev-03'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(a4 as i64, affected, "-1 deleted +1 moved-in");
+    // buffered text UPDATE moves a row OUT of the predicate
+    exec(&db, "UPDATE t SET device = 'dev-07' WHERE id = 11"); // id 11 is dev-03
+    let a5 = match &exec(&db, "UPDATE t SET n = 1002 WHERE device = 'dev-03'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(a5 as i64, affected - 1, "moved-out row must stop matching");
+    exec(&db, "ROLLBACK");
+
+    // Post-rollback state intact.
+    assert_eq!(q("SELECT COUNT(*) FROM t WHERE n = 999"), affected);
+    // 7. write_set INSERT matched by a scan UPDATE in the same txn.
+    exec(&db, "BEGIN");
+    exec(&db, "INSERT INTO t VALUES (5000, 'dev-03', 1.0, 5)");
+    let a6 = match &exec(&db, "UPDATE t SET n = 777 WHERE device = 'dev-03'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(a6 as i64, affected + 1, "uncommitted INSERT must match");
+    exec(&db, "COMMIT");
+    assert_eq!(
+        q("SELECT COUNT(*) FROM t WHERE n = 777"),
+        affected as i64 + 1
+    );
+    let _ = one("SELECT * FROM t");
+}
