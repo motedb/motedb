@@ -495,23 +495,22 @@ impl TextFTSIndex {
         let _t1 = Instant::now();
         let mut batch_token_count = 0u64;
 
-        // 🚀 W3: tokenize the batch in PARALLEL (the tokenizer is Send+Sync
-        // and tokenize(&self) touches no shared state) — tokenization was
-        // the dominant single-threaded cost of CREATE TEXT INDEX at 100K
-        // docs. The dictionary interning + term_docs grouping below stays
-        // SERIAL, so term-id assignment and pending-buffer growth remain
-        // deterministic.
+        // 🚀 W3+G1: tokenize the batch in PARALLEL with the BUFFER variant
+        // (one normalization buffer per doc, zero per-token allocations —
+        // 700K per-token Strings under rayon were the measured bottleneck:
+        // jemalloc mutex contention + arena init). Dictionary interning +
+        // grouping stay SERIAL, keeping term-id assignment deterministic.
         #[cfg(feature = "rayon")]
-        let tokenized: Vec<(DocumentId, Vec<crate::index::text_types::Token>)> = {
+        let tokenized: Vec<(DocumentId, crate::index::text_types::TokenizedText)> = {
             use rayon::prelude::*;
             docs.par_iter()
-                .map(|&(doc_id, text)| (doc_id, self.tokenizer.tokenize(text)))
+                .map(|&(doc_id, text)| (doc_id, self.tokenizer.tokenize_buf(text)))
                 .collect()
         };
         #[cfg(not(feature = "rayon"))]
-        let tokenized: Vec<(DocumentId, Vec<crate::index::text_types::Token>)> = docs
+        let tokenized: Vec<(DocumentId, crate::index::text_types::TokenizedText)> = docs
             .iter()
-            .map(|&(doc_id, text)| (doc_id, self.tokenizer.tokenize(text)))
+            .map(|&(doc_id, text)| (doc_id, self.tokenizer.tokenize_buf(text)))
             .collect();
 
         // Build per-term doc lists (lightweight intermediate structure)
@@ -519,13 +518,13 @@ impl TextFTSIndex {
         let mut doc_lengths_batch = HashMap::new();
 
         for (doc_id, tokens) in &tokenized {
-            doc_lengths_batch.insert(*doc_id, tokens.len() as u32);
-            batch_token_count += tokens.len() as u64;
+            doc_lengths_batch.insert(*doc_id, tokens.token_count() as u32);
+            batch_token_count += tokens.token_count() as u64;
 
-            for token in tokens {
-                let term_id = self.dictionary.get_or_insert(&token.text);
+            for (term_text, position) in tokens.iter() {
+                let term_id = self.dictionary.get_or_insert(term_text);
                 let pos = if self.enable_positions {
-                    Some(token.position)
+                    Some(position)
                 } else {
                     None
                 };

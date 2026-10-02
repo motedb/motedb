@@ -39,6 +39,52 @@ pub trait Tokenizer: Send + Sync {
 
     /// Get tokenizer name
     fn name(&self) -> &str;
+
+    /// 🚀 G1: buffer-tokenizing variant for bulk indexing — zero per-token
+    /// allocations. Default implementation still calls `tokenize` but packs
+    /// the owned tokens into ONE buffer (one alloc per doc instead of one
+    /// per token); tokenizers override with true borrowed slicing.
+    fn tokenize_buf<'a>(&self, text: &'a str) -> TokenizedText<'a> {
+        let toks = self.tokenize(text);
+        let mut buf = String::with_capacity(text.len());
+        let mut ranges = Vec::with_capacity(toks.len());
+        for t in toks {
+            let start = buf.len() as u32;
+            buf.push_str(&t.text);
+            ranges.push((start, t.text.len() as u32, t.position));
+        }
+        TokenizedText {
+            buf: std::borrow::Cow::Owned(buf),
+            ranges,
+        }
+    }
+}
+
+/// 🚀 G1: allocation-free tokenization result — one normalization buffer
+/// (borrowed when the text needs no case folding) + (offset, len, position)
+/// ranges into it. Replaces `Vec<Token>`'s per-token String allocation in
+/// the bulk-indexing path (700K tokens ≈ 700K mallocs under rayon contention
+/// — the measured CREATE TEXT INDEX bottleneck).
+pub struct TokenizedText<'a> {
+    buf: std::borrow::Cow<'a, str>,
+    ranges: Vec<(u32, u32, u32)>, // (byte offset, byte len, token position)
+}
+
+impl<'a> TokenizedText<'a> {
+    /// Number of tokens.
+    #[inline]
+    pub fn token_count(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Iterate `(token_text, position)`.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
+        self.ranges.iter().map(move |&(off, len, pos)| {
+            // SAFETY-free: ranges were produced by slicing the buffer.
+            (&self.buf[off as usize..off as usize + len as usize], pos)
+        })
+    }
 }
 
 /// Whitespace tokenizer (default, fast)
@@ -87,6 +133,44 @@ impl Tokenizer for WhitespaceTokenizer {
 
     fn name(&self) -> &str {
         "whitespace"
+    }
+
+    /// 🚀 G1: one lowercase per doc (borrowed when case-sensitive), then
+    /// byte ranges into it — zero per-token allocations. Semantics are
+    /// byte-identical to `tokenize` (same split, same length filters, same
+    /// position numbering: Rust's `str::to_lowercase` is context-free, so
+    /// folding the whole string equals folding each token).
+    fn tokenize_buf<'a>(&self, text: &'a str) -> TokenizedText<'a> {
+        let normalized = if self.case_sensitive {
+            std::borrow::Cow::Borrowed(text)
+        } else {
+            std::borrow::Cow::Owned(text.to_lowercase())
+        };
+        let mut ranges: Vec<(u32, u32, u32)> = Vec::new();
+        let mut pos = 0u32;
+        let mut rest: &str = &normalized;
+        let mut consumed = 0usize;
+        loop {
+            let trimmed = rest.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            if trimmed.is_empty() {
+                break;
+            }
+            consumed += rest.len() - trimmed.len();
+            let word_len = trimmed
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(trimmed.len());
+            let word = &trimmed[..word_len];
+            if word.len() >= self.min_len && word.len() <= self.max_len {
+                ranges.push((consumed as u32, word.len() as u32, pos));
+                pos += 1;
+            }
+            consumed += word_len;
+            rest = &trimmed[word_len..];
+        }
+        TokenizedText {
+            buf: normalized,
+            ranges,
+        }
     }
 }
 
@@ -1606,5 +1690,50 @@ mod tests {
 
         assert_eq!(posting.term_frequency(1), 3);
         assert_eq!(posting.max_tf(), 3);
+    }
+}
+
+#[cfg(test)]
+mod tokenize_buf_tests {
+    use super::*;
+
+    /// 🔒 G1: the buffer variant must be byte-identical to the owned
+    /// variant — same tokens, same positions, same length filtering —
+    /// across the boundary shapes (CJK, underscores, mixed case, mixed
+    /// separators, length-edge tokens, case-sensitivity modes).
+    #[test]
+    fn whitespace_tokenize_buf_matches_tokenize() {
+        let texts = [
+            "alpha bravo charlie delta",
+            "row 42 mixed_CASE under_score ok",
+            "  leading and   trailing   ",
+            "中文 ngram 分词 test",
+            "a ab abc abcd abcde (paren) [bracket] ,comma. ",
+            "TAB\tsep\nnewline",
+            "MiXeD CaSe WoRdS",
+            "tooshort x exactlymax ok",
+            "___only___under___",
+            "",
+        ];
+        for &case_sensitive in &[false, true] {
+            let mut t = WhitespaceTokenizer::default();
+            t.case_sensitive = case_sensitive;
+            for text in texts {
+                let owned: Vec<(String, u32)> = t
+                    .tokenize(text)
+                    .into_iter()
+                    .map(|tok| (tok.text, tok.position))
+                    .collect();
+                let buf: Vec<(String, u32)> = t
+                    .tokenize_buf(text)
+                    .iter()
+                    .map(|(s, p)| (s.to_string(), p))
+                    .collect();
+                assert_eq!(
+                    owned, buf,
+                    "mismatch (case_sensitive={case_sensitive}) on {text:?}"
+                );
+            }
+        }
     }
 }

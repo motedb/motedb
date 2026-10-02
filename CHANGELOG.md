@@ -2,6 +2,27 @@
 
 ## [0.12.0] — 未发布
 
+### 🚀 G1 FTS 构建零 per-token 分配: TokenizedText 借用化 (0.72→0.48s)
+
+- 🔍 **根因** (采样): W3 并行分词后剩余瓶颈是 **per-token String 分配
+  在 rayon 下的分配器争用** (malloc_init_hard 9.8K + mutex_slow 9.5K +
+  malloc 8.8K 采样) — 100K 文档 ≈ 700K 次 token 级 malloc
+- 🚀 **TokenizedText**: Tokenizer trait 新增 tokenize_buf (默认实现把
+  owned tokens 打包进单缓冲 — 每文档一次分配而非每 token 一次);
+  WhitespaceTokenizer 覆写真·借用路径 (整文档一次 lowercase + 字节范围
+  切片, case_sensitive 时零分配)。batch_insert 并行阶段切到
+  tokenize_buf — 语义字节级等价 (Rust to_lowercase 上下文无关, 整串
+  折叠 == 逐 token 折叠), 等价性测试
+  whitespace_tokenize_buf_matches_tokenize (10 形状 × 2 case 模式:
+  CJK/下划线/混合分隔/长度边界/前后空白)
+- 实测: 100K 文档 CREATE TEXT INDEX 0.718 → **0.478s (1.5×)**; 自 W3
+  前的 0.822 累计 1.72×。行业对位: 反超 tantivy 0.244s 的差距收窄到
+  2×, FTS5 0.104s 差 4.6× (结构性: btree 持久化索引 vs FTS5 专用段
+  写入器)。复采样确认剩余热点分散 (并行协调+真实分词), 无单一靶点 —
+  止损。flush 阈值实验 (2000→10000) 无效已回退 (批大小 10K 下节奏
+  相同)
+- 对抗验证 ALL PASS; 全量 239 bin 第十五轮全绿
+
 ### 🚀 F1 ANN 尾部根因: 冷缺页斜坡 — 打开期 madvise 预热 (p99 30ms → 1.5ms)
 
 - 🔍 **根因** (逐查询延迟 vs 游走统计相关性分析): DiskANN 的"尾部延迟"
