@@ -2,6 +2,27 @@
 
 ## [0.12.0] — 未发布
 
+### 🚀 D1 scan-UPDATE 写侧收尾: 字节级预检 + 去重集 FxHash + 批量 WAL 单次刷
+
+- 🚀 **谓词字节级预检** (colscan_precheck): AND 链各简单比较合取在原始
+  列数据上直接判 (文本字节比较/定点数值比较, 字面量类型与列类型完全
+  一致才裁决 — 与随后的精确稀疏求值不可能相左); ~98% 未命中行跳过稀疏
+  行填充与 Value::Text 分配。扫描地板 4.44 → 2.2ms/50K 行
+- 🚀 **去重集 FxHash**: newest-wins 段去重的 50K 次 SipHash 插入 (每语句
+  ~2ms 纯哈希) 换 FxHash (G1 组索引同款权衡)
+- 🚀 **批量 WAL 单次页缓存刷** (begin/end_deferred_batch): W2 的 Periodic
+  每-append 页缓存 flush 在多记录批量语句里逐记录生效 (781 次 write()
+  系统调用/语句) — 批量语句内挂起, 语句末每分区一次 flush。W2 契约保持
+  (已提交字节在语句返回前进 OS 页缓存); 硬崩溃矩阵验证: 50K 表 1/2 条
+  批量 scan-UPDATE 后 os._exit, 重开 782/782 行完整存活
+- 实测 (50K 表, 谓词命中 782 行): 默认档 (group_commit, 每提交 fsync)
+  48.7K → **58.8K rows/s**; periodic 档 (与 SQLite WAL+NORMAL 同耐久
+  口径) 79.9K → **115.2K rows/s — 反超 SQLite 110K**。默认档仍慢于
+  SQLite-NORMAL 因其每提交 fsync (更强耐久, 口径不对等)。剩余大头为段
+  发布的 fcntl 同步 (~1.6ms/语句) — 属耐久语义 (checkpoint 先 durable
+  flush 段再截 WAL 的顺序依赖), 不动
+- 对抗验证 ALL PASS; 全量 239 bin 第十二轮全绿
+
 ### 🚀 C1 scan-UPDATE 谓词下推: 列段扫描免全行物化 (9.3K→50K rows/s, 5.4×)
 
 - 🚀 **谓词下推** (try_colscan_predicate_row_ids): scan UPDATE 的 WHERE 在

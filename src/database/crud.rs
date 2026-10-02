@@ -855,10 +855,25 @@ impl MoteDB {
         schema: &crate::types::TableSchema,
     ) -> Result<u64> {
         let mut n = 0u64;
-        for (row_id, old_row, new_row) in updates {
-            self.update_row_with_schema_impl(table_name, row_id, &old_row, new_row, schema, true)?;
-            n += 1;
-        }
+        // 🔑 D1: one page-cache flush at batch end instead of one write()
+        // syscall per record (Periodic durability).
+        self.wal.begin_deferred_batch();
+        let result = (|| -> Result<()> {
+            for (row_id, old_row, new_row) in updates {
+                self.update_row_with_schema_impl(
+                    table_name,
+                    row_id,
+                    &old_row,
+                    new_row,
+                    schema,
+                    true,
+                )?;
+                n += 1;
+            }
+            Ok(())
+        })();
+        self.wal.end_deferred_batch();
+        result?;
         self.wal.wal_group_barrier();
         Ok(n)
     }
@@ -1494,10 +1509,16 @@ impl MoteDB {
     /// 🔑 批量 DELETE: WAL deferred + 语句级栅栏 (同 UPDATE 批量化)。
     pub fn delete_rows_batch(&self, table_name: &str, deletes: Vec<(RowId, Row)>) -> Result<u64> {
         let mut n = 0u64;
-        for (row_id, old_row) in deletes {
-            self.delete_row_impl(table_name, row_id, old_row, true)?;
-            n += 1;
-        }
+        self.wal.begin_deferred_batch();
+        let result = (|| -> Result<()> {
+            for (row_id, old_row) in deletes {
+                self.delete_row_impl(table_name, row_id, old_row, true)?;
+                n += 1;
+            }
+            Ok(())
+        })();
+        self.wal.end_deferred_batch();
+        result?;
         self.wal.wal_group_barrier();
         Ok(n)
     }

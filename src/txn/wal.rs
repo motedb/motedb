@@ -666,6 +666,13 @@ struct PartitionWAL {
 
     /// WAL configuration
     pub(crate) config: WALConfig,
+
+    /// 🔑 D1: set around multi-record batch statements (update/delete_rows_
+    /// batch): the Periodic per-append page-cache flush is deferred to ONE
+    /// flush at batch end — 781 per-record write() syscalls become one per
+    /// partition, keeping the W2 contract (committed bytes reach the OS
+    /// cache before the statement returns).
+    defer_periodic_flush: bool,
 }
 
 impl PartitionWAL {
@@ -683,6 +690,7 @@ impl PartitionWAL {
             next_lsn: 0,
             last_checkpoint: 0,
             config,
+            defer_periodic_flush: false,
         })
     }
 
@@ -794,6 +802,7 @@ impl PartitionWAL {
             next_lsn,
             last_checkpoint,
             config,
+            defer_periodic_flush: false,
         })
     }
 
@@ -829,7 +838,13 @@ impl PartitionWAL {
                 // loses at most the fsync window. The old behavior kept
                 // records in the userspace BufWriter — a mere process exit
                 // could drop committed transactions.
-                self.file.flush()?;
+                //
+                // 🔑 D1: inside a multi-record batch statement the flush is
+                // deferred to ONE flush at batch end (end_deferred_batch) —
+                // the per-record write() syscall was ~1µs × rows.
+                if !self.defer_periodic_flush {
+                    self.file.flush()?;
+                }
             }
             DurabilityLevel::NoSync => {}
         }
@@ -2142,6 +2157,28 @@ impl WALManager {
         let mut wal = entry.value().lock();
         wal.append(record)?;
         Ok(())
+    }
+
+    /// 🔑 D1: bracket a multi-record batch statement. Between begin/end the
+    /// Periodic per-append page-cache flush is suppressed; end flushes every
+    /// partition's BufWriter once (one write() syscall per partition with
+    /// data) so the statement's committed bytes still reach the OS cache
+    /// before it returns.
+    pub fn begin_deferred_batch(&self) {
+        for entry in self.partitions.iter() {
+            let mut wal = entry.value().lock();
+            wal.defer_periodic_flush = true;
+        }
+    }
+
+    pub fn end_deferred_batch(&self) {
+        for entry in self.partitions.iter() {
+            let mut wal = entry.value().lock();
+            wal.defer_periodic_flush = false;
+            if matches!(wal.config.durability_level, DurabilityLevel::Periodic { .. }) {
+                let _ = wal.file.flush();
+            }
+        }
     }
 
     /// 🔑 组提交栅栏: 等队列排空 — gc 线程取走的批次已 fsync 后才清空

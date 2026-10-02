@@ -17022,7 +17022,12 @@ impl QueryExecutor {
         // Single-segment, no duplicate keys: every row_id appears exactly
         // once — the dedup set is pure overhead (an insert per scanned row).
         let use_seen = segs.len() > 1 || store.may_have_duplicate_keys();
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // FxHash over SipHash: 50K dedup inserts per statement were ~2ms of
+        // pure hashing (G1's group-index made the same trade).
+        let mut seen: std::collections::HashSet<
+            u64,
+            std::hash::BuildHasherDefault<crate::storage::lsm::columnar::FxHasher>,
+        > = std::collections::HashSet::default();
         let mut buf: Vec<Value> = vec![Value::Null; ncols];
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
@@ -17052,8 +17057,10 @@ impl QueryExecutor {
             }
             let text_has_null: Vec<bool> = cols
                 .iter()
-                .map(|(_, c)| matches!(c, ColScanCol::Text(t) if t.has_any_null()))
+                .map(|(_, c)| matches!(c, ColScanCol::Text(t, ..) if t.has_any_null()))
                 .collect();
+            let cols_ref: Vec<(usize, &ColScanCol)> =
+                cols.iter().map(|(p, c)| (*p, c)).collect();
             for i in 0..n {
                 let row_id = seg.sst.row_map.key(i) & 0xFFFFFFFF;
                 if use_seen {
@@ -17064,6 +17071,12 @@ impl QueryExecutor {
                 }
                 if has_del && seg.sst.row_map.is_deleted(i) {
                     continue; // tombstoned in a newer segment position
+                }
+                // 🚀 D1: byte/numeric precheck first — for the ~98% of rows
+                // that don't match, this skips the sparse-row fill (and the
+                // per-row Value::Text allocation for text predicates).
+                if Self::colscan_precheck(compiled, cols_ref.as_slice(), i) == Some(false) {
+                    continue;
                 }
                 // Fill only the referenced positions (the predicate reads
                 // nothing else; the rest stays Null).
@@ -17080,7 +17093,7 @@ impl QueryExecutor {
                             // type filter above already declined them).
                             _ => f.get_i64(i).map(Value::Integer).unwrap_or(Value::Null),
                         },
-                        ColScanCol::Text(t) => {
+                        ColScanCol::Text(t, ..) => {
                             let st = if text_has_null[ci] {
                                 t.get_str(i).map(|x| x as &str)
                             } else {
@@ -17106,6 +17119,73 @@ impl QueryExecutor {
             }
         }
         Some(matched)
+    }
+
+
+    /// 🚀 D1 precheck: byte-level/numeric conjunct test on raw column data,
+    /// used to skip building sparse-row Values for rows that definitely
+    /// don't match. Conservative by construction — only decides when the
+    /// literal type EXACTLY matches the column type (so the decision can
+    /// never disagree with the exact sparse-buffer eval that follows on
+    /// pass). None = can't precheck; Some(false) = row definitely out;
+    /// Some(true) = passed the fast conjuncts (exact eval still decides).
+    fn colscan_precheck(
+        cw: &CompiledWhere,
+        cols: &[(usize, &ColScanCol)],
+        i: usize,
+    ) -> Option<bool> {
+        match cw {
+            CompiledWhere::And(parts) => {
+                for p in parts {
+                    if !Self::colscan_precheck(p, cols, i)? {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
+            CompiledWhere::Eq(pos, v) | CompiledWhere::Ne(pos, v) => {
+                let (_, col) = cols.iter().find(|(p, _)| p == pos)?;
+                let eq = match (col, v) {
+                    (ColScanCol::Text(t, ..), Value::Text(lit)) => {
+                        t.get_str_fast(i).as_bytes() == lit.as_bytes().as_ref()
+                    }
+                    (
+                        ColScanCol::Fixed(f, crate::types::ColumnType::Integer),
+                        Value::Integer(lit),
+                    ) => f.get_i64(i)? == *lit,
+                    (
+                        ColScanCol::Fixed(f, crate::types::ColumnType::Float),
+                        Value::Float(lit),
+                    ) => f.get_f64(i)? == *lit,
+                    _ => return None, // cross-type / NULL literal → exact eval
+                };
+                Some(if matches!(cw, CompiledWhere::Eq(..)) { eq } else { !eq })
+            }
+            CompiledWhere::Lt(pos, v)
+            | CompiledWhere::Le(pos, v)
+            | CompiledWhere::Gt(pos, v)
+            | CompiledWhere::Ge(pos, v) => {
+                let (_, col) = cols.iter().find(|(p, _)| p == pos)?;
+                let ord = match (col, v) {
+                    (
+                        ColScanCol::Fixed(f, crate::types::ColumnType::Integer),
+                        Value::Integer(lit),
+                    ) => f.get_i64(i)?.partial_cmp(lit)?,
+                    (
+                        ColScanCol::Fixed(f, crate::types::ColumnType::Float),
+                        Value::Float(lit),
+                    ) => f.get_f64(i)?.partial_cmp(lit)?,
+                    _ => return None,
+                };
+                Some(match cw {
+                    CompiledWhere::Lt(..) => ord == std::cmp::Ordering::Less,
+                    CompiledWhere::Le(..) => ord != std::cmp::Ordering::Greater,
+                    CompiledWhere::Gt(..) => ord == std::cmp::Ordering::Greater,
+                    _ => ord != std::cmp::Ordering::Less,
+                })
+            }
+            _ => None, // Or/Not/InHash/Like/IsNull → exact eval only
+        }
     }
 
     fn execute_update(&self, stmt: UpdateStmt) -> Result<QueryResult> {
