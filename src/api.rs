@@ -31,6 +31,19 @@ enum FastPkRowId {
     Defer,
 }
 
+/// 🔑 J1: one fused-retrieval hit — RRF score plus the per-engine scores
+/// when that list contained the document.
+#[derive(Debug, Clone)]
+pub struct HybridHit {
+    pub row_id: RowId,
+    /// Fused Reciprocal Rank Fusion score (higher = better).
+    pub rrf: f32,
+    /// BM25 score from the text list (None = not in the text top-N).
+    pub bm25: Option<f32>,
+    /// Vector distance from the KNN list (None = not in the vector top-N).
+    pub distance: Option<f32>,
+}
+
 /// Pre-computed metadata for fast PK SELECT execution.
 struct FastPkMeta {
     /// "select", "update", or "delete"
@@ -3652,6 +3665,120 @@ impl Database {
         k: usize,
     ) -> Result<Vec<(RowId, f32)>> {
         self.inner.vector_search(index_name, query, k)
+    }
+
+    /// 🔑 J1 hybrid retrieval: fuse a BM25-ranked text list and a vector KNN
+    /// list with Reciprocal Rank Fusion:
+    ///     rrf(d) = Σ_lists 1 / (rrf_k + rank_in_list)      (rank 1-based)
+    /// RRF needs no score calibration between the two engines (the standard
+    /// industry choice). Candidate depth is k × fetch_mult from each list —
+    /// docs that rank low on BOTH lists can still surface; docs absent from
+    /// a list simply contribute 0 from it.
+    ///
+    /// Returns up to k hits, descending by fused score, with the per-list
+    /// scores attached when a list contained the doc. Rows are fetched for
+    /// the final hits (columnar batch) — the Python binding projects them
+    /// straight into dicts.
+    pub fn hybrid_search(
+        &self,
+        text_index: &str,
+        text_query: &str,
+        vector_index: &str,
+        query_vector: &[f32],
+        k: usize,
+        rrf_k: usize,
+        fetch_mult: usize,
+    ) -> Result<Vec<HybridHit>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch = (k.saturating_mul(fetch_mult.max(1))).clamp(16, 512);
+        let bm25_list = self.text_search_ranked(text_index, text_query, fetch)?;
+        let vec_list = self.vector_search(vector_index, query_vector, fetch)?;
+
+        let rrf_denom = rrf_k.max(1) as f32;
+        // rank → contribution: rank 1 → 1/(rrf_k+1), rank r → 1/(rrf_k+r).
+        let mut scores: std::collections::HashMap<RowId, (f32, Option<f32>, Option<f32>)> =
+            std::collections::HashMap::new();
+        for (rank, (rid, score)) in bm25_list.iter().enumerate() {
+            let e = scores.entry(*rid).or_insert((0.0, None, None));
+            e.0 += 1.0 / (rrf_denom + rank as f32 + 1.0);
+            e.1 = Some(*score);
+        }
+        for (rank, (rid, dist)) in vec_list.iter().enumerate() {
+            let e = scores.entry(*rid).or_insert((0.0, None, None));
+            e.0 += 1.0 / (rrf_denom + rank as f32 + 1.0);
+            e.2 = Some(*dist);
+        }
+        let mut hits: Vec<HybridHit> = scores
+            .into_iter()
+            .map(|(row_id, (rrf, bm25, distance))| HybridHit {
+                row_id,
+                rrf,
+                bm25,
+                distance,
+            })
+            .collect();
+        // Descending fused score; deterministic tiebreak by row_id asc.
+        hits.sort_by(|a, b| {
+            b.rrf
+                .partial_cmp(&a.rrf)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.row_id.cmp(&b.row_id))
+        });
+        hits.truncate(k);
+        Ok(hits)
+    }
+
+    /// 🔑 J1: fetch full rows for hybrid-search hits (columnar batch, order
+    /// preserved). Returns (column_names, rows) — rows carry the original
+    /// values; scores live in HybridHit.
+    pub fn hybrid_search_rows(
+        &self,
+        text_index: &str,
+        text_query: &str,
+        vector_index: &str,
+        query_vector: &[f32],
+        k: usize,
+        rrf_k: usize,
+        fetch_mult: usize,
+    ) -> Result<(Vec<String>, Vec<Row>, Vec<HybridHit>)> {
+        let hits = self.hybrid_search(
+            text_index,
+            text_query,
+            vector_index,
+            query_vector,
+            k,
+            rrf_k,
+            fetch_mult,
+        )?;
+        // Table name comes from the vector index's registration (text and
+        // vector indexes must target the same table for fusion to make sense).
+        let resolved = self.inner.index_registry.resolve_index_name(vector_index);
+        let table_name: String = match &resolved {
+            Some((t, _)) => t.clone(),
+            None => vector_index
+                .split('_')
+                .next()
+                .unwrap_or(vector_index)
+                .to_string(),
+        };
+        let schema = self.inner.get_table_schema(&table_name)?;
+        let ids: Vec<RowId> = hits.iter().map(|h| h.row_id).collect();
+        let batch = self.inner.get_table_rows_batch(&table_name, &ids)?;
+        let mut lookup: std::collections::HashMap<RowId, &Row> =
+            std::collections::HashMap::with_capacity(batch.len());
+        for (rid, r) in &batch {
+            if let Some(row) = r {
+                lookup.insert(*rid, row);
+            }
+        }
+        let rows: Vec<Row> = hits
+            .iter()
+            .filter_map(|h| lookup.get(&h.row_id).cloned().cloned())
+            .collect();
+        let names: Vec<String> = schema.column_names();
+        Ok((names, rows, hits))
     }
 
     /// 全文搜索（BM25排序）

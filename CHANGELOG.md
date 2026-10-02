@@ -2,6 +2,20 @@
 
 ## [0.12.0] — 未发布
 
+### 🔑 J1 混合检索: BM25 + 向量 RRF 融合 (产品定位闭环)
+
+- 🔑 **hybrid_search API** (Rust + Python): 同一查询里 BM25 全文列表与
+  向量 KNN 列表按 **Reciprocal Rank Fusion** 融合 —
+  `rrf(d) = Σ_lists 1/(rrf_k + rank)`。RRF 免两引擎分数标定 (行业标准);
+  候选深度 k×fetch_mult (16-512 夹紧), 两列表都命中的文档自然浮顶。
+  返回每行带 __rrf__ / __bm25__ / __distance__ 三键 + 行数据 (列式批取,
+  顺序保持)
+- Python: `db.hybrid_search(text_index, text_query, vector_index,
+  query_vector, k=10, rrf_k=60, fetch_mult=4)`
+- 差分测试 ×2: 融合分数与两原语手算逐位对拍 (test_hybrid_search.rs);
+  k/k>文档数/确定性/rrf_k 敏感性/rows 投影对齐
+- Python E2E: 12 文档 fixture, 双列表命中 3/5 浮顶
+
 ### 📋 I1 调研建档: 1M GROUP BY / range 剩余差距的结构性归因 (未改动代码)
 
 - 🔍 **GROUP BY 4.0ms vs DuckDB 1.33ms (3×)**: 采样证实 G1 并行内核正常

@@ -527,6 +527,56 @@ impl PyDatabase {
         Ok(Self { db })
     }
 
+    /// 🔑 J1 hybrid retrieval: BM25 text list + vector KNN list fused with
+    /// Reciprocal Rank Fusion. Returns a list of row dicts (the table's own
+    /// columns) with three extra keys:
+    ///   "__rrf__"      fused score (higher = better)
+    ///   "__bm25__"     BM25 score (None when the text list missed the doc)
+    ///   "__distance__" vector distance (None when KNN missed it)
+    ///
+    ///     db.hybrid_search("docs_body", "rust database",
+    ///                      "docs_emb", [0.1, 0.2, 0.3, 0.4], k=10)
+    #[pyo3(signature = (text_index, text_query, vector_index, query_vector, k=10, rrf_k=60, fetch_mult=4))]
+    fn hybrid_search(
+        &self,
+        py: Python<'_>,
+        text_index: &str,
+        text_query: &str,
+        vector_index: &str,
+        query_vector: Vec<f32>,
+        k: usize,
+        rrf_k: usize,
+        fetch_mult: usize,
+    ) -> PyResult<PyObject> {
+        let (names, rows, hits) = py
+            .allow_threads(|| {
+                self.db.hybrid_search_rows(
+                    text_index,
+                    text_query,
+                    vector_index,
+                    &query_vector,
+                    k,
+                    rrf_k,
+                    fetch_mult,
+                )
+            })
+            .map_err(py_err)?;
+        let keys: Vec<PyObject> = names.iter().map(|c| c.as_str().into_py(py)).collect();
+        let list = pyo3::types::PyList::empty_bound(py);
+        let mut text_cache: InternMap = std::collections::HashMap::default();
+        for (row, hit) in rows.iter().zip(hits.iter()) {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            for (key, val) in keys.iter().zip(row.iter()) {
+                dict.set_item(key.clone(), mote_to_py_cached(val, &mut text_cache))?;
+            }
+            dict.set_item("__rrf__", hit.rrf)?;
+            dict.set_item("__bm25__", hit.bm25)?;
+            dict.set_item("__distance__", hit.distance)?;
+            list.append(dict)?;
+        }
+        Ok(list.into_any().unbind())
+    }
+
     /// Execute a statement. SELECT returns a list of row dicts;
     /// INSERT/UPDATE/DELETE returns the affected-row count; DDL returns None.
     #[pyo3(signature = (sql, params=None))]
