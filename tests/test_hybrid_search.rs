@@ -11,26 +11,28 @@ fn setup() -> (Database, tempfile::TempDir) {
         .unwrap();
     // 12 docs: bodies with varying keyword counts, embeddings in a line.
     let texts = [
-        "rust database engine",        // 0
-        "rust rust rust embedded",     // 1 (strong 'rust')
-        "database of databases",       // 2
-        "engine room",                 // 3
-        "rust database",               // 4
-        "vector search index",         // 5
-        "embedding vectors here",      // 6
-        "nothing relevant at all",     // 7
-        "database engine rust fast",   // 8
-        "totally different words",     // 9
-        "rust",                        // 10
-        "engine engine engine",        // 11 (strong 'engine')
+        "rust database engine",      // 0
+        "rust rust rust embedded",   // 1 (strong 'rust')
+        "database of databases",     // 2
+        "engine room",               // 3
+        "rust database",             // 4
+        "vector search index",       // 5
+        "embedding vectors here",    // 6
+        "nothing relevant at all",   // 7
+        "database engine rust fast", // 8
+        "totally different words",   // 9
+        "rust",                      // 10
+        "engine engine engine",      // 11 (strong 'engine')
     ];
     for (i, t) in texts.iter().enumerate() {
         let v = i as f32 * 0.25;
         db.execute(format!("INSERT INTO docs VALUES ({i}, '{t}', [{v}, {v}, {v}, {v}])").as_str())
             .unwrap();
     }
-    db.execute("CREATE TEXT INDEX docs_body ON docs (body)").unwrap();
-    db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb)").unwrap();
+    db.execute("CREATE TEXT INDEX docs_body ON docs (body)")
+        .unwrap();
+    db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb)")
+        .unwrap();
     (db, dir)
 }
 
@@ -62,7 +64,15 @@ fn hybrid_rrf_matches_hand_computation() {
     }
 
     let hits = db
-        .hybrid_search("docs_body", "rust database", "docs_emb", &[1.0, 1.0, 1.0, 1.0], 10, 60, 4)
+        .hybrid_search(
+            "docs_body",
+            "rust database",
+            "docs_emb",
+            &[1.0, 1.0, 1.0, 1.0],
+            10,
+            60,
+            4,
+        )
         .unwrap();
     assert_eq!(hits.len(), 10);
     for h in &hits {
@@ -86,7 +96,10 @@ fn hybrid_rrf_matches_hand_computation() {
     }
     // Docs appearing in BOTH lists outrank single-list docs with the same
     // per-list ranks (the whole point of fusion).
-    let both_lists: Vec<_> = hits.iter().filter(|h| h.bm25.is_some() && h.distance.is_some()).collect();
+    let both_lists: Vec<_> = hits
+        .iter()
+        .filter(|h| h.bm25.is_some() && h.distance.is_some())
+        .collect();
     assert!(!both_lists.is_empty(), "fixture must have overlap docs");
 }
 
@@ -96,15 +109,39 @@ fn hybrid_k_edges_and_determinism() {
     let (db, _dir) = setup();
     // k = 100 (more docs than exist): clamp to distinct candidate count.
     let hits = db
-        .hybrid_search("docs_body", "rust", "docs_emb", &[0.0, 0.0, 0.0, 0.0], 100, 60, 4)
+        .hybrid_search(
+            "docs_body",
+            "rust",
+            "docs_emb",
+            &[0.0, 0.0, 0.0, 0.0],
+            100,
+            60,
+            4,
+        )
         .unwrap();
     assert!(hits.len() <= 12);
     // Determinism: same inputs → identical output.
     let a = db
-        .hybrid_search("docs_body", "rust", "docs_emb", &[0.5, 0.5, 0.5, 0.5], 5, 60, 4)
+        .hybrid_search(
+            "docs_body",
+            "rust",
+            "docs_emb",
+            &[0.5, 0.5, 0.5, 0.5],
+            5,
+            60,
+            4,
+        )
         .unwrap();
     let b = db
-        .hybrid_search("docs_body", "rust", "docs_emb", &[0.5, 0.5, 0.5, 0.5], 5, 60, 4)
+        .hybrid_search(
+            "docs_body",
+            "rust",
+            "docs_emb",
+            &[0.5, 0.5, 0.5, 0.5],
+            5,
+            60,
+            4,
+        )
         .unwrap();
     assert_eq!(
         a.iter().map(|h| h.row_id).collect::<Vec<_>>(),
@@ -112,12 +149,28 @@ fn hybrid_k_edges_and_determinism() {
     );
     // rrf_k=1 sharpens top ranks (still descending, valid scores).
     let c = db
-        .hybrid_search("docs_body", "rust", "docs_emb", &[0.5, 0.5, 0.5, 0.5], 5, 1, 4)
+        .hybrid_search(
+            "docs_body",
+            "rust",
+            "docs_emb",
+            &[0.5, 0.5, 0.5, 0.5],
+            5,
+            1,
+            4,
+        )
         .unwrap();
     assert!(c.iter().all(|h| h.rrf > 0.0));
     // rows projection: names + row values align.
     let (names, rows, hits2) = db
-        .hybrid_search_rows("docs_body", "rust", "docs_emb", &[0.5, 0.5, 0.5, 0.5], 5, 60, 4)
+        .hybrid_search_rows(
+            "docs_body",
+            "rust",
+            "docs_emb",
+            &[0.5, 0.5, 0.5, 0.5],
+            5,
+            60,
+            4,
+        )
         .unwrap();
     assert_eq!(rows.len(), hits2.len());
     assert_eq!(names.len(), rows.first().map(|r| r.len()).unwrap_or(0));

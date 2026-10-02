@@ -982,7 +982,7 @@ impl PyDatabase {
 }
 
 #[pymodule]
-fn motedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `Database` is the primary entry point — expose it under that name;
     // PyDatabase remains importable for introspection.
     m.add_class::<PyDatabase>()?;

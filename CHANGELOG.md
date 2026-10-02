@@ -2,6 +2,18 @@
 
 ## [0.12.0] — 未发布
 
+### 🔑 J2 Arrow/pandas 互操作: 混合布局 Python 包 + query_arrow/query_pandas
+
+- 🔑 **mixed 布局**: 原生扩展改名 `motedb._native` (pymodule fn `_native`—
+  符号推导: maturin 期望 PyInit__native), 新增真 `motedb/__init__.py`
+  包装层 (python/motedb/ + pyproject.toml)
+- 🔑 **query_arrow(sql, params)**: SELECT → pyarrow.Table — 列式 numpy
+  直通; VECTOR 列 → `fixed_size_list<float32>[N]` (Arrow 规范向量表示,
+  2D ndarray 快径 + 等长嵌套 list 兜底); **query_pandas** 经 Arrow 转
+  DataFrame (pyarrow/pandas 可选依赖, 缺失给安装指引)
+- E2E: 1000 行标量往返值精确; 向量列类型与值验证; hybrid_search 经包装
+  层可达 (`import motedb` 面不变)
+
 ### 🔑 J1 混合检索: BM25 + 向量 RRF 融合 (产品定位闭环)
 
 - 🔑 **hybrid_search API** (Rust + Python): 同一查询里 BM25 全文列表与
