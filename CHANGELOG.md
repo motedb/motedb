@@ -2,6 +2,19 @@
 
 ## [0.12.0] — 未发布
 
+### 🔑 J3 过滤向量检索: 迭代加深候选池 (高选择性谓词不再漏结果)
+
+- 🔒 **问题**: `WHERE flag = 1 ORDER BY emb <-> ? LIMIT k` 的 WHERE 在
+  top-k 之后过滤 — 谓词选择性高时 (匹配行少且离查询点远) 存活数远小于
+  k; brute-force 分支更只取 plan.k 个候选 (过滤后常为 0)
+- 🚀 **修复** (execute_vector_order_by_plan 重构): 迭代加深 — 候选深度
+  ×4 重复 (索引路径 ≤4096; brute-force 路径 ≤活行数, 其扫描成本与深度
+  无关, 深堆近免费), 直到存活 ≥k+offset 或达深度上限。无过滤时单轮,
+  零额外开销 (仅一次活行数统计)
+- 回归测试 filtered_vector_search_deepens_until_k (200 行 fixture: 匹配
+  行放远端/非匹配行放查询点旁 — 旧代码返回 0 行, 新代码精确返回最近
+  5 个匹配 [0,25,50,75,100]); Python E2E 同验证
+
 ### 🔑 J2 Arrow/pandas 互操作: 混合布局 Python 包 + query_arrow/query_pandas
 
 - 🔑 **mixed 布局**: 原生扩展改名 `motedb._native` (pymodule fn `_native`—

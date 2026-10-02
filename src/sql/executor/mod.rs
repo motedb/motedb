@@ -22252,101 +22252,83 @@ impl QueryExecutor {
                     })
                     .unwrap_or(false)
         };
-        let candidates = if use_index {
-            // Over-fetch from the graph, then re-rank with the table's
-            // full-precision vectors. The index ranks by SQ8-dequantized
-            // distance, which reshuffles near-equal neighbours (measured
-            // recall@10 0.985 on real 384-d embeddings); the exact re-rank of
-            // a slightly larger candidate set recovers most of that. For
-            // small k the extra candidates come from the search list the
-            // graph walk already visited, so it costs no extra traversal.
-            // 🔑 A1 校准: 过度取数必须覆盖 SQ8 量化重排噪声 — 紧簇数据上
-            // 精确 top-10 的成员在 SQ8 序中落到 32 名开外 (k_over=32 时
-            // recall@10 卡 0.857 与 L 无关); 64 起 recall 门达标。
-            let k_over = (plan.k * 6).max(plan.k + 64).min(1024);
-            let approx = self
+        // 🔑 J3 filtered vector search: the WHERE predicate applies AFTER the
+        // top-k selection, so a selective predicate leaves fewer than k
+        // survivors. Iteratively deepen the candidate depth (×4) until k
+        // survive or the depth cap: 4096 for the graph-index path, live-row
+        // count for brute force (whose scan cost is depth-independent — the
+        // deeper heap is nearly free).
+        let live_rows: usize = {
+            let store = self
                 .db
-                .vector_search(&index_name, &plan.query_vector, k_over)?;
-            self.rerank_exact(
-                &plan.table,
-                &plan.column,
-                &plan.query_vector,
-                plan.cosine,
-                approx,
-                plan.k,
-            )?
-        } else {
-            // Embedded envelope (or no index) — exact brute-force scan.
-            self.brute_force_vector_knn(
-                &plan.table,
-                &plan.column,
-                &plan.query_vector,
-                plan.k,
-                plan.cosine,
-            )?
-        };
-        debug_log!(
-            "[Executor] 🔍 vector_search返回了{}个候选",
-            candidates.len()
-        );
-
-        let row_ids: Vec<u64> = candidates.iter().map(|(id, _dist)| *id).collect();
-
-        if !row_ids.is_empty() {
-            debug_log!(
-                "[Executor] 🔍 row_ids前5个: {:?}",
-                &row_ids[..5.min(row_ids.len())]
-            );
-        }
-
-        if row_ids.is_empty() {
-            // 返回空结果
-            let schema = self.db.get_table_schema(&plan.table)?;
-            return Ok(QueryResult::Select {
-                columns: schema.columns.iter().map(|c| c.name.clone()).collect(),
-                rows: vec![],
-            });
-        }
-
-        // 2. 批量获取行数据
-        let schema = self.db.get_table_schema(&plan.table)?;
-        let batch_rows = self.db.get_table_rows_batch(&plan.table, &row_ids)?;
-
-        debug_log!(
-            "[Executor] 🔍 get_table_rows_batch返回了{}个行",
-            batch_rows.len()
-        );
-
-        // 3. 转换为SQL行格式（保持向量搜索的顺序）
-        let mut sql_rows = Vec::with_capacity(row_ids.len());
-        for (row_id, row_opt) in batch_rows {
-            if let Some(row) = row_opt {
-                let sql_row = row_to_sql_row(&row, &schema)?;
-
-                // 🔍 Debug: 打印前3个的row_id和id列
-                if sql_rows.len() < 3 {
-                    if let Some(_id_value) = sql_row.get("id") {
-                        debug_log!("[Executor] 🔍 row_id={} → id列={:?}", row_id, _id_value);
-                    }
-                }
-
-                sql_rows.push((row_id, sql_row));
-            }
-        }
-
-        // 4. 应用WHERE条件（如果有）
-        let filtered_rows: Vec<(u64, SqlRow)> = if let Some(ref where_clause) = stmt.where_clause {
-            sql_rows
-                .into_iter()
-                .filter(|(_, row)| {
-                    self.evaluator
-                        .eval(where_clause, row)
-                        .and_then(|val| self.to_bool(&val))
-                        .unwrap_or(false)
+                .get_or_create_col_segment_store(&plan.table, &[])
+                .ok();
+            store
+                .map(|st| {
+                    st.segments_snapshot()
+                        .iter()
+                        .map(|sg| sg.sst.num_rows)
+                        .sum::<usize>()
+                        + st.buffered_row_count()
                 })
-                .collect()
+                .unwrap_or(0)
+        };
+        let max_depth = if use_index {
+            4096usize.max(plan.k)
         } else {
-            sql_rows
+            live_rows.max(plan.k)
+        };
+        let schema = self.db.get_table_schema(&plan.table)?;
+        let mut depth = plan.k.max(16);
+        let filtered_rows: Vec<(u64, SqlRow)> = loop {
+            let depth_k = depth.min(max_depth);
+            let candidates = if use_index {
+                let approx = self
+                    .db
+                    .vector_search(&index_name, &plan.query_vector, depth_k)?;
+                self.rerank_exact(
+                    &plan.table,
+                    &plan.column,
+                    &plan.query_vector,
+                    plan.cosine,
+                    approx,
+                    depth_k,
+                )?
+            } else {
+                self.brute_force_vector_knn(
+                    &plan.table,
+                    &plan.column,
+                    &plan.query_vector,
+                    depth_k,
+                    plan.cosine,
+                )?
+            };
+            let row_ids: Vec<u64> = candidates.iter().map(|(id, _dist)| *id).collect();
+            let batch_rows = self.db.get_table_rows_batch(&plan.table, &row_ids)?;
+            let sql_rows: Vec<(u64, SqlRow)> = batch_rows
+                .into_iter()
+                .filter_map(|(row_id, row_opt)| {
+                    row_opt.map(|row| row_to_sql_row(&row, &schema).map(|sr| (row_id, sr)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut survivors: Vec<(u64, SqlRow)> = match &stmt.where_clause {
+                Some(wc) => sql_rows
+                    .into_iter()
+                    .filter(|(_, row)| {
+                        self.evaluator
+                            .eval(wc, row)
+                            .and_then(|val| self.to_bool(&val))
+                            .unwrap_or(false)
+                    })
+                    .collect(),
+                None => sql_rows,
+            };
+            let need = plan.k + stmt.offset.unwrap_or(0);
+            if survivors.len() >= need || depth_k >= max_depth {
+                break survivors;
+            }
+            survivors.clear();
+            depth = depth_k.saturating_mul(4).max(depth_k + 16);
         };
 
         // 5. 简单列投影（避免递归调用 project_columns）

@@ -180,3 +180,71 @@ fn hybrid_k_edges_and_determinism() {
         assert!(matches!(r.first(), Some(Value::Integer(_))));
     }
 }
+
+// 🔒 J3: filtered vector search — `WHERE sel_predicate ORDER BY emb <-> ?
+// LIMIT k` must return the k NEAREST rows AMONG THE MATCHING SET (not
+// post-filter a pre-k candidate list down to a handful). A selective
+// predicate (few matching rows, far from the query point) previously
+// returned < k results because the candidate depth was fixed at ~k.
+#[test]
+fn filtered_vector_search_deepens_until_k() {
+    let (db, _dir) = setup();
+    // Rebuild a bigger fixture: 200 docs; only ids ≡ 0 mod 25 match the
+    // filter (8 rows); place matches FAR from the query point and non-matches
+    // NEAR it, so a fixed-depth top-k contains almost no matching rows.
+    db.execute("DROP TABLE docs").unwrap();
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, flag INT, emb VECTOR(4))")
+        .unwrap();
+    for i in 0..200 {
+        // non-matches cluster near the query point (1.0,1.0,1.0,1.0);
+        // matches sit far away (line at 9.0+).
+        let (v, flag) = if i % 25 == 0 {
+            let x = 9.0 + (i as f32) * 0.01;
+            ([x, x, x, x], 1)
+        } else {
+            let x = 1.0 + (i as f32) * 0.001;
+            ([x, x, x, x], 0)
+        };
+        db.execute(
+            format!(
+                "INSERT INTO docs VALUES ({i}, 'doc{i}', {flag}, [{v0}, {v1}, {v2}, {v3}])",
+                v0 = v[0],
+                v1 = v[1],
+                v2 = v[2],
+                v3 = v[3]
+            )
+            .as_str(),
+        )
+        .unwrap();
+    }
+    db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb)")
+        .unwrap();
+
+    let rows = db
+        .execute("SELECT id FROM docs WHERE flag = 1 ORDER BY emb <-> [1.0, 1.0, 1.0, 1.0] LIMIT 5")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let ids: Vec<i64> = match &rows {
+        motedb::QueryResult::Select { rows, .. } => rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Value::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        ids.len(),
+        5,
+        "selective filter must still return k nearest matches"
+    );
+    // Every returned row matches the filter.
+    for id in &ids {
+        assert_eq!(id % 25, 0, "returned row {id} does not match the filter");
+    }
+    // And they are the 5 NEAREST matches (ids 0,25,50,75,100 in distance
+    // order of the 9.0-line).
+    assert_eq!(ids, vec![0, 25, 50, 75, 100], "wrong nearest-match order");
+}
