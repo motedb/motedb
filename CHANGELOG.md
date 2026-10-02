@@ -2,6 +2,28 @@
 
 ## [0.12.0] — 未发布
 
+### 🚀 F1 ANN 尾部根因: 冷缺页斜坡 — 打开期 madvise 预热 (p99 30ms → 1.5ms)
+
+- 🔍 **根因** (逐查询延迟 vs 游走统计相关性分析): DiskANN 的"尾部延迟"
+  不是算法问题 — 游走统计均匀 (pops 220-330, evals 0.5-2.2K), 但慢查询
+  全部聚集在打开后前 30 个 (首查询 337ms, 前 6 个 66-337ms): SQ8 向量 +
+  邻接表 mmap 的硬缺页摊在游走路径上; 此前报告的 p95 7.8/p99 30ms 是
+  预热不足 (5 次) 的口径伪影, 热稳态真实尾部分布良好
+- 🚀 **修复** (9fe20ad): DiskANNIndex::load 时对 vectors_sq8.bin 与
+  graph.bin 各 madvise(MADV_WILLNEED) (SQ8Vectors/DiskGraph::
+  warm_page_cache) — 通知内核异步预读。文件页可回收, 不抬 RSS 上限;
+  稳态本就要触碰大部分页, 这只是把成本从首查询提前到打开
+- 实测 (220K×384, 200 查询): 首查询 337 → **1.9ms (176×)**; 全程
+  p50 0.59 / p95 1.22 / **p99 1.51 / max 1.90ms** (此前 p99 30ms);
+  热稳态本身也提速 2.4× (p50 1.42→0.58)。recall@10 0.9985 /
+  recall@1 1.0 不变; resource_bench 全形状 RSS 无回归 (knn 查询增量
+  0.2MB, edge 首查询 RSS 1.3MB, steady -4.3MB)
+- 行业对位更新: 同 recall 档 (≈1.0) 下 p50 0.59ms vs FAISS Flat 5.4ms
+  (9×); 对 HNSW ef64 (recall 0.888, p50 0.098ms) 尾部差距从 130× 收窄
+  到 ~6× 且我们 recall 高 11 个点; 对 IVF-nprobe32 (recall 0.947,
+  p50 2.34ms) 全面占优
+- 全量 239 bin 第十四轮全绿
+
 ### 🔒 E1 scan-DELETE 谓词下推镜像 + 事务聚合 WHERE 丢失修复 (差分实抓)
 
 - 🔒 **txn_aggregate_overlaid 完全忽略 WHERE** (M 战役遗留正确性 bug, E1
