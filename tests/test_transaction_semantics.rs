@@ -692,3 +692,64 @@ fn match_ryw_inside_transaction() {
         [1]
     );
 }
+
+// 🔒 Regression (E1 differential catch): txn_aggregate_overlaid ignored the
+// WHERE clause entirely — inside a transaction WITH buffered writes,
+// `COUNT(*) WHERE device = '..'` returned the unfiltered total (and SUM/
+// AVG/MIN/MAX aggregated every row). The overlay path must filter by the
+// same predicate the non-transactional aggregate paths apply.
+#[test]
+fn txn_aggregate_where_is_applied() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, device TEXT, v INT)")
+        .unwrap();
+    for i in 0..500 {
+        db.execute(
+            format!(
+                "INSERT INTO t VALUES ({}, 'dev-{:02}', {})",
+                i,
+                i % 8,
+                i % 11
+            )
+            .as_str(),
+        )
+        .unwrap();
+    }
+    let auto = |sql: &str| -> i64 {
+        match &rows(db.execute(sql).unwrap())[0][0] {
+            Value::Integer(n) => *n,
+            v => panic!("{v:?}"),
+        }
+    };
+
+    // Reference (autocommit): COUNT / SUM / AVG with WHERE.
+    let c_ref = auto("SELECT COUNT(*) FROM t WHERE device = 'dev-03'");
+    let s_ref = auto("SELECT SUM(v) FROM t WHERE v >= 7");
+    assert!(c_ref > 0);
+
+    // Same queries inside a transaction WITH a buffered write (the routing
+    // gate sends these to txn_aggregate_overlaid).
+    db.execute("BEGIN").unwrap();
+    db.execute("UPDATE t SET v = v WHERE id = 0").unwrap(); // buffered pending
+    let c_txn = auto("SELECT COUNT(*) FROM t WHERE device = 'dev-03'");
+    assert_eq!(c_txn, c_ref, "in-txn COUNT WHERE must equal autocommit");
+    let s_txn = auto("SELECT SUM(v) FROM t WHERE v >= 7");
+    assert_eq!(s_txn, s_ref, "in-txn SUM WHERE must equal autocommit");
+    // Unfiltered total unchanged (WHERE-none still counts everything).
+    let total = auto("SELECT COUNT(*) FROM t");
+    assert_eq!(total, 500);
+    // write_set rows are filtered by the predicate too.
+    db.execute("INSERT INTO t VALUES (900, 'dev-03', 99)")
+        .unwrap();
+    let c2 = auto("SELECT COUNT(*) FROM t WHERE device = 'dev-03'");
+    assert_eq!(
+        c2,
+        c_ref + 1,
+        "uncommitted INSERT matching the WHERE counts"
+    );
+    let c3 = auto("SELECT COUNT(*) FROM t WHERE device = 'dev-05'");
+    assert_eq!(c3, auto("SELECT COUNT(*) FROM t WHERE device = 'dev-05'"));
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(auto("SELECT COUNT(*) FROM t"), 500);
+}

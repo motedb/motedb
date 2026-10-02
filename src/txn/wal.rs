@@ -2175,7 +2175,10 @@ impl WALManager {
         for entry in self.partitions.iter() {
             let mut wal = entry.value().lock();
             wal.defer_periodic_flush = false;
-            if matches!(wal.config.durability_level, DurabilityLevel::Periodic { .. }) {
+            if matches!(
+                wal.config.durability_level,
+                DurabilityLevel::Periodic { .. }
+            ) {
                 let _ = wal.file.flush();
             }
         }

@@ -2336,7 +2336,23 @@ impl QueryExecutor {
         if agg_infos.is_empty() || agg_infos.len() != stmt.columns.len() {
             return Ok(None);
         }
-        let row_refs: Vec<&Row> = all_rows.iter().collect();
+        // 🔒 WHERE filtering — the overlaid row set is the WHOLE table (the
+        // pending maps only carry this txn's writes), so the predicate must
+        // be applied here or COUNT/SUM/AVG/MIN/MAX WHERE silently aggregates
+        // every row (differential test: in-txn `COUNT(*) WHERE device=..`
+        // after a buffered UPDATE returned the unfiltered total). Positional
+        // compiled evaluation — no per-row SqlRow HashMap.
+        let filtered: Vec<Row> = match &stmt.where_clause {
+            Some(wc) => {
+                let compiled = Self::compile_where(wc, schema);
+                all_rows
+                    .into_iter()
+                    .filter(|row| Self::compiled_or_eval_row(compiled.as_ref(), wc, row, schema))
+                    .collect()
+            }
+            None => all_rows,
+        };
+        let row_refs: Vec<&Row> = filtered.iter().collect();
         let mut out_row: Vec<Value> = Vec::with_capacity(agg_infos.len());
         for (agg, col) in agg_infos.iter().zip(stmt.columns.iter()) {
             let v = self.compute_aggregate_positional(agg, &row_refs)?;
@@ -17059,8 +17075,7 @@ impl QueryExecutor {
                 .iter()
                 .map(|(_, c)| matches!(c, ColScanCol::Text(t, ..) if t.has_any_null()))
                 .collect();
-            let cols_ref: Vec<(usize, &ColScanCol)> =
-                cols.iter().map(|(p, c)| (*p, c)).collect();
+            let cols_ref: Vec<(usize, &ColScanCol)> = cols.iter().map(|(p, c)| (*p, c)).collect();
             for i in 0..n {
                 let row_id = seg.sst.row_map.key(i) & 0xFFFFFFFF;
                 if use_seen {
@@ -17121,7 +17136,6 @@ impl QueryExecutor {
         Some(matched)
     }
 
-
     /// 🚀 D1 precheck: byte-level/numeric conjunct test on raw column data,
     /// used to skip building sparse-row Values for rows that definitely
     /// don't match. Conservative by construction — only decides when the
@@ -17153,13 +17167,16 @@ impl QueryExecutor {
                         ColScanCol::Fixed(f, crate::types::ColumnType::Integer),
                         Value::Integer(lit),
                     ) => f.get_i64(i)? == *lit,
-                    (
-                        ColScanCol::Fixed(f, crate::types::ColumnType::Float),
-                        Value::Float(lit),
-                    ) => f.get_f64(i)? == *lit,
+                    (ColScanCol::Fixed(f, crate::types::ColumnType::Float), Value::Float(lit)) => {
+                        f.get_f64(i)? == *lit
+                    }
                     _ => return None, // cross-type / NULL literal → exact eval
                 };
-                Some(if matches!(cw, CompiledWhere::Eq(..)) { eq } else { !eq })
+                Some(if matches!(cw, CompiledWhere::Eq(..)) {
+                    eq
+                } else {
+                    !eq
+                })
             }
             CompiledWhere::Lt(pos, v)
             | CompiledWhere::Le(pos, v)
@@ -17171,10 +17188,9 @@ impl QueryExecutor {
                         ColScanCol::Fixed(f, crate::types::ColumnType::Integer),
                         Value::Integer(lit),
                     ) => f.get_i64(i)?.partial_cmp(lit)?,
-                    (
-                        ColScanCol::Fixed(f, crate::types::ColumnType::Float),
-                        Value::Float(lit),
-                    ) => f.get_f64(i)?.partial_cmp(lit)?,
+                    (ColScanCol::Fixed(f, crate::types::ColumnType::Float), Value::Float(lit)) => {
+                        f.get_f64(i)?.partial_cmp(lit)?
+                    }
                     _ => return None,
                 };
                 Some(match cw {
@@ -17604,9 +17620,6 @@ impl QueryExecutor {
             }
         }
 
-        // 🚀 Use真正的流式扫描 (O(1) memory)
-        let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
-
         let mut affected_rows = 0;
         // 🔒 M2 overlay: rows already buffered-deleted in this txn are
         // skipped; rows with a buffered UPDATE are seen at their pending NEW
@@ -17622,6 +17635,48 @@ impl QueryExecutor {
         } else {
             Default::default()
         };
+
+        // 🚀 C1 mirror: predicate pushdown for scan DELETE — the WHERE is
+        // evaluated against column segments (only the referenced columns
+        // decode; unmatched rows never materialize) and full rows are
+        // fetched for the matches only. Pending rows whose buffered NEW
+        // value newly matches are appended (the loop re-checks every match
+        // against the overlaid row with the full evaluator).
+        let compiled_where_del = stmt
+            .where_clause
+            .as_ref()
+            .and_then(|wc| Self::compile_where(wc, &schema));
+        let row_iter: Box<dyn Iterator<Item = Result<(RowId, Row)>>> =
+            match stmt.where_clause.as_ref().zip(compiled_where_del.as_ref()) {
+                Some((wc, cw)) => {
+                    match self.try_colscan_predicate_row_ids(&stmt.table, &schema, cw) {
+                        Some(mut ids) => {
+                            for (rid, new_row) in pending_update_rows.iter() {
+                                if ids.contains(rid) {
+                                    continue; // re-checked by the loop anyway
+                                }
+                                let sql_row = row_to_sql_row(new_row, &schema)?;
+                                let m = self
+                                    .evaluator
+                                    .eval(wc, &sql_row)
+                                    .and_then(|val| self.to_bool(&val))
+                                    .unwrap_or(false);
+                                if m {
+                                    ids.push(*rid);
+                                }
+                            }
+                            let fetched = self.db.get_table_rows_batch(&stmt.table, &ids)?;
+                            Box::new(
+                                fetched
+                                    .into_iter()
+                                    .filter_map(|(rid, opt)| opt.map(|row| Ok((rid, row)))),
+                            )
+                        }
+                        None => Box::new(self.db.scan_table_rows_streaming(&stmt.table)?),
+                    }
+                }
+                None => Box::new(self.db.scan_table_rows_streaming(&stmt.table)?),
+            };
 
         // 🔑 In transaction mode, also process write_set rows (same as execute_update).
         let txn_rows = if self.is_in_transaction() {

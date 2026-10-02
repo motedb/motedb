@@ -861,12 +861,7 @@ impl MoteDB {
         let result = (|| -> Result<()> {
             for (row_id, old_row, new_row) in updates {
                 self.update_row_with_schema_impl(
-                    table_name,
-                    row_id,
-                    &old_row,
-                    new_row,
-                    schema,
-                    true,
+                    table_name, row_id, &old_row, new_row, schema, true,
                 )?;
                 n += 1;
             }

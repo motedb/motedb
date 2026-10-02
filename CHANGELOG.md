@@ -2,6 +2,26 @@
 
 ## [0.12.0] — 未发布
 
+### 🔒 E1 scan-DELETE 谓词下推镜像 + 事务聚合 WHERE 丢失修复 (差分实抓)
+
+- 🔒 **txn_aggregate_overlaid 完全忽略 WHERE** (M 战役遗留正确性 bug, E1
+  差分测试实抓): 事务内且有缓冲写 (pending UPDATE/DELETE) 时, 路由把
+  COUNT/SUM/AVG/MIN/MAX 送到 overlay 路径 — 该路径对整表 overlaid 行集
+  求聚合, 谓词从未应用 (`COUNT(*) WHERE device='..'` 返回未过滤总数)。
+  修复: 编译谓词位置求值过滤 (compiled_or_eval_row, 免逐行 SqlRow
+  HashMap); write_set 行同样过谓词。回归测试
+  txn_aggregate_where_is_applied (COUNT/SUM 对拍 + 未过滤总数不变 +
+  write_set 匹配计数 + ROLLBACK 恢复)
+- 🚀 **scan-DELETE 谓词下推** (C1 镜像): DELETE 扫描路径此前逐行
+  SqlRow HashMap 求值 (比 UPDATE 的位置求值更重); 现复用
+  try_colscan_predicate_row_ids — 谓词列扫描 + 命中行批量取回, pending
+  双向 overlay 同 UPDATE (移入谓词的缓冲新值行追加, 循环内重判)。实测
+  50K 表 781 行/语句: p50 6.93ms ≈ **112.6K rows/s (与 scan-UPDATE
+  持平, SQLite 同口径 110K)**。差分回归
+  colscan_delete_predicate_pushdown_matches_generic (五段+墓碑 /
+  文本+数值链 / 事务移入移出唯一值 / write_set 匹配)
+- 对抗验证 ALL PASS; 全量 239 bin 第十三轮全绿
+
 ### 🚀 D1 scan-UPDATE 写侧收尾: 字节级预检 + 去重集 FxHash + 批量 WAL 单次刷
 
 - 🚀 **谓词字节级预检** (colscan_precheck): AND 链各简单比较合取在原始

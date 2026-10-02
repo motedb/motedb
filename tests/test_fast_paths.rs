@@ -1433,3 +1433,105 @@ fn colscan_update_predicate_pushdown_matches_generic() {
     );
     let _ = one("SELECT * FROM t");
 }
+
+// 🔒 C1-mirror regression: scan-DELETE predicate pushdown must delete
+// exactly the rows the SELECT predicate counts — across text/numeric
+// predicates, multi-segment + tombstone tables, and transactional overlays.
+#[test]
+fn colscan_delete_predicate_pushdown_matches_generic() {
+    let (db, _dir) = create_db();
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, device TEXT, val FLOAT, n INT)",
+    );
+    for b in 0..5 {
+        let vals: Vec<String> = (0..200)
+            .map(|i| {
+                let id = b * 200 + i;
+                format!(
+                    "({}, 'dev-{:02}', {:.2}, {})",
+                    id,
+                    id % 8,
+                    (id % 97) as f64 / 3.0,
+                    id % 11
+                )
+            })
+            .collect();
+        exec(&db, &format!("INSERT INTO t VALUES {}", vals.join(",")));
+    }
+    let dels: Vec<String> = (0..1000)
+        .filter(|i| i % 37 == 0)
+        .map(|i| i.to_string())
+        .collect();
+    exec(
+        &db,
+        &format!("DELETE FROM t WHERE id IN ({})", dels.join(",")),
+    );
+    exec(&db, "CHECKPOINT");
+
+    let q = |sql: &str| -> i64 {
+        match &rows(&db, sql)[0][0] {
+            Value::Integer(n) => *n,
+            v => panic!("{v:?}"),
+        }
+    };
+    let baseline = q("SELECT COUNT(*) FROM t"); // 1000 - 27 tombstoned
+
+    // text predicate scan DELETE — affected must equal the SELECT count.
+    let expected = q("SELECT COUNT(*) FROM t WHERE device = 'dev-02'");
+    let affected = match &exec(&db, "DELETE FROM t WHERE device = 'dev-02'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows as i64,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(affected, expected);
+    assert_eq!(q("SELECT COUNT(*) FROM t"), baseline - expected);
+    assert_eq!(q("SELECT COUNT(*) FROM t WHERE device = 'dev-02'"), 0);
+
+    // numeric AND-chain predicate.
+    let expected2 = q("SELECT COUNT(*) FROM t WHERE n >= 7 AND val > 20.0");
+    assert!(expected2 > 0);
+    let affected2 = match &exec(&db, "DELETE FROM t WHERE n >= 7 AND val > 20.0") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows as i64,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(affected2, expected2);
+    assert_eq!(q("SELECT COUNT(*) FROM t WHERE n >= 7 AND val > 20.0"), 0);
+
+    // in-txn: buffered text UPDATE moves a row INTO the predicate → deleted.
+    exec(&db, "BEGIN");
+    exec(&db, "UPDATE t SET device = 'dev-04' WHERE id = 1");
+    let before = q("SELECT COUNT(*) FROM t WHERE device = 'dev-04'");
+    let a = match &exec(&db, "DELETE FROM t WHERE device = 'dev-04'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(a as i64, before);
+    // moved-out: buffered UPDATE through a UNIQUE value then away from it —
+    // the row must stop matching that value (and nothing else shares it).
+    exec(&db, "UPDATE t SET device = 'dev-77' WHERE id = 3");
+    exec(&db, "UPDATE t SET device = 'dev-78' WHERE id = 3");
+    let b = match &exec(&db, "DELETE FROM t WHERE device = 'dev-77'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(b, 0, "moved-out row must not match");
+    assert_eq!(
+        rows(&db, "SELECT id FROM t WHERE id = 3").len(),
+        1,
+        "id=3 survives"
+    );
+    // ROLLBACK restores everything.
+    exec(&db, "ROLLBACK");
+    assert_eq!(q("SELECT COUNT(*) FROM t"), baseline - expected - expected2);
+
+    // write_set INSERT matched by a scan DELETE in the same txn.
+    exec(&db, "BEGIN");
+    exec(&db, "INSERT INTO t VALUES (5000, 'dev-09', 1.0, 5)");
+    let c = match &exec(&db, "DELETE FROM t WHERE device = 'dev-09'") {
+        motedb::sql::QueryResult::Modification { affected_rows } => *affected_rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(c, 1, "uncommitted INSERT must match the scan DELETE");
+    exec(&db, "COMMIT");
+    assert!(rows(&db, "SELECT id FROM t WHERE id = 5000").is_empty());
+}
