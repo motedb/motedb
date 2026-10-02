@@ -7,8 +7,11 @@ use std::time::Instant;
 
 /// Cached decoded column segment (text only — fixed columns use O(1) direct read).
 enum CachedCol {
+    /// 🔑 H1: Arc — the cache-hit path used to clone the FixedSegment
+    /// (Owned(Vec<u8>) data = full column memcpy) on EVERY read; per-morsel
+    /// readers made that ~8MB of copies per query at 1M rows.
     #[allow(dead_code)]
-    Fixed(FixedSegment),
+    Fixed(std::sync::Arc<FixedSegment>),
     Text(TextSegment),
     Vector(VectorSegment),
     /// (row_id, geometry) pairs — small (bincode per point), decoded once
@@ -372,16 +375,24 @@ impl Segment {
     }
 
     pub fn read_fixed_cached(&self, col_idx: usize) -> Option<FixedSegment> {
+        // Arc inside the cache → this clone is a pointer bump + FixedSegment
+        // shallow copy (num_rows + enum ptrs), NOT a column memcpy.
+        Some((*self.read_fixed_cached_arc(col_idx)?).clone())
+    }
+
+    /// 🚀 H1: Arc-sharing variant for parallel kernels (morsels share one
+    /// decode instead of each cloning the column bytes).
+    pub fn read_fixed_cached_arc(&self, col_idx: usize) -> Option<std::sync::Arc<FixedSegment>> {
         {
             let mut cache = self.col_cache.lock();
             if let Some(CachedCol::Fixed(f)) = cache.get(col_idx) {
-                return Some(f.clone());
+                return Some(std::sync::Arc::clone(f));
             }
         }
-        let seg = self.sst.read_fixed_i64(col_idx).ok()?;
+        let seg = std::sync::Arc::new(self.sst.read_fixed_i64(col_idx).ok()?);
         self.col_cache
             .lock()
-            .insert(col_idx, CachedCol::Fixed(seg.clone()));
+            .insert(col_idx, CachedCol::Fixed(std::sync::Arc::clone(&seg)));
         Some(seg)
     }
 
@@ -528,7 +539,7 @@ impl Segment {
                 }
             }
             if let Ok(seg) = self.sst.read_fixed_i64(ci) {
-                let cached = CachedCol::Fixed(seg);
+                let cached = CachedCol::Fixed(std::sync::Arc::new(seg));
                 let v = decode_cached_value(&cached, idx, ct);
                 self.col_cache.lock().insert(ci, cached);
                 return v;
@@ -631,7 +642,7 @@ impl Segment {
                     }
                 }
                 if let Ok(seg) = self.sst.read_fixed_i64(ci) {
-                    let cached = CachedCol::Fixed(seg);
+                    let cached = CachedCol::Fixed(std::sync::Arc::new(seg));
                     row.push(decode_cached_value(&cached, idx, ct));
                     self.col_cache.lock().insert(ci, cached);
                 } else {

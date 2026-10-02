@@ -3673,6 +3673,153 @@ impl ColSegmentStore {
         self.top_k_row_indices_typed(order_col, k, desc, false)
     }
 
+    /// 🚀 H1: parallel morsel top-K over the sort column only. Bounded
+    /// per-morsel candidate buffers (sorted-insert with threshold early-out —
+    /// after warmup a row costs one compare) replace the old path's
+    /// all-entries materialization + select_nth (~24MB and ~4.7ms at 1M
+    /// rows). Eligible when keys are unique across segments (single segment
+    /// or an INSERT-only store): no cross-segment dedup needed; tombstones
+    /// and NULLs are handled per row exactly like the fallback path.
+    /// Returns None when ineligible — caller uses the heap path.
+    fn top_k_row_indices_parallel(
+        &self,
+        order_col: usize,
+        k: usize,
+        desc: bool,
+        is_float: bool,
+    ) -> Option<Vec<(usize, usize)>> {
+        if k == 0 {
+            return Some(Vec::new());
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            let _ = (order_col, desc, is_float);
+            return None;
+        }
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+
+            let segs = self.segments_snapshot();
+            if segs.len() > 1 && self.may_have_duplicate_keys() {
+                return None; // cross-segment newest-wins dedup — fallback
+            }
+
+            const CHUNK: usize = 128 * 1024;
+            let mut work: Vec<(usize, usize, usize)> = Vec::new();
+            for (sidx, seg) in segs.iter().enumerate() {
+                let n = seg.sst.num_rows;
+                let mut start = 0usize;
+                while start < n {
+                    let end = (start + CHUNK).min(n);
+                    work.push((sidx, start, end));
+                    start = end;
+                }
+            }
+            if work.is_empty() {
+                return Some(Vec::new());
+            }
+
+            // 🔑 G1-lesson: pre-read each segment's sort column ONCE and
+            // share the decode via Arc — per-morsel cache reads each cloned
+            // the column bytes (Owned Vec memcpy).
+            let mut seg_cols: Vec<Option<std::sync::Arc<FixedSegment>>> =
+                Vec::with_capacity(segs.len());
+            for seg in segs.iter() {
+                seg_cols.push(seg.read_fixed_cached_arc(order_col));
+            }
+
+            let partials: Vec<Vec<(u64, u32, u32)>> = work
+                .into_par_iter()
+                .map(|(sidx, r0, r1)| {
+                    let seg = &segs[sidx];
+                    let has_deletions = seg.sst.row_map.has_any_deleted();
+                    let Some(fseg) = seg_cols[sidx].clone() else {
+                        return Vec::new();
+                    };
+                    // Local top-k: kept sorted ascending by ord; a row first
+                    // pays the threshold compare, insert only when it beats
+                    // the current k-th (rare after warmup).
+                    let mut local: Vec<(u64, u32, u32)> = Vec::with_capacity(k.min(64));
+                    macro_rules! offer {
+                        ($ord:expr, $row:expr) => {{
+                            let ord = $ord;
+                            if local.len() < k {
+                                let pos = local.partition_point(|(o, _, _)| *o <= ord);
+                                local.insert(pos, (ord, sidx as u32, $row as u32));
+                            } else if ord < local[k - 1].0 {
+                                local.pop();
+                                let pos = local.partition_point(|(o, _, _)| *o <= ord);
+                                local.insert(pos, (ord, sidx as u32, $row as u32));
+                            }
+                        }};
+                    }
+                    if is_float {
+                        let has_nulls = fseg.has_nulls();
+                        let raw = fseg.raw_f64_typed_slice();
+                        for i in r0..r1 {
+                            if has_deletions && seg.sst.row_map.is_deleted(i) {
+                                continue;
+                            }
+                            if has_nulls && fseg.is_null(i) {
+                                // NULL sorts as the smallest value (NULLs
+                                // first ASC / last DESC) — engine-wide
+                                // order_by_cmp semantics.
+                                offer!(if desc { u64::MAX } else { u64::MIN }, i);
+                                continue;
+                            }
+                            let v = raw[i];
+                            let bits = v.to_bits();
+                            let to = if bits & (1u64 << 63) != 0 {
+                                !bits
+                            } else {
+                                bits ^ (1u64 << 63)
+                            };
+                            offer!(if desc { u64::MAX - to } else { to }, i);
+                        }
+                    } else {
+                        let has_nulls = fseg.has_nulls();
+                        let raw = fseg.raw_i64_slice();
+                        for i in r0..r1 {
+                            if has_deletions && seg.sst.row_map.is_deleted(i) {
+                                continue;
+                            }
+                            if has_nulls && fseg.is_null(i) {
+                                offer!(if desc { u64::MAX } else { u64::MIN }, i);
+                                continue;
+                            }
+                            let key = (raw[i] as u64) ^ (1u64 << 63);
+                            offer!(if desc { !key } else { key }, i);
+                        }
+                    }
+                    local
+                })
+                .collect();
+
+            // Merge: global top-k over all candidates (ascending ord = the
+            // requested order, same encoding as the fallback path).
+            let mut merged: Vec<(u64, u32, u32)> = Vec::with_capacity(k.min(64));
+            for part in partials {
+                for c in part {
+                    if merged.len() < k {
+                        let pos = merged.partition_point(|(o, _, _)| *o <= c.0);
+                        merged.insert(pos, c);
+                    } else if c.0 < merged[k - 1].0 {
+                        merged.pop();
+                        let pos = merged.partition_point(|(o, _, _)| *o <= c.0);
+                        merged.insert(pos, c);
+                    }
+                }
+            }
+            Some(
+                merged
+                    .into_iter()
+                    .map(|(_, s, r)| (s as usize, r as usize))
+                    .collect(),
+            )
+        }
+    }
+
     /// Type-aware top-K. `is_float` selects the correct decoder so Float columns
     /// are not misread as Integer (their 8-byte fixed slot decodes as garbage i64).
     pub fn top_k_row_indices_typed(
@@ -3684,6 +3831,11 @@ impl ColSegmentStore {
     ) -> Vec<(usize, usize)> {
         if k == 0 {
             return Vec::new();
+        }
+        // 🚀 H1: parallel morsel kernel for unique-key tables; the heap path
+        // below remains the general (dedup/newest-wins) fallback.
+        if let Some(v2) = self.top_k_row_indices_parallel(order_col, k, desc, is_float) {
+            return v2;
         }
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;

@@ -1535,3 +1535,136 @@ fn colscan_delete_predicate_pushdown_matches_generic() {
     exec(&db, "COMMIT");
     assert!(rows(&db, "SELECT id FROM t WHERE id = 5000").is_empty());
 }
+
+// 🔒 W4b-B kernel DELETE differential: executemany DELETE through the batch
+// kernel must produce exactly the per-row executor's state and counts
+// (chained shapes share no pending state with DELETE, but absent rows,
+// duplicate deletes, and in-txn visibility are all contract).
+#[test]
+fn executemany_delete_batch_kernel_matches_per_row() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    let seed: Vec<String> = (0..60).map(|i| format!("({}, {})", i, i)).collect();
+    exec(&db, &format!("INSERT INTO t VALUES {}", seed.join(",")));
+
+    // Absent ids and duplicates affect 0; real ids affect 1 each.
+    let batch: Vec<Vec<Value>> = vec![
+        vec![Value::Integer(10)],
+        vec![Value::Integer(10)],      // duplicate → 0
+        vec![Value::Integer(999_999)], // absent → 0
+        vec![Value::Integer(11)],
+        vec![Value::Integer(12)],
+    ];
+    let n = db
+        .execute_prepared_many("DELETE FROM t WHERE id = ?", batch)
+        .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM t")[0],
+        vec![Value::Integer(57)]
+    );
+
+    // In-txn: visible via COUNT inside, exact after ROLLBACK / COMMIT.
+    let tx = db.begin_transaction().unwrap();
+    let n = db
+        .execute_prepared_many(
+            "DELETE FROM t WHERE id = ?",
+            (20..25).map(|i| vec![Value::Integer(i)]).collect(),
+        )
+        .unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM t")[0],
+        vec![Value::Integer(52)]
+    );
+    db.rollback_transaction(tx).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM t")[0],
+        vec![Value::Integer(57)]
+    );
+
+    let tx = db.begin_transaction().unwrap();
+    db.execute_prepared_many(
+        "DELETE FROM t WHERE id = ?",
+        (30..33).map(|i| vec![Value::Integer(i)]).collect(),
+    )
+    .unwrap();
+    db.commit_transaction(tx).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM t")[0],
+        vec![Value::Integer(54)]
+    );
+
+    // Re-insert of a batch-deleted PK must work (pk_lookup cleanup at commit).
+    exec(&db, "INSERT INTO t VALUES (10, 100)");
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE id = 10"),
+        vec![vec![Value::Integer(100)]]
+    );
+}
+
+// 🔒 H1 differential: the parallel morsel top-K must agree with the full
+// ORDER BY sort — across float/int × asc/desc, NULLs, tombstones,
+// multi-segment INSERT-only tables (v2 path) and tables with duplicate keys
+// (fallback path), k=1 and k>n.
+#[test]
+fn topk_parallel_kernel_matches_full_sort() {
+    let (db, _dir) = create_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, f FLOAT, g INT)");
+    // Multi-batch INSERT → several segments; sprinkle NULLs; delete some rows.
+    for b in 0..4 {
+        let mut vals = Vec::new();
+        for i in 0..250 {
+            let id = b * 250 + i;
+            let f = if id % 17 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("{:.3}", ((id * 7919) % 10007) as f64 / 97.0 - 50.0)
+            };
+            let g = if id % 23 == 0 {
+                "NULL".to_string()
+            } else {
+                ((id * 104729) % 9973 - 5000).to_string()
+            };
+            vals.push(format!("({}, {}, {})", id, f, g));
+        }
+        exec(&db, &format!("INSERT INTO t VALUES {}", vals.join(",")));
+    }
+    let dels: Vec<String> = (0..1000)
+        .filter(|i| i % 31 == 0)
+        .map(|i| i.to_string())
+        .collect();
+    exec(
+        &db,
+        &format!("DELETE FROM t WHERE id IN ({})", dels.join(",")),
+    );
+    exec(&db, "CHECKPOINT");
+
+    let full = |sql: &str| -> Vec<Vec<Value>> { rows(&db, sql) };
+    for (col, asc) in [("f", true), ("f", false), ("g", true), ("g", false)] {
+        for k in [1usize, 5, 30, 2000] {
+            let dir = if asc { "ASC" } else { "DESC" };
+            let topk = full(&format!(
+                "SELECT id FROM t ORDER BY {col} {dir}, id {dir} LIMIT {k}"
+            ));
+            let mut sorted = full(&format!("SELECT id FROM t ORDER BY {col} {dir}, id {dir}"));
+            sorted.truncate(k);
+            assert_eq!(
+                topk, sorted,
+                "ORDER BY {col} {dir} LIMIT {k} disagrees with full sort"
+            );
+        }
+    }
+
+    // Duplicate-key table (UPDATEs → duplicate row_ids across segments) must
+    // stay correct via the fallback path.
+    exec(&db, "UPDATE t SET f = f - 100.0 WHERE id < 400");
+    for k in [1usize, 10, 100] {
+        let topk = full(&format!(
+            "SELECT id FROM t ORDER BY f ASC, id ASC LIMIT {k}"
+        ));
+        let mut sorted = full("SELECT id FROM t ORDER BY f ASC, id ASC");
+        sorted.truncate(k);
+        assert_eq!(topk, sorted, "dup-key table top-k diverged at k={k}");
+    }
+}

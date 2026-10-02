@@ -2,6 +2,31 @@
 
 ## [0.12.0] — 未发布
 
+### 🚀 H1 1M TopK: 并行 morsel top-k + 列缓存 Arc 化 (9.2→1.5ms, 6.2×, 追平 DuckDB)
+
+- 🔍 **归因链** (两轮采样): (a) 旧快路径把整列物化成 entries Vec
+  (24B/行 × 1M = 24MB + select_nth) ≈ 4.7ms; (b) 换并行后瓶颈露头 —
+  每查询对每段**重新 zstd 解压**排序列 (非缓存 read_fixed_f64) ≈ 3ms;
+  (c) 换缓存后又露头 — **缓存命中路径 clone FixedSegment = 全列 memcpy**
+  (Owned(Vec) derive Clone, G1 战役同款教训), 每 morsel 每查询 ~8MB 拷贝
+- 🚀 **三层修复**:
+  1. top_k_row_indices_parallel — 128K morsel 并行, 每 morsel 有界候选
+     缓冲 (sorted-insert + 阈值早退, 热后每行一次比较), 全局归并取 top-k。
+     门控: 单段或无重复键表; 墓碑/NULL 逐行语义与回退路径一致 (NULL
+     最小值排序等); 重复键表回退原 heap 路径 (顺带建档: 旧 f64 多段分支
+     本就漏 dedup)
+  2. CachedCol::Fixed 改 Arc 存储 + read_fixed_cached_arc — 缓存命中从
+     全列 memcpy 变指针递增
+  3. 段级 Arc 预读共享进 morsels (免每 morsel 重复取列)
+- 实测 1M 行: top-10 ASC 9.21 → **1.49ms (6.2×)**, top-100 DESC 1.56ms;
+  DuckDB 1.25ms — 差距 5.3× → **1.2× (视同追平)**; 100K 档 0.24ms 无
+  回归。差分测试 topk_parallel_kernel_matches_full_sort (float/int ×
+  asc/desc × NULL × 墓碑 × 多段插入表 × 重复键回退 × k∈{1,5,30,2000}
+  对照全排序)
+- 附: executemany DELETE 批内核差分测试补齐
+  (executemany_delete_batch_kernel_matches_per_row)
+- 对抗验证 ALL PASS; 全量 239 bin 第十六轮全绿
+
 ### 🚀 G1 FTS 构建零 per-token 分配: TokenizedText 借用化 (0.72→0.48s)
 
 - 🔍 **根因** (采样): W3 并行分词后剩余瓶颈是 **per-token String 分配
