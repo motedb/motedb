@@ -2,6 +2,16 @@
 
 ## [0.12.0] — 未发布
 
+### 🔑 J4 SQL 面: LIMIT ?/OFFSET ? 参数化 (建档项清账)
+
+- 🔑 `SELECT ... LIMIT ? OFFSET ?` 参数化: parser 存参数位
+  (limit_param/offset_param, 匿名 ? 与 ?N 共用既有自动编号),
+  substitute_params_stmt 从绑定参数解析 (负数/非整数/未绑定 → 清晰
+  InvalidArgument), contains_parameter_stmt 与 max_parameter_index 纳入
+  门控与校验。UNION/EXCEPT/INTERSECT 结果集上明确报不支持
+- Python E2E 四形状 (LIMIT ? / OFFSET ? / 组合 / WHERE+LIMIT 混用) +
+  四错误路径 + Rust 回归 parameterized_limit_offset
+
 ### 🔑 J3 过滤向量检索: 迭代加深候选池 (高选择性谓词不再漏结果)
 
 - 🔒 **问题**: `WHERE flag = 1 ORDER BY emb <-> ? LIMIT k` 的 WHERE 在

@@ -248,3 +248,75 @@ fn filtered_vector_search_deepens_until_k() {
     // order of the 9.0-line).
     assert_eq!(ids, vec![0, 25, 50, 75, 100], "wrong nearest-match order");
 }
+
+// 🔒 J4: parameterized LIMIT/OFFSET — `LIMIT ?` / `LIMIT ? OFFSET ?` resolve
+// from bound parameters; negative/unbound values error; set-op results
+// reject the form with a clear message.
+#[test]
+fn parameterized_limit_offset() {
+    let (db, _dir) = setup();
+    let n = |sql: &str, params: Vec<Value>| -> (usize, i64) {
+        let rows = db
+            .execute_prepared(sql, params)
+            .unwrap()
+            .materialize()
+            .unwrap();
+        match rows {
+            motedb::QueryResult::Select { rows, .. } => {
+                let first = match &rows.first().map(|r| r[0].clone()) {
+                    Some(Value::Integer(i)) => *i,
+                    None => -1,
+                    o => panic!("{o:?}"),
+                };
+                (rows.len(), first)
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+
+    assert_eq!(
+        n(
+            "SELECT id FROM docs ORDER BY id LIMIT ?",
+            vec![Value::Integer(3)]
+        ),
+        (3, 0)
+    );
+    assert_eq!(
+        n(
+            "SELECT id FROM docs ORDER BY id LIMIT 4 OFFSET ?",
+            vec![Value::Integer(10)]
+        ),
+        (2, 10) // 12-doc fixture: only 2 rows survive OFFSET 10
+    );
+    assert_eq!(
+        n(
+            "SELECT id FROM docs ORDER BY id LIMIT ? OFFSET ?",
+            vec![Value::Integer(5), Value::Integer(7)]
+        ),
+        (5, 7)
+    );
+    assert_eq!(
+        n(
+            "SELECT id FROM docs WHERE id >= ? ORDER BY id LIMIT ?",
+            vec![Value::Integer(9), Value::Integer(2)]
+        ),
+        (2, 9)
+    );
+
+    for (sql, params) in [
+        ("SELECT id FROM docs LIMIT ?", vec![Value::Integer(-1)]),
+        ("SELECT id FROM docs LIMIT ?", vec![]),
+    ] {
+        assert!(
+            db.execute_prepared(sql, params).is_err(),
+            "must reject {sql}"
+        );
+    }
+    assert!(db.execute("SELECT id FROM docs LIMIT ?").is_err());
+    assert!(db
+        .execute_prepared(
+            "SELECT id FROM docs UNION SELECT id FROM docs LIMIT ?",
+            vec![Value::Integer(3)]
+        )
+        .is_err());
+}

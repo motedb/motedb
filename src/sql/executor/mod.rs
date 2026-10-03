@@ -4492,6 +4492,8 @@ impl QueryExecutor {
             distinct: stmt.distinct,
             group_by: stmt.group_by.clone(),
             having,
+            limit_param: None,
+            offset_param: None,
             latest_by: stmt.latest_by.clone(),
         })
     }
@@ -8647,6 +8649,8 @@ impl QueryExecutor {
                     .as_ref()
                     .map(walk_expr)
                     .unwrap_or(0)
+                    .max(s.limit_param.unwrap_or(0))
+                    .max(s.offset_param.unwrap_or(0))
                     .max(s.columns.iter().fold(0, |acc, c| {
                         acc.max(match c {
                             SelectColumn::Expr(e, _) => walk_expr(e),
@@ -9252,6 +9256,11 @@ impl QueryExecutor {
                 .having
                 .as_ref()
                 .is_some_and(Self::contains_parameter)
+            // 🔑 J4: `LIMIT ?` / `OFFSET ?` — the parser stores the 1-based
+            // parameter index here; missing from this gate, the statement
+            // skipped substitution and LIMIT stayed None (unbounded).
+            || stmt.limit_param.is_some()
+            || stmt.offset_param.is_some()
             // 🔑 Parameterized MATCH: the parser folds `MATCH(c, ?)` into a
             // sentinel string, so no Expr::Parameter survives — without this
             // arm the stmt skipped substitution and matched the LITERAL
@@ -9309,6 +9318,30 @@ impl QueryExecutor {
     fn substitute_params_stmt(&self, stmt: &SelectStmt) -> Result<SelectStmt> {
         let params = self.evaluator.get_params();
         let sub = |expr: &Expr| -> Result<Expr> { Self::substitute_expr(expr, &params) };
+        // 🔑 J4: resolve `LIMIT ?` / `OFFSET ?` from the bound parameters.
+        let resolve_pos = |idx: Option<usize>| -> Result<Option<usize>> {
+            match idx {
+                None => Ok(None),
+                Some(i) => match params.get(i - 1) {
+                    Some(Value::Integer(n)) if *n >= 0 => Ok(Some(*n as usize)),
+                    Some(Value::Integer(n)) => Err(MoteDBError::InvalidArgument(format!(
+                        "LIMIT/OFFSET parameter ?{} must be non-negative, got {}",
+                        i, n
+                    ))),
+                    Some(v) => Err(MoteDBError::InvalidArgument(format!(
+                        "LIMIT/OFFSET parameter ?{} must be an integer, got {:?}",
+                        i, v
+                    ))),
+                    None => Err(MoteDBError::InvalidArgument(format!(
+                        "Parameter ?{} not bound ({} parameters provided)",
+                        i,
+                        params.len()
+                    ))),
+                },
+            }
+        };
+        let limit_from_param = resolve_pos(stmt.limit_param)?;
+        let offset_from_param = resolve_pos(stmt.offset_param)?;
 
         let where_clause = match &stmt.where_clause {
             Some(w) => Some(sub(w)?),
@@ -9347,11 +9380,15 @@ impl QueryExecutor {
             from: stmt.from.clone(),
             where_clause,
             order_by,
-            limit: stmt.limit,
-            offset: stmt.offset,
+            // 🔑 J4: parameters resolved above take precedence; a literal
+            // LIMIT/OFFSET in the same clause position is the parsed value.
+            limit: limit_from_param.or(stmt.limit),
+            offset: offset_from_param.or(stmt.offset),
             distinct: stmt.distinct,
             group_by: stmt.group_by.clone(),
             having: stmt.having.clone(),
+            limit_param: None,
+            offset_param: None,
             latest_by: stmt.latest_by.clone(),
         })
     }
@@ -23768,6 +23805,8 @@ mod tests {
             order_by: None,
             limit: None,
             offset: None,
+            limit_param: None,
+            offset_param: None,
             distinct: false,
             group_by: None,
             having: None,

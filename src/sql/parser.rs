@@ -97,7 +97,12 @@ impl Parser {
                         };
                     }
                     // Attach CTEs + trailing clauses to the outermost SetOp.
-                    let (order_by, limit, offset) = self.parse_trailing_clauses()?;
+                    let (order_by, limit, offset, lp, op) = self.parse_trailing_clauses()?;
+                    if lp.is_some() || op.is_some() {
+                        return Err(self.error(
+                            "parameterized LIMIT/OFFSET is not supported on UNION/EXCEPT/INTERSECT results",
+                        ));
+                    }
                     if let Statement::SetOp {
                         ctes: ref mut c,
                         order_by: ref mut o,
@@ -116,10 +121,12 @@ impl Parser {
                     // No UNION/EXCEPT followed. If the first was just a plain
                     // SELECT (no INTERSECT), attach trailing clauses to it.
                     let mut select = stmt.clone();
-                    let (order_by, limit, offset) = self.parse_trailing_clauses()?;
+                    let (order_by, limit, offset, lp, op) = self.parse_trailing_clauses()?;
                     select.order_by = order_by;
                     select.limit = limit;
                     select.offset = offset;
+                    select.limit_param = lp;
+                    select.offset_param = op;
                     Statement::Select {
                         stmt: select,
                         ctes: std::mem::take(&mut ctes),
@@ -127,7 +134,12 @@ impl Parser {
                 } else {
                     // First was an INTERSECT chain (no UNION/EXCEPT): attach
                     // CTEs + trailing clauses to the outermost INTERSECT SetOp.
-                    let (order_by, limit, offset) = self.parse_trailing_clauses()?;
+                    let (order_by, limit, offset, lp, op) = self.parse_trailing_clauses()?;
+                    if lp.is_some() || op.is_some() {
+                        return Err(self.error(
+                            "parameterized LIMIT/OFFSET is not supported on UNION/EXCEPT/INTERSECT results",
+                        ));
+                    }
                     let mut left_stmt = first;
                     if let Statement::SetOp {
                         ctes: ref mut c,
@@ -254,6 +266,8 @@ impl Parser {
             order_by: None,
             limit: None,
             offset: None,
+            limit_param: None,
+            offset_param: None,
             latest_by,
         })
     }
@@ -262,10 +276,12 @@ impl Parser {
     /// Used for standalone SELECTs (no set operator).
     fn parse_select(&mut self) -> Result<SelectStmt> {
         let mut s = self.parse_select_core()?;
-        let (order_by, limit, offset) = self.parse_trailing_clauses()?;
+        let (order_by, limit, offset, lp, op) = self.parse_trailing_clauses()?;
         s.order_by = order_by;
         s.limit = limit;
         s.offset = offset;
+        s.limit_param = lp;
+        s.offset_param = op;
         Ok(s)
     }
 
@@ -312,24 +328,58 @@ impl Parser {
     /// SELECT) and by the set-op parser (to attach these to the outermost node).
     fn parse_trailing_clauses(
         &mut self,
-    ) -> Result<(Option<Vec<OrderByExpr>>, Option<usize>, Option<usize>)> {
+    ) -> Result<(
+        Option<Vec<OrderByExpr>>,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+    )> {
         let order_by = if self.match_token(TokenType::Order) {
             self.expect(TokenType::By)?;
             Some(self.parse_order_by()?)
         } else {
             None
         };
+        // 🔑 J4: `LIMIT ?` / `OFFSET ?` — a Parameter token stores its 1-based
+        // index; resolution happens in substitute_params_stmt (SELECT only).
         let limit = if self.match_token(TokenType::Limit) {
-            Some(self.parse_usize()?)
+            if let TokenType::Parameter(raw) = self.current().token_type {
+                self.advance();
+                // Same auto-numbering as the expr path: unnamed ? takes the
+                // next sequential 1-based index.
+                let idx = if raw == 0 {
+                    let next = self.next_param_idx;
+                    self.next_param_idx += 1;
+                    next
+                } else {
+                    raw as usize
+                };
+                (None, Some(idx))
+            } else {
+                (Some(self.parse_usize()?), None)
+            }
         } else {
-            None
+            (None, None)
         };
         let offset = if self.match_token(TokenType::Offset) {
-            Some(self.parse_usize()?)
+            if let TokenType::Parameter(raw) = self.current().token_type {
+                self.advance();
+                let idx = if raw == 0 {
+                    let next = self.next_param_idx;
+                    self.next_param_idx += 1;
+                    next
+                } else {
+                    raw as usize
+                };
+                (None, Some(idx))
+            } else {
+                (Some(self.parse_usize()?), None)
+            }
         } else {
-            None
+            (None, None)
         };
-        Ok((order_by, limit, offset))
+        Ok((order_by, limit.0, offset.0, limit.1, offset.1))
     }
 
     /// Parse a WITH clause: `WITH [RECURSIVE] name [(col, ...)] AS ( SELECT ... ), ...`

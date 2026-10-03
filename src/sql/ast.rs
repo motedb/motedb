@@ -87,6 +87,11 @@ pub struct SelectStmt {
     pub order_by: Option<Vec<OrderByExpr>>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// 🔑 J4: 1-based parameter index for `LIMIT ?` — resolved from bound
+    /// params in substitute_params_stmt (the prepared-statement gate looks
+    /// at these too). None for literal/absent LIMIT.
+    pub limit_param: Option<usize>,
+    pub offset_param: Option<usize>,
     pub latest_by: Option<Vec<String>>, // LATEST BY column_list
 }
 
