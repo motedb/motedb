@@ -2,6 +2,18 @@
 
 ## [0.12.0] — 未发布
 
+### Known Limitations（发布时随 Release Notes 公布）
+
+- `geom` 为保留字，不能作列名（`GEOMETRY` 类型别名冲突）
+- `LIMIT ?` 参数化不支持 UNION/EXCEPT/INTERSECT 结果集（普通 SELECT 支持）
+- 事务内未提交 INSERT 对 `MATCH` 全文谓词不可见（读己之写覆盖到
+  扫描/聚合/点查，FTS 快路径待补）
+- 时序表推荐 `ts TIMESTAMP`；`ts INT` 功能完整但 Gorilla/zone-map 优化
+  需要 0.12.0 之后的段重写才能完全生效
+- LATEST BY 大表（>1M 行）性能待优化（段级归并，0.12.x 计划）
+- executemany 与 SQLite 差 2.4-2.7×（Python 逐行过桥开销，批量 API 可达
+  189-457K rows/s）
+
 ### 🚀 K1 时序 ORDER BY ts LIMIT k: INT 列三重修复 (1.2s → 1.76ms, 680×)
 
 - 🔍 **根因三层** (I2 发现 1 的根治): `ts INT`（非 TIMESTAMP）的

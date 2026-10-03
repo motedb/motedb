@@ -551,3 +551,20 @@ println!("Total rows: {}", results.row_count());
 
 **Previous**: [Quick Start](./01-quick-start.md)
 **Next**: [Batch Operations](./04-batch-operations.md)
+
+
+## 参数化 LIMIT / OFFSET（0.12 新增）
+
+```rust,ignore
+db.execute_prepared("SELECT id FROM t ORDER BY id LIMIT ? OFFSET ?",
+                    vec![Value::Integer(10), Value::Integer(20)])?;
+```
+
+Python: `db.query("SELECT ... LIMIT ? OFFSET ?", params=[10, 20])`。
+
+限制：UNION/EXCEPT/INTERSECT 结果集不支持参数化 LIMIT/OFFSET（普通
+SELECT 全支持）；参数必须是非负整数。
+
+## Python 混合检索 / Arrow（0.12 新增）
+
+见 [17-hybrid-arrow.md](17-hybrid-arrow.md)。

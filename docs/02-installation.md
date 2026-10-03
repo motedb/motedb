@@ -76,7 +76,7 @@ let config = DBConfig {
     auto_flush_interval: 60,
 
     // Default durability level
-    durability_level: motedb::DurabilityLevel::Full,
+    durability_level: motedb::DurabilityLevel::Synchronous,
 };
 
 let db = Database::create_with_config("myapp.mote", config)?;
@@ -137,14 +137,14 @@ pub enum DurabilityLevel {
 ```rust
 // High performance mode (data loss possible)
 let config = DBConfig {
-    durability_level: DurabilityLevel::Memory,
+    durability_level: DurabilityLevel::NoSync,
     enable_wal: false,
     ..Default::default()
 };
 
 // Safe mode (recommended for production)
 let config = DBConfig {
-    durability_level: DurabilityLevel::Full,
+    durability_level: DurabilityLevel::Synchronous,
     enable_wal: true,
     auto_flush_interval: 30,
     ..Default::default()
@@ -205,7 +205,7 @@ let config = DBConfig {
     memtable_size_mb: 32,       // Larger memtable
     row_cache_size: 1000,       // Smaller cache
     enable_wal: false,          // Disable WAL (improves write speed)
-    durability_level: DurabilityLevel::Memory,
+    durability_level: DurabilityLevel::NoSync,
     auto_flush_interval: 120,   // Longer flush interval
     ..Default::default()
 };
@@ -218,7 +218,7 @@ let config = DBConfig {
     memtable_size_mb: 8,        // Standard memtable
     row_cache_size: 50000,      // Larger cache
     enable_wal: true,
-    durability_level: DurabilityLevel::Full,
+    durability_level: DurabilityLevel::Synchronous,
     bloom_filter_bits: 12,      // Larger Bloom Filter
     ..Default::default()
 };
@@ -231,7 +231,7 @@ let config = DBConfig {
     memtable_size_mb: 16,
     row_cache_size: 10000,
     enable_wal: true,
-    durability_level: DurabilityLevel::Full,
+    durability_level: DurabilityLevel::Synchronous,
     auto_flush_interval: 60,
     compression: true,
     ..Default::default()
@@ -293,7 +293,7 @@ let config = DBConfig {
 let config = DBConfig {
     memtable_size_mb: 32,
     enable_wal: false,
-    durability_level: DurabilityLevel::Memory,
+    durability_level: DurabilityLevel::NoSync,
     ..Default::default()
 };
 
@@ -309,7 +309,7 @@ db.flush()?;
 ```rust
 let config = DBConfig {
     enable_wal: true,
-    durability_level: DurabilityLevel::Full,
+    durability_level: DurabilityLevel::Synchronous,
     auto_flush_interval: 30,
     ..Default::default()
 };
