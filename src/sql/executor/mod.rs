@@ -4155,7 +4155,13 @@ impl QueryExecutor {
                         let schema_agg = self.db.get_table_schema(table_name)?;
                         let pend_agg = self.txn_pending_rows(table_name);
                         let dels_agg = self.txn_pending_delete_ids(table_name);
-                        if pend_agg.is_empty() && dels_agg.is_empty() {
+                        // 🔒 Smoke-caught (J5): write_set INSERTs must route
+                        // to the overlaid aggregate too — with ONLY buffered
+                        // inserts (pend/dels empty), the raw storage aggregate
+                        // silently dropped every uncommitted row from
+                        // COUNT/SUM/AVG with a WHERE clause.
+                        let ws_agg = self.txn_write_set_rows(table_name);
+                        if pend_agg.is_empty() && dels_agg.is_empty() && ws_agg.is_empty() {
                             if let Some(result) =
                                 self.col_segment_aggregate(stmt, table_name, &store)?
                             {
@@ -4199,7 +4205,8 @@ impl QueryExecutor {
                             // set instead (storage + pending fold).
                             let pend = self.txn_pending_rows(table_name);
                             let dels = self.txn_pending_delete_ids(table_name);
-                            if pend.is_empty() && dels.is_empty() {
+                            let ws = self.txn_write_set_rows(table_name);
+                            if pend.is_empty() && dels.is_empty() && ws.is_empty() {
                                 if let Some(result) = self.col_segment_multi_aggregate(
                                     stmt, table_name, &store, &schema,
                                 )? {

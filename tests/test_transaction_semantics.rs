@@ -753,3 +753,65 @@ fn txn_aggregate_where_is_applied() {
     db.execute("ROLLBACK").unwrap();
     assert_eq!(auto("SELECT COUNT(*) FROM t"), 500);
 }
+
+// 🔒 J5 regression (acceptance smoke catch): with ONLY buffered INSERTs in
+// the transaction (no pending updates/deletes), the aggregate routing gate
+// let `col_segment_aggregate` answer from RAW STORAGE — uncommitted rows
+// vanished from COUNT/SUM/AVG with a WHERE clause (plain COUNT(*) had its
+// own ws handling and was correct).
+#[test]
+fn txn_inserts_visible_in_filtered_aggregate() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, v INT)")
+        .unwrap();
+    for i in 0..500 {
+        db.execute(format!("INSERT INTO docs VALUES ({i}, 'doc {i} alpha', {i})").as_str())
+            .unwrap();
+    }
+    let count_alpha = |db: &Database| -> i64 {
+        match &rows(
+            db.execute("SELECT COUNT(*) FROM docs WHERE body LIKE '%alpha%'")
+                .unwrap(),
+        )[0][0]
+        {
+            Value::Integer(n) => *n,
+            v => panic!("{v:?}"),
+        }
+    };
+    assert_eq!(count_alpha(&db), 500);
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO docs VALUES (900, 'txx alpha', 900)")
+        .unwrap();
+    // Plain COUNT(*) sees the ws row (pre-existing path).
+    assert_eq!(
+        ints(&rows(db.execute("SELECT COUNT(*) FROM docs").unwrap())),
+        [501]
+    );
+    // WHERE-filtered aggregate MUST see it too (was 500).
+    assert_eq!(count_alpha(&db), 501, "ws row missing from filtered COUNT");
+    assert_eq!(
+        ints(&rows(
+            db.execute("SELECT COUNT(*) FROM docs WHERE body LIKE '%txx%'")
+                .unwrap()
+        )),
+        [1]
+    );
+    assert_eq!(
+        ints(&rows(
+            db.execute("SELECT SUM(v) FROM docs WHERE id = 900")
+                .unwrap()
+        )),
+        [900]
+    );
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(count_alpha(&db), 500);
+
+    // COMMIT makes it durable.
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO docs VALUES (901, 'kept alpha', 901)")
+        .unwrap();
+    db.execute("COMMIT").unwrap();
+    assert_eq!(count_alpha(&db), 501);
+}

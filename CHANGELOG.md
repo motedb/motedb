@@ -2,6 +2,19 @@
 
 ## [0.12.0] — 未发布
 
+### 🔒 J5 事务聚合路由: write_set INSERT 纳入门控 (产品验收冒烟实抓)
+
+- 🔒 **纯 INSERT 事务里带 WHERE 的聚合漏未提交行**: 聚合路由 gate 只检查
+  pending updates/deletes — 仅缓冲 INSERT (write_set 非空, 两者为空) 时
+  仍走裸存储聚合, `COUNT(*) WHERE body LIKE ...` 少计未提交行 (无 WHERE
+  的 COUNT 有自己的 ws 处理, 一直正确)。修复: 两处 gate (col_segment_
+  aggregate / multi_aggregate) 增加 write_set 检查, 非空即路由
+  txn_aggregate_overlaid (E1 的谓词过滤覆盖此路径)
+- 回归测试 txn_inserts_visible_in_filtered_aggregate (COUNT/SUM 混合
+  形状 + 回滚/提交)
+- 产品验收冒烟 9 步全绿 (四索引 + hybrid + arrow/pandas + 参数化
+  LIMIT/OFFSET + 事务 RYW + 崩溃持久性)
+
 ### 🔑 J4 SQL 面: LIMIT ?/OFFSET ? 参数化 (建档项清账)
 
 - 🔑 `SELECT ... LIMIT ? OFFSET ?` 参数化: parser 存参数位

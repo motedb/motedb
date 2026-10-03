@@ -1,66 +1,66 @@
 {
  "artifact_mb": {
   "motedb_cli": 7.5,
-  "python_so": 9.2
+  "python_so": null
  },
  "open_fresh_rss_mb": 2.5,
  "load": {
-  "rows_per_s": 93696,
-  "python_conv_s": 0.85,
-  "load_s": 1.07,
+  "rows_per_s": 102557,
+  "python_conv_s": 0.84,
+  "load_s": 0.98,
   "driver_arrays_mb": 160.6,
-  "load_peak_rss_delta_mb": 209.5,
+  "load_peak_rss_delta_mb": 187.3,
   "disk_wal_pre_cp_mb": 162.0,
-  "checkpoint_s": 0.52,
+  "checkpoint_s": 0.47,
   "disk_after_cp_mb": 162.0
  },
  "index_fts": {
-  "build_s": 0.89,
-  "rss_delta_mb": 24.6,
+  "build_s": 1.02,
+  "rss_delta_mb": 30.4,
   "disk_mb": 175.8
  },
  "query_rss_delta_mb": {
   "point": -0.0,
-  "range_agg_fused": 0.0,
+  "range_agg_fused": -0.0,
   "range_agg_between_80pct": 0.0,
-  "groupby": -0.0,
-  "topk": 0.0,
-  "join": 0.0,
+  "groupby": 0.0,
+  "topk": -0.0,
+  "join": -0.0,
   "fts_match": 0.1,
   "vector_knn10": 0.0,
-  "full_scan_project": 0.8
+  "full_scan_project": 0.4
  },
- "steady_state_rss_delta_mb": -3.2,
+ "steady_state_rss_delta_mb": -8.7,
  "latency_ms": {
   "point": 0.0,
   "range_agg_fused": 0.27,
-  "range_agg_between_80pct": 0.23,
-  "groupby": 0.65,
-  "knn10": 9.46
+  "range_agg_between_80pct": 0.22,
+  "groupby": 0.62,
+  "knn10": 10.19
  },
  "reopen": {
   "open_s": 0.022,
-  "rss_delta_mb": 0.2
+  "rss_delta_mb": 0.0
  },
  "crash_recovery": {
-  "reopen_s": 0.008,
+  "reopen_s": 0.009,
   "rows_visible": 1300,
   "expected": 1300
  },
  "edge_preset": {
-  "load_s": 1.78,
+  "load_s": 1.7,
   "disk_pre_cp_mb": 157.3,
-  "checkpoint_s": 0.41,
+  "checkpoint_s": 0.42,
   "disk_mb": 157.3,
-  "knn_first_query_rss_mb": -2.0,
-  "knn_p50_ms": 9.0
+  "knn_first_query_rss_mb": -0.3,
+  "knn_p50_ms": 9.77
  },
  "sqlite_ref": {
   "load_s": 0.04,
-  "load_rss_delta_mb": 7.1,
+  "load_rss_delta_mb": 6.9,
   "disk_mb": 12.8,
-  "point_rss": 0.0,
+  "point_rss": -0.0,
   "range_agg_rss": 0.0,
-  "groupby_rss": 0.1
+  "groupby_rss": 0.0
  }
 }
