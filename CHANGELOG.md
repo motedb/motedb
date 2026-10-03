@@ -2,6 +2,28 @@
 
 ## [0.12.0] — 未发布
 
+### 📋 I2 空间/时序 SOTA 对照建档: 3 项 SOTA + 4 项新发现 (未改引擎代码)
+
+新增 compete_spatial_ts.py (1M 行时序 + 500K 3D 点 × 3 引擎)。正确性:
+spatial_eval / ts_eval 双 PASS (recall/集合等值/乱序/reopen 全对)。
+
+- ✅ **时序 SOTA**: 范围聚合 p50 0.004ms (zone-map 剪枝, SQLite 4.4ms
+  / DuckDB 0.41ms 的 100-1000×); 时间删 1 万行 0.003s (SQLite 0.46s)
+- ✅ **空间 SOTA**: bbox WITHIN p50 0.001ms (SQLite 0.39 / DuckDB 1.33
+  的 400-1300×); KNN10 p50 0.002ms (SQLite 全扫 41ms / DuckDB 1.6ms)
+- 🔍 **发现 1 — ts ORDER BY ts LIMIT k**: 1M 行 1.2s (SQLite DESC 索引
+  0.006ms)。EXPLAIN 证实 top-k 内核已选中; 慢在 pass-1 逐段 Gorilla 全
+  解 + 幸存行逐行整段解码 — 修复: 段级剪枝后仅解码 top-k 所在段
+- 🔍 **发现 2 — LATEST BY**: 1M 行 176ms (SQLite (sid,ts DESC) 索引
+  0.2ms / DuckDB arg_max 1.5ms)。fold 是 O(N) 逐行 HashMap — 修复:
+  段级 per-sensor max-ts 元数据 + 归并
+- 🔍 **发现 3 — ST_RADIUS_3D 计数**: 500K 点 r=0.1 54ms (DuckDB 列数学
+  1.3ms) — 命中行逐行物化取回; 修复: COUNT 形状走 i-Octree 纯计数
+- 🔍 **发现 4 — 时序/空间装载**: 206K/373K rows/s vs DuckDB 7M/50M —
+  时序 SQL 多行 VALUES 逐行解析; 空间 POINT('x y z') 文本解析。修复:
+  insert_arrays 支持 TimeSeries/GEOMETRY 列式装载
+- 附带确认保留字: `geom` 不能作列名 (解析层)
+
 ### 🔒 J5 事务聚合路由: write_set INSERT 纳入门控 (产品验收冒烟实抓)
 
 - 🔒 **纯 INSERT 事务里带 WHERE 的聚合漏未提交行**: 聚合路由 gate 只检查
