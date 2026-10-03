@@ -1644,10 +1644,18 @@ impl ColumnarStore {
             let Some(ts_block) = blocks.iter().find(|b| b.column_id == ts_idx as u16) else {
                 continue;
             };
-            if ts_block.encoding != ColumnEncoding::GorillaTimestamp {
-                continue; // non-gorilla ts: caller falls back to the general path
-            }
-            let ts_micros = gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize);
+            // 🔑 K1: ts may be INT (DeltaVarint integer gorilla) instead of
+            // TIMESTAMP — both decode to i64 micros. Rejecting DeltaVarint
+            // made pass 1 collect NOTHING for INT-timeseries tables.
+            let ts_micros = match ts_block.encoding {
+                ColumnEncoding::GorillaTimestamp => {
+                    gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize)
+                }
+                ColumnEncoding::DeltaVarint => {
+                    gorilla::decode_integers(&ts_block.data, segment.row_count as usize)
+                }
+                _ => continue, // non-gorilla ts: caller falls back to the general path
+            };
             for &ts in ts_micros.iter() {
                 let key = if desc { ts } else { ts.wrapping_neg() };
                 if heap.len() < k {
@@ -1671,17 +1679,36 @@ impl ColumnarStore {
             if budget == 0 {
                 break;
             }
+            // 🔑 K1: zone-map gate — skip segments whose extremes can't reach
+            // the threshold. ⚠️ Legacy segments written before the INT-ts
+            // zone-map fix carry (0,0) metadata with rows > 0 — never prune.
+            let metadata_alive =
+                segment.max_timestamp != 0 || segment.min_timestamp != 0 || segment.row_count == 0;
+            let qualifies = if !metadata_alive {
+                true
+            } else if desc {
+                segment.max_timestamp >= threshold
+            } else {
+                segment.min_timestamp <= threshold.wrapping_neg()
+            };
+            if !qualifies {
+                continue;
+            }
             if !segment.is_timestamp_sorted {
                 // unsorted segment: full ts decode + threshold filter
                 let blocks = manager.read_columns(segment, &[ts_idx as u16])?;
                 let Some(ts_block) = blocks.iter().find(|b| b.column_id == ts_idx as u16) else {
                     continue;
                 };
-                if ts_block.encoding != ColumnEncoding::GorillaTimestamp {
-                    continue;
-                }
-                let ts_micros =
-                    gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize);
+                let ts_micros = match ts_block.encoding {
+                    ColumnEncoding::GorillaTimestamp => {
+                        gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize)
+                    }
+                    ColumnEncoding::DeltaVarint => {
+                        gorilla::decode_integers(&ts_block.data, segment.row_count as usize)
+                    }
+                    _ => continue,
+                };
                 for (i, &ts) in ts_micros.iter().enumerate() {
                     let key = if desc { ts } else { ts.wrapping_neg() };
                     if key > threshold || (key == threshold && wanted_rows.len() < budget) {
@@ -1697,10 +1724,15 @@ impl ColumnarStore {
             let Some(ts_block) = blocks.iter().find(|b| b.column_id == ts_idx as u16) else {
                 continue;
             };
-            if ts_block.encoding != ColumnEncoding::GorillaTimestamp {
-                continue;
-            }
-            let all_ts = gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize);
+            let all_ts = match ts_block.encoding {
+                ColumnEncoding::GorillaTimestamp => {
+                    gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize)
+                }
+                ColumnEncoding::DeltaVarint => {
+                    gorilla::decode_integers(&ts_block.data, segment.row_count as usize)
+                }
+                _ => continue,
+            };
             // scan from the qualifying end (DESC: largest ts first = tail;
             // ASC-key = -ts so largest key = smallest ts = head).
             let range: Box<dyn Iterator<Item = (usize, i64)>> = if desc {
@@ -1794,7 +1826,16 @@ impl ColumnarStore {
             w.truncate(budget);
             w
         };
-        for (seg_ord, row_idx, _ts) in wanted_rows.drain(..) {
+        // 🔑 K1: decode each involved segment ONCE (the old loop re-read and
+        // re-decoded the segment's needed columns per SURVIVOR row — k rows
+        // in one segment cost k full column decodes).
+        let mut by_seg: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
+        for (pos, (seg_ord, row_idx, _ts)) in wanted_rows.iter().enumerate() {
+            by_seg.entry(*seg_ord).or_default().push((pos, *row_idx));
+        }
+        let mut out_slots: Vec<Option<(i64, SqlRow)>> = vec![None; wanted_rows.len()];
+        for (seg_ord, rows_in_seg) in by_seg {
             let segment = &segments[seg_ord];
             let blocks = manager.read_columns(segment, &all_ids)?;
             let schema_blocks: Vec<&ColumnBlock> = blocks
@@ -1803,26 +1844,34 @@ impl ColumnarStore {
                 .collect();
             let decoded =
                 self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
-            let Some(row) = decoded.get(row_idx) else {
-                continue;
-            };
-            let ts = match row.get(ts_idx) {
-                Some(Value::Timestamp(t)) => t.as_micros(),
-                Some(Value::Integer(v)) => *v,
-                _ => 0,
-            };
-            let mut sql_row = SqlRow::new();
-            for &ci in &needed_idx {
-                sql_row.insert(
-                    schema.columns[ci].name.clone(),
-                    row.get(ci).cloned().unwrap_or(Value::Null),
-                );
+            for (pos, row_idx) in rows_in_seg {
+                let Some(row) = decoded.get(row_idx) else {
+                    continue;
+                };
+                let ts = match row.get(ts_idx) {
+                    Some(Value::Timestamp(t)) => t.as_micros(),
+                    Some(Value::Integer(v)) => *v,
+                    _ => 0,
+                };
+                let mut sql_row = SqlRow::new();
+                for &ci in &needed_idx {
+                    sql_row.insert(
+                        schema.columns[ci].name.clone(),
+                        row.get(ci).cloned().unwrap_or(Value::Null),
+                    );
+                }
+                out_slots[pos] = Some((ts, sql_row));
             }
+        }
+        for slot in out_slots.into_iter().flatten() {
             next_seq_for_ties += 1;
-            seg_row.push((ts, next_seq_for_ties, sql_row));
+            seg_row.push((slot.0, next_seq_for_ties, slot.1));
         }
         for bi in wanted_buf {
-            let (bts, sql_row) = buffer_rows.swap_remove(bi);
+            let (bts, mut sql_row) = buffer_rows.swap_remove(bi);
+            // 🔑 K1: pass2b removed the ts value under `ts_col` to compute
+            // the sort key — put it back so the projection sees the column.
+            sql_row.insert(ts_col.clone(), Value::Integer(bts));
             next_seq_for_ties += 1;
             seg_row.push((bts, next_seq_for_ties, sql_row));
         }

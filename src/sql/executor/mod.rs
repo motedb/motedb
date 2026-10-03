@@ -3595,6 +3595,34 @@ impl QueryExecutor {
         if stmt.latest_by.is_some() {
             return self.materialize_as_streaming(stmt);
         }
+        // 🔑 K1: ORDER BY <ts_col> [DESC] LIMIT k on a TimeSeries table must
+        // reach execute_select_internal's try_ts_order_limit (bounded heap
+        // over the Gorilla ts column, zone-map pruned). The streaming
+        // branches below serve this shape with a general 1M-row sort
+        // (~0.8s vs ~1ms) — the internal fast path never ran from the
+        // Python query() entry.
+        if stmt.latest_by.is_none()
+            && stmt.where_clause.is_none()
+            && stmt.limit.is_some()
+            && !stmt.distinct
+            && stmt.group_by.is_none()
+            && stmt.having.is_none()
+            && stmt.order_by.as_ref().is_some_and(|ob| ob.len() == 1)
+        {
+            if let Some(TableRef::Table { name, .. }) = stmt.from.as_ref() {
+                if let Ok(schema) = self.db.get_table_schema(name) {
+                    if schema.table_type == crate::types::TableType::TimeSeries {
+                        let key = &stmt.order_by.as_ref().unwrap()[0];
+                        if let crate::sql::ast::Expr::Column(cn) = &key.expr {
+                            let bare = cn.rsplit('.').next().unwrap_or(cn);
+                            if Some(bare) == schema.timeseries_column.as_deref() {
+                                return self.materialize_as_streaming(stmt);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // 🔑 Explicit NULLS FIRST/LAST that differs from the dialect default
         // must be sorted by apply_order_by (the only comparator honoring the
         // flag). Run the general path and POST-SORT its result — internal
@@ -22447,7 +22475,7 @@ impl QueryExecutor {
     fn try_ts_order_limit(
         &self,
         stmt: &SelectStmt,
-        table: &str,
+        table: &str, // TRACE-K1
         schema: &crate::types::TableSchema,
         asc: bool,
     ) -> Result<Option<QueryResult>> {
@@ -22456,6 +22484,9 @@ impl QueryExecutor {
             .limit
             .unwrap_or(0)
             .saturating_add(stmt.offset.unwrap_or(0));
+        if std::env::var_os("MOTE_TRACE_K1").is_some() {
+            eprintln!("[k1] try_ts_order_limit entered, table={table} k={k}");
+        }
         if k == 0 {
             return Ok(None);
         }
@@ -22476,6 +22507,9 @@ impl QueryExecutor {
             };
         let rows = self.db.columnar_store.topk_by_ts(table, k, !asc, &needed)?;
         if rows.is_empty() {
+            if std::env::var_os("MOTE_TRACE_K1").is_some() {
+                eprintln!("[k1] topk_by_ts returned 0 rows → fallback");
+            }
             return Ok(None);
         }
         let columns: Vec<String> =

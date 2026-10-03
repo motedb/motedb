@@ -326,8 +326,16 @@ impl ColumnarWriteBuffer {
 
         // Track timestamp
         if let Some(ts_idx) = self.ts_column_idx {
-            if let Value::Timestamp(ts) = &row[ts_idx] {
-                let micros = ts.as_micros();
+            // 🔑 K1: the ts column may be INT (INTEGER buffer) rather than
+            // TIMESTAMP — only tracking the Timestamp variant left the
+            // segment zone map at (0, 0) for INT-timeseries tables, and
+            // topk_by_ts's segment gate then pruned EVERY segment.
+            let micros = match &row[ts_idx] {
+                Value::Timestamp(ts) => Some(ts.as_micros()),
+                Value::Integer(v) => Some(*v),
+                _ => None,
+            };
+            if let Some(micros) = micros {
                 self.min_timestamp = Some(self.min_timestamp.map_or(micros, |m| m.min(micros)));
                 self.max_timestamp = Some(self.max_timestamp.map_or(micros, |m| m.max(micros)));
             }
@@ -427,6 +435,12 @@ impl ColumnarWriteBuffer {
             if let Some(ts_idx) = self.ts_column_idx {
                 let in_range = match &self.columns[ts_idx] {
                     ColumnBuffer::Timestamp(vals) => vals
+                        .get(row_idx)
+                        .is_some_and(|ts| ts.is_some_and(|ts| ts >= start_ts && ts <= end_ts)),
+                    // 🔑 K1: INTEGER ts buffers were hardcoded false —
+                    // snapshot_rows returned NOTHING for INT-timeseries
+                    // tables until checkpoint.
+                    ColumnBuffer::Integer(vals) => vals
                         .get(row_idx)
                         .is_some_and(|ts| ts.is_some_and(|ts| ts >= start_ts && ts <= end_ts)),
                     _ => false,

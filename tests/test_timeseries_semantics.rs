@@ -258,3 +258,43 @@ fn test_ts_ttl_enforcement() {
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM tt"), Value::Integer(5));
     assert_eq!(scalar(&db, "SELECT MIN(v) FROM tt"), Value::Float(2.0));
 }
+
+// 🔒 K1 regression: a TIMESERIES table whose ts column is declared INT
+// (not TIMESTAMP) stores segments with DeltaVarint encoding — topk_by_ts
+// used to reject that encoding in every pass and return EMPTY results.
+#[test]
+fn ts_order_limit_int_ts_column() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE sen (ts INT, sid INT, v FLOAT) TIMESERIES(ts)")
+        .unwrap();
+    for i in 0..30i64 {
+        db.execute(
+            format!(
+                "INSERT INTO sen (ts, sid, v) VALUES ({}, {}, {:.1})",
+                i * 10,
+                i % 4,
+                i as f64
+            )
+            .as_str(),
+        )
+        .unwrap();
+    }
+    db.checkpoint().unwrap();
+    let r = rows(&db, "SELECT sid, ts, v FROM sen ORDER BY ts DESC LIMIT 5");
+    assert_eq!(r.len(), 5, "INT-ts top-k returned nothing");
+    assert_eq!(r[0][1], Value::Integer(290), "top ts must be the max");
+    assert_eq!(
+        rows(&db, "SELECT ts FROM sen ORDER BY ts ASC LIMIT 3"),
+        vec![
+            vec![Value::Integer(0)],
+            vec![Value::Integer(10)],
+            vec![Value::Integer(20)],
+        ]
+    );
+    // pre-checkpoint path too (write buffer rows)
+    db.execute("INSERT INTO sen (ts, sid, v) VALUES (999, 9, 99.0)")
+        .unwrap();
+    let r2 = rows(&db, "SELECT ts, v FROM sen ORDER BY ts DESC LIMIT 1");
+    assert_eq!(r2[0][0], Value::Integer(999));
+}

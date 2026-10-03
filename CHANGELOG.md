@@ -2,6 +2,27 @@
 
 ## [0.12.0] — 未发布
 
+### 🚀 K1 时序 ORDER BY ts LIMIT k: INT 列三重修复 (1.2s → 1.76ms, 680×)
+
+- 🔍 **根因三层** (I2 发现 1 的根治): `ts INT`（非 TIMESTAMP）的
+  TIMESERIES 表上 top-k 全链路失效 — (1) topk_by_ts 三个解码点全部只认
+  GorillaTimestamp 编码，DeltaVarint（INT 列的整数 gorilla）一律
+  continue → 空结果; (2) write_buffer 的时间追踪只认 Value::Timestamp →
+  INT 表段元数据恒 (0,0)，zone-map gate 把每一段都剪掉; (3)
+  snapshot_rows 的 in_range 检查对 Integer 缓冲硬编码 false → 未提交行
+  对 LATEST BY / top-k 不可见直到 checkpoint
+- 🚀 **性能修复**: pass-2 按段分组解码（旧循环每幸存行重新读+解码整段
+  的 needed 列）+ pass-2a 段级 zone-map gate（(0,0) 元数据不剪枝）
+- 实测 1M 行 `ORDER BY ts DESC LIMIT 10`: 1,196 → **1.76ms (680×)**,
+  快于 DuckDB 全扫 2.1ms（SQLite 的 0.006ms 是 (sid,ts DESC) 复合索引
+  命中，我们可按同构索引另立项）
+- 顺带: 流式入口补 try_ts_order_limit 路由（Python query() 此前从未
+  走到该内核，EXPLAIN 显示的 fast path 是纸面计划）; pass-2b 回填被
+  remove 的 ts 值（投影缺列）
+- 回归测试 ts_order_limit_int_ts_column (checkpoint 前后 / ASC /
+  OFFSET / top-1 正确性); ts_eval + 对抗验证 ALL PASS; 全量 239 bin
+  第二十一轮全绿
+
 ### 📋 I2 空间/时序 SOTA 对照建档: 3 项 SOTA + 4 项新发现 (未改引擎代码)
 
 新增 compete_spatial_ts.py (1M 行时序 + 500K 3D 点 × 3 引擎)。正确性:
