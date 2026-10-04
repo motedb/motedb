@@ -186,6 +186,31 @@ jobs:
             exit 101
           fi
           echo "attempt 1 outcome=${{ steps.ci1.outcome }}, attempt 2 outcome=${{ steps.ci2.outcome }} — suite OK"
+      - name: diagnostics (failing test names → step summary)
+        if: failure()
+        run: |
+          # One more full pass with --no-fail-fast so a crashing binary does
+          # not hide which TESTS failed in the others; names land in the
+          # step summary (readable without admin log access).
+          {
+            echo "### mac integration failing tests"
+            cargo test --workspace --all-features -- --test-threads=1 \
+              --skip bench_ --skip stress_ --skip perf_ \
+              --skip test_memory_linear --skip test_memory_leak \
+              --skip test_memory_does_not_grow_unbounded \
+              --skip test_disk_usage --skip test_no_bloat --skip test_perf_ \
+              --skip test_scan_latency_bounded --skip test_insert_latency_bounded \
+              --skip test_aggregate_latency_bounded --skip test_distinct_latency_bounded \
+              --skip test_where_latency_bounded --skip test_pk_select_latency_stable \
+              --skip test_latency_growth_sublinear --skip test_scalability_latency \
+              --skip test_scalability_memory \
+              --skip test_durability_large_dataset_checkpoint_recovery \
+              --skip test_performance_guarantees --no-fail-fast \
+              2>&1 | tee /tmp/full.log | grep -E "^test .* FAILED|panicked at" \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "--- summary ---" >> "$GITHUB_STEP_SUMMARY"
+            grep -E "test result:" /tmp/full.log >> "$GITHUB_STEP_SUMMARY" || true
+          } || echo "diagnostics pass done" >> "$GITHUB_STEP_SUMMARY"
 
 
   # ── Cross-compile: aarch64-unknown-linux-gnu (build only) ────────────────
