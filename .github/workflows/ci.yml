@@ -186,36 +186,41 @@ jobs:
             exit 101
           fi
           echo "attempt 1 outcome=${{ steps.ci1.outcome }}, attempt 2 outcome=${{ steps.ci2.outcome }} — suite OK"
-      - name: diagnostics (failing test names → step summary)
+      - name: diagnostics (per-binary pass → step summary + annotations)
         if: failure()
         run: |
-          # One more full pass with --no-fail-fast so a crashing binary does
-          # not hide which TESTS failed in the others; names land in the
-          # step summary (readable without admin log access).
+          # 🔑 K-debug: cargo 顶层一次跑时，crashing binary 会以 exit 101
+          # 中断整个套件且不留 FAILED 行。逐 bin 运行并把每个 bin 的退出码
+          # 通过 ::error:: annotations 上报（匿名可读）。
           {
-            echo "### mac integration failing tests"
-            cargo test --workspace --all-features -- --test-threads=1 \
-              --skip bench_ --skip stress_ --skip perf_ \
-              --skip test_memory_linear --skip test_memory_leak \
-              --skip test_memory_does_not_grow_unbounded \
-              --skip test_disk_usage --skip test_no_bloat --skip test_perf_ \
-              --skip test_scan_latency_bounded --skip test_insert_latency_bounded \
-              --skip test_aggregate_latency_bounded --skip test_distinct_latency_bounded \
-              --skip test_where_latency_bounded --skip test_pk_select_latency_stable \
-              --skip test_latency_growth_sublinear --skip test_scalability_latency \
-              --skip test_scalability_memory \
-              --skip test_durability_large_dataset_checkpoint_recovery \
-              --skip test_performance_guarantees --no-fail-fast \
-              2>&1 | tee /tmp/full.log | grep -E "^test .* FAILED|panicked at" \
-              >> "$GITHUB_STEP_SUMMARY"
-            echo "--- summary ---" >> "$GITHUB_STEP_SUMMARY"
-            grep -E "test result:" /tmp/full.log >> "$GITHUB_STEP_SUMMARY" || true
-            # 🔑 annotations 通道：匿名可读（check-runs annotations API），
-            # 每条 :error:: 一行，绕开 step summary 的抓取限制
-            grep -E "panicked at" /tmp/full.log | head -20 \
-              | while read -r line; do echo "::error title=mac-integration::$line"; done
-            grep -E "^test .* FAILED" /tmp/full.log | head -20 \
-              | while read -r line; do echo "::error title=mac-integration::$line"; done
+            echo "### mac integration per-binary status"
+            BINS=$(cargo test --workspace --all-features -- --list 2>/dev/null \
+              | grep -E "^Running|^ " >/dev/null; cargo test --workspace \
+              --all-features --no-run 2>&1 | grep -oE "Executable tests/[a-z0-9_]+\.rs" \
+              | sed 's/Executable //;s/\.rs$//' | sort -u)
+            for t in $BINS; do
+              grep -qE "bench_|stress_" <<<"$t" && continue
+              cargo test --all-features --test "$t" -- --test-threads=1 \
+                --skip bench_ --skip stress_ --skip perf_ \
+                --skip test_memory_linear --skip test_memory_leak \
+                --skip test_memory_does_not_grow_unbounded \
+                --skip test_disk_usage --skip test_no_bloat --skip test_perf_ \
+                --skip test_scan_latency_bounded --skip test_insert_latency_bounded \
+                --skip test_aggregate_latency_bounded --skip test_distinct_latency_bounded \
+                --skip test_where_latency_bounded --skip test_pk_select_latency_stable \
+                --skip test_latency_growth_sublinear --skip test_scalability_latency \
+                --skip test_scalability_memory \
+                --skip test_durability_large_dataset_checkpoint_recovery \
+                --skip test_performance_guarantees --no-fail-fast \
+                > /tmp/one.log 2>&1
+              rc=$?
+              echo "::error title=mac-integration::$t exit=$rc"
+              if [ $rc -ne 0 ] && [ $rc -ne 101 ]; then
+                grep -E "panicked at|FAILED" /tmp/one.log | head -5 \
+                  | while read -r line; do echo "::error ::$line"; done
+              fi
+            done
+          } || echo "per-binary diagnostics done" >> "$GITHUB_STEP_SUMMARY"
           } || echo "diagnostics pass done" >> "$GITHUB_STEP_SUMMARY"
 
 
