@@ -210,6 +210,12 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
             echo "--- summary ---" >> "$GITHUB_STEP_SUMMARY"
             grep -E "test result:" /tmp/full.log >> "$GITHUB_STEP_SUMMARY" || true
+            # 🔑 annotations 通道：匿名可读（check-runs annotations API），
+            # 每条 :error:: 一行，绕开 step summary 的抓取限制
+            grep -E "panicked at" /tmp/full.log | head -20 \
+              | while read -r line; do echo "::error title=mac-integration::$line"; done
+            grep -E "^test .* FAILED" /tmp/full.log | head -20 \
+              | while read -r line; do echo "::error title=mac-integration::$line"; done
           } || echo "diagnostics pass done" >> "$GITHUB_STEP_SUMMARY"
 
 
