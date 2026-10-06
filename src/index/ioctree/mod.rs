@@ -261,7 +261,7 @@ impl IOctreeIndex {
                 let a = p.as_array();
                 let (dx, dy, dz) = (a[0] - c[0], a[1] - c[1], a[2] - c[2]);
                 let d = (dx * dx + dy * dy + dz * dz).sqrt();
-                (d <= radius).then(|| (p.row_id, d))
+                (d <= radius).then_some((p.row_id, d))
             }));
             results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         }

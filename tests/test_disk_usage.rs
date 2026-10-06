@@ -89,7 +89,11 @@ fn disk_usage_measurement() {
     collect_files(std::path::Path::new(&mote_path), &mut all_files, 0);
     let mut by_dir: Vec<(String, u64)> = Vec::new();
     for (path, size) in &all_files {
-        let dir = path.rsplitn(2, '/').nth(1).unwrap_or(".").to_string();
+        let dir = path
+            .rsplit_once('/')
+            .map(|x| x.0)
+            .unwrap_or(".")
+            .to_string();
         if let Some(entry) = by_dir.iter_mut().find(|(d, _)| d == &dir) {
             entry.1 += *size;
         } else {

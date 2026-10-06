@@ -454,7 +454,7 @@ fn auto_increment_basic() {
     let r = rows(&db, "SELECT id FROM t ORDER BY id");
     let ids: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })

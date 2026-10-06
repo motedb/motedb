@@ -59,7 +59,7 @@ fn nested_in_subqueries() {
         &db,
         "SELECT id FROM a WHERE id IN (SELECT ref FROM b WHERE ref IN (SELECT ref FROM c))",
     );
-    assert!(r.len() >= 1);
+    assert!(!r.is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -202,7 +202,7 @@ fn like_with_percent_in_middle() {
     exec(&db, "INSERT INTO t VALUES (3, 'hello')");
     // LIKE 'hello%world' matches 'hello world' (has space between).
     let r = rows(&db, "SELECT id FROM t WHERE s LIKE 'hello%world'");
-    assert!(r.len() >= 1, "should match hello world");
+    assert!(!r.is_empty(), "should match hello world");
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn order_by_pk_desc() {
     let r = rows(&db, "SELECT id FROM t ORDER BY id DESC");
     let ids: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })

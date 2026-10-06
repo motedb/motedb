@@ -850,7 +850,7 @@ fn shuffled_bulk_insert_fast_and_correct() {
         );
     }
     let total = rows(&db, "SELECT COUNT(*) FROM t");
-    assert_eq!(total[0], vec![Value::Integer(n as i64)]);
+    assert_eq!(total[0], vec![Value::Integer(n)]);
 
     // Duplicate PK in one batch → error (same as sorted path), not silent loss.
     let err = db

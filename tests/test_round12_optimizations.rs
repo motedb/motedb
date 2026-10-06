@@ -299,7 +299,7 @@ fn fused_range_aggregation_matches_expected() {
                 Some(d) => d.as_str() >= "dev-2" && d.as_str() < "dev-4",
                 None => false,
             };
-            let v_ok = matches!(r.val, Some(x) if x >= -5.0 && x <= 5.0);
+            let v_ok = matches!(r.val, Some(x) if (-5.0..=5.0).contains(&x));
             d_ok && v_ok
         })
         .count();
@@ -475,7 +475,7 @@ fn expected_join_groups(
     // device → zone from sen (device# % 4, devices 0..7)
     let zone_of = |d: &str| -> Option<i64> {
         let n: i64 = d.trim_start_matches("dev-").parse().unwrap();
-        (n < 8).then(|| n % 4)
+        (n < 8).then_some(n % 4)
     };
     let mut groups: BTreeMap<String, (i64, i64, f64)> = BTreeMap::new();
     for r in src {

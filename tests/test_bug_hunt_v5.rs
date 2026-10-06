@@ -210,7 +210,7 @@ fn order_by_two_columns() {
     let r = rows(&db, "SELECT id FROM t ORDER BY a ASC, b ASC");
     let ids: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })
@@ -231,7 +231,7 @@ fn order_by_two_columns_mixed_direction() {
     let r = rows(&db, "SELECT id FROM t ORDER BY a ASC, b DESC");
     let ids: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })

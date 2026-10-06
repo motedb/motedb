@@ -332,7 +332,7 @@ fn test_timestamp_functions() {
     // 2023-11-14 22:13:20 UTC = 1700000000 seconds = 1700000000000000 microseconds
     let r = rows(&db, "SELECT HOUR(1700000000000000) AS h FROM t");
     if let Value::Integer(h) = r[0][0] {
-        assert!(h >= 0 && h <= 23, "HOUR should be 0-23, got {}", h);
+        assert!((0..=23).contains(&h), "HOUR should be 0-23, got {}", h);
     }
 }
 

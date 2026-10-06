@@ -95,7 +95,6 @@ fn corrupted_files_never_panic_on_reopen_and_query() {
     let src = db_dir(seed.path());
 
     let mut rng = Lcg(0xDEADBEEF12345678);
-    let all = files_under(&src);
     let mut panics = 0;
     const ITERATIONS: usize = 80; // CI-sized; the 5000-iteration sweep runs as an example
     for it in 0..ITERATIONS {
@@ -120,7 +119,7 @@ fn corrupted_files_never_panic_on_reopen_and_query() {
             if len == 0 {
                 continue;
             }
-            if rng.next() % 4 == 0 {
+            if rng.next().is_multiple_of(4) {
                 let keep = (rng.next() % len).max(1);
                 let _ = std::fs::File::options().write(true).open(f).map(|mut fh| {
                     use std::io::Write;

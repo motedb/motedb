@@ -1628,7 +1628,7 @@ impl Database {
             .filter(|((t, _), _)| t == table)
             .filter_map(|(_, row)| {
                 row.get(pk_pos)
-                    .map(|v| crate::database::pk_cache::PkKey::from_value(v))
+                    .map(crate::database::pk_cache::PkKey::from_value)
             })
             .collect();
 

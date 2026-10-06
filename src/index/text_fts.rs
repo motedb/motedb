@@ -198,10 +198,6 @@ impl TermStream {
         m
     }
 
-    fn is_empty(&self) -> bool {
-        self.df == 0
-    }
-
     /// Current (doc, tf) — the minimum head across sources; on ties the
     /// earliest source (pending) wins.
     fn current(&self) -> Option<(u32, u16)> {
@@ -305,13 +301,9 @@ fn intersect_streams_limited(
         term_ids[i] = t;
     }
 
-    'outer: loop {
+    'outer: while let Some((mut target, _)) = streams[0].current() {
         // Reach consensus: every stream at the same doc, or a strictly
         // increasing target until someone exhausts.
-        let (mut target, _) = match streams[0].current() {
-            Some(p) => p,
-            None => break,
-        };
         loop {
             let mut stable = true;
             for s in streams[1..].iter_mut() {
@@ -1542,8 +1534,8 @@ impl TextFTSIndex {
                     let mut present = false;
                     for (i, s) in streams.iter().enumerate() {
                         if s.current().is_some_and(|(d, _)| d == pivot_doc)
-                            && !(!deleted_term_docs.is_empty()
-                                && deleted_term_docs.contains(&(term_ids[i], doc_id)))
+                            && (deleted_term_docs.is_empty()
+                                || !deleted_term_docs.contains(&(term_ids[i], doc_id)))
                         {
                             present = true;
                             let tf = s.current().unwrap().1 as f32;
@@ -1673,8 +1665,8 @@ impl TextFTSIndex {
                     s.seek(doc);
                 }
                 if s.current().is_some_and(|(d, _)| d == doc)
-                    && !(!deleted_term_docs.is_empty()
-                        && deleted_term_docs.contains(&(term_ids[i], doc_id)))
+                    && (deleted_term_docs.is_empty()
+                        || !deleted_term_docs.contains(&(term_ids[i], doc_id)))
                 {
                     bound += bounds[i];
                     tfs.push((i, s.current().unwrap().1));
@@ -1965,7 +1957,8 @@ impl TextFTSIndex {
         }
 
         {
-            let mut doc_lens = self.pending_doc_lengths.write();
+            // 同步屏障：等在飞的 doc length 写入释放写锁后再 flush（见下）。
+            let _doc_lens = self.pending_doc_lengths.write();
         }
 
         let _t4_elapsed = t4.elapsed();

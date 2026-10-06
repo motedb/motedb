@@ -311,7 +311,7 @@ fn order_by_where_limit_combined() {
     let r = rows(&db, "SELECT id FROM t WHERE v > 80 ORDER BY v DESC LIMIT 3");
     let ids: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })

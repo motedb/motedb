@@ -241,7 +241,7 @@ impl SQ8Vectors {
             _entry_size: entry_size,
             data_mmap: Arc::new(RwLock::new(data_mmap)),
             offsets: Arc::new(RwLock::new(offsets)),
-            count: Arc::new(RwLock::new(index_count as u64)),
+            count: Arc::new(RwLock::new(index_count)),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size.max(1)).unwrap(),
             ))),

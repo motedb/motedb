@@ -178,11 +178,10 @@ fn test_ioctree_knn_search() {
     if result.is_ok() {
         db.wait_for_indexes_ready();
 
-        match db.ioctree_knn_search("pts_pos", &motedb::types::Point3D::new(0.0, 0.0, 0.0), 3) {
-            Ok(neighbors) => {
-                assert!(neighbors.len() <= 3, "KNN should return at most 3 results");
-            }
-            Err(_) => {}
+        if let Ok(neighbors) =
+            db.ioctree_knn_search("pts_pos", &motedb::types::Point3D::new(0.0, 0.0, 0.0), 3)
+        {
+            assert!(neighbors.len() <= 3, "KNN should return at most 3 results");
         }
     }
 }
@@ -249,7 +248,7 @@ fn test_match_against_sql() {
         Ok(r) => {
             let r = rows(r);
             // Should find docs 1 and 3
-            assert!(r.len() >= 1, "MATCH_AGAINST should find at least 1 result");
+            assert!(!r.is_empty(), "MATCH_AGAINST should find at least 1 result");
         }
         Err(_) => {
             // MATCH_AGAINST may not be fully implemented

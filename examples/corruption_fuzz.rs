@@ -104,7 +104,6 @@ fn main() {
     println!("seed files: {}", files_under(&src).len());
 
     let mut rng = Lcg(0xDEADBEEF12345678);
-    let all = files_under(&src);
     let mut panics = 0;
     let mut oks = 0;
     let mut errs = 0;
@@ -137,7 +136,7 @@ fn main() {
             if len == 0 {
                 continue;
             }
-            if rng.next() % 4 == 0 {
+            if rng.next().is_multiple_of(4) {
                 // truncate to random prefix
                 let keep = (rng.next() % len).max(1);
                 let _ = std::fs::File::options().write(true).open(f).map(|mut fh| {

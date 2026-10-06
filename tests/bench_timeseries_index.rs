@@ -132,7 +132,7 @@ fn bench_timeseries_full_suite() {
     let zone_time = t0.elapsed();
     println!("Zone=5 ({} rows): {:.2?}", zone_results.len(), zone_time);
     // zone 5 is every 10th row
-    assert!(zone_results.len() > 0, "Should find zone=5 rows");
+    assert!(!zone_results.is_empty(), "Should find zone=5 rows");
 
     // 3b: Label equals (bloom filter)
     let label_cond = vec![ColumnCondition::Equals {

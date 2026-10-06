@@ -701,7 +701,7 @@ fn test_mod_i64_min_minus_one() {
     db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MIN))
         .unwrap();
     // Should not panic — i64::MIN % -1 is UB in C but returns 0 in our fix
-    let r = rows(&db, &format!("SELECT val % -1 FROM t WHERE id = 1"));
+    let r = rows(&db, &"SELECT val % -1 FROM t WHERE id = 1".to_string());
     assert_eq!(r.len(), 1, "Should return 1 row");
     // Result should be 0 (checked_rem returns None → fallback 0)
     assert_eq!(r[0][0], Value::Integer(0), "i64::MIN % -1 should be 0");

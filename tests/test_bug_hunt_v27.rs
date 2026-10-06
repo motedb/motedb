@@ -190,12 +190,11 @@ fn lower_of_null_propagates() {
 fn upper_of_null_propagates() {
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT UPPER(NULL)");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "UPPER(NULL) should be NULL"
-        ),
-        Err(_) => {}
+        )
     }
 }
 
@@ -203,12 +202,11 @@ fn upper_of_null_propagates() {
 fn trim_of_null_propagates() {
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT TRIM(NULL)");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "TRIM(NULL) should be NULL"
-        ),
-        Err(_) => {}
+        )
     }
 }
 
@@ -216,12 +214,11 @@ fn trim_of_null_propagates() {
 fn substr_of_null_propagates() {
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT SUBSTR(NULL, 1, 3)");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "SUBSTR(NULL, ...) should be NULL"
-        ),
-        Err(_) => {}
+        )
     }
 }
 
@@ -229,12 +226,11 @@ fn substr_of_null_propagates() {
 fn sqrt_of_null_propagates() {
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT SQRT(NULL)");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "SQRT(NULL) should be NULL"
-        ),
-        Err(_) => {}
+        )
     }
 }
 
@@ -242,12 +238,11 @@ fn sqrt_of_null_propagates() {
 fn pow_of_null_propagates() {
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT POW(NULL, 2)");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "POW(NULL, 2) should be NULL"
-        ),
-        Err(_) => {}
+        )
     }
 }
 
@@ -255,12 +250,11 @@ fn pow_of_null_propagates() {
 fn abs_of_null_propagates() {
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT ABS(NULL)");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "ABS(NULL) should be NULL"
-        ),
-        Err(_) => {}
+        )
     }
 }
 
@@ -269,12 +263,11 @@ fn round_of_null_propagates() {
     // ROUND(NULL) — SQL says NULL, not TypeError.
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT ROUND(NULL)");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "ROUND(NULL) should be NULL"
-        ),
-        Err(_) => {}
+        )
     }
 }
 
@@ -726,5 +719,5 @@ fn where_not_in_with_null_in_subquery() {
     // NOT IN (10, NULL) — strict SQL: returns 0 rows.
     let r = rows(&db, "SELECT id FROM t WHERE v NOT IN (10, NULL)");
     // Lenient impl may return rows where v != 10. Accept either.
-    assert!(r.len() == 0 || r.len() == 2, "got {} rows", r.len());
+    assert!(r.is_empty() || r.len() == 2, "got {} rows", r.len());
 }

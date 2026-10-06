@@ -319,10 +319,13 @@ fn test_int_float_comparison() {
 
     // Compare float column with integer literal
     let r = rows(db.execute("SELECT id FROM t WHERE val = 10").unwrap());
-    assert!(r.len() >= 1, "INT literal should compare with FLOAT column");
+    assert!(
+        !r.is_empty(),
+        "INT literal should compare with FLOAT column"
+    );
 
     let r = rows(db.execute("SELECT id FROM t WHERE val > 9").unwrap());
-    assert!(r.len() >= 1);
+    assert!(!r.is_empty());
 }
 
 // === Multiple tables with different schemas ===

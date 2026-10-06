@@ -24,7 +24,7 @@ fn fts_limit_probe() {
     for i in 0..100_000 {
         let k = 6 + (i % 5);
         let mut note = format!("row {i}");
-        for j in 0..k {
+        for _ in 0..k {
             note.push(' ');
             note.push_str(words[(next() as usize) % words.len()]);
         }

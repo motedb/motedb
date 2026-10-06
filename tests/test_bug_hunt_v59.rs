@@ -219,12 +219,9 @@ fn test_leftstr_rightstr() {
 fn test_repeat() {
     let (db, _d) = db();
     let res = db.execute("SELECT REPEAT('ab', 3)");
-    match res {
-        Ok(r) => {
-            let got = rows(r.materialize().unwrap());
-            assert_eq!(got, vec![vec![Value::text("ababab".into())]]);
-        }
-        Err(_) => {}
+    if let Ok(r) = res {
+        let got = rows(r.materialize().unwrap());
+        assert_eq!(got, vec![vec![Value::text("ababab".into())]]);
     }
 }
 

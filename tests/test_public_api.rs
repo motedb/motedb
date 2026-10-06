@@ -166,7 +166,7 @@ fn test_savepoint_release() {
     // Auto-committed writes (execute) are NOT affected by savepoint rollback.
     // Savepoints only affect transactional writes (insert_row_with_txn).
     // So all 3 rows should still be there since execute() auto-commits.
-    assert!(r.len() >= 1, "At minimum row 1 should exist");
+    assert!(!r.is_empty(), "At minimum row 1 should exist");
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn test_transaction_stats() {
 
     let stats_after = db.transaction_stats();
     assert!(
-        stats_after.total_committed >= stats_before.total_committed + 1,
+        stats_after.total_committed > stats_before.total_committed,
         "committed count should increase"
     );
 }

@@ -18,9 +18,8 @@ fn dbg() {
         .unwrap()
         .materialize()
         .unwrap();
-    match r2 {
-        QueryResult::Select { rows, .. } => println!("rows after failed batch: {:?}", rows),
-        _ => {}
+    if let QueryResult::Select { rows, .. } = r2 {
+        println!("rows after failed batch: {:?}", rows)
     }
     let _ = Value::Integer(0);
 }

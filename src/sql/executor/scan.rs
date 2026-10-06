@@ -29,7 +29,7 @@ impl QueryExecutor {
                 if has_col_seg {
                     if let Ok(store) = self
                         .db
-                        .get_or_create_col_segment_store(table, &schema.col_types().to_vec())
+                        .get_or_create_col_segment_store(table, schema.col_types())
                     {
                         let ws = self.txn_write_set_rows(table);
                         return self.execute_full_scan_txn_merge(

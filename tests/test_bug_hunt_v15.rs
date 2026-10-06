@@ -373,7 +373,7 @@ fn everything_combined_query() {
     // Verify descending order of a+b.
     let vals: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })

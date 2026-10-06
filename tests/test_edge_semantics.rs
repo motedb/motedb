@@ -296,7 +296,7 @@ fn test_group_by_exact_aggregate_values() {
     assert_eq!(rows.len(), 2);
     let counts: std::collections::HashMap<String, i64> = rows
         .iter()
-        .filter_map(|r| match (r.get(0), r.get(1)) {
+        .filter_map(|r| match (r.first(), r.get(1)) {
             (Some(Value::Text(t)), Some(Value::Integer(n))) => Some((t.to_string(), *n)),
             _ => None,
         })
@@ -344,7 +344,7 @@ fn test_large_group_by_aggregates() {
     let mut expected: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     for i in 0..999 {
         let g = i % 3;
-        let v = i as i64;
+        let v = i;
         db.execute(&format!("INSERT INTO t (g, v) VALUES ({}, {})", g, v))
             .unwrap();
         *expected.entry(g).or_insert(0) += v;

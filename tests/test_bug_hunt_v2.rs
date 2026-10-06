@@ -142,7 +142,7 @@ fn where_null_not_equal() {
     let r = rows(&db, "SELECT id FROM t WHERE v != 10");
     let ids: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })
@@ -320,7 +320,7 @@ fn order_by_asc_desc() {
     }
     let asc: Vec<i64> = rows(&db, "SELECT v FROM t ORDER BY v ASC")
         .into_iter()
-        .filter_map(|r| match r.get(0) {
+        .filter_map(|r| match r.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })
@@ -328,7 +328,7 @@ fn order_by_asc_desc() {
     assert_eq!(asc, vec![10, 20, 30]);
     let desc: Vec<i64> = rows(&db, "SELECT v FROM t ORDER BY v DESC")
         .into_iter()
-        .filter_map(|r| match r.get(0) {
+        .filter_map(|r| match r.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })
@@ -346,7 +346,7 @@ fn order_by_limit_offset() {
     let r = rows(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 3 OFFSET 2");
     let vals: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })

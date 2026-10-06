@@ -215,7 +215,7 @@ fn test_integer_overflow_add() {
         .unwrap();
 
     // INT_MAX + 1 — should either error, or produce a result > i64::MAX (not wrap to INT_MIN)
-    let result = db.execute(&format!("UPDATE t SET a = a + 1 WHERE id = 1"));
+    let result = db.execute(&"UPDATE t SET a = a + 1 WHERE id = 1".to_string());
     match result {
         Ok(_) => {
             let r = row(&db, "SELECT a FROM t WHERE id = 1");
@@ -280,7 +280,7 @@ fn test_unary_minus_i64_min() {
         .unwrap();
 
     // -(-9223372036854775808) should promote to Float or error
-    let r = row(&db, &format!("SELECT -v FROM t WHERE id = 1"));
+    let r = row(&db, &"SELECT -v FROM t WHERE id = 1".to_string());
     // Should be Float(i64::MIN as f64) = 9.223372036854776e18
     assert!(
         matches!(&r[0], Value::Float(f) if *f > 9e18),

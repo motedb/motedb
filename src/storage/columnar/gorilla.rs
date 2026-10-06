@@ -568,7 +568,7 @@ mod tests {
             seed = seed
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            vals.push(base + ((seed >> 33) as i64).rem_euclid(3_125_000_000));
+            vals.push(base + (seed >> 33).rem_euclid(3_125_000_000));
         }
         vals.sort_unstable();
         let enc = encode_timestamps(&vals);

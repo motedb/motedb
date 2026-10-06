@@ -27,7 +27,7 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 fn sorted_int_ids(r: &[Vec<Value>]) -> Vec<i64> {
     let mut v: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(i)) => Some(*i),
             _ => None,
         })
@@ -207,14 +207,14 @@ fn test_asc_is_reverse_of_desc() {
         .unwrap();
     let asc: Vec<i64> = q(&db, "SELECT v FROM t ORDER BY v ASC, id ASC")
         .iter()
-        .filter_map(|r| match r.get(0) {
+        .filter_map(|r| match r.first() {
             Some(Value::Integer(i)) => Some(*i),
             _ => None,
         })
         .collect();
     let mut desc: Vec<i64> = q(&db, "SELECT v FROM t ORDER BY v DESC, id DESC")
         .iter()
-        .filter_map(|r| match r.get(0) {
+        .filter_map(|r| match r.first() {
             Some(Value::Integer(i)) => Some(*i),
             _ => None,
         })

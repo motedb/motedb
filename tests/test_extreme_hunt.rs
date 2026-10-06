@@ -403,7 +403,7 @@ fn test_count_group_by_where_different_col() {
 fn test_create_drop_create_cycle() {
     let (db, _d) = mk();
     for cycle in 0..3 {
-        db.execute(&format!("CREATE TABLE cyc (id INT PRIMARY KEY, v TEXT)"))
+        db.execute(&"CREATE TABLE cyc (id INT PRIMARY KEY, v TEXT)".to_string())
             .unwrap();
         db.execute(&format!(
             "INSERT INTO cyc VALUES ({}, 'cycle{}')",

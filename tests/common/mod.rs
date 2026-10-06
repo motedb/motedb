@@ -82,7 +82,7 @@ pub fn insert_test_rows_from(db: &Database, n: usize, start_id: usize) {
         let mut sql = String::with_capacity(batch_size * 50);
         for i in start..end {
             let id = start_id + i + 1;
-            let tag = if id % 3 == 0 { "US" } else { "EU" };
+            let tag = if id.is_multiple_of(3) { "US" } else { "EU" };
             sql.push_str(&format!("({}, {:.1}, '{}'),", id, id as f64, tag));
         }
         sql.truncate(sql.len() - 1);

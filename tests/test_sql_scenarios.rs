@@ -342,7 +342,7 @@ fn test_min_max_extremes() {
         Value::Float(f) => Some(*f as i64),
         _ => None,
     };
-    let min = rows[0].get(0).and_then(to_i);
+    let min = rows[0].first().and_then(to_i);
     let max = rows[0].get(1).and_then(to_i);
     assert_eq!(min, Some(5), "MIN picks the smallest");
     assert_eq!(max, Some(100), "MAX picks the largest");

@@ -730,90 +730,6 @@ impl VecAcc {
         }
     }
 
-    /// 全行折叠（无谓词路径 — 不物化 selection）。
-    fn fold_all(&mut self, cv: &ColumnVector, func: VecAggFunc) {
-        let n = cv.len();
-        for i in 0..n {
-            if cv.valid.is_null(i) {
-                continue;
-            }
-            self.nn += 1;
-            match &cv.data {
-                ColData::I64(v) => match func {
-                    VecAggFunc::Sum | VecAggFunc::Avg => self.add_int(v[i]),
-                    VecAggFunc::Min => {
-                        if self.min.as_ref().is_none_or(|m| match m {
-                            Value::Integer(mi) => v[i] < *mi,
-                            _ => true,
-                        }) {
-                            self.min = Some(Value::Integer(v[i]));
-                        }
-                    }
-                    VecAggFunc::Max => {
-                        if self.max.as_ref().is_none_or(|m| match m {
-                            Value::Integer(mi) => v[i] > *mi,
-                            _ => true,
-                        }) {
-                            self.max = Some(Value::Integer(v[i]));
-                        }
-                    }
-                    _ => {}
-                },
-                ColData::F64(v) => match func {
-                    VecAggFunc::Sum | VecAggFunc::Avg => {
-                        self.fsum.add(v[i]);
-                        self.has_f = true;
-                    }
-                    VecAggFunc::Min => {
-                        if self.min.as_ref().is_none_or(|m| match m {
-                            Value::Float(mf) => v[i] < *mf,
-                            _ => true,
-                        }) {
-                            self.min = Some(Value::Float(v[i]));
-                        }
-                    }
-                    VecAggFunc::Max => {
-                        if self.max.as_ref().is_none_or(|m| match m {
-                            Value::Float(mf) => v[i] > *mf,
-                            _ => true,
-                        }) {
-                            self.max = Some(Value::Float(v[i]));
-                        }
-                    }
-                    _ => {}
-                },
-                _ => {
-                    let val = cv.get(i);
-                    match func {
-                        VecAggFunc::Sum | VecAggFunc::Avg => match val {
-                            Value::Integer(x) => self.add_int(x),
-                            Value::Float(x) => {
-                                self.fsum.add(x);
-                                self.has_f = true;
-                            }
-                            _ => {}
-                        },
-                        VecAggFunc::Min => {
-                            if self.min.as_ref().is_none_or(|m| {
-                                val.partial_cmp(m) == Some(std::cmp::Ordering::Less)
-                            }) {
-                                self.min = Some(val);
-                            }
-                        }
-                        VecAggFunc::Max => {
-                            if self.max.as_ref().is_none_or(|m| {
-                                val.partial_cmp(m) == Some(std::cmp::Ordering::Greater)
-                            }) {
-                                self.max = Some(val);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
     fn finalize(&self, func: VecAggFunc, ts: bool) -> Value {
         match func {
             VecAggFunc::CountStar => Value::Integer(self.count as i64),
@@ -908,7 +824,7 @@ pub fn try_vec_no_group_aggregate(
             VecAggSpec {
                 func,
                 col: col.filter(|_| !matches!(func, VecAggFunc::CountStar)),
-                ts: col.map_or(false, |c| {
+                ts: col.is_some_and(|c| {
                     matches!(schema.col_types().get(c), Some(ColumnType::Timestamp))
                 }),
             },
@@ -1569,7 +1485,7 @@ pub fn try_vec_group_by(
                     agg_specs.push(VecAggSpec {
                         func,
                         col: col.filter(|_| !matches!(func, VecAggFunc::CountStar)),
-                        ts: col.map_or(false, |c| {
+                        ts: col.is_some_and(|c| {
                             matches!(schema.col_types().get(c), Some(ColumnType::Timestamp))
                         }),
                     });
@@ -1654,9 +1570,9 @@ pub fn try_vec_group_by(
     let single_key = key_exprs.len() == 1;
     let single_int_key = key_exprs.len() == 1
         && agg_specs.iter().all(|s| {
-            s.col.map_or(true, |c| {
+            s.col.is_none_or(|c| {
                 matches!(
-                    batchless_type(&cts, needed[c]),
+                    batchless_type(cts, needed[c]),
                     ColumnType::Integer | ColumnType::Timestamp
                 )
             })
@@ -2104,7 +2020,7 @@ pub fn try_vec_equi_join_gb(
                     agg_specs.push(VecAggSpec {
                         func,
                         col: col.filter(|_| !matches!(func, VecAggFunc::CountStar)),
-                        ts: col.map_or(false, |c| {
+                        ts: col.is_some_and(|c| {
                             matches!(pschema.col_types().get(c), Some(ColumnType::Timestamp))
                         }),
                     });
@@ -2190,11 +2106,9 @@ pub fn try_vec_equi_join_gb(
     }) {
         return Ok(None);
     }
-    let mut bpred = bpred;
     if let Some(p) = bpred.as_mut() {
         remap_pred(p, &bneeded);
     }
-    let mut ppred = ppred;
     if let Some(p) = ppred.as_mut() {
         remap_pred(p, &pneeded);
     }
@@ -3013,7 +2927,6 @@ pub fn try_vec_filter_topk(
     };
     let desc = !obe.asc;
     let cts = schema.col_types();
-    let key_float = matches!(cts.get(order_col), Some(ColumnType::Float));
     let key_ok = matches!(
         cts.get(order_col),
         Some(ColumnType::Integer | ColumnType::Float | ColumnType::Boolean | ColumnType::Timestamp)
@@ -3155,7 +3068,7 @@ pub fn try_vec_filter_topk(
                                 .iter()
                                 .all(|l| leaf_tv_leaf(&batch.cols, l, r as usize) == TV::True)
                         } else {
-                            mixed_set.as_ref().map_or(false, |s| s.contains(&r))
+                            mixed_set.as_ref().is_some_and(|s| s.contains(&r))
                         };
                         if !pass {
                             continue;

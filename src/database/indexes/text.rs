@@ -29,7 +29,7 @@ impl MoteDB {
         name: &str,
         tokenizer: Option<(String, Option<usize>)>,
     ) -> Result<()> {
-        use crate::index::tokenizers::{NgramTokenizer, Tokenizer as _, WhitespaceTokenizer};
+        use crate::index::tokenizers::{NgramTokenizer, WhitespaceTokenizer};
 
         ensure_open!(self);
         // 🎯 统一路径：{db}.mote/indexes/text_{name}/

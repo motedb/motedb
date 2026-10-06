@@ -52,7 +52,7 @@ fn test_savepoint_rollback() {
     // Savepoints only affect transactional writes (insert_row_with_txn).
     let result = db.execute("SELECT COUNT(*) FROM t").unwrap();
     let r = rows(result);
-    assert!(r.len() >= 1);
+    assert!(!r.is_empty());
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn test_nested_savepoints() {
 
     let result = db.execute("SELECT COUNT(*) FROM t").unwrap();
     let r = rows(result);
-    assert!(r.len() >= 1);
+    assert!(!r.is_empty());
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn test_rollback_transaction() {
     let result = db.execute("SELECT COUNT(*) FROM t").unwrap();
     let r = rows(result);
     // Row 2 was auto-committed by execute(), so it's durable
-    assert!(r.len() >= 1);
+    assert!(!r.is_empty());
 }
 
 #[test]

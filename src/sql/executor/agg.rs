@@ -625,7 +625,7 @@ impl QueryExecutor {
         if matches!(target, Value::Null) {
             return Box::new(|_| false);
         }
-        fn non_null<'a>(fv: Option<&'a Value>) -> Option<&'a Value> {
+        fn non_null(fv: Option<&Value>) -> Option<&Value> {
             fv.filter(|v| !matches!(v, Value::Null))
         }
         match op {

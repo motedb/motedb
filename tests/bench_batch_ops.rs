@@ -81,7 +81,7 @@ fn bench_batch_insert_sizes() {
                 batch.push(vec![
                     Value::Integer(id),
                     Value::text(format!("name_{}", id)),
-                    Value::Integer((id % 1000) as i64),
+                    Value::Integer((id % 1000)),
                 ]);
             }
 

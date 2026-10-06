@@ -27,7 +27,7 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 fn sorted_int(r: &[Vec<Value>]) -> Vec<i64> {
     let mut v: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(i)) => Some(*i),
             _ => None,
         })

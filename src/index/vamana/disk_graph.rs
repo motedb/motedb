@@ -289,7 +289,7 @@ impl DiskGraph {
             mmap: Arc::new(RwLock::new(data_mmap)),
             inbound: Arc::new(RwLock::new(inbound)),
             index: Arc::new(RwLock::new(index_map)),
-            count: Arc::new(RwLock::new(index_count as u64)),
+            count: Arc::new(RwLock::new(index_count)),
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
             ))),
@@ -1071,6 +1071,31 @@ impl Drop for DiskGraph {
     }
 }
 
+/// Read one neighbor record at `offset` from an open graph file (used by the
+/// load-time inbound-count rebuild before Self exists).
+fn read_neighbors_from(file: &mut File, offset: u64) -> Result<Vec<RowId>> {
+    use std::io::{Read as _, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))
+        .map_err(StorageError::Io)?;
+    let mut buf8 = [0u8; 8];
+    let mut buf4 = [0u8; 4];
+    if file.read_exact(&mut buf8).is_err() {
+        return Ok(Vec::new());
+    }
+    if file.read_exact(&mut buf4).is_err() {
+        return Ok(Vec::new());
+    }
+    let count = u32::from_le_bytes(buf4) as usize;
+    let mut neighbors = Vec::with_capacity(count);
+    for _ in 0..count {
+        if file.read_exact(&mut buf8).is_err() {
+            break;
+        }
+        neighbors.push(u64::from_le_bytes(buf8));
+    }
+    Ok(neighbors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,29 +1155,4 @@ mod tests {
             assert_eq!(n.len(), 1, "node {} should have 1 neighbor", i);
         }
     }
-}
-
-/// Read one neighbor record at `offset` from an open graph file (used by the
-/// load-time inbound-count rebuild before Self exists).
-fn read_neighbors_from(file: &mut File, offset: u64) -> Result<Vec<RowId>> {
-    use std::io::{Read as _, Seek, SeekFrom};
-    file.seek(SeekFrom::Start(offset))
-        .map_err(StorageError::Io)?;
-    let mut buf8 = [0u8; 8];
-    let mut buf4 = [0u8; 4];
-    if file.read_exact(&mut buf8).is_err() {
-        return Ok(Vec::new());
-    }
-    if file.read_exact(&mut buf4).is_err() {
-        return Ok(Vec::new());
-    }
-    let count = u32::from_le_bytes(buf4) as usize;
-    let mut neighbors = Vec::with_capacity(count);
-    for _ in 0..count {
-        if file.read_exact(&mut buf8).is_err() {
-            break;
-        }
-        neighbors.push(u64::from_le_bytes(buf8));
-    }
-    Ok(neighbors)
 }

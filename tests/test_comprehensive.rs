@@ -525,7 +525,7 @@ fn test_where_like() {
     // _ wildcard — 'h_l%' matches "hello" (h, _, l, %)
     let underscore_rows = query_rows(&db, "SELECT * FROM t WHERE s LIKE 'h_l%'");
     assert!(
-        underscore_rows.len() >= 1,
+        !underscore_rows.is_empty(),
         "LIKE 'h_l%%' should match 'hello'"
     );
     assert_eq!(

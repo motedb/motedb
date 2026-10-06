@@ -43,7 +43,7 @@ fn sql_rows(db: &Arc<MoteDB>, sql: &str) -> Vec<Vec<Value>> {
 /// 建表：500 行，周期 NULL（val/qty/ts），8 个设备，checkpoint 成段。
 fn seed(db: &Arc<MoteDB>) {
     ex(
-        &db,
+        db,
         "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP, dev TEXT, val REAL, qty INT)",
     );
     for i in 1..=500i64 {
@@ -61,7 +61,7 @@ fn seed(db: &Arc<MoteDB>) {
             (1_700_000_000_000_000 + i * 777).to_string()
         };
         ex(
-            &db,
+            db,
             &format!(
                 "INSERT INTO t VALUES ({}, {}, 'dev-{:02}', {}, {})",
                 i,

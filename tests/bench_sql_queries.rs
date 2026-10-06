@@ -499,10 +499,7 @@ fn bench_subquery() {
     let sub2_ms = {
         let start = Instant::now();
         for _ in 0..q {
-            match db.execute("SELECT id FROM sales WHERE customer IN (SELECT customer FROM sales WHERE region = 'US')") {
-                Ok(r) => { let _ = r.materialize(); }
-                Err(_) => {}
-            }
+            if let Ok(r) = db.execute("SELECT id FROM sales WHERE customer IN (SELECT customer FROM sales WHERE region = 'US')") { let _ = r.materialize(); }
         }
         start.elapsed().as_millis() as u64
     };

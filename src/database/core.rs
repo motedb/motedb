@@ -309,7 +309,7 @@ pub(crate) fn autocommit_write_stripe(sql: &str, stripes: usize) -> Option<usize
         if rb.len() <= 4 || !rb[..4].eq_ignore_ascii_case(b"INTO") {
             return None;
         }
-        rest = &rest[4..].trim_start();
+        rest = rest[4..].trim_start();
     } else {
         // UPDATE <table> | DELETE FROM <table>
         rest = rest.trim_start();
@@ -318,7 +318,7 @@ pub(crate) fn autocommit_write_stripe(sql: &str, stripes: usize) -> Option<usize
             if rb.len() <= 4 || !rb[..4].eq_ignore_ascii_case(b"FROM") {
                 return None;
             }
-            rest = &rest[4..].trim_start();
+            rest = rest[4..].trim_start();
         }
     }
 
@@ -2395,9 +2395,7 @@ impl MoteDB {
                     // the alias, every custom-named column index was
                     // unreachable via the query APIs after reopen.
                     let standard_name = format!("{}.{}", table_name, column_name);
-                    if !indexes.contains_key(&standard_name) {
-                        indexes.insert(standard_name, arc);
-                    }
+                    indexes.entry(standard_name).or_insert(arc);
                 }
                 Err(e) => {
                     debug_log!(

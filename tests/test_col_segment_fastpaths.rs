@@ -279,7 +279,7 @@ fn test_distinct_text_respects_max_values() {
     // max_values=5 caps the result
     let vals = store.distinct_text_values(0, 5);
     assert!(vals.len() <= 5, "result capped at max_values");
-    assert!(vals.len() >= 1, "returns at least 1");
+    assert!(!vals.is_empty(), "returns at least 1");
 }
 
 #[test]

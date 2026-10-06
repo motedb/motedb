@@ -64,8 +64,8 @@ fn graph_delete_survives_flush_reload() {
         "deleted node must not resolve via sidecar"
     );
     // Remaining nodes must not have been dropped by the prefix-scan rebuild
-    assert!(g.neighbors(1).len() > 0, "node 1 edges must survive");
-    assert!(g.neighbors(3).len() > 0, "node 3 edges must survive");
+    assert!(!g.neighbors(1).is_empty(), "node 1 edges must survive");
+    assert!(!g.neighbors(3).is_empty(), "node 3 edges must survive");
 }
 
 #[test]

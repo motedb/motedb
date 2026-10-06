@@ -1913,7 +1913,7 @@ impl ColumnarSSTable {
             return Ok(());
         }
         let mut buf = vec![0u8; file_len];
-        use std::io::{Read, Seek, SeekFrom};
+
         let ok = match &self.file {
             Some(f) => read_exact_at(f, &mut buf, 0).is_ok(),
             None => false,
@@ -2396,7 +2396,7 @@ impl ColumnarSSTable {
             }
         } else {
             let mut buf = vec![0u8; len];
-            use std::io::{Read, Seek};
+
             let ok = if let Some(ref cached) = self.file {
                 read_exact_at(cached, &mut buf, start as u64).is_ok()
             } else if let Ok(f) = std::fs::File::open(&self.path) {
@@ -2534,7 +2534,7 @@ impl ColumnarSSTable {
         }
         // Seek+read into a fresh Vec.
         let mut buf = vec![0u8; len];
-        use std::io::{Read, Seek};
+
         let ok = if let Some(ref cached) = self.file {
             read_exact_at(cached, &mut buf, start as u64).is_ok()
         } else if let Ok(f) = std::fs::File::open(&self.path) {
@@ -2568,7 +2568,7 @@ impl ColumnarSSTable {
         }
         let len = end - start;
         let mut buf = vec![0u8; len];
-        use std::io::{Read, Seek};
+
         let ok = if let Some(ref cached) = self.file {
             read_exact_at(cached, &mut buf, start as u64).is_ok()
         } else if let Ok(f) = std::fs::File::open(&self.path) {

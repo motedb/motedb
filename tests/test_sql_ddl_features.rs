@@ -285,7 +285,7 @@ fn test_data_type_aliases() {
         let result = db.execute(&format!("SELECT COUNT(*) FROM {}", table));
         if let Ok(r) = result {
             let r = rows(r);
-            assert!(r.len() >= 1);
+            assert!(!r.is_empty());
         }
     }
 }
@@ -335,7 +335,7 @@ fn test_latest_by() {
     match result {
         Ok(r) => {
             let r = rows(r);
-            assert!(r.len() >= 1, "LATEST BY should return at least 1 row");
+            assert!(!r.is_empty(), "LATEST BY should return at least 1 row");
         }
         Err(_) => {
             // LATEST BY may not be fully implemented

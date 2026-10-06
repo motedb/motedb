@@ -322,7 +322,7 @@ fn distinct_order_by_combined() {
     assert_eq!(r.len(), 3);
     let vals: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })

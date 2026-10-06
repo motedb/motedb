@@ -19,8 +19,7 @@ fn rss_mb() -> f64 {
         .and_then(|o| {
             let s = String::from_utf8_lossy(&o.stdout);
             s.lines()
-                .skip(1)
-                .next()
+                .nth(1)
                 .and_then(|l| l.trim().parse::<usize>().ok())
                 .map(|v| v as f64 / 1024.0)
         })
@@ -323,9 +322,7 @@ fn bench_mixed_multimodal_10k() {
     let (db, _dir) = edge_db();
     let n = 10_000usize;
 
-    db.execute(&format!(
-        "CREATE TABLE items (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(64), loc GEOMETRY, info TEXT, price FLOAT, region TEXT)"
-    )).unwrap();
+    db.execute(&"CREATE TABLE items (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(64), loc GEOMETRY, info TEXT, price FLOAT, region TEXT)".to_string()).unwrap();
 
     timed(&format!("INSERT {} multimodal items", n), || {
         let batch = 1000;
@@ -463,7 +460,7 @@ fn test_vector_insert_and_knn() {
         .materialize()
         .unwrap();
     if let motedb::QueryResult::Select { rows, .. } = r {
-        assert!(rows.len() >= 1, "should find nearest vector");
+        assert!(!rows.is_empty(), "should find nearest vector");
     }
 }
 
@@ -486,7 +483,7 @@ fn test_spatial_insert_and_distance() {
         .materialize()
         .unwrap();
     if let motedb::QueryResult::Select { rows, .. } = r {
-        assert!(rows.len() >= 1, "should find nearest point");
+        assert!(!rows.is_empty(), "should find nearest point");
     }
 }
 

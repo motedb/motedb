@@ -6,7 +6,6 @@
 //! Run: cargo test --release --test bench_vs_sqlite_100k -- --nocapture --test-threads=1 --ignored
 
 use motedb::{types::Value, DBConfig, Database};
-use rusqlite;
 use std::time::Instant;
 
 // ── Helpers ──────────────────────────────────────────────────────────────

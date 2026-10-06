@@ -242,7 +242,7 @@ fn savepoint_rollback_restores_ws_update() {
     let tx = db.begin_transaction().unwrap();
     db.insert_row_with_txn("t", tx, vec![Value::Integer(5), Value::Text("a".into())])
         .unwrap();
-    db.savepoint(tx, "s1".into()).unwrap();
+    db.savepoint(tx, "s1").unwrap();
     db.execute("UPDATE t SET v = 'changed' WHERE id = 5")
         .unwrap();
     db.rollback_to_savepoint(tx, "s1").unwrap();
@@ -268,7 +268,7 @@ fn savepoint_rollback_after_pk_relocation() {
     let tx = db.begin_transaction().unwrap();
     db.insert_row_with_txn("t", tx, vec![Value::Integer(5), Value::Text("a".into())])
         .unwrap();
-    db.savepoint(tx, "s1".into()).unwrap();
+    db.savepoint(tx, "s1").unwrap();
     db.execute("UPDATE t SET id = 7 WHERE id = 5").unwrap();
     db.rollback_to_savepoint(tx, "s1").unwrap();
     db.commit_transaction(tx).unwrap();

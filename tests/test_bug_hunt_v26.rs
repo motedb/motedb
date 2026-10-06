@@ -125,7 +125,7 @@ fn insert_after_alter_preserves_boolean_column() {
     exec(&db, "INSERT INTO t VALUES (2, 20, TRUE)");
     let r = rows(&db, "SELECT active FROM t WHERE id = 2");
     match &r[0][0] {
-        Value::Bool(b) => assert_eq!(*b, true),
+        Value::Bool(b) => assert!(*b),
         o => panic!("expected Bool(true), got {:?}", o),
     }
 }

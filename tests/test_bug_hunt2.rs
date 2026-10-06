@@ -232,7 +232,7 @@ fn test_insert_many_then_select_with_conditions() {
         &db,
         "SELECT * FROM t WHERE status = 'active' AND v > 100 ORDER BY id",
     );
-    assert!(rows.len() > 0, "Should find active rows with v > 100");
+    assert!(!rows.is_empty(), "Should find active rows with v > 100");
     for row in &rows {
         assert_eq!(row[1], Value::text("active".to_string()));
         match &row[2] {

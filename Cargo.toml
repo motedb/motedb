@@ -146,6 +146,11 @@ lto = "thin"       # was "fat" — fat LTO makes every rebuild take 5-10 min
 codegen-units = 16  # was 1 — parallel codegen for faster builds
 strip = true
 
+# cargo-fuzz builds pass --cfg fuzzing; declare it so rustc doesn't flag
+# the jemalloc-ASAN guard in src/lib.rs as an unexpected cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 # Use this for final release binaries: cargo build --profile production
 # Use this for final release binaries: cargo build --profile production
 [profile.production]

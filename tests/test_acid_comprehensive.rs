@@ -312,7 +312,7 @@ fn test_isolation_tx_sees_own_writes() {
 
     // Within same tx, should see own write
     let rows = query_rows(&db, "SELECT * FROM t");
-    assert!(rows.len() >= 1, "Transaction should see its own writes");
+    assert!(!rows.is_empty(), "Transaction should see its own writes");
 
     let _ = db.commit_transaction(tx);
 }

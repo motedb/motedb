@@ -79,7 +79,7 @@ fn test_columnar_api_ingest_and_query() {
         if let Some(Value::Timestamp(ts)) = sql_row.get("ts") {
             let micros = ts.as_micros();
             assert!(
-                micros >= 1_500_000 && micros <= 1_600_000,
+                (1_500_000..=1_600_000).contains(&micros),
                 "Timestamp {} should be in [1500000, 1600000]",
                 micros
             );
@@ -147,7 +147,7 @@ fn test_columnar_gorilla_compression_roundtrip() {
     let mut rows = Vec::new();
     for i in 0..500 {
         rows.push(vec![
-            Value::Timestamp(Timestamp::from_micros(1_000_000 + i as i64 * 1_000)),
+            Value::Timestamp(Timestamp::from_micros(1_000_000 + i * 1_000)),
             Value::Float(25.0 + (i as f64) * 0.01),
             Value::Integer(i),
             Value::Bool(i % 2 == 0),

@@ -101,7 +101,7 @@ fn test_parameterized_select_multi_params() {
         vec![Value::Integer(30), Value::Integer(40)],
     );
     assert!(
-        rows.len() > 0,
+        !rows.is_empty(),
         "Should find rows with age between 30 and 40"
     );
     for row in &rows {
@@ -149,7 +149,10 @@ fn test_parameterized_numbered_params() {
         "SELECT * FROM users WHERE age > ?1 AND score < ?2",
         vec![Value::Integer(15), Value::Float(999.0)],
     );
-    assert!(rows.len() > 0, "Should find rows with age>15 and score<999");
+    assert!(
+        !rows.is_empty(),
+        "Should find rows with age>15 and score<999"
+    );
 }
 
 #[test]
@@ -231,7 +234,7 @@ fn test_table_qualified_column_where() {
     insert_n_users(&db, 30);
 
     let rows = query_rows(&db, "SELECT * FROM users WHERE users.age > 30");
-    assert!(rows.len() > 0);
+    assert!(!rows.is_empty());
     for row in &rows {
         let age = match &row[2] {
             Value::Integer(a) => *a,
@@ -275,7 +278,7 @@ fn test_full_scan_where_filter() {
     insert_n_users(&db, 200);
 
     let rows = query_rows(&db, "SELECT * FROM users WHERE age = 35");
-    assert!(rows.len() > 0);
+    assert!(!rows.is_empty());
     for row in &rows {
         let age = match &row[2] {
             Value::Integer(a) => *a,
@@ -590,7 +593,7 @@ fn test_comprehensive_summary() {
 
     // Correctness
     let rows = query_rows(&db, "SELECT * FROM users WHERE age > 45");
-    assert!(rows.len() > 0);
+    assert!(!rows.is_empty());
     for row in &rows {
         let age = match &row[2] {
             Value::Integer(a) => *a,

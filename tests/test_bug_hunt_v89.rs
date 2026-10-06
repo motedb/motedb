@@ -27,7 +27,7 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 fn sorted_int(r: &[Vec<Value>]) -> Vec<i64> {
     let mut v: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(i)) => Some(*i),
             _ => None,
         })
@@ -123,7 +123,7 @@ fn test_int_overflow_wraps_safely() {
         Ok(r) => {
             let r = rows(r);
             // Accept either Float (promoted) or error already handled. Just verify no silent wrap to negative.
-            if let Some(Value::Integer(i)) = r.get(0).and_then(|row| row.get(0)) {
+            if let Some(Value::Integer(i)) = r.first().and_then(|row| row.first()) {
                 assert!(*i > 0, "must not silently wrap to negative; got {}", i);
             }
         }

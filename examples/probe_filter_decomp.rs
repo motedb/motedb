@@ -31,7 +31,7 @@ fn main() {
     }
     // Warm: force compaction + preload + col_cache.
     let _ = db.execute("SELECT COUNT(*) FROM t WHERE val > 500");
-    for i in 0..2 {
+    for _ in 0..2 {
         let _ = db.execute("SELECT COUNT(*) FROM t WHERE val > 500");
     }
     let t = Instant::now();

@@ -1347,7 +1347,6 @@ enum CompiledWhere {
     IsNull(usize, bool),       // col[pos] IS NULL / IS NOT NULL
     And(Vec<CompiledWhere>),   // all must match (short-circuit)
     Or(Vec<CompiledWhere>),    // any must match (short-circuit)
-    Not(Box<CompiledWhere>),   // negation
 }
 
 impl CompiledWhere {
@@ -1499,7 +1498,6 @@ impl CompiledWhere {
                 }
                 Some(false)
             }
-            CompiledWhere::Not(inner) => Some(!inner.eval(row)?),
         }
     }
 
@@ -1580,9 +1578,6 @@ impl CompiledWhere {
                 for c in conds {
                     c.collect_positions(positions);
                 }
-            }
-            CompiledWhere::Not(inner) => {
-                inner.collect_positions(positions);
             }
         }
     }
@@ -1720,7 +1715,6 @@ impl CompiledWhere {
                 }
                 Some(false)
             }
-            CompiledWhere::Not(inner) => Some(!inner.eval_at(row, pos_to_idx)?),
         }
     }
 }
@@ -2354,7 +2348,7 @@ impl QueryExecutor {
         };
         let row_refs: Vec<&Row> = filtered.iter().collect();
         let mut out_row: Vec<Value> = Vec::with_capacity(agg_infos.len());
-        for (agg, col) in agg_infos.iter().zip(stmt.columns.iter()) {
+        for (agg, _) in agg_infos.iter().zip(stmt.columns.iter()) {
             let v = self.compute_aggregate_positional(agg, &row_refs)?;
             out_row.push(v);
         }
@@ -2362,7 +2356,7 @@ impl QueryExecutor {
             .columns
             .iter()
             .map(|c| match c {
-                SelectColumn::Expr(Expr::FunctionCall { name, .. }, Some(a)) => a.clone(),
+                SelectColumn::Expr(Expr::FunctionCall { name: _, .. }, Some(a)) => a.clone(),
                 SelectColumn::Expr(Expr::FunctionCall { name, .. }, None) => name.clone(),
                 SelectColumn::Column(n) => n.clone(),
                 _ => "expr".to_string(),
@@ -2581,19 +2575,19 @@ impl QueryExecutor {
             // active transaction "succeeded", and the later ROLLBACK TO also
             // "succeeded" while the UPDATE stayed committed.
             Statement::Savepoint(name) => {
-                self.execute_savepoint(&name)?;
+                self.execute_savepoint(name)?;
                 StreamingQueryResult::Definition {
                     message: format!("SAVEPOINT {name} created"),
                 }
             }
             Statement::RollbackToSavepoint(name) => {
-                self.execute_rollback_to_savepoint(&name)?;
+                self.execute_rollback_to_savepoint(name)?;
                 StreamingQueryResult::Definition {
                     message: format!("rolled back to SAVEPOINT {name}"),
                 }
             }
             Statement::ReleaseSavepoint(name) => {
-                self.execute_release_savepoint(&name)?;
+                self.execute_release_savepoint(name)?;
                 StreamingQueryResult::Definition {
                     message: format!("SAVEPOINT {name} released"),
                 }
@@ -3644,7 +3638,7 @@ impl QueryExecutor {
             let inner = self.materialize_as_streaming(&inner_stmt)?;
             let QueryResult::Select {
                 columns: mut cols,
-                rows: mut rows,
+                mut rows,
             } = inner.materialize()?
             else {
                 unreachable!("materialize_as_streaming always yields Select");
@@ -6772,7 +6766,7 @@ impl QueryExecutor {
         // accumulating value→row_id entries until commit — differential
         // testing: COUNT(*) WHERE id=X returned 7/8 phantom rows in the
         // ROLLBACK-TO window while row LIST queries verified correctly).
-        let filter_pos = schema.get_column_position(&filter_col);
+        let filter_pos = schema.get_column_position(filter_col);
         let batch: Vec<_> = batch
             .into_iter()
             .filter(|(_, opt)| {
@@ -8908,9 +8902,8 @@ impl QueryExecutor {
         schema: &TableSchema,
     ) -> bool {
         if let Some(cw) = compiled {
-            match cw.eval(row) {
-                Some(b) => return b,
-                None => {}
+            if let Some(b) = cw.eval(row) {
+                return b;
             }
         }
         Self::eval_expr_on_row(fallback_expr, row, schema)
@@ -9434,7 +9427,7 @@ impl QueryExecutor {
     /// SELECT 有 substitute_params_stmt；UPDATE/DELETE 在此对 WHERE 与
     /// SET 表达式做同样的 Literal 替换。
     fn do_substitute_params_mutation(
-        self: &Self,
+        &self,
         expr: &mut Option<Expr>,
         assignments: Option<&mut Vec<(String, Expr)>>,
     ) -> Result<()> {
@@ -10672,10 +10665,10 @@ impl QueryExecutor {
                                     // returned 7/8 phantom rows while the row
                                     // LIST path verified correctly).
                                     let count = if let Ok(schema) =
-                                        self.db.get_table_schema(&table_name)
+                                        self.db.get_table_schema(table_name)
                                     {
                                         let pos = schema.get_column_position(&col_name);
-                                        match self.db.get_table_rows_batch(&table_name, &row_ids) {
+                                        match self.db.get_table_rows_batch(table_name, &row_ids) {
                                             Ok(batch) => {
                                                 let c = batch
                                                     .iter()
@@ -17065,7 +17058,6 @@ impl QueryExecutor {
             CompiledWhere::InHash(p, _, _, _) => out.push(*p),
             CompiledWhere::Like(p, _, _) => out.push(*p),
             CompiledWhere::IsNull(p, _) => out.push(*p),
-            CompiledWhere::Not(inner) => Self::compiled_where_positions(inner, out),
         }
     }
 
@@ -17233,7 +17225,7 @@ impl QueryExecutor {
                 let (_, col) = cols.iter().find(|(p, _)| p == pos)?;
                 let eq = match (col, v) {
                     (ColScanCol::Text(t, ..), Value::Text(lit)) => {
-                        t.get_str_fast(i).as_bytes() == lit.as_bytes().as_ref()
+                        t.get_str_fast(i).as_bytes() == lit.as_bytes()
                     }
                     (
                         ColScanCol::Fixed(f, crate::types::ColumnType::Integer),
@@ -17432,7 +17424,7 @@ impl QueryExecutor {
         };
 
         for result in row_iter {
-            let (mut row_id, mut row) = result?;
+            let (row_id, mut row) = result?;
             if pending_delete_ids_u.contains(&row_id) {
                 continue;
             }
@@ -17759,7 +17751,7 @@ impl QueryExecutor {
 
         let mut pending_deletes: Vec<(crate::types::RowId, Vec<Value>)> = Vec::new();
         for result in row_iter {
-            let (mut row_id, mut row) = result?;
+            let (row_id, mut row) = result?;
             // 🔒 M2 overlay: skip rows already buffered-deleted in this txn;
             // rows with a buffered UPDATE are seen at their pending NEW value.
             if pending_delete_ids.contains(&row_id) {
@@ -18433,7 +18425,7 @@ impl QueryExecutor {
             if let Some(tid) = self.current_txn_id() {
                 let pk_pos = schema
                     .primary_key()
-                    .and_then(|pk| schema.get_column(&pk))
+                    .and_then(|pk| schema.get_column(pk))
                     .map(|cd| cd.position);
                 let ctx = self.db.txn_coordinator.get_context(tid)?;
                 let ws_rows: Vec<(RowId, Row)> = ctx
@@ -19382,66 +19374,65 @@ impl QueryExecutor {
         // replaying those against storage would create phantom rows (the
         // earlier failed attempt).
         for delta in replay {
-            match delta {
-                crate::txn::coordinator::DeltaOperation::Update(row_id, table_name, old_value) => {
-                    let old_row =
-                        std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
-                    if let Ok(schema) = self.db.get_table_schema(&table_name) {
-                        // 🔒 Write-write conflict guard: restore the old row
-                        // ONLY when storage still holds exactly what this txn
-                        // read (current == old means nobody else committed an
-                        // update after our snapshot). A concurrent committed
-                        // UPDATE between our snapshot and our rollback must
-                        // survive — blind restore clobbered it back to the
-                        // pre-txn value (adversarial harness: t1 sets v=1,
-                        // t2 sets v=2 + commits, t1 rolls back → v reverted
-                        // to 100 instead of staying 2).
-                        let current = self.db.get_table_row(&table_name, row_id).ok().flatten();
-                        let mine = TXN_WROTE
-                            .with(|m| m.borrow().get(&(table_name.clone(), row_id)).cloned());
-                        // Restore when storage holds either our snapshot (nobody
-                        // wrote since) or OUR OWN last write (the common
-                        // rollback case). Anything else is a concurrent
-                        // committer's value — it must survive.
-                        let untouched = match (&current, &mine) {
-                            (Some(cur), Some(writes)) => {
-                                let snapshot: &Row = old_row.as_ref();
-                                cur == snapshot || writes.iter().any(|w| cur == w.as_ref())
-                            }
-                            (Some(cur), None) => {
-                                let snapshot: &Row = old_row.as_ref();
-                                cur == snapshot
-                            }
-                            _ => false,
-                        };
-                        if untouched {
-                            let _ = self.db.update_row_in_table_with_schema(
-                                &table_name,
-                                row_id,
-                                old_row.clone(),
-                                old_row.clone(),
-                                &schema,
-                            );
+            if let crate::txn::coordinator::DeltaOperation::Update(row_id, table_name, old_value) =
+                delta
+            {
+                let old_row =
+                    std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
+                if let Ok(schema) = self.db.get_table_schema(&table_name) {
+                    // 🔒 Write-write conflict guard: restore the old row
+                    // ONLY when storage still holds exactly what this txn
+                    // read (current == old means nobody else committed an
+                    // update after our snapshot). A concurrent committed
+                    // UPDATE between our snapshot and our rollback must
+                    // survive — blind restore clobbered it back to the
+                    // pre-txn value (adversarial harness: t1 sets v=1,
+                    // t2 sets v=2 + commits, t1 rolls back → v reverted
+                    // to 100 instead of staying 2).
+                    let current = self.db.get_table_row(&table_name, row_id).ok().flatten();
+                    let mine =
+                        TXN_WROTE.with(|m| m.borrow().get(&(table_name.clone(), row_id)).cloned());
+                    // Restore when storage holds either our snapshot (nobody
+                    // wrote since) or OUR OWN last write (the common
+                    // rollback case). Anything else is a concurrent
+                    // committer's value — it must survive.
+                    let untouched = match (&current, &mine) {
+                        (Some(cur), Some(writes)) => {
+                            let snapshot: &Row = old_row.as_ref();
+                            cur == snapshot || writes.iter().any(|w| cur == w.as_ref())
                         }
-                        // Keep tracking: record the restored row as the
-                        // value "we" are responsible for now, so a NESTED
-                        // rollback replaying an earlier delta still recognizes
-                        // storage as ours (writes chain: 42 → 1 → 2; rolling
-                        // back to the outer savepoint restores 42 through the
-                        // intermediate 2 and 1 — removing the entry here would
-                        // strand the next delta unrecognized).
-                        TXN_WROTE.with(|m| {
-                            m.borrow_mut()
-                                .entry((table_name.clone(), row_id))
-                                .or_default()
-                                .push(Arc::new(old_row))
-                        });
-                        // current != old (or row gone): a concurrent committer
-                        // won — keep their value (first-committer-wins on the
-                        // read side; the txn being rolled back simply loses).
+                        (Some(cur), None) => {
+                            let snapshot: &Row = old_row.as_ref();
+                            cur == snapshot
+                        }
+                        _ => false,
+                    };
+                    if untouched {
+                        let _ = self.db.update_row_in_table_with_schema(
+                            &table_name,
+                            row_id,
+                            old_row.clone(),
+                            old_row.clone(),
+                            &schema,
+                        );
                     }
+                    // Keep tracking: record the restored row as the
+                    // value "we" are responsible for now, so a NESTED
+                    // rollback replaying an earlier delta still recognizes
+                    // storage as ours (writes chain: 42 → 1 → 2; rolling
+                    // back to the outer savepoint restores 42 through the
+                    // intermediate 2 and 1 — removing the entry here would
+                    // strand the next delta unrecognized).
+                    TXN_WROTE.with(|m| {
+                        m.borrow_mut()
+                            .entry((table_name.clone(), row_id))
+                            .or_default()
+                            .push(Arc::new(old_row))
+                    });
+                    // current != old (or row gone): a concurrent committer
+                    // won — keep their value (first-committer-wins on the
+                    // read side; the txn being rolled back simply loses).
                 }
-                _ => {}
             }
         }
         Ok(QueryResult::Definition {
@@ -19867,7 +19858,7 @@ impl QueryExecutor {
             ids.len()
         };
         let col_name = match &stmt.columns[0] {
-            SelectColumn::Expr(e, Some(alias)) => alias.clone(),
+            SelectColumn::Expr(_, Some(alias)) => alias.clone(),
             SelectColumn::Expr(e, None) => Self::expr_to_column_name(e),
             _ => "COUNT(*)".to_string(),
         };
@@ -19921,8 +19912,7 @@ impl QueryExecutor {
         };
 
         let mut keep: Vec<u64> = Vec::with_capacity(candidates.len());
-        let mut in_candidates: std::collections::HashSet<u64> =
-            candidates.iter().copied().collect();
+        let in_candidates: std::collections::HashSet<u64> = candidates.iter().copied().collect();
         for id in candidates {
             if deleted.contains(&id) {
                 continue;
@@ -21399,7 +21389,7 @@ impl QueryExecutor {
     ) -> Result<Vec<u64>> {
         if let Some(index_name) = index_name {
             if self.db.text_indexes.contains_key(index_name) {
-                return Ok(self.db.text_search(index_name, query)?);
+                return self.db.text_search(index_name, query);
             }
         }
         use crate::index::tokenizers::{Tokenizer as _, WhitespaceTokenizer};
@@ -21630,10 +21620,6 @@ impl QueryExecutor {
             // within budget, so a table of many small segments doesn't decode
             // + cache + trim everything on every query.
             let mut cached_total: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
-            let mut scratch: Vec<f32> = vec![0.0; qdim];
-            // Reusable chunk buffer for the edge-bounded streaming path below
-            // (bounded at ~8MB, shared across segments).
-            let mut chunk_buf: Vec<u8> = Vec::new();
             // 🔑 Version dedup, newest wins: an UPDATE leaves the old vector in
             // an older segment (its tombstone is not visible here) and the new
             // one in the write buffer — both used to be offered, so a single
@@ -23070,15 +23056,12 @@ impl QueryExecutor {
                 Self::is_pure_time_predicate(left, ts_col)
                     && Self::is_pure_time_predicate(right, ts_col)
             }
-            Expr::BinaryOp { left, op, right }
-                if matches!(
-                    op,
-                    BinaryOperator::Ge
-                        | BinaryOperator::Gt
-                        | BinaryOperator::Le
-                        | BinaryOperator::Lt
-                ) =>
-            {
+            Expr::BinaryOp {
+                left,
+                op:
+                    BinaryOperator::Ge | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Lt,
+                right,
+            } => {
                 let (c, _) = match (left.as_ref(), right.as_ref()) {
                     (Expr::Column(c), Expr::Literal(l)) => (c, l),
                     (Expr::Literal(l), Expr::Column(c)) => (c, l),
@@ -23477,6 +23460,11 @@ struct VectorOrderByPlan {
     /// Only used by the brute-force fallback (no index); indexed search
     /// takes the metric from the index definition.
     cosine: bool,
+}
+
+/// VEC M1 接线辅助：单行结果包装。
+fn outc_rows(outcome: &crate::sql::vector_exec::VecScanAggOutcome) -> Vec<Vec<Value>> {
+    vec![outcome.values.clone()]
 }
 
 #[cfg(test)]
@@ -24104,9 +24092,4 @@ mod tests {
         );
         assert!(checked >= 1000, "row-level checks too small: {checked}");
     }
-}
-
-/// VEC M1 接线辅助：单行结果包装。
-fn outc_rows(outcome: &crate::sql::vector_exec::VecScanAggOutcome) -> Vec<Vec<Value>> {
-    vec![outcome.values.clone()]
 }

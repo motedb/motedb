@@ -189,7 +189,7 @@ fn crash_child_mode() {
                 h.join().expect("writer thread");
             }
             // Last Arc reference — close cleanly if we were never killed.
-            if let Some(db) = std::sync::Arc::try_unwrap(db_arc).ok() {
+            if let Ok(db) = std::sync::Arc::try_unwrap(db_arc) {
                 let _ = db.close();
             }
             std::process::exit(0);
@@ -258,7 +258,7 @@ fn test_kill9_mid_write_recovers_with_prefix_and_durability() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 120) + 5) as u64 // 5..125ms
+        ((*state % 120) + 5) // 5..125ms
     };
 
     let mut killed_runs = 0;
@@ -427,7 +427,7 @@ fn test_kill9_update_delete_recovers_exactly() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 150) + 5) as u64
+        ((*state % 150) + 5)
     };
 
     let mut killed_runs = 0;
@@ -524,7 +524,7 @@ fn test_kill9_txn_atomicity_and_prefix() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 200) + 10) as u64
+        ((*state % 200) + 10)
     };
 
     let mut killed_runs = 0;
@@ -623,7 +623,7 @@ fn test_kill9_timeseries_prefix_recovery() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 150) + 5) as u64
+        ((*state % 150) + 5)
     };
 
     let mut killed_runs = 0;
@@ -713,7 +713,7 @@ fn test_kill9_concurrent_writers_prefix_per_thread() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 250) + 20) as u64 // 20..270ms — let threads interleave
+        ((*state % 250) + 20) // 20..270ms — let threads interleave
     };
 
     let mut killed_runs = 0;
@@ -807,7 +807,7 @@ fn test_kill9_upsert_recovers_exactly() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 200) + 10) as u64
+        ((*state % 200) + 10)
     };
 
     let mut killed_runs = 0;

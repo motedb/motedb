@@ -258,7 +258,7 @@ fn bench_2m_memory_and_perf() {
     println!(
         "  Peak RSS:                        {:>8.1} MB  (target ≤60 MB) {}",
         mb(rss_peak.max(rss_after_insert)),
-        if mb(rss_peak.max(rss_after_insert) as usize) <= 60.0 {
+        if mb(rss_peak.max(rss_after_insert)) <= 60.0 {
             "✅"
         } else {
             "❌"

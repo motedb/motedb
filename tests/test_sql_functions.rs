@@ -291,7 +291,7 @@ fn test_arithmetic_where() {
         db.execute("SELECT id FROM t WHERE score * 1.0 > 90")
             .unwrap(),
     );
-    assert!(r.len() >= 1);
+    assert!(!r.is_empty());
 }
 
 #[test]

@@ -336,7 +336,7 @@ impl VersionStore {
 
         let interval = (self.max_entries as u64 / 4).max(1);
         let tick = self.inserts_since_evict.fetch_add(1, Ordering::Relaxed);
-        if tick % interval != 0 {
+        if !tick.is_multiple_of(interval) {
             return;
         }
 

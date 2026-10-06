@@ -299,10 +299,7 @@ fn bench_scale(n: usize) -> Results {
 #[test]
 #[ignore = "release benchmark: run with --ignored"]
 fn bench_release_report() {
-    println!(
-        "\n{}",
-        "╔══════════════════════════════════════════════════════════════════════════╗"
-    );
+    println!("\n╔══════════════════════════════════════════════════════════════════════════╗");
     println!("║         MoteDB v0.5.2 — Comprehensive Performance Report               ║");
     println!("║         Release Build · for_edge() config · macOS arm64                 ║");
     println!("╚══════════════════════════════════════════════════════════════════════════╝");

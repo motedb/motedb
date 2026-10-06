@@ -7,7 +7,7 @@ use motedb::{Database, QueryResult};
 
 fn fval(db: &Database, sql: &str) -> i64 {
     match db.execute(sql).unwrap().materialize().unwrap() {
-        QueryResult::Select { rows, .. } => match rows.get(0).and_then(|r| r.get(0)) {
+        QueryResult::Select { rows, .. } => match rows.first().and_then(|r| r.first()) {
             Some(Value::Integer(i)) => *i,
             other => panic!("expected int, got {:?}", other),
         },

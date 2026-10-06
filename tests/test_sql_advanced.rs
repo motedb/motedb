@@ -43,14 +43,11 @@ fn test_cast_int_to_text() {
     let db = Database::create(TempDir::new().unwrap()).unwrap();
     let result = db.execute("SELECT CAST(42 AS TEXT)");
     // CAST may not be fully supported in the parser
-    match result {
-        Ok(r) => {
-            let r = row(r);
-            if let Value::Text(s) = &r[0] {
-                assert_eq!(s.as_str(), "42");
-            }
+    if let Ok(r) = result {
+        let r = row(r);
+        if let Value::Text(s) = &r[0] {
+            assert_eq!(s.as_str(), "42");
         }
-        Err(_) => {}
     }
 }
 
@@ -59,12 +56,9 @@ fn test_cast_in_where() {
     let (db, _dir) = setup_orders();
     // CAST amount to integer and compare
     let result = db.execute("SELECT id FROM orders WHERE CAST(amount AS INT) = 10 ORDER BY id");
-    match result {
-        Ok(r) => {
-            let r = rows(r);
-            assert!(r.len() >= 2, "Should find Widget orders (amount=10)");
-        }
-        Err(_) => {}
+    if let Ok(r) = result {
+        let r = rows(r);
+        assert!(r.len() >= 2, "Should find Widget orders (amount=10)");
     }
 }
 

@@ -472,7 +472,6 @@ impl QueryExecutor {
         // ORDER BY i.id, t.id LIMIT 27 的最后一行与无 LIMIT 版本不一致)。
         let limit = stmt.limit.unwrap_or(usize::MAX);
         let early_break_ok = stmt.where_clause.is_none() && stmt.order_by.is_none();
-        let has_where = stmt.where_clause.is_some();
         let lncol = lschema.columns.len();
         let mut joined: Vec<Vec<Value>> = Vec::with_capacity(lrows.len().min(limit));
         for (_, lrow) in &lrows {
@@ -535,7 +534,7 @@ impl QueryExecutor {
                 join_type: JoinType::Inner,
                 on_condition,
             } => {
-                let (mut base, mut steps) = Self::flatten_left_deep_inner(left)?;
+                let (base, mut steps) = Self::flatten_left_deep_inner(left)?;
                 match right.as_ref() {
                     TableRef::Table { name, alias } => {
                         steps.push((name.clone(), alias.clone(), on_condition.clone()));
@@ -1796,28 +1795,23 @@ impl QueryExecutor {
         let rk = right_rows.first().map(|(_, r)| r.clone());
         let all_in = |keys: &Option<SqlRow>| {
             keys.as_ref()
-                .map_or(false, |k| refs.iter().all(|c| k.contains_key(c)))
+                .is_some_and(|k| refs.iter().all(|c| k.contains_key(c)))
         };
-        let (expr_left, col_side_right) = if all_in(&lk)
-            && lk.as_ref().map_or(true, |k| {
-                !k.contains_key(&col_name)
-                    || rk.as_ref().map_or(true, |r| !r.contains_key(&col_name))
-                    || true
-            }) {
+        let (expr_left, col_side_right) = if all_in(&lk) {
             // 表达式在左; 列须在右 (或列在左也行? 严格: 列在另一侧才省事)
-            let col_in_right = rk.as_ref().map_or(false, |k| k.contains_key(&col_name));
+            let col_in_right = rk.as_ref().is_some_and(|k| k.contains_key(&col_name));
             if col_in_right {
                 (true, true)
             } else if rk
                 .as_ref()
-                .map_or(false, |k| refs.iter().all(|c| k.contains_key(c)))
+                .is_some_and(|k| refs.iter().all(|c| k.contains_key(c)))
             {
                 (false, false) // 表达式在右, 列在左
             } else {
                 return Ok(None);
             }
         } else if all_in(&rk) {
-            let col_in_left = lk.as_ref().map_or(false, |k| k.contains_key(&col_name));
+            let col_in_left = lk.as_ref().is_some_and(|k| k.contains_key(&col_name));
             if !col_in_left {
                 return Ok(None);
             }
@@ -1911,11 +1905,11 @@ impl QueryExecutor {
             let rkeys = right_rows.first().map(|(_, r)| r.clone());
             for r in &on_residual {
                 if let Some((cn, op, v)) = Self::residual_single_table_pred(r) {
-                    if lkeys.as_ref().map_or(false, |k| k.contains_key(&cn)) {
+                    if lkeys.as_ref().is_some_and(|k| k.contains_key(&cn)) {
                         left_preds.push((cn, op, v));
                         continue;
                     }
-                    if rkeys.as_ref().map_or(false, |k| k.contains_key(&cn)) {
+                    if rkeys.as_ref().is_some_and(|k| k.contains_key(&cn)) {
                         right_preds.push((cn, op, v));
                         continue;
                     }

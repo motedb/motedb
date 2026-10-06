@@ -76,7 +76,7 @@ fn hybrid_rrf_matches_hand_computation() {
         .unwrap();
     assert_eq!(hits.len(), 10);
     for h in &hits {
-        let (rrf, bm25, dist) = expected[&h.row_id];
+        let (rrf, bm25, _) = expected[&h.row_id];
         assert!(
             (h.rrf - rrf).abs() < 1e-6,
             "rrf mismatch for doc {}: engine {} vs hand {}",

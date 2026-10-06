@@ -203,7 +203,7 @@ fn main() {
                         _ => format!("'{}'", texts[rng.below(texts.len() as u64) as usize]),
                     };
                     let sql = format!("UPDATE t SET {setcol} = {setval} WHERE {pred}");
-                    let ra = con.execute(&sql, ()).map(|n| n).map_err(|e| e.to_string());
+                    let ra = con.execute(&sql, ()).map_err(|e| e.to_string());
                     let rb = db.execute(&sql).map(|_| ()).map_err(|e| e.to_string());
                     if ra.is_err() != rb.is_err() {
                         divergences.push(format!("UPDATE error divergence: {sql}"));
@@ -225,7 +225,7 @@ fn main() {
                         _ => format!("c = '{}'", texts[rng.below(texts.len() as u64) as usize]),
                     };
                     let sql = format!("DELETE FROM t WHERE {pred}");
-                    let ra = con.execute(&sql, ()).map(|n| n).map_err(|e| e.to_string());
+                    let ra = con.execute(&sql, ()).map_err(|e| e.to_string());
                     let rb = db.execute(&sql).map(|_| ()).map_err(|e| e.to_string());
                     if ra.is_err() != rb.is_err() {
                         divergences.push(format!("DELETE error divergence: {sql}"));
@@ -251,9 +251,9 @@ fn main() {
                         compare(&db, &con, $s, $o, &mut divergences, &mut checks)
                     };
                 }
-                q!(&format!("SELECT COUNT(*) FROM t"), false);
+                q!(&"SELECT COUNT(*) FROM t".to_string(), false);
                 q!(&format!("SELECT COUNT(*) FROM t WHERE a = {av}"), false);
-                q!(&format!("SELECT COUNT(*) FROM t WHERE a IS NULL"), false);
+                q!(&"SELECT COUNT(*) FROM t WHERE a IS NULL".to_string(), false);
                 q!(
                     &format!("SELECT COUNT(*) FROM t WHERE a > {av} AND b IS NOT NULL"),
                     false
@@ -262,12 +262,12 @@ fn main() {
                     &format!("SELECT COUNT(*) FROM t WHERE a < {av} OR c IS NULL"),
                     false
                 );
-                q!(&format!("SELECT SUM(a), MIN(a), MAX(a) FROM t"), false);
+                q!(&"SELECT SUM(a), MIN(a), MAX(a) FROM t".to_string(), false);
                 q!(&format!("SELECT AVG(b) FROM t WHERE a >= {av}"), false);
-                q!(&format!("SELECT COUNT(DISTINCT a) FROM t"), false);
-                q!(&format!("SELECT a, COUNT(*) FROM t GROUP BY a"), false);
+                q!(&"SELECT COUNT(DISTINCT a) FROM t".to_string(), false);
+                q!(&"SELECT a, COUNT(*) FROM t GROUP BY a".to_string(), false);
                 q!(
-                    &format!("SELECT c, COUNT(*), AVG(a) FROM t GROUP BY c HAVING COUNT(*) > 1"),
+                    &"SELECT c, COUNT(*), AVG(a) FROM t GROUP BY c HAVING COUNT(*) > 1".to_string(),
                     false
                 );
                 q!(
@@ -278,22 +278,22 @@ fn main() {
                     &format!("SELECT id FROM t WHERE a IN ({av}, {}, 999)", rng.below(21)),
                     false
                 );
-                q!(&format!("SELECT id FROM t WHERE c LIKE '%a%'"), false);
+                q!(&"SELECT id FROM t WHERE c LIKE '%a%'".to_string(), false);
                 q!("SELECT SUM(a) FROM t WHERE a IS NULL", false);
                 q!("SELECT AVG(b) FROM t WHERE 1 = 0", false);
                 // Harder semantics: NULL-aware COUNT, text MIN/MAX, NULL
                 // ordering, arithmetic predicates, DISTINCT+ORDER, unicode
                 // collation, empty-set MIN/MAX/AVG/SUM.
                 q!(
-                    &&format!("SELECT COUNT(a), COUNT(b), COUNT(c) FROM t"),
+                    &&"SELECT COUNT(a), COUNT(b), COUNT(c) FROM t".to_string(),
                     false
                 );
                 q!(
-                    &&format!("SELECT MIN(c), MAX(c) FROM t WHERE c IS NOT NULL"),
+                    &&"SELECT MIN(c), MAX(c) FROM t WHERE c IS NOT NULL".to_string(),
                     false
                 );
                 q!(
-                    &&format!("SELECT MIN(a), MAX(a), SUM(a), AVG(a) FROM t WHERE 1 = 0"),
+                    &&"SELECT MIN(a), MAX(a), SUM(a), AVG(a) FROM t WHERE 1 = 0".to_string(),
                     false
                 );
                 q!(
@@ -305,13 +305,12 @@ fn main() {
                     false
                 );
                 q!(
-                    &&format!("SELECT DISTINCT a FROM t WHERE a IS NOT NULL ORDER BY a"),
+                    &&"SELECT DISTINCT a FROM t WHERE a IS NOT NULL ORDER BY a".to_string(),
                     false
                 );
                 q!(
-                    &&format!(
-                        "SELECT a, COUNT(*) FROM t WHERE b IS NOT NULL GROUP BY a ORDER BY a"
-                    ),
+                    &&"SELECT a, COUNT(*) FROM t WHERE b IS NOT NULL GROUP BY a ORDER BY a"
+                        .to_string(),
                     false
                 );
                 q!(
@@ -319,7 +318,7 @@ fn main() {
                     false
                 );
                 q!(
-                    &&format!("SELECT COUNT(*) FROM t WHERE NOT (a IS NULL)"),
+                    &&"SELECT COUNT(*) FROM t WHERE NOT (a IS NULL)".to_string(),
                     false
                 );
                 q!(
@@ -327,7 +326,7 @@ fn main() {
                     false
                 );
                 q!(
-                    &&format!("SELECT COUNT(*) FROM t WHERE c IS NULL OR a IS NULL"),
+                    &&"SELECT COUNT(*) FROM t WHERE c IS NULL OR a IS NULL".to_string(),
                     false
                 );
                 q!(
@@ -394,7 +393,7 @@ fn main() {
 
     let mut divs: Vec<String> = Vec::new();
     let mut checks2 = 0u64;
-    let mut cmp =
+    let cmp =
         |sql: &str, o: bool, d: &mut Vec<String>, c: &mut u64| compare(&db, &con, sql, o, d, c);
 
     // Txn 1: INSERT inside txn visible after COMMIT.

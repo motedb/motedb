@@ -27,7 +27,7 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 fn sorted_int(r: &[Vec<Value>]) -> Vec<i64> {
     let mut v: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(i)) => Some(*i),
             _ => None,
         })
@@ -194,7 +194,7 @@ fn test_nested_derived_tables() {
 fn test_commit_without_begin() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(id INT PRIMARY KEY)").unwrap();
-    let res = db.execute("COMMIT");
+    let _ = db.execute("COMMIT");
     // Should error (no active transaction) or no-op.
     // Either is acceptable; just verify no crash and table still usable.
     let r = q(&db, "SELECT COUNT(*) FROM t");
@@ -348,7 +348,7 @@ fn test_batch_insert_duplicate_pk() {
     db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
         .unwrap();
     // Batch with duplicate PK (id=1 twice).
-    let res = db.execute("INSERT INTO t VALUES (1,10),(1,20),(2,30)");
+    let _ = db.execute("INSERT INTO t VALUES (1,10),(1,20),(2,30)");
     // Either: whole batch fails (0 rows), or partial (id=1 first wins, id=2 inserted).
     // Verify no corruption: querying shouldn't panic.
     let r = q(&db, "SELECT COUNT(*) FROM t");

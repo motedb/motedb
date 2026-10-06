@@ -3,14 +3,13 @@
 //! Run: cargo test --release --test bench_vs_sqlite_v05 -- --nocapture --test-threads=1
 
 use motedb::Database;
-use rusqlite;
 use std::time::Instant;
 
 fn setup_motedb(n: usize) -> Database {
     let dir = "/tmp/motedb_vs_sqlite";
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(format!("{}.mote", &dir));
-    let db = Database::create(&dir).unwrap();
+    let db = Database::create(dir).unwrap();
     db.execute(
         "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, product TEXT, qty INT, price FLOAT)",
     )
@@ -44,8 +43,8 @@ fn setup_motedb(n: usize) -> Database {
 
 fn setup_sqlite(n: usize) -> rusqlite::Connection {
     let path = "/tmp/motedb_vs_sqlite.sqlite";
-    let _ = std::fs::remove_file(&path);
-    let conn = rusqlite::Connection::open(&path).unwrap();
+    let _ = std::fs::remove_file(path);
+    let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         .unwrap();
     conn.execute_batch("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER, price REAL)").unwrap();

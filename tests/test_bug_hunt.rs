@@ -424,7 +424,7 @@ fn test_in_with_null_in_list() {
 
     // 10 IN (10, NULL) should find 10
     let rows = query_rows(&db, "SELECT * FROM t WHERE v IN (10, NULL)");
-    assert!(rows.len() >= 1, "10 IN (10, NULL) should at least find 10");
+    assert!(!rows.is_empty(), "10 IN (10, NULL) should at least find 10");
 }
 
 // ============================================================

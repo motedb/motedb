@@ -1076,7 +1076,7 @@ fn large_text_roundtrip_and_merge() {
     let check = |db: &Database, tag: &str| {
         for (i, n) in sizes.iter().enumerate() {
             let r = scalar(
-                &db,
+                db,
                 &format!("SELECT LENGTH(t) FROM big WHERE id = {}", i + 1),
             );
             assert_eq!(r, Value::Integer(*n as i64), "{tag}: id={} want {n}", i + 1);

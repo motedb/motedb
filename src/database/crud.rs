@@ -1174,8 +1174,6 @@ impl MoteDB {
         row_id: RowId,
         old_row: &Row,
     ) {
-        let mut index_key_buf = String::with_capacity(table_name.len() + 1 + 16);
-
         // DashMap direct lookup for indexed columns
         let prefix_len = table_name.len() + 1;
 
@@ -2859,7 +2857,7 @@ impl MoteDB {
             .primary_key()
             .and_then(|pk| schema.get_column(pk))
             .map(|c| c.position)
-            .map_or(false, |p| {
+            .is_some_and(|p| {
                 rows.iter()
                     .any(|r| !matches!(r.get(p), None | Some(Value::Null)))
             });

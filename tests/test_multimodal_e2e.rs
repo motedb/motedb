@@ -532,8 +532,7 @@ fn test_memory_does_not_grow_unbounded() {
             .and_then(|o| {
                 let s = String::from_utf8_lossy(&o.stdout);
                 s.lines()
-                    .skip(1)
-                    .next()
+                    .nth(1)
                     .and_then(|l| l.trim().parse::<usize>().ok())
                     .map(|v| v as f64 / 1024.0)
             })

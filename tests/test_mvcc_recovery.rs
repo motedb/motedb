@@ -324,7 +324,7 @@ fn test_fts_match_against() {
         .unwrap();
     // MATCH should find documents containing 'fox'.
     let r = rows(&db, "SELECT id FROM docs WHERE MATCH(body, 'fox')");
-    assert!(r.len() >= 1, "Should find at least 1 doc with 'fox'");
+    assert!(!r.is_empty(), "Should find at least 1 doc with 'fox'");
 }
 
 /// LIKE with special regex chars (not wildcards).
@@ -338,7 +338,7 @@ fn test_like_literal_percent_char() {
     db.flush().unwrap();
     // LIKE '50%off' — the % is a wildcard, matches both.
     let r = rows(&db, "SELECT id FROM t WHERE v LIKE '50%off'");
-    assert!(r.len() >= 1, "LIKE with % should match");
+    assert!(!r.is_empty(), "LIKE with % should match");
 }
 
 // ═════════════════════════════════════════════════════════════════

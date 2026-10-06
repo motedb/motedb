@@ -575,5 +575,5 @@ fn test_ioctree_1000_points() {
         &db,
         "SELECT id FROM large_cloud WHERE ST_RADIUS_3D(pt, 5.0, 5.0, 5.0, 1.74)",
     );
-    assert!(r3.len() >= 1, "Should find at least the exact point");
+    assert!(!r3.is_empty(), "Should find at least the exact point");
 }

@@ -3156,24 +3156,23 @@ impl ColSegmentStore {
             // Decode each aggregate column once per segment. The tag drives
             // the fold: Bool columns are 1 byte wide — get_i64/get_f64 would
             // stride 8 bytes and read past the column.
-            let mut aggs: Vec<(Option<FixedSegment>, Option<TextSegment>, ColumnTypeTag)> =
-                agg_cols
-                    .iter()
-                    .map(|&ac| {
-                        if ac < seg.sst.column_tags.len() {
-                            let tag = seg.sst.column_tags[ac];
-                            if tag.is_fixed() {
-                                (seg.read_fixed_cached(ac), None, tag)
-                            } else if matches!(tag, ColumnTypeTag::Text) {
-                                (None, seg.read_text_cached(ac), ColumnTypeTag::Text)
-                            } else {
-                                (None, None, ColumnTypeTag::Text)
-                            }
+            let aggs: Vec<(Option<FixedSegment>, Option<TextSegment>, ColumnTypeTag)> = agg_cols
+                .iter()
+                .map(|&ac| {
+                    if ac < seg.sst.column_tags.len() {
+                        let tag = seg.sst.column_tags[ac];
+                        if tag.is_fixed() {
+                            (seg.read_fixed_cached(ac), None, tag)
+                        } else if matches!(tag, ColumnTypeTag::Text) {
+                            (None, seg.read_text_cached(ac), ColumnTypeTag::Text)
                         } else {
                             (None, None, ColumnTypeTag::Text)
                         }
-                    })
-                    .collect();
+                    } else {
+                        (None, None, ColumnTypeTag::Text)
+                    }
+                })
+                .collect();
 
             let has_deletions = seg.sst.row_map.has_any_deleted();
 
@@ -4552,7 +4551,7 @@ impl ColSegmentStore {
         if tail_rows * 2 >= base_rows {
             return Ok(false);
         }
-        let old_segs: Vec<Arc<Segment>> = segs[1..].iter().cloned().collect();
+        let old_segs: Vec<Arc<Segment>> = segs[1..].to_vec();
         drop(segs);
         self.merge_tail_segments(old_segs)?;
         Ok(true)

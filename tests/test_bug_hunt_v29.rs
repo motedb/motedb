@@ -70,7 +70,7 @@ fn join_on_timestamp_column_matches_current_limitation() {
     let r = rows(&db, "SELECT a.id, b.id FROM a JOIN b ON a.ts = b.ts");
     // Accept 0 (current limitation) or 1 (correct). Document which.
     assert!(
-        r.len() == 0 || r.len() == 1,
+        r.is_empty() || r.len() == 1,
         "JOIN on TIMESTAMP: expected 0 (limitation) or 1 (correct), got {}",
         r.len()
     );

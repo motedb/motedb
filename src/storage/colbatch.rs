@@ -102,7 +102,7 @@ impl ValidityBitmap {
 
     #[inline]
     pub fn push(&mut self, valid: bool) {
-        if self.len % 64 == 0 {
+        if self.len.is_multiple_of(64) {
             self.words.push(0);
         }
         if valid {
@@ -267,7 +267,7 @@ impl ColumnVector {
             ColData::Bool(bits) => bits.len() * 8,
             ColData::Utf8(v) => {
                 v.iter()
-                    .map(|s| s.as_ptr() as usize + s.len() * 1 - s.as_ptr() as usize + 16)
+                    .map(|s| s.as_ptr() as usize + s.len() - s.as_ptr() as usize + 16)
                     .sum::<usize>()
                     + v.len() * 8
             }
@@ -310,7 +310,7 @@ impl ColumnVector {
             }
             (ColData::Bool(bits), Value::Bool(b)) => {
                 let bit = self.valid.len();
-                if bit % 64 == 0 {
+                if bit.is_multiple_of(64) {
                     bits.push(0);
                 }
                 if *b {
@@ -337,7 +337,7 @@ impl ColumnVector {
             }
             (ColData::Bool(bits), Value::Null) => {
                 let bit = self.valid.len();
-                if bit % 64 == 0 {
+                if bit.is_multiple_of(64) {
                     bits.push(0);
                 }
                 self.valid.push(false);
@@ -469,6 +469,18 @@ pub fn i64_vec_as_timestamp(cv: &ColumnVector, i: usize) -> Value {
     }
 }
 
+/// 输出排序比较（NULL 最小 — 与 executor 的 order_by_cmp 语义一致）。
+pub fn colbatch_order_cmp(a: &crate::types::Value, b: &crate::types::Value) -> std::cmp::Ordering {
+    use crate::types::Value;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,7 +603,7 @@ mod tests {
         let cts = [ColumnType::Integer, ColumnType::Text];
         let mut b = ColumnBatch::with_types(&cts, 8);
         for i in 0..6i64 {
-            let row = vec![Value::Integer(i), Value::text(format!("t{}", i))];
+            let row = [Value::Integer(i), Value::text(format!("t{}", i))];
             for (ci, c) in b.cols.iter_mut().enumerate() {
                 let cv = std::sync::Arc::get_mut(c).expect("独占");
                 assert!(cv.push_value(&row[ci]));
@@ -628,17 +640,5 @@ mod tests {
         assert_eq!(cv.get(1), Value::Null);
         assert_eq!(cv.get(3), Value::Integer(4));
         assert_eq!(cv.len(), 4);
-    }
-}
-
-/// 输出排序比较（NULL 最小 — 与 executor 的 order_by_cmp 语义一致）。
-pub fn colbatch_order_cmp(a: &crate::types::Value, b: &crate::types::Value) -> std::cmp::Ordering {
-    use crate::types::Value;
-    use std::cmp::Ordering;
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
-        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
     }
 }

@@ -104,7 +104,7 @@ fn test_timestamp_sort_binary_search() {
         if let Some(Value::Timestamp(ts)) = row.get("ts") {
             let micros = ts.as_micros();
             assert!(
-                micros >= 1_400_000 && micros <= 1_600_000,
+                (1_400_000..=1_600_000).contains(&micros),
                 "Narrow range result out of bounds: {}",
                 micros
             );
@@ -323,7 +323,7 @@ fn test_segment_manager_binary_search_pruning() {
         if let Some(Value::Timestamp(ts)) = row.get("ts") {
             let micros = ts.as_micros();
             assert!(
-                micros >= 2_030_000 && micros <= 2_050_000,
+                (2_030_000..=2_050_000).contains(&micros),
                 "Out of range: {}",
                 micros
             );

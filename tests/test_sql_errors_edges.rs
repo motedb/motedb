@@ -83,12 +83,9 @@ fn test_select_nonexistent_column() {
 
     let result = db.execute("SELECT nonexistent FROM t");
     // Accept either error or NULL result
-    match result {
-        Ok(r) => {
-            let r = rows(r);
-            assert!(matches!(&r[0][0], Value::Null));
-        }
-        Err(_) => {}
+    if let Ok(r) = result {
+        let r = rows(r);
+        assert!(matches!(&r[0][0], Value::Null));
     }
 }
 
@@ -102,12 +99,9 @@ fn test_update_nonexistent_column() {
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     let result = db.execute("UPDATE t SET ghost = 5 WHERE id = 1");
-    match result {
-        Ok(_) => {
-            let r = rows(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
-            assert_eq!(&r[0][0], &Value::Integer(10));
-        }
-        Err(_) => {}
+    if let Ok(_) = result {
+        let r = rows(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
+        assert_eq!(&r[0][0], &Value::Integer(10));
     }
 }
 

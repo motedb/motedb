@@ -398,7 +398,7 @@ fn aggregates_with_negative_and_mixed() {
             .unwrap();
     }
     let sum = one(&db, "SELECT SUM(v) FROM t");
-    assert_eq!(sum[0], Value::Integer(10 - 5 + 7 - 3 + 0));
+    assert_eq!(sum[0], Value::Integer((10 - 5 + 7 - 3)));
     assert_eq!(sum[0], Value::Integer(9));
 
     let min = one(&db, "SELECT MIN(v) FROM t");

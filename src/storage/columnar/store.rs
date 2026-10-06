@@ -284,12 +284,6 @@ impl ColumnarStore {
             table_id
         );
 
-        let ts_col_idx_of = |schema: &TableSchema| -> Option<usize> {
-            schema
-                .timeseries_column
-                .as_ref()
-                .and_then(|n| schema.columns.iter().position(|c| &c.name == n))
-        };
         // Read all columns from each segment + row_id column
         let column_count = schema.columns.len() as u16;
         let mut merged_columns: Vec<ColumnBuffer> = schema
@@ -1674,7 +1668,7 @@ impl ColumnarStore {
         // Pass 2a: segment rows above the threshold (ts > threshold are
         // guaranteed in; ts == threshold admitted while budget remains).
         let mut wanted_rows: Vec<(usize, usize, i64)> = Vec::with_capacity(k);
-        let mut budget = k;
+        let budget = k;
         for (seg_ord, segment) in segments.iter().enumerate() {
             if budget == 0 {
                 break;
@@ -1815,7 +1809,7 @@ impl ColumnarStore {
         // Trim to exactly k (threshold ties may over-admit) BEFORE decoding.
         let mut seg_row: Vec<(i64, i64, SqlRow)> = Vec::new(); // (ts, seq, row)
         let mut next_seq_for_ties: i64 = 0;
-        let mut wanted_rows: Vec<(usize, usize, i64)> = {
+        let wanted_rows: Vec<(usize, usize, i64)> = {
             let mut w = std::mem::take(&mut wanted_rows);
             // prefer larger keys first when trimming (sort desc by key)
             w.sort_by(|a, b| {
@@ -1942,7 +1936,7 @@ impl ColumnarStore {
         let group_col_idx = match &group {
             RangeGroup::ByColumn(c) => Some(col_idx(c)?),
             RangeGroup::ByTimeBucket { ts_col, .. } => {
-                if ts_col != &schema.timeseries_column.as_deref().unwrap_or("") {
+                if ts_col != schema.timeseries_column.as_deref().unwrap_or("") {
                     return Err(StorageError::Columnar(
                         "TIME_BUCKET group key must be the time-series column".into(),
                     ));

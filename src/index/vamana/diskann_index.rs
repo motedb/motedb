@@ -110,59 +110,6 @@ impl VectorStorage {
         self.vectors.unpin_all();
     }
 
-    /// 🚀 预加载 quantized 向量到 LRU cache（触发 mmap page fault）。
-    /// 用于 greedy_search 两阶段访存优化：先批量预加载，再串行算距离，
-    /// 让 distance 第二次调 get_quantized 时 cache 命中（无 page fault stall）。
-    fn prefetch(&self, row_id: RowId) {
-        // Touch the entry (page fault) without copying it into the LRU.
-        let _ = self
-            .vectors
-            .with_quantized(row_id, |_, _, codes| std::hint::black_box(codes.len()));
-    }
-
-    /// 🚀 Compute distance using optimized SQ8 asymmetric distance, run
-    /// directly on the mmap'd entry (no copy, no LRU churn).
-    fn distance(&self, query: &[f32], row_id: RowId, metric: DistanceKind) -> f32 {
-        self.vectors
-            .with_quantized(row_id, |min, max, codes| match metric {
-                DistanceKind::Euclidean => {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        self.quantizer
-                            .asymmetric_distance_l2_neon_raw(query, codes, min, max)
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        self.quantizer
-                            .asymmetric_distance_l2_avx2_raw(query, codes, min, max)
-                    }
-                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-                    {
-                        self.quantizer
-                            .asymmetric_distance_l2_raw(query, codes, min, max)
-                    }
-                }
-                DistanceKind::Cosine => {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        self.quantizer
-                            .asymmetric_distance_cosine_neon_raw(query, codes, min, max)
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        self.quantizer
-                            .asymmetric_distance_cosine_avx2_raw(query, codes, min, max)
-                    }
-                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-                    {
-                        self.quantizer
-                            .asymmetric_distance_cosine_raw(query, codes, min, max)
-                    }
-                }
-            })
-            .unwrap_or(f32::MAX)
-    }
-
     fn insert(&self, row_id: RowId, vector: Vec<f32>) -> Result<()> {
         self.vectors.insert(row_id, vector)
     }
@@ -417,7 +364,7 @@ impl DiskANNIndex {
         // backing files — without it the first queries after open pay hard
         // page faults mid-walk (66-337ms on query #1 at 220K×384 vs 1.4ms
         // steady state). Advisory and async; file-backed pages remain
-        /// reclaimable under memory pressure.
+        // reclaimable under memory pressure.
         vectors.vectors.warm_page_cache();
         graph.warm_page_cache();
 
@@ -742,7 +689,7 @@ impl DiskANNIndex {
                 .par_iter()
                 .filter_map(|&id| self.incremental_insert_into_graph(id, medoid_id).err())
                 .collect();
-            for e in errs {
+            if let Some(e) = errs.into_iter().next() {
                 return Err(e);
             }
             for &id in batch.iter() {

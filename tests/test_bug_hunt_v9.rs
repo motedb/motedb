@@ -313,7 +313,7 @@ fn order_by_across_segments() {
     let r = rows(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 5");
     let vals: Vec<i64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         })

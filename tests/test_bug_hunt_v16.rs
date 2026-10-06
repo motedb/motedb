@@ -131,7 +131,7 @@ fn order_by_float_desc_correct() {
     let r = rows(&db, "SELECT v FROM t ORDER BY v DESC LIMIT 5");
     let vals: Vec<f64> = r
         .iter()
-        .filter_map(|row| match row.get(0) {
+        .filter_map(|row| match row.first() {
             Some(Value::Float(f)) => Some(*f),
             _ => None,
         })

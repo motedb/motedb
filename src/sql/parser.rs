@@ -353,7 +353,7 @@ impl Parser {
                     self.next_param_idx += 1;
                     next
                 } else {
-                    raw as usize
+                    raw
                 };
                 (None, Some(idx))
             } else {
@@ -370,7 +370,7 @@ impl Parser {
                     self.next_param_idx += 1;
                     next
                 } else {
-                    raw as usize
+                    raw
                 };
                 (None, Some(idx))
             } else {
@@ -1269,8 +1269,8 @@ impl Parser {
 
     fn parse_create_index(&mut self) -> Result<CreateIndexStmt> {
         // Parse optional index type: TEXT/VECTOR/SPATIAL/TIMESTAMP
-        let mut tokenizer: Option<(String, Option<usize>)> = None;
-        let mut index_type = match &self.current().token_type {
+        let tokenizer: Option<(String, Option<usize>)> = None;
+        let index_type = match &self.current().token_type {
             TokenType::Text => {
                 self.advance();
                 IndexType::Text

@@ -547,9 +547,9 @@ impl ExprEvaluator {
                 if std::env::var_os("MOTE_TRACE").is_some() {
                     eprintln!("{}", std::backtrace::Backtrace::force_capture());
                 }
-                return Err(MoteDBError::Query(
+                Err(MoteDBError::Query(
                     "EXISTS evaluation must be done by executor".into(),
-                ));
+                ))
             }
             Expr::Subquery(_) => {
                 // Subqueries are handled at executor level, not here

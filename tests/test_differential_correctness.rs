@@ -282,17 +282,17 @@ fn differential_vs_sqlite_including_joins_and_boundaries() {
                 let mut run =
                     |sql: String, o: bool| compare(&db, &con, &sql, o, &label, &mut divergences);
                 // Core shapes.
-                run(format!("SELECT COUNT(*) FROM t"), false);
-                run(format!("SELECT COUNT(a), COUNT(b) FROM t"), false);
+                run("SELECT COUNT(*) FROM t".to_string(), false);
+                run("SELECT COUNT(a), COUNT(b) FROM t".to_string(), false);
                 run(format!("SELECT SUM(a) FROM t WHERE a < {av}"), false);
                 run(format!("SELECT AVG(b) FROM t WHERE a >= {av}"), false);
                 run(
-                    format!("SELECT MIN(c), MAX(c) FROM t WHERE c IS NOT NULL"),
+                    "SELECT MIN(c), MAX(c) FROM t WHERE c IS NOT NULL".to_string(),
                     false,
                 );
                 // JOIN shapes (INNER / LEFT / RIGHT / FULL, with predicates).
                 run(
-                    format!("SELECT COUNT(*) FROM t INNER JOIN u ON u.t_id = t.id"),
+                    "SELECT COUNT(*) FROM t INNER JOIN u ON u.t_id = t.id".to_string(),
                     false,
                 );
                 run(
@@ -306,13 +306,12 @@ fn differential_vs_sqlite_including_joins_and_boundaries() {
                     false,
                 );
                 run(
-                    format!(
-                        "SELECT COUNT(*) FROM t LEFT JOIN u ON u.t_id = t.id WHERE u.id IS NULL"
-                    ),
+                    "SELECT COUNT(*) FROM t LEFT JOIN u ON u.t_id = t.id WHERE u.id IS NULL"
+                        .to_string(),
                     false,
                 );
                 run(
-                    format!("SELECT u.tag, COUNT(*), AVG(t.a) FROM t INNER JOIN u ON u.t_id = t.id GROUP BY u.tag"),
+                    "SELECT u.tag, COUNT(*), AVG(t.a) FROM t INNER JOIN u ON u.t_id = t.id GROUP BY u.tag".to_string(),
                     false,
                 );
                 // RIGHT / FULL JOIN.
@@ -323,24 +322,24 @@ fn differential_vs_sqlite_including_joins_and_boundaries() {
                     false,
                 );
                 run(
-                    format!("SELECT COUNT(*) FROM t FULL JOIN u ON u.t_id = t.id"),
+                    "SELECT COUNT(*) FROM t FULL JOIN u ON u.t_id = t.id".to_string(),
                     false,
                 );
                 // Boundary predicates.
                 run(
-                    format!("SELECT COUNT(*) FROM t WHERE a > 9000000000000000000"),
+                    "SELECT COUNT(*) FROM t WHERE a > 9000000000000000000".to_string(),
                     false,
                 );
                 run(
-                    format!("SELECT COUNT(*) FROM t WHERE b > 1e299 OR b < -1e299"),
+                    "SELECT COUNT(*) FROM t WHERE b > 1e299 OR b < -1e299".to_string(),
                     false,
                 );
-                run(format!("SELECT COUNT(*) FROM t WHERE c = 'x'"), false);
+                run("SELECT COUNT(*) FROM t WHERE c = 'x'".to_string(), false);
                 run(
-                    format!("SELECT id FROM t WHERE a = 4611686018427387904"),
+                    "SELECT id FROM t WHERE a = 4611686018427387904".to_string(),
                     false,
                 );
-                run(format!("SELECT COUNT(*) FROM t WHERE b = 0.0"), false);
+                run("SELECT COUNT(*) FROM t WHERE b = 0.0".to_string(), false);
                 // Ordered shape with tie-break.
                 run(
                     format!("SELECT id, a FROM t WHERE a IS NOT NULL ORDER BY a DESC, id LIMIT 5 OFFSET {av}"),

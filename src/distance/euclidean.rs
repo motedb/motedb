@@ -207,6 +207,100 @@ unsafe fn euclidean_distance_squared_neon(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
+/// b 侧为盘上 LE f32 字节切片 (任意对齐) 的欧氏平方距离变体 — 流式 knn
+/// 直接喂 mmap 借出的列字节, 免对齐缓冲复制趟 (154MB 表 ~8-12ms)。
+/// aarch64 vld1q / x86 loadu 非对齐加载原生支持; 标量回退用 from_le_bytes
+/// (可移植, 慢路径)。
+pub fn euclidean_distance_squared_bytes(a: &[f32], b: &[u8]) -> f32 {
+    let n = a.len();
+    debug_assert_eq!(b.len(), n * 4, "byte slice must hold exactly n f32 (LE)");
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { euclid_sq_neon_ab(a, b.as_ptr()) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && n >= 8 {
+            unsafe { euclid_sq_avx2_ab(a, b.as_ptr()) }
+        } else {
+            euclid_sq_scalar_bytes(a, b)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        euclid_sq_scalar_bytes(a, b)
+    }
+}
+
+/// 可移植标量回退 (BE 主机亦正确)。
+/// aarch64 恒走 NEON 路径，此回退只被 x86_64 / 其它架构引用。
+#[cfg(not(target_arch = "aarch64"))]
+fn euclid_sq_scalar_bytes(a: &[f32], b: &[u8]) -> f32 {
+    let mut sum = 0.0f32;
+    for (i, av) in a.iter().enumerate() {
+        let o = i * 4;
+        let bv = f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let diff = av - bv;
+        sum += diff * diff;
+    }
+    sum
+}
+
+/// NEON: b 侧非对齐字节指针 (vld1q 无对齐要求)。
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn euclid_sq_neon_ab(a: &[f32], b: *const u8) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let chunks = n / 16;
+    let bp = b as *const f32;
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut sum2 = vdupq_n_f32(0.0);
+    let mut sum3 = vdupq_n_f32(0.0);
+    let mut sum4 = vdupq_n_f32(0.0);
+    for i in 0..chunks {
+        let o = i * 16;
+        let a1 = vld1q_f32(a.as_ptr().add(o));
+        let b1 = vld1q_f32(bp.add(o));
+        let a2 = vld1q_f32(a.as_ptr().add(o + 4));
+        let b2 = vld1q_f32(bp.add(o + 4));
+        let a3 = vld1q_f32(a.as_ptr().add(o + 8));
+        let b3 = vld1q_f32(bp.add(o + 8));
+        let a4 = vld1q_f32(a.as_ptr().add(o + 12));
+        let b4 = vld1q_f32(bp.add(o + 12));
+        let d1 = vsubq_f32(a1, b1);
+        let d2 = vsubq_f32(a2, b2);
+        let d3 = vsubq_f32(a3, b3);
+        let d4 = vsubq_f32(a4, b4);
+        sum1 = vfmaq_f32(sum1, d1, d1);
+        sum2 = vfmaq_f32(sum2, d2, d2);
+        sum3 = vfmaq_f32(sum3, d3, d3);
+        sum4 = vfmaq_f32(sum4, d4, d4);
+    }
+    let combined = vaddq_f32(vaddq_f32(sum1, sum2), vaddq_f32(sum3, sum4));
+    let mut total = vaddvq_f32(combined);
+    let off = chunks * 16;
+    let rem4 = (n - off) / 4;
+    let mut sum_rem = vdupq_n_f32(0.0);
+    for i in 0..rem4 {
+        let o = off + i * 4;
+        let av = vld1q_f32(a.as_ptr().add(o));
+        let bv = vld1q_f32(bp.add(o));
+        let d = vsubq_f32(av, bv);
+        sum_rem = vfmaq_f32(sum_rem, d, d);
+    }
+    total += vaddvq_f32(sum_rem);
+    for i in (off + rem4 * 4)..n {
+        let bo = i * 4;
+        let bv = f32::from_le_bytes(std::ptr::read_unaligned(b.add(bo) as *const [u8; 4]));
+        let d = a[i] - bv;
+        total += d * d;
+    }
+    total
+}
+
 /// AVX2水平求和（优化版本）
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -342,98 +436,6 @@ mod tests {
         assert_eq!(dist_sq, 25.0);
         assert!((dist - 5.0).abs() < 1e-6);
     }
-}
-
-/// b 侧为盘上 LE f32 字节切片 (任意对齐) 的欧氏平方距离变体 — 流式 knn
-/// 直接喂 mmap 借出的列字节, 免对齐缓冲复制趟 (154MB 表 ~8-12ms)。
-/// aarch64 vld1q / x86 loadu 非对齐加载原生支持; 标量回退用 from_le_bytes
-/// (可移植, 慢路径)。
-pub fn euclidean_distance_squared_bytes(a: &[f32], b: &[u8]) -> f32 {
-    let n = a.len();
-    debug_assert_eq!(b.len(), n * 4, "byte slice must hold exactly n f32 (LE)");
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { euclid_sq_neon_ab(a, b.as_ptr()) }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") && n >= 8 {
-            unsafe { euclid_sq_avx2_ab(a, b.as_ptr()) }
-        } else {
-            euclid_sq_scalar_bytes(a, b)
-        }
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        euclid_sq_scalar_bytes(a, b)
-    }
-}
-
-/// 可移植标量回退 (BE 主机亦正确)。
-fn euclid_sq_scalar_bytes(a: &[f32], b: &[u8]) -> f32 {
-    let mut sum = 0.0f32;
-    for (i, av) in a.iter().enumerate() {
-        let o = i * 4;
-        let bv = f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-        let diff = av - bv;
-        sum += diff * diff;
-    }
-    sum
-}
-
-/// NEON: b 侧非对齐字节指针 (vld1q 无对齐要求)。
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[inline]
-unsafe fn euclid_sq_neon_ab(a: &[f32], b: *const u8) -> f32 {
-    use std::arch::aarch64::*;
-    let n = a.len();
-    let chunks = n / 16;
-    let bp = b as *const f32;
-    let mut sum1 = vdupq_n_f32(0.0);
-    let mut sum2 = vdupq_n_f32(0.0);
-    let mut sum3 = vdupq_n_f32(0.0);
-    let mut sum4 = vdupq_n_f32(0.0);
-    for i in 0..chunks {
-        let o = i * 16;
-        let a1 = vld1q_f32(a.as_ptr().add(o));
-        let b1 = vld1q_f32(bp.add(o));
-        let a2 = vld1q_f32(a.as_ptr().add(o + 4));
-        let b2 = vld1q_f32(bp.add(o + 4));
-        let a3 = vld1q_f32(a.as_ptr().add(o + 8));
-        let b3 = vld1q_f32(bp.add(o + 8));
-        let a4 = vld1q_f32(a.as_ptr().add(o + 12));
-        let b4 = vld1q_f32(bp.add(o + 12));
-        let d1 = vsubq_f32(a1, b1);
-        let d2 = vsubq_f32(a2, b2);
-        let d3 = vsubq_f32(a3, b3);
-        let d4 = vsubq_f32(a4, b4);
-        sum1 = vfmaq_f32(sum1, d1, d1);
-        sum2 = vfmaq_f32(sum2, d2, d2);
-        sum3 = vfmaq_f32(sum3, d3, d3);
-        sum4 = vfmaq_f32(sum4, d4, d4);
-    }
-    let combined = vaddq_f32(vaddq_f32(sum1, sum2), vaddq_f32(sum3, sum4));
-    let mut total = vaddvq_f32(combined);
-    let off = chunks * 16;
-    let rem4 = (n - off) / 4;
-    let mut sum_rem = vdupq_n_f32(0.0);
-    for i in 0..rem4 {
-        let o = off + i * 4;
-        let av = vld1q_f32(a.as_ptr().add(o));
-        let bv = vld1q_f32(bp.add(o));
-        let d = vsubq_f32(av, bv);
-        sum_rem = vfmaq_f32(sum_rem, d, d);
-    }
-    total += vaddvq_f32(sum_rem);
-    for i in (off + rem4 * 4)..n {
-        let bo = i * 4;
-        let bv = f32::from_le_bytes(std::ptr::read_unaligned(b.add(bo) as *const [u8; 4]));
-        let d = a[i] - bv;
-        total += d * d;
-    }
-    total
 }
 
 /// AVX2: b 侧非对齐 (loadu)。

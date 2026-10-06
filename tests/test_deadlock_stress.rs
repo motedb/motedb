@@ -70,7 +70,7 @@ fn deadlock_mix_stress() {
         handles.push(std::thread::spawn(move || {
             let mut i = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                let table = if (i + t) % 2 == 0 { "a" } else { "b" };
+                let table = if (i + t).is_multiple_of(2) { "a" } else { "b" };
                 let id = 1000 + t * 100_000 + i;
                 let _ = db.execute(&format!("INSERT INTO {table} VALUES ({id}, {i})"));
                 let _ = db.execute(&format!("UPDATE {table} SET v = v + 1 WHERE id = {id}"));
@@ -223,7 +223,7 @@ fn deadlock_mix_stress_hard() {
                 }
                 let _ = db.savepoint(tx, format!("sp{i}").as_str());
                 let _ = db.execute("UPDATE a SET v = v + 1 WHERE v < 3");
-                if i % 3 == 0 {
+                if i.is_multiple_of(3) {
                     let _ = db.rollback_to_savepoint(tx, &format!("sp{i}"));
                 }
                 let _ = db.commit_transaction(tx);
