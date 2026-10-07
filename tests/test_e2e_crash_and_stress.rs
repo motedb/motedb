@@ -225,7 +225,7 @@ fn test_ecommerce_workload() {
             i,
             i,
             9.99 + (i as f64 * 0.5),
-            { (i % 100) }
+            { i % 100 }
         ))
         .unwrap();
     }

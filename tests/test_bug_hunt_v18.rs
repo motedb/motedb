@@ -393,8 +393,8 @@ fn correlated_subquery_in_select_currently_uncorrelated() {
     );
     assert_eq!(r.len(), 5);
     // Non-NULL-dept rows all get the same (wrong) global-max value.
-    for i in 0..4 {
-        match &r[i][1] {
+    for (i, row) in r.iter().take(4).enumerate() {
+        match &row[1] {
             Value::Integer(_) => {}
             other => panic!("row {}: expected Integer, got {:?}", i, other),
         }

@@ -126,12 +126,9 @@ fn test_atomicity_double_delete_no_panic() {
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
     // Second delete of same row — should succeed (affected_rows = 0) or error, but NOT panic
     let result = db.execute("DELETE FROM t WHERE id = 1");
-    match result {
-        Ok(r) => {
-            let ar = r.materialize().unwrap().affected_rows();
-            assert_eq!(ar, 0, "Double delete should affect 0 rows");
-        }
-        Err(_) => {} // Also acceptable
+    if let Ok(r) = result {
+        let ar = r.materialize().unwrap().affected_rows();
+        assert_eq!(ar, 0, "Double delete should affect 0 rows");
     }
 }
 

@@ -8,13 +8,6 @@ use motedb::types::Value;
 use motedb::Database;
 use tempfile::TempDir;
 
-fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    match db.execute(sql).unwrap().materialize().unwrap() {
-        motedb::sql::QueryResult::Select { rows, .. } => rows,
-        other => panic!("expected Select, got {:?} for {}", other, sql),
-    }
-}
-
 #[test]
 fn test_corrupt_column_index_self_rebuilds() {
     let dir = TempDir::new().unwrap();

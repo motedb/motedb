@@ -5,14 +5,15 @@
 //! 1. **TIMESTAMP column comparisons with string literals returned empty.**
 //!    `WHERE ts > '2024-01-01'`, `WHERE ts = '2024-01-15T10:30:00'`, etc.
 //!    always returned no rows. Two root causes:
-//!    a. Value PartialOrd/PartialEq had no (Timestamp, Text) arm — fell
-//!       through to None/false. Fixed by parsing the text as ISO date.
-//!    b. The col-segment scan decoded TIMESTAMP filter columns as None
-//!       (the filter-col decode only handled Integer/Float/Boolean), so
-//!       the predicate always received None. Added Timestamp decode.
-//!    Also added Timestamp::parse_iso (public) and fixed two ColumnarSeg
-//!    decode sites that read TIMESTAMP columns as Integer instead of
-//!    Timestamp (affecting SELECT projection).
+//!    - Value PartialOrd/PartialEq had no (Timestamp, Text) arm — fell
+//!      through to None/false. Fixed by parsing the text as ISO date.
+//!    - The col-segment scan decoded TIMESTAMP filter columns as None
+//!      (the filter-col decode only handled Integer/Float/Boolean), so
+//!      the predicate always received None. Added Timestamp decode.
+//!
+//! Also added Timestamp::parse_iso (public) and fixed two ColumnarSeg
+//! decode sites that read TIMESTAMP columns as Integer instead of
+//! Timestamp (affecting SELECT projection).
 //!
 //! 2. **JOIN + GROUP BY + HAVING with aggregate expression returned empty.**
 //!    `SELECT c.name, SUM(o.amt) AS total ... HAVING SUM(o.amt) > 100`

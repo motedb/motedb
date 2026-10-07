@@ -7,11 +7,11 @@
 //! Integer before storage. The f64 bit pattern was then reinterpreted as i64
 //! on read → silent data corruption (3.0 → 4613937818241073152).
 //!
-//! **Fix:** Added Float→Integer coercion in all INSERT paths:
-//!   - crud.rs insert_row_to_table (single-row INSERT)
-//!   - crud.rs batch_insert_rows_to_table (batch INSERT < 100 rows)
-//!   - crud.rs fast_batch_insert (AUTO_INCREMENT batch INSERT ≥ 100 rows)
-//!   - row_converter.rs sql_row_to_row + values_to_row_by_columns
+//! **Fix:** Added Float→Integer coercion in all INSERT paths: crud.rs
+//! insert_row_to_table (single-row INSERT), crud.rs
+//! batch_insert_rows_to_table (batch INSERT < 100 rows), crud.rs
+//! fast_batch_insert (AUTO_INCREMENT batch INSERT ≥ 100 rows), and
+//! row_converter.rs sql_row_to_row + values_to_row_by_columns.
 //! Fractional floats (3.14) are still correctly rejected by validate_row.
 
 use motedb::sql::QueryResult;

@@ -275,10 +275,10 @@ fn test_large_order_by_desc_fully_sorted() {
     assert_eq!(rows.last().unwrap()[0], Value::Integer(0));
 }
 
-/// GROUP BY with COUNT verified exactly. There are two known GROUP BY aggregate
-/// bugs tracked separately (and marked ignored below):
-///   1. SUM/MAX alongside COUNT in one GROUP BY: only COUNT is emitted.
-///   2. SUM as the sole GROUP BY aggregate returns COUNT instead of the sum.
+/// GROUP BY with COUNT verified exactly. There are two known GROUP BY
+/// aggregate bugs tracked separately (and marked ignored below): SUM/MAX
+/// alongside COUNT in one GROUP BY emits only COUNT, and SUM as the sole
+/// GROUP BY aggregate returns COUNT instead of the sum.
 /// Here we verify COUNT-per-group is correct (the path that works), plus SUM
 /// without GROUP BY (which is correct).
 #[test]

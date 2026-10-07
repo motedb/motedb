@@ -177,12 +177,11 @@ fn length_of_null_propagates() {
 fn lower_of_null_propagates() {
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT LOWER(NULL)");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "LOWER(NULL) should be NULL"
-        ),
-        Err(_) => {} // accept error too, document below
+        );
     }
 }
 
@@ -362,8 +361,8 @@ fn max_i64_plus_one_literal_clamped_or_errored() {
     // i64::MAX (silent wrong), or promote to Float (acceptable). Document.
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT 9223372036854775808");
-    match r {
-        Ok(rows) => match &rows[0][0] {
+    if let Ok(rows) = r {
+        match &rows[0][0] {
             Value::Integer(n) => assert!(
                 *n == 9223372036854775807,
                 "i64::MAX+1 silently clamped to i64::MAX = {}",
@@ -375,8 +374,7 @@ fn max_i64_plus_one_literal_clamped_or_errored() {
                 f
             ),
             o => panic!("unexpected: {:?}", o),
-        },
-        Err(_) => {} // parse error is acceptable
+        }
     }
 }
 
@@ -400,13 +398,12 @@ fn division_by_zero_errors() {
     // Postgres errors on /0; SQLite returns NULL. Document actual behavior.
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT 10 / 0");
-    match r {
-        Ok(rows) => match &rows[0][0] {
+    if let Ok(rows) = r {
+        match &rows[0][0] {
             Value::Null => {}                        // SQLite-style
             Value::Float(f) if f.is_infinite() => {} // some engines
             _ => panic!("10/0 returned {:?}", rows[0][0]),
-        },
-        Err(_) => {} // error is acceptable
+        }
     }
 }
 

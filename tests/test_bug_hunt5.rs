@@ -521,16 +521,13 @@ fn test_deeply_nested_parens_rejected() {
     }
     // Should not crash — should return a parse error
     let result = db.execute(&sql);
-    match result {
-        Err(e) => {
-            let msg = format!("{:?}", e);
-            assert!(
-                msg.contains("nesting") || msg.contains("Expected") || msg.contains("parse"),
-                "Should get parse error, got: {}",
-                msg
-            );
-        }
-        Ok(_) => {} // also acceptable if it somehow succeeds
+    if let Err(e) = result {
+        let msg = format!("{:?}", e);
+        assert!(
+            msg.contains("nesting") || msg.contains("Expected") || msg.contains("parse"),
+            "Should get parse error, got: {}",
+            msg
+        );
     }
 }
 
@@ -580,9 +577,9 @@ fn test_index_rebuild_skips_deleted_rows() {
     // Query via index should only return live rows
     let r = rows(&db, "SELECT id FROM t ORDER BY id");
     assert_eq!(r.len(), 5, "Only 5 live rows should exist, got {}", r.len());
-    for i in 0..5 {
+    for (i, row) in r.iter().take(5).enumerate() {
         let id = 6 + i as i64;
-        assert_eq!(r[i][0], Value::Integer(id), "Row {} should exist", id);
+        assert_eq!(row[0], Value::Integer(id), "Row {} should exist", id);
     }
 }
 
@@ -701,7 +698,7 @@ fn test_mod_i64_min_minus_one() {
     db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MIN))
         .unwrap();
     // Should not panic — i64::MIN % -1 is UB in C but returns 0 in our fix
-    let r = rows(&db, &"SELECT val % -1 FROM t WHERE id = 1".to_string());
+    let r = rows(&db, "SELECT val % -1 FROM t WHERE id = 1");
     assert_eq!(r.len(), 1, "Should return 1 row");
     // Result should be 0 (checked_rem returns None → fallback 0)
     assert_eq!(r[0][0], Value::Integer(0), "i64::MIN % -1 should be 0");

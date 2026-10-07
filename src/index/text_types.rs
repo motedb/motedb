@@ -1716,8 +1716,10 @@ mod tokenize_buf_tests {
             "",
         ];
         for &case_sensitive in &[false, true] {
-            let mut t = WhitespaceTokenizer::default();
-            t.case_sensitive = case_sensitive;
+            let t = WhitespaceTokenizer {
+                case_sensitive,
+                ..Default::default()
+            };
             for text in texts {
                 let owned: Vec<(String, u32)> = t
                     .tokenize(text)

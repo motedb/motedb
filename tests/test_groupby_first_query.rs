@@ -24,7 +24,7 @@ fn groupby_first_query_multi_segment() {
                     Value::Text(format!("dev-{:03}", (b * 50000 + i) % 64).into()),
                     Value::Text("north".into()),
                     Value::Float((i as f64) * 0.01),
-                    Value::Integer(1700000000_000_000 + (b as i64) * 50_000 + i as i64),
+                    Value::Integer(1_700_000_000_000_000 + (b as i64) * 50_000 + i as i64),
                 ]
             })
             .collect();

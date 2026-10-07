@@ -703,30 +703,28 @@ fn bm25_score_projection() {
         "SELECT id, BM25_SCORE(content, 'quick') AS s FROM d WHERE MATCH(content, 'quick')",
     );
     assert_eq!(r.len(), 2);
-    let (id0, s0) = match &r[0] {
-        v => (
-            match &v[0] {
-                Value::Integer(i) => *i,
-                o => panic!("{o:?}"),
-            },
-            match &v[1] {
-                Value::Float(f) => *f,
-                o => panic!("{o:?}"),
-            },
-        ),
-    };
-    let (id1, s1) = match &r[1] {
-        v => (
-            match &v[0] {
-                Value::Integer(i) => *i,
-                o => panic!("{o:?}"),
-            },
-            match &v[1] {
-                Value::Float(f) => *f,
-                o => panic!("{o:?}"),
-            },
-        ),
-    };
+    let v = &r[0];
+    let (id0, s0) = (
+        match &v[0] {
+            Value::Integer(i) => *i,
+            o => panic!("{o:?}"),
+        },
+        match &v[1] {
+            Value::Float(f) => *f,
+            o => panic!("{o:?}"),
+        },
+    );
+    let v = &r[1];
+    let (id1, s1) = (
+        match &v[0] {
+            Value::Integer(i) => *i,
+            o => panic!("{o:?}"),
+        },
+        match &v[1] {
+            Value::Float(f) => *f,
+            o => panic!("{o:?}"),
+        },
+    );
     assert_eq!(id0, 2, "tf=2 doc must rank first");
     assert_eq!(id1, 1);
     assert!(

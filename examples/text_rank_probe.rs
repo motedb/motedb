@@ -3,14 +3,6 @@
 //! triggers the FTS auto-flush mid-backfill.
 use motedb::{DBConfig, Database};
 
-fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| (1..=64).contains(&s.len()))
-        .map(|s| s.to_string())
-        .collect()
-}
-
 fn main() -> motedb::Result<()> {
     let n: usize = std::env::args()
         .nth(1)

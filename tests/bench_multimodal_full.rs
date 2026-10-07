@@ -322,7 +322,7 @@ fn bench_mixed_multimodal_10k() {
     let (db, _dir) = edge_db();
     let n = 10_000usize;
 
-    db.execute(&"CREATE TABLE items (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(64), loc GEOMETRY, info TEXT, price FLOAT, region TEXT)".to_string()).unwrap();
+    db.execute("CREATE TABLE items (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(64), loc GEOMETRY, info TEXT, price FLOAT, region TEXT)").unwrap();
 
     timed(&format!("INSERT {} multimodal items", n), || {
         let batch = 1000;

@@ -13,7 +13,7 @@ fn dir_walk_bytes(path: &std::path::Path) -> u64 {
     total
 }
 
-fn collect_files(path: &std::path::Path, out: &mut Vec<(String, u64)>, depth: usize) {
+fn collect_files(path: &std::path::Path, out: &mut Vec<(String, u64)>) {
     if path.is_file() {
         if let Ok(meta) = path.metadata() {
             out.push((path.display().to_string(), meta.len()));
@@ -21,7 +21,7 @@ fn collect_files(path: &std::path::Path, out: &mut Vec<(String, u64)>, depth: us
     } else if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
-                collect_files(&entry.path(), out, depth + 1);
+                collect_files(&entry.path(), out);
             }
         }
     }
@@ -86,7 +86,7 @@ fn disk_usage_measurement() {
     // Sub-directory breakdown (all files, including hidden)
     println!("\n  Directory breakdown:");
     let mut all_files: Vec<(String, u64)> = Vec::new();
-    collect_files(std::path::Path::new(&mote_path), &mut all_files, 0);
+    collect_files(std::path::Path::new(&mote_path), &mut all_files);
     let mut by_dir: Vec<(String, u64)> = Vec::new();
     for (path, size) in &all_files {
         let dir = path

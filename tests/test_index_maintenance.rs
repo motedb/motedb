@@ -292,18 +292,16 @@ fn fts_limit_without_order_by_is_unranked_doc_order() {
     db.execute("CREATE TEXT INDEX docs_body ON docs (body)")
         .unwrap();
 
-    let unranked: Vec<i64> = match db
+    let rows = db
         .query("SELECT id FROM docs WHERE MATCH(body, 'hit') LIMIT 3")
-        .unwrap()
-    {
-        rows => rows
-            .iter()
-            .map(|row| match &row[0] {
-                Value::Integer(id) => *id,
-                other => panic!("{other:?}"),
-            })
-            .collect(),
-    };
+        .unwrap();
+    let unranked: Vec<i64> = rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Integer(id) => *id,
+            other => panic!("{other:?}"),
+        })
+        .collect();
     assert_eq!(
         unranked,
         vec![1, 2, 3],

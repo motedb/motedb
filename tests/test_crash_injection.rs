@@ -7,13 +7,13 @@
 //!
 //! This is the durability contract an edge device (robot losing power, or a
 //! supervisor OOM-killing the process) actually depends on:
-//!   1. Prefix:     committed rows form a contiguous prefix 0..=k — a row is
-//!                  never partially applied and a later row never survives an
-//!                  earlier lost one (transaction ordering).
+//!   1. Prefix: committed rows form a contiguous prefix 0..=k — a row is
+//!      never partially applied and a later row never survives an
+//!      earlier lost one (transaction ordering).
 //!   2. Durability: every write the database ACKNOWLEDGED (execute() returned
-//!                  Ok, recorded in the sidecar journal by the child before
-//!                  the kill) is present with its exact payload. Torn values
-//!                  or lost acks are durability bugs.
+//!      Ok, recorded in the sidecar journal by the child before
+//!      the kill) is present with its exact payload. Torn values
+//!      or lost acks are durability bugs.
 //!
 //! SIGKILL semantics: the OS page cache survives process death, so anything
 //! the child wrote via write(2) — WAL records and journal lines alike — is
@@ -258,7 +258,7 @@ fn test_kill9_mid_write_recovers_with_prefix_and_durability() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 120) + 5) // 5..125ms
+        (*state % 120) + 5 // 5..125ms
     };
 
     let mut killed_runs = 0;
@@ -427,7 +427,7 @@ fn test_kill9_update_delete_recovers_exactly() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 150) + 5)
+        (*state % 150) + 5
     };
 
     let mut killed_runs = 0;
@@ -524,7 +524,7 @@ fn test_kill9_txn_atomicity_and_prefix() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 200) + 10)
+        (*state % 200) + 10
     };
 
     let mut killed_runs = 0;
@@ -623,7 +623,7 @@ fn test_kill9_timeseries_prefix_recovery() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 150) + 5)
+        (*state % 150) + 5
     };
 
     let mut killed_runs = 0;
@@ -713,7 +713,7 @@ fn test_kill9_concurrent_writers_prefix_per_thread() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 250) + 20) // 20..270ms — let threads interleave
+        (*state % 250) + 20 // 20..270ms — let threads interleave
     };
 
     let mut killed_runs = 0;
@@ -807,7 +807,7 @@ fn test_kill9_upsert_recovers_exactly() {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
-        ((*state % 200) + 10)
+        (*state % 200) + 10
     };
 
     let mut killed_runs = 0;
@@ -968,8 +968,5 @@ fn read_journal(path: &std::path::Path) -> Vec<i64> {
     // The final line may be torn (kill mid-write) — parse only complete
     // lines; a torn line means the ack never completed, so it makes no
     // durability promise.
-    s.lines()
-        .filter(|l| l.parse::<i64>().is_ok())
-        .map(|l| l.parse::<i64>().unwrap())
-        .collect()
+    s.lines().filter_map(|l| l.parse::<i64>().ok()).collect()
 }

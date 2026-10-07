@@ -805,12 +805,12 @@ fn test_delete_specific_rows_remaining_exact() {
     assert_eq!(rs.len(), 15); // deleted 5 rows (10,11,12,13,14)
 
     // First 10 rows still there
-    for i in 0..10 {
-        assert_eq!(rs[i][0], Value::Integer(i as i64));
+    for (i, row) in rs.iter().take(10).enumerate() {
+        assert_eq!(row[0], Value::Integer(i as i64));
     }
     // Rows 15-19 still there (offset by deleted 5)
-    for i in 10..15 {
-        assert_eq!(rs[i][0], Value::Integer(i as i64 + 5));
+    for (i, row) in rs.iter().enumerate().take(15).skip(10) {
+        assert_eq!(row[0], Value::Integer(i as i64 + 5));
     }
 }
 

@@ -101,7 +101,7 @@ fn setup_motedb() -> (Database, std::path::PathBuf) {
             ))
     };
     // Keep dir alive by leaking it (test process is short-lived).
-    let dir_path = dir.into_path();
+    let dir_path = dir.keep();
     let db = Database::create_with_config(&dir_path, DBConfig::for_edge()).unwrap();
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, region TEXT, score FLOAT, qty INT)",

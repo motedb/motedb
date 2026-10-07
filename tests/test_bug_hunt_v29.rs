@@ -246,12 +246,9 @@ fn ambiguous_bare_column_in_where_after_join() {
     exec(&db, "INSERT INTO b VALUES (1, 20)");
     // Bare `x` is ambiguous. WHERE x = 10 may pick a.x or b.x.
     let r = try_rows(&db, "SELECT a.id FROM a JOIN b ON a.id = b.id WHERE x = 10");
-    match r {
-        Ok(rows) => {
-            // Document: 0 or 1 rows (depends on which x was picked).
-            assert!(rows.len() <= 1, "expected 0 or 1 rows, got {}", rows.len());
-        }
-        Err(_) => {} // error is SQL-standard behavior
+    if let Ok(rows) = r {
+        // Document: 0 or 1 rows (depends on which x was picked).
+        assert!(rows.len() <= 1, "expected 0 or 1 rows, got {}", rows.len());
     }
 }
 
@@ -267,10 +264,8 @@ fn ambiguous_bare_column_in_group_by_after_join() {
         &db,
         "SELECT cat, COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY cat",
     );
-    match r {
-        Ok(rows) => assert!(!rows.is_empty() || rows.is_empty()), // any result OK
-        Err(_) => {}                                              // error is acceptable
-    }
+    // Any result (rows or error) is acceptable here.
+    let _ = r;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -563,12 +558,11 @@ fn cast_string_to_integer() {
 fn cast_null_propagates() {
     let (db, _dir) = new_db();
     let r = try_rows(&db, "SELECT CAST(NULL, 'INTEGER')");
-    match r {
-        Ok(rows) => assert!(
+    if let Ok(rows) = r {
+        assert!(
             matches!(rows[0][0], Value::Null),
             "CAST(NULL, ...) should be NULL"
-        ),
-        Err(_) => {} // accept error too
+        );
     }
 }
 

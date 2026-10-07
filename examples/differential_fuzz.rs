@@ -51,11 +51,7 @@ fn run_sqlite(con: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let ncols = stmt.column_count();
     let mut rows_iter = stmt.query([]).map_err(|e| format!("sqlite err: {e}"))?;
     let mut rows: Vec<Vec<String>> = Vec::new();
-    loop {
-        let r = match rows_iter.next().map_err(|e| format!("sqlite err: {e}"))? {
-            Some(r) => r,
-            None => break,
-        };
+    while let Some(r) = rows_iter.next().map_err(|e| format!("sqlite err: {e}"))? {
         let mut row = Vec::with_capacity(ncols);
         for i in 0..ncols {
             let v: rusqlite::types::Value = r.get(i).unwrap_or(rusqlite::types::Value::Null);
@@ -251,9 +247,9 @@ fn main() {
                         compare(&db, &con, $s, $o, &mut divergences, &mut checks)
                     };
                 }
-                q!(&"SELECT COUNT(*) FROM t".to_string(), false);
+                q!("SELECT COUNT(*) FROM t", false);
                 q!(&format!("SELECT COUNT(*) FROM t WHERE a = {av}"), false);
-                q!(&"SELECT COUNT(*) FROM t WHERE a IS NULL".to_string(), false);
+                q!("SELECT COUNT(*) FROM t WHERE a IS NULL", false);
                 q!(
                     &format!("SELECT COUNT(*) FROM t WHERE a > {av} AND b IS NOT NULL"),
                     false
@@ -262,12 +258,12 @@ fn main() {
                     &format!("SELECT COUNT(*) FROM t WHERE a < {av} OR c IS NULL"),
                     false
                 );
-                q!(&"SELECT SUM(a), MIN(a), MAX(a) FROM t".to_string(), false);
+                q!("SELECT SUM(a), MIN(a), MAX(a) FROM t", false);
                 q!(&format!("SELECT AVG(b) FROM t WHERE a >= {av}"), false);
-                q!(&"SELECT COUNT(DISTINCT a) FROM t".to_string(), false);
-                q!(&"SELECT a, COUNT(*) FROM t GROUP BY a".to_string(), false);
+                q!("SELECT COUNT(DISTINCT a) FROM t", false);
+                q!("SELECT a, COUNT(*) FROM t GROUP BY a", false);
                 q!(
-                    &"SELECT c, COUNT(*), AVG(a) FROM t GROUP BY c HAVING COUNT(*) > 1".to_string(),
+                    "SELECT c, COUNT(*), AVG(a) FROM t GROUP BY c HAVING COUNT(*) > 1",
                     false
                 );
                 q!(
@@ -278,7 +274,7 @@ fn main() {
                     &format!("SELECT id FROM t WHERE a IN ({av}, {}, 999)", rng.below(21)),
                     false
                 );
-                q!(&"SELECT id FROM t WHERE c LIKE '%a%'".to_string(), false);
+                q!("SELECT id FROM t WHERE c LIKE '%a%'", false);
                 q!("SELECT SUM(a) FROM t WHERE a IS NULL", false);
                 q!("SELECT AVG(b) FROM t WHERE 1 = 0", false);
                 // Harder semantics: NULL-aware COUNT, text MIN/MAX, NULL

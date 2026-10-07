@@ -13,7 +13,7 @@ use motedb::{DBConfig, Database};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-fn median_of(v: &mut Vec<Duration>) -> Duration {
+fn median_of(v: &mut [Duration]) -> Duration {
     v.sort();
     v[v.len() / 2]
 }

@@ -188,18 +188,10 @@ fn test_where_in_subquery() {
 
     let result =
         db.execute("SELECT id FROM orders WHERE customer_id IN (SELECT id FROM vip_customers)");
-    match result {
-        Ok(r) => {
-            // IN subquery may fail during materialization if Subquery expr is unsupported
-            match r.materialize() {
-                Ok(motedb::QueryResult::Select { rows, .. }) => {
-                    assert!(rows.len() <= 3, "IN subquery should find at most 3 matches");
-                }
-                _ => {} // unsupported or error
-            }
-        }
-        Err(_) => {
-            // IN subquery may not be fully supported
+    if let Ok(r) = result {
+        // IN subquery may fail during materialization if Subquery expr is unsupported
+        if let Ok(motedb::QueryResult::Select { rows, .. }) = r.materialize() {
+            assert!(rows.len() <= 3, "IN subquery should find at most 3 matches");
         }
     }
 }

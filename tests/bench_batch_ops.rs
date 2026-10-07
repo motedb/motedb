@@ -81,7 +81,7 @@ fn bench_batch_insert_sizes() {
                 batch.push(vec![
                     Value::Integer(id),
                     Value::text(format!("name_{}", id)),
-                    Value::Integer((id % 1000)),
+                    Value::Integer(id % 1000),
                 ]);
             }
 
@@ -488,15 +488,14 @@ fn bench_batch_update_delete() {
     let upd_count = n / 2;
     let upd_ms = {
         let start = Instant::now();
-        for i in 0..upd_count {
+        for (i, rid) in row_ids.iter().take(upd_count).enumerate() {
             let id = (i + 1) as i64;
             let new_row = vec![
                 Value::Integer(id),
                 Value::text(format!("updated_{}", id)),
                 Value::Integer(id * 20),
             ];
-            db.update_row("bud", row_ids[i], new_row)
-                .expect("update_row");
+            db.update_row("bud", *rid, new_row).expect("update_row");
         }
         start.elapsed().as_millis() as u64
     };

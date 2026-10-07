@@ -432,11 +432,8 @@ fn test_empty_in_list() {
         .execute("SELECT id FROM t WHERE v IN ()")
         .and_then(|s| s.materialize());
     // Accept either empty result or error (document current behavior).
-    match res {
-        Ok(r) => {
-            let _ = rows(r);
-        } // empty is fine
-        Err(_) => {} // error is fine
+    if let Ok(r) = res {
+        let _ = rows(r); // empty is fine
     }
 }
 

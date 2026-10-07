@@ -25,8 +25,10 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut config = DBConfig::default();
-    config.max_result_rows = None;
+    let config = DBConfig {
+        max_result_rows: None,
+        ..Default::default()
+    };
     let db = Database::create_with_config(&dir, config.clone()).unwrap();
 
     if dim == 0 {

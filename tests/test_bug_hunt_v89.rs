@@ -119,15 +119,12 @@ fn test_int_overflow_wraps_safely() {
     let res = db
         .execute("SELECT 9223372036854775807 + 1 FROM t")
         .and_then(|s| s.materialize());
-    match res {
-        Ok(r) => {
-            let r = rows(r);
-            // Accept either Float (promoted) or error already handled. Just verify no silent wrap to negative.
-            if let Some(Value::Integer(i)) = r.first().and_then(|row| row.first()) {
-                assert!(*i > 0, "must not silently wrap to negative; got {}", i);
-            }
+    if let Ok(r) = res {
+        let r = rows(r);
+        // Accept either Float (promoted) or error already handled. Just verify no silent wrap to negative.
+        if let Some(Value::Integer(i)) = r.first().and_then(|row| row.first()) {
+            assert!(*i > 0, "must not silently wrap to negative; got {}", i);
         }
-        Err(_) => {} // error is acceptable
     }
 }
 

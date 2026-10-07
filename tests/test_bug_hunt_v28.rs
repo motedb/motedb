@@ -68,20 +68,17 @@ fn ambiguous_bare_column_select_after_join_errors_or_picks_deterministically() {
     // Bare `name` is ambiguous. SQL standard: error. MoteDB may pick one
     // silently — document the behavior (should NOT panic).
     let r = try_rows(&db, "SELECT name FROM emp JOIN dept ON emp.id = dept.id");
-    match r {
-        Ok(rows) => {
-            // Got a value — must be one of the two names (not crash, not garbage).
-            assert_eq!(rows.len(), 1);
-            match &rows[0][0] {
-                Value::Text(s) => assert!(
-                    s.as_str() == "Alice" || s.as_str() == "Sales",
-                    "ambiguous bare col picked unexpected: {}",
-                    s
-                ),
-                o => panic!("expected text, got {:?}", o),
-            }
+    if let Ok(rows) = r {
+        // Got a value — must be one of the two names (not crash, not garbage).
+        assert_eq!(rows.len(), 1);
+        match &rows[0][0] {
+            Value::Text(s) => assert!(
+                s.as_str() == "Alice" || s.as_str() == "Sales",
+                "ambiguous bare col picked unexpected: {}",
+                s
+            ),
+            o => panic!("expected text, got {:?}", o),
         }
-        Err(_) => {} // error is the SQL-standard behavior; acceptable
     }
 }
 

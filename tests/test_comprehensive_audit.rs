@@ -170,19 +170,16 @@ fn test_parameterized_unbound_error() {
 
     // execute() with ? is non-prepared — may silently return 0 rows (acceptable)
     let result = db.execute("SELECT * FROM users WHERE id = ?");
-    match result {
-        Ok(r) => {
-            let rows = match r.materialize() {
-                Ok(motedb::QueryResult::Select { rows, .. }) => rows,
-                _ => vec![],
-            };
-            assert_eq!(
-                rows.len(),
-                0,
-                "Unbound ? via execute() should return 0 rows"
-            );
-        }
-        Err(_) => {} // Also acceptable
+    if let Ok(r) = result {
+        let rows = match r.materialize() {
+            Ok(motedb::QueryResult::Select { rows, .. }) => rows,
+            _ => vec![],
+        };
+        assert_eq!(
+            rows.len(),
+            0,
+            "Unbound ? via execute() should return 0 rows"
+        );
     }
 }
 
@@ -211,15 +208,12 @@ fn test_execute_with_unbound_parameter() {
 
     // execute() with ? should not panic — either error or 0 rows
     let result = db.execute("SELECT * FROM users WHERE id = ?");
-    match result {
-        Ok(r) => {
-            let rows = match r.materialize() {
-                Ok(motedb::QueryResult::Select { rows, .. }) => rows,
-                _ => vec![],
-            };
-            assert_eq!(rows.len(), 0, "Unbound parameter should return 0 rows");
-        }
-        Err(_) => {} // OK
+    if let Ok(r) = result {
+        let rows = match r.materialize() {
+            Ok(motedb::QueryResult::Select { rows, .. }) => rows,
+            _ => vec![],
+        };
+        assert_eq!(rows.len(), 0, "Unbound parameter should return 0 rows");
     }
 }
 

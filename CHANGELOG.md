@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.12.1] — 2026-10-07
+
+工程整洁版：零告警收官 + 发布通道修复后的第一个常规 patch。
+
+- **clippy --all-targets 全目标清零**（0.12.0 收官时 lib 为 0，tests/
+  examples 尚余 ~95 条风格项）：match→if let / match→let ×16、循环
+  索引迭代化 ×6、doc 注释列表缩进修正 ×11、`filter+map`→`filter_map`、
+  `&mut Vec`→`&mut [_]`、deprecated `TempDir::into_path`→`keep()`、
+  数字下划线分组统一、`field_reassign_with_default` 初始化化 ×3
+  （含 lib 内 1 处）
+- **废弃代码删除 ×3**: test_corruption_recovery / test_knn_parallel
+  各自的未用 `rows` helper、text_rank_probe 的未用 `tokenize`;
+  test_disk_usage 的 `collect_files` 移除从未读取的 `depth` 参数
+- **发布通道**: v0.12.0 起 crates.io（CARGO_TOKEN）与 PyPI
+  （motedb-python trusted publisher）恢复可用 — v0.9.1 起连续 11 次
+  CI 发布失败的根因（token 失效 + publisher claims 不匹配）均已修复
+- 行为零变更：纯测试/示例/注释与 CI 层面的清理，不触及引擎代码路径
+  （lib 内仅 1 处测试 helper 的初始化语法改写）
+
 ## [0.12.0] — 2026-10-07
 
 ### Known Limitations（发布时随 Release Notes 公布）

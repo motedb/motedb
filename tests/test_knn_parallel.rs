@@ -25,13 +25,6 @@ fn gen_vec(i: usize, salt: usize) -> Vec<f32> {
         .collect()
 }
 
-fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    match db.execute(sql).unwrap().materialize().unwrap() {
-        motedb::sql::QueryResult::Select { rows, .. } => rows,
-        _ => panic!("expected select"),
-    }
-}
-
 fn knn_ids(db: &Database, metric: &str, q: &[f32], k: usize) -> Vec<i64> {
     let sql = format!(
         "SELECT id FROM t ORDER BY emb {} ? LIMIT {}",
