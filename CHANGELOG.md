@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.12.0] — 未发布
+## [0.12.0] — 2026-10-07
 
 ### Known Limitations（发布时随 Release Notes 公布）
 
