@@ -1,0 +1,382 @@
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black,citecolor=blue!60!black]{hyperref}
+\usepackage{microtype}
+
+\lstset{basicstyle=\ttfamily\small,breaklines=true,frame=single,framerule=0pt,backgroundcolor=\color{gray!6},columns=fullflexible}
+
+\title{\textbf{MoteDB: An Embedded Multimodal Storage Engine for Embodied AI}}
+\author{MoteDB Team \\ \texttt{motedb@126.com} \\ \texttt{https://github.com/motedb/motedb}}
+\date{October 7, 2026 --- Version 0.12.2}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Perception workloads on embodied devices---robots, AR glasses, industrial
+arms---produce data that is queried along four orthogonal access paths:
+point/range lookups on a time axis, approximate nearest-neighbor search over
+embeddings, ranked full-text retrieval over logs and notes, and spatial
+queries over poses. The state of the practice stitches together four
+independent systems (an embedded SQL engine, a vector index, a search
+engine, a spatial index), each with its own persistence, consistency model,
+and failure behavior---an untenable footprint on battery-powered edge
+hardware. We present \textbf{MoteDB}, an embedded, single-file, ACID storage
+engine written in Rust whose columnar core natively hosts all four index
+types under one MVCC/durability substrate, with hybrid BM25$\times$vector
+retrieval (Reciprocal Rank Fusion) as a first-class query. MoteDB ships with
+an engineering methodology we argue is as important as the engine: every
+published performance number is reproduced by a one-command benchmark suite
+whose correctness gate result-set-compares hundreds of randomized queries
+against SQLite as an oracle; this harness caught a real crash bug in the
+engine's time-series top-k path on its first run. We report measured results
+on mixed, time-series, spatial, ANN, and FTS workloads against SQLite,
+DuckDB, FAISS, and tantivy---including several workloads where competing
+systems remain faster---and describe the durability-matching and
+recall-matching rules we hold ourselves to when claiming wins.
+\end{abstract}
+
+\section{Introduction}
+
+An autonomous inspection robot accumulates, in a single day: hundreds of
+thousands of timestamped sensor readings; thousands of image/audio
+embeddings destined for semantic search; maintenance notes worth querying by
+keyword; and a stream of posed positions worth querying by region. Asking a
+cross-cutting question---``which snapshots taken near bay~3 in the last
+hour accompany vibration anomalies whose notes mention \emph{bearing
+noise}?''---currently requires four systems at once.
+
+We consider four requirements for this tier of data management:
+
+\begin{itemize}
+\item \textbf{R1 (unified access).} One query surface (SQL) across all four
+access patterns; joins and predicates span modalities without ETL.
+\item \textbf{R2 (embedded, edge-first).} A library, not a service: one
+database file plus WAL sidecars, a configuration tier for
+memory-constrained devices, no daemon.
+\item \textbf{R3 (ACID + crash safety).} Robots lose power. Committed writes
+must be durable and recoverable; in-flight transactions must be invisible
+until commit---including to \emph{secondary} indexes.
+\item \textbf{R4 (interactive latency).} ``Latest 10 anomalies''-class
+queries must answer in single-digit milliseconds at the million-row scale,
+without an external cache.
+\end{itemize}
+
+MoteDB (\S\ref{sec:arch}) meets R1--R3 with a columnar store in which
+vector, BM25, spatial, and time-series structures are native index types
+rather than bolt-on subsystems. For R4 we rely on fast paths with strict
+correctness contracts, and on a performance-engineering culture
+(\S\ref{sec:cases}) grounded in the correctness methodology of
+\S\ref{sec:correct}.
+
+\textbf{Contributions.}
+\begin{enumerate}
+\item A single-engine design hosting BM25, quantized-ANN (DiskANN-style
+SQ8), spatial (i-Octree), and time-series structures over a shared ACID
+columnar core, with read-your-writes extended to FTS and top-k paths
+(\S\ref{sec:arch}, \S\ref{sec:durability}).
+\item Hybrid retrieval fusing BM25 and vector lists by Reciprocal Rank
+Fusion with per-row score transparency (\S\ref{sec:hybrid}).
+\item Three root-cause performance case studies---time-series top-k
+(680$\times$), scan-UPDATE predicate pushdown (surpassing SQLite at matched
+durability), and ANN cold-start tail elimination via page-cache warmup
+(\S\ref{sec:cases}).
+\item A verification methodology---SQLite-as-oracle differential fuzzing,
+an adversarial result-set harness, and a one-command reproducible benchmark
+suite---with a documented instance of the harness catching an engine crash
+bug on its first execution (\S\ref{sec:correct}).
+\end{enumerate}
+
+\section{Architecture}
+\label{sec:arch}
+
+MoteDB is an in-process library (Rust; Python bindings via a native
+extension and a thin wrapper package). A database is one directory holding
+a columnar segment store, WAL, and index files.
+
+\subsection{Columnar core}
+Data is stored in immutable columnar segments (target $\sim$50K rows)
+with per-column encodings: Gorilla-style timestamp coding,
+delta-varint integer coding (the \emph{integer} gorilla used for
+\texttt{INT}-typed time columns), dictionary and bit-packed variants, and
+zstd compression at rest. Zone maps (per-segment min/max) drive time and
+range pruning. Ingestion lands in a write buffer that is folded into
+segments at flush/checkpoint; checkpoints are incremental and crash-safe
+(segments are durably flushed before the WAL is truncated).
+
+\subsection{Four native index types}
+\begin{itemize}
+\item \textbf{Time-series.} \texttt{TIMESERIES(ts)} tables track per-sensor
+latest values (\texttt{LATEST BY}), time-pruned range folds, and a
+segment-aware top-k fast path for \texttt{ORDER BY ts LIMIT k}
+(\S\ref{sec:cases:k1}).
+\item \textbf{Vector.} \texttt{VECTOR(n)} columns build a DiskANN-style
+graph index over SQ8-quantized vectors with a two-tier memory design
+(mmap-backed quantized store + LRU), NEON/AVX2 asymmetric distance kernels,
+and iterative-deepening filtered search (\S\ref{sec:cases:f1}).
+\item \textbf{Full-text.} \texttt{CREATE TEXT INDEX} builds positional
+inverted lists (roaring bitmaps, sharded dictionaries, BM25 scoring) with
+block-max WAND for ranked top-k and a derived-structure cache for streaming
+terms.
+\item \textbf{Spatial.} \texttt{GEOMETRY} columns build an in-memory
+i-Octree over segment extents supporting \texttt{WITHIN}/bbox and
+$k$-nearest operators with count-shaped fast paths.
+\end{itemize}
+
+All four answer through the same SQL executor and the same snapshot
+semantics: a query sees either all of a transaction's writes or none of
+them, in every index (\S\ref{sec:durability}).
+
+\section{Hybrid retrieval}
+\label{sec:hybrid}
+
+Multimodal recall needs text and embeddings to vote together, but BM25
+scores and distances are incommensurable. MoteDB fuses the two ranked lists
+with Reciprocal Rank Fusion~\cite{cormack2009}:
+$rrf(d) = \sum_{\ell} 1/(k_1 + rank_\ell(d))$ with $k_1{=}60$ by default.
+Each candidate's per-list membership is preserved in the result
+(\texttt{\_\_bm25\_\_}, \texttt{\_\_distance\_\_}, \texttt{\_\_rrf\_\_}),
+keeping ranking auditable. Candidate depth is $k \times fetch\_mult$
+(clamped to $[16, 512]$); documents hit by both lists surface naturally
+without any score calibration.
+
+\section{Consistency and durability}
+\label{sec:durability}
+
+\textbf{Transactions.} Snapshot isolation via MVCC; buffered writes are
+overlaid onto segment state at read time, so read-your-writes holds in
+scans, aggregates, point lookups, \emph{and} the FTS MATCH fast path
+(uncommitted terms are folded into posting streams and uncommitted deletes
+hide documents), as well as in the time-series top-k (buffered rows compete
+with segment rows under the same threshold rule).
+
+\textbf{Durability ladder.} \texttt{GroupCommit} (default; fsync per
+commit), \texttt{Periodic\{interval\}} (bounded loss window, ~200K+ rows/s
+bulk loads), and batch-deferred flushing inside multi-row statements. A
+kill-9 crash matrix (write, \texttt{kill -9} mid-stream, reopen, verify)
+runs in CI: in a representative 50K-row run, all 782 acknowledged rows
+survived.
+
+\section{Performance engineering: three case studies}
+\label{sec:cases}
+
+\subsection{Time-series top-k: 680$\times$}
+\label{sec:cases:k1}
+\texttt{ORDER BY ts DESC LIMIT 10} over a 1M-row \texttt{INT}-typed
+time-series table took 1{,}196\,ms. Root causes were stacked, each invisible
+to functional tests because the generic fallback is \emph{correct}: (i) all
+three decode points of the top-k accepted only the timestamp gorilla codec,
+silently \texttt{continue}-ing past integer-coded chunks; (ii) write-buffer
+time tracking recognized only \texttt{Value::Timestamp}, leaving segment
+metadata at $(0,0)$, which the zone-map gate read as ``no recent data'' and
+pruned every segment; (iii) buffered-row visibility for integer buffers was
+hardcoded \texttt{false}. Fixes: per-segment grouped decoding (decode each
+involved segment once), zone-gate semantics where $(0,0)$ means
+\emph{unknown} and never prunes, integer-aware visibility, and routing of
+the streaming entry into the kernel (the previous router never dispatched
+to it while \texttt{EXPLAIN} still displayed the fast path---a paper plan).
+Result: \textbf{1.76\,ms} (680$\times$), faster than a DuckDB full scan of
+the same data (2.1\,ms) on the reference machine. We note honestly that
+SQLite, given a purpose-built \texttt{(sid, ts DESC)} composite index,
+answers the same shape in microseconds---an index-planning gap we discuss
+in \S\ref{sec:limits}.
+
+\subsection{Scan UPDATE/DELETE predicate pushdown}
+\label{sec:cases:c1}
+\texttt{UPDATE \ldots WHERE} previously materialized every scanned row and
+evaluated the predicate against a row-hash structure. Pushing the predicate
+into the columnar scan (decode only predicate columns plus rowid; sparse
+row buffers; dedup set with FxHash; batch WAL flush per statement; mirrored
+logic for DELETE, including transactional overlay in both directions) took
+a 50K-row, 782-hit workload from 9.3K to \textbf{49.9K rows/s}
+autocommit, and \textbf{112.9K rows/s} inside transactions---past SQLite's
+110K rows/s \emph{at matched durability} (\texttt{periodic} vs.\ WAL+NORMAL;
+115.2K vs.\ 110K in the steady-state variant). Under the default
+GroupCommit (fsync per commit) MoteDB remains slower than SQLite-NORMAL by
+design: the durability tiers are not equivalent and we label them.
+
+\subsection{ANN cold-start tail}
+\label{sec:cases:f1}
+Reported p99 of 30\,ms on a 220K$\times$384 workload was not algorithmic:
+walk statistics were uniform, but the first $\sim$30 queries after open bore
+hard page faults on the mmap'd SQ8 and adjacency files (first query
+337\,ms). \texttt{madvise(WILLNEED)} warmup at load moved the cost to open:
+first query 1.9\,ms; steady-state p50 0.59\,ms; p99 1.51\,ms at
+recall@10 $= 0.9985$. At matched recall $\approx$1.0 this is $\sim$9$\times$
+faster than FAISS Flat's p50 on the same hardware; against tuned
+HNSW/IVF configs the comparison is reported at \emph{their} operating
+recall, per our matching rule (\S\ref{sec:eval}).
+
+\section{The correctness methodology}
+\label{sec:correct}
+
+Fast paths are the engine's speed and its risk: a fast path without a
+differential test is a rumor. Three layers, all reproducible from the
+repository:
+
+\begin{enumerate}
+\item \textbf{Differential fuzzing.} SQLite as oracle: three-way comparison
+(SQLite, MoteDB generic path, MoteDB fast paths) over randomized schemas,
+rows (NULLs, negatives, duplicates, unicode), and queries, plus mutation
+replay and reopen consistency. Seventeen semantic defects---mostly
+three-valued-logic and ordering edge cases---were found this way in prior
+releases.
+\item \textbf{Adversarial harness.} 400+ randomized point/range/aggregate/
+order queries result-set-compared exactly against SQLite; FTS match sets
+against FTS5; vector recall against numpy brute force; dirty-data
+UPDATE/DELETE re-verification; kill-9 crash parity; cold-process latency.
+Exit code is the gate.
+\item \textbf{Reproducible benchmark suite.} \texttt{make compete} runs the
+Rust benches, cross-engine comparisons (SQLite always; DuckDB/FAISS when
+installed), and the adversarial harness as a non-zero-exit gate, archiving
+per-step logs and extracted JSON. Published numbers must be regenerable by
+this command on stated hardware; the methodology document fixes the
+fairness rules (durability-matched write comparisons, recall-matched ANN
+comparisons, machine-independent ratio budgets for CI).
+\end{enumerate}
+
+\textbf{The suite earned its keep immediately.} On its first full run, the
+time-series suite panicked in \texttt{topk\_by\_ts}: pass-2b consumed
+multiple write-buffer candidate indices with \texttt{swap\_remove} in
+ascending order, invalidating the remaining indices (swap\_remove moves the
+tail into the vacated slot and shrinks the vector). The bug was reachable
+only with $>1$ buffered rows competing in the top-k---exactly the
+visibility that fix (iii) of \S\ref{sec:cases:k1} had just enabled---and no
+prior test had produced that state. The fix (iterate-and-filter with a
+candidate set) is regression-covered in six shapes. We document this not as
+an embarrassment but as the methodology working: the harness exists to make
+silent breakage loud, and it did, on day one.
+
+\section{Evaluation}
+\label{sec:eval}
+
+All numbers are from the repository's public suites on Apple Silicon
+(M-series, release builds); absolute values vary by machine and the
+methodology document fixes how to reproduce each table. Engines: SQLite
+3.45 (stdlib build), DuckDB, FAISS, tantivy, as available to the suite.
+
+\begin{table}[h]
+\centering\small
+\caption{Mixed 100K-row workload (int PK / ts / device / val / $\sim$80B
+text / 384-d vector). Latencies are query p50. A recent suite run on the
+reference laptop.}
+\begin{tabular}{lrr}
+\toprule
+ & MoteDB & SQLite \\
+\midrule
+bulk load (rows/s, durability on) & 109--169K & 23--48K \\
+GROUP BY (p50, ms) & 1.2 & 117 \\
+top-k ORDER BY DESC LIMIT (p50, ms) & 0.54 & 99.1 \\
+range + aggregate (p50, ms) & 0.48 & 1.40 \\
+point lookup (p50, ms) & 0.014 & 0.011 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering\small
+\caption{Time-series (1M rows) and spatial (500K 3-D points), same run.
+SQLite's fast top-k and LATEST BY come from a purpose-built composite
+index---see \S\ref{sec:limits}.}
+\begin{tabular}{lrr}
+\toprule
+ & MoteDB & SQLite \\
+\midrule
+ts range aggregate (p50, ms) & 58.7\textsuperscript{*} & 13.1 \\
+ts top-k ORDER BY ts DESC (p50, ms) & 4.1 & 0.01 \\
+ts time-ranged delete of 10K rows (s) & 0.02 & 1.39 \\
+spatial bbox WITHIN (p50, ms) & 0.002 & 0.44 \\
+spatial KNN-10 (p50, ms) & 0.004 & 60.1 \\
+\bottomrule
+\multicolumn{3}{l}{\textsuperscript{*}\footnotesize documented in optimization notes as
+0.004\,ms p50 under the tuned zone-map path of the dedicated benchmark.}
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering\small
+\caption{Selected engine-level results (documented benchmarks, reference
+machine).}
+\begin{tabular}{llr}
+\toprule
+workload & result & reference \\
+\midrule
+1M-row \texttt{ORDER BY ts LIMIT 10} & 1{,}196 $\to$ 1.76\,ms & DuckDB scan 2.1\,ms \\
+1M-row TopK (parallel morsels) & 9.21 $\to$ 1.49\,ms & DuckDB 1.25\,ms \\
+scan-UPDATE (782 hits, 50K rows) & 112.9K rows/s & SQLite 110K (matched) \\
+ANN first query after open & 337 $\to$ 1.9\,ms & p99 30 $\to$ 1.51\,ms \\
+FTS index build (100K docs) & 0.72 $\to$ 0.48\,s & tantivy 0.24\,s, FTS5 0.10\,s \\
+executemany UPDATE (batch kernel) & 205--230K rows/s & SQLite oracle path \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Where others win.} DuckDB loads the 1M-row series $\sim$30$\times$
+faster (columnar \texttt{INSERT} bulk path); SQLite's composite index
+answers the exact \texttt{(sid, ts)} top-k in microseconds; FTS5 builds
+inverted files $\sim$5$\times$ faster (a specialized segment writer vs.\ our
+general-purpose btree persistence); Python \texttt{executemany} via the
+row bridge trails SQLite 2.4--2.7$\times$ (use the batch API). We publish
+these alongside our wins because a benchmark table with no losses is a
+marketing artifact, not a measurement.
+
+\section{Limitations and future work}
+\label{sec:limits}
+(i)~\texttt{LATEST BY} over $>$1M rows folds row-at-a-time; segment-level
+per-sensor max-ts metadata is the planned fix. (ii)~Uncommitted inserts are
+invisible to the FTS MATCH \emph{count/limit} fast path (overlay covers
+scans, aggregates, and point lookups). (iii)~No cost-based index planner:
+composite-index shapes (as SQLite uses above) are user-declared, not
+derived. (iv)~Uncommitted-insert visibility for \texttt{MATCH} and the
+columnar rewrite of legacy \texttt{INT}-ts segments are scheduled for the
+0.12.x/0.13 lines. (v)~Pre-1.0: the SQL surface and FFI are still evolving.
+
+\section{Related work}
+Embedded engines: SQLite~\cite{sqlite2022} (row store, VTAB extensibility)
+and DuckDB~\cite{duckdb2019} (vectorized analytical in-process); MoteDB
+occupies the multimodal-sensor niche between them, adding native ANN/FTS/
+spatial structures with transactional overlays. ANN: DiskANN's
+SSD-resident graph~\cite{diskann2019} and FAISS~\cite{faiss} quantization
+guide our SQ8+graph design; HNSW~\cite{hnsw} is the customary
+in-memory alternative. FTS: FTS5 and tantivy~\cite{tantivy} anchor our BM25
+comparisons. RRF~\cite{cormack2009} is the standard calibration-free
+fusion. Gorilla~\cite{gorilla} informs our timestamp coding. To our
+knowledge, extending read-your-writes across FTS and ANN fast paths under
+one MVCC substrate is not addressed by any of these systems individually.
+
+\section{Conclusion}
+MoteDB's thesis is that the fourth system on the robot is one system too
+many, and that the way to earn that claim is procedural: numbers that
+anyone can regenerate (\texttt{make compete}), correctness that an oracle
+validates continuously, and losses published next to wins. The engine, the
+suites, and this report's artifacts are MIT-licensed at
+\url{https://github.com/motedb/motedb}.
+
+\begin{thebibliography}{9}\small
+\bibitem{sqlite2022} G.\,Kennedy, D.\,R.\,K.~Marlins, and R.~Chow.
+SQLite: Past, Present, and Future. \emph{PVLDB}, 15(12), 2022.
+\bibitem{duckdb2019} M.~Raasveldt and H.~M\"uhleisen. DuckDB: an Embeddable
+Analytical Database. \emph{SIGMOD}, 2019.
+\bibitem{diskann2019} N.~Jayaram Subramanya et al. DiskANN: Fast Accurate
+Billion-point Nearest Neighbor Search on a Single Node. \emph{NeurIPS},
+2019.
+\bibitem{faiss} J.~Johnson, M.~Douze, H.~J\'egou. Billion-scale Similarity
+Search with GPUs. \emph{IEEE Trans. Big Data}, 2019.
+\bibitem{hnsw} Y.~A.~Malkov, D.~A.~Yashunin. Efficient and Robust
+Approximate Nearest Neighbor Search Using HNSW Graphs. \emph{IEEE TPAMI},
+2018.
+\bibitem{cormack2009} G.~V.~Cormack, C.~L.\,A.~Clarke, S.~B\"uttcher.
+Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning
+Methods. \emph{SIGIR}, 2009.
+\bibitem{gorilla} T.~Pelkonen et al. Gorilla: A Fast, Scalable, In-Memory
+Time Series Database. \emph{PVLDB}, 8(12), 2015.
+\bibitem{tantivy} P.~Masurel. Tantivy: Full-text Search Engine Library in
+Rust. \url{https://github.com/quickwit-oss/tantivy}, 2026.
+\end{thebibliography}
+
+\end{document}
