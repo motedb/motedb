@@ -29,3 +29,6 @@ bindings/python/target/
 
 # benchmark suite outputs
 benchmark_results/
+
+__pycache__/
+*.pyc
