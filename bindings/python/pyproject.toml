@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "motedb-python"
-version = "0.12.1"
+version = "0.12.2"
 description = "AI-native embedded multimodal database — vectors, full-text, spatial, time-series in one ACID engine."
 requires-python = ">=3.9"
 license = { text = "MIT" }

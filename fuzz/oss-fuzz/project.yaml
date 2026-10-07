@@ -1,0 +1,10 @@
+homepage: "https://github.com/motedb/motedb"
+language: rust
+primary_contact: "motedb@126.com"
+auto_ccs:
+  - "motedb@126.com"
+main_repo: "https://github.com/motedb/motedb"
+fuzzing_engines:
+  - libfuzzer
+sanitizers:
+  - address

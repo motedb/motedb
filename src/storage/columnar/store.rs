@@ -1861,8 +1861,18 @@ impl ColumnarStore {
             next_seq_for_ties += 1;
             seg_row.push((slot.0, next_seq_for_ties, slot.1));
         }
-        for bi in wanted_buf {
-            let (bts, mut sql_row) = buffer_rows.swap_remove(bi);
+        // 🔑 Iterate + filter, never swap_remove: wanted_buf holds ≥1 indices
+        // into buffer_rows, and swap_remove relocates the tail into the removed
+        // slot — removing in any order invalidates the remaining indices
+        // (panic "index should be < len" or, worse, silently taking the wrong
+        // rows). First reproduced by compete_spatial_ts (1M rows, >1 buffered
+        // rows visible to top-k — only reachable since uncommitted rows became
+        // visible to this path).
+        let wanted: std::collections::HashSet<usize> = wanted_buf.into_iter().collect();
+        for (bi, (bts, mut sql_row)) in buffer_rows.into_iter().enumerate() {
+            if !wanted.contains(&bi) {
+                continue;
+            }
             // 🔑 K1: pass2b removed the ts value under `ts_col` to compute
             // the sort key — put it back so the projection sees the column.
             sql_row.insert(ts_col.clone(), Value::Integer(bts));

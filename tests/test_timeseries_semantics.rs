@@ -298,3 +298,70 @@ fn ts_order_limit_int_ts_column() {
     let r2 = rows(&db, "SELECT ts, v FROM sen ORDER BY ts DESC LIMIT 1");
     assert_eq!(r2[0][0], Value::Integer(999));
 }
+
+#[test]
+fn ts_order_limit_multiple_buffered_rows() {
+    // Regression: topk_by_ts pass-2b collected multiple write-buffer indices
+    // into `wanted_buf`, then consumed them with swap_remove in ascending
+    // order — swap_remove relocates the tail into the removed slot, so the
+    // remaining indices went stale (panic "index should be < len", or the
+    // wrong rows silently taken). Only reachable with >1 buffered rows, which
+    // no earlier test produced. Found by the reproducible compete suite
+    // (compete_spatial_ts, 1M rows).
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE sen (ts INT, sid INT, v FLOAT) TIMESERIES(ts)")
+        .unwrap();
+    for i in 0..50i64 {
+        db.execute(
+            format!(
+                "INSERT INTO sen (ts, sid, v) VALUES ({}, {}, {:.1})",
+                i * 10,
+                i % 4,
+                i as f64
+            )
+            .as_str(),
+        )
+        .unwrap();
+    }
+    db.checkpoint().unwrap();
+    // ≥2 rows stay in the write buffer (never checkpointed):
+    for (ts, v) in [(9000, 900.0), (8000, 800.0), (7000, 700.0)] {
+        db.execute(format!("INSERT INTO sen (ts, sid, v) VALUES ({ts}, 9, {v})").as_str())
+            .unwrap();
+    }
+    // Buffered rows win the top-k outright.
+    let r = rows(&db, "SELECT ts, v FROM sen ORDER BY ts DESC LIMIT 3");
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(9000), Value::Float(900.0)],
+            vec![Value::Integer(8000), Value::Float(800.0)],
+            vec![Value::Integer(7000), Value::Float(700.0)],
+        ],
+        "3 buffered rows must all survive pass-2b (swap_remove bug panicked here)"
+    );
+    // k spilling past the buffer mixes buffered + segment rows, newest first.
+    let r5 = rows(&db, "SELECT ts FROM sen ORDER BY ts DESC LIMIT 6");
+    assert_eq!(
+        r5,
+        vec![
+            vec![Value::Integer(9000)],
+            vec![Value::Integer(8000)],
+            vec![Value::Integer(7000)],
+            vec![Value::Integer(490)],
+            vec![Value::Integer(480)],
+            vec![Value::Integer(470)],
+        ]
+    );
+    // ASC path exercises the inverted branch of the same loop.
+    let ra = rows(&db, "SELECT ts FROM sen ORDER BY ts ASC LIMIT 3");
+    assert_eq!(
+        ra,
+        vec![
+            vec![Value::Integer(0)],
+            vec![Value::Integer(10)],
+            vec![Value::Integer(20)],
+        ]
+    );
+}

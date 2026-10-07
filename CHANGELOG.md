@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.12.2] — 2026-10-07
+
+时序 top-k 崩溃修复 + 一键复现基准套件。
+
+### 🔒 时序 top-k 缓冲行遍历崩溃修复（新复现套件实抓）
+
+- 🔒 **`ORDER BY ts LIMIT k` 多缓冲行 panic/漏行**: topk_by_ts pass-2b 把
+  ≥2 个 write-buffer 索引收集进 `wanted_buf` 后用 `swap_remove` 升序消费 —
+  swap_remove 会把尾元素搬到被删位、len 减一，剩余索引全部失效（越界
+  panic "index should be < len"，或静默取错行）。仅当写缓冲区同时有 >1
+  行命中 top-k 时触发（K1 修好"未提交行可见"后才可达），此前的回归
+  测试只造了 1 行缓冲因此漏网。1M 行 compete_spatial_ts 首查即崩
+- 修复: 改为 enumerate + HashSet 过滤（语义等价、顺序确定、无索引失效）
+- 回归: ts_order_limit_multiple_buffered_rows（3 缓冲行 ASC/DESC +
+  k 溢出混合段行 6 形状）
+
+### 🚀 `make compete` 一键复现基准套件
+
+- scripts/compete.sh 编排 Rust bench 四件套 + Python 跨引擎 compete
+  （mote/sqlite 必跑，duckdb/faiss 装了就跑）+ adversarial_verify 正确性
+  门禁，任一步失败即非零退出；逐步骤日志 + 提取的 JSON 落盘
+  benchmark_results/<时间戳>/。**上面的崩溃就是这套件首次运行抓到的**
+- `make wheel`: 先从本地源码重建 Python 绑定再跑（套件驱动的是已安装
+  的 motedb-python — 版本号相同不代表代码相同，本套件自身调试时踩过）
+- 方法论成文: docs/benchmark_methodology.md（数据集确定性种子、耐久档
+  对齐口径、recall 对齐口径、机器无关比值门禁、发布数字的规则）
+
+### 工程
+
+- **OSS-Fuzz 接入预置**: fuzz/oss-fuzz/（project.yaml + Dockerfile +
+  build.sh），拷入 google/oss-fuzz projects/ 即可提 PR
+
 ## [0.12.1] — 2026-10-07
 
 工程整洁版：零告警收官 + 发布通道修复后的第一个常规 patch。
