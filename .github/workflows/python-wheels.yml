@@ -27,10 +27,11 @@ jobs:
           # unix-only FileExt; tikv-jemalloc crates are target-gated off
           # msvc, where its C code cannot build — Windows uses the system
           # allocator).
+          # NOTE: aarch64-pc-windows-msvc REMOVED in v0.12.4 — maturin-action
+          # trips on the WindowsApps python3.EXE stub (EACCES) when
+          # cross-targeting; revisit when the action fixes python discovery.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -55,10 +56,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/setup-python@v5
         with:
-          working-directory: bindings/python
-          args: sdist --out dist
+          python-version: "3.11"
+      # 🔑 NOT maturin-action: its `args` are forwarded to `maturin build`,
+      # so a `sdist --out dist` subcommand leaks into cargo's rustc flags
+      # ("Unrecognized option: 'out'", v0.12.3). Plain pip maturin runs the
+      # exact command verified locally.
+      - name: Build sdist
+        working-directory: bindings/python
+        run: |
+          python -m pip install --quiet maturin
+          python -m maturin sdist --out dist
       - uses: actions/upload-artifact@v4
         with:
           name: sdist

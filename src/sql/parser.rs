@@ -17,7 +17,11 @@ pub struct Parser {
 /// because each level consumes several parser stack frames and test/runtime
 /// threads often have small stacks (~512KB). 64 levels covers any realistic
 /// SQL expression while bounding worst-case stack usage to a few hundred KB.
-const MAX_RECURSION_DEPTH: usize = 64;
+/// 表达式嵌套深度上限。每层守卫计数对应 parse_expr → parse_prefix →
+/// (向量字面量/CASE/子查询) 一条约 40KB 栈帧的递归链 —— 10 层 ≈ 400KB,
+/// 在 macOS CI 的 512KB 测试线程栈内安全(v0.12.3 在 CI 上以 64 层上限
+/// 栈溢出 SIGABRT 实抓; 真实 SQL 的表达式嵌套极少超过 5 层)。
+const MAX_RECURSION_DEPTH: usize = 10;
 /// Maximum identifier length (table/column names) — prevents DoS via memory exhaustion
 const MAX_IDENTIFIER_LENGTH: usize = 4096;
 

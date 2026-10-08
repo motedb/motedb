@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.12.4] — 2026-10-09
+
+v0.12.3 发布流水线修复(首次 CI 实跑抓出 ×3)。
+
+- **sdist job 失败**: maturin-action 的 `args` 会转发给 `maturin build`,
+  `sdist --out dist` 子命令参数泄漏进 cargo 的 rustc 命令行
+  ("Unrecognized option: 'out'")。sdist job 改为 pip 安装 maturin 直接
+  执行(与本地验证完全一致的命令路径)
+- **Windows aarch64 wheel 失败**: maturin-action 交叉目标下解析
+  python 解释器时踩中 WindowsApps `python3.EXE` 存根的 EACCES(action
+  上游问题)。移除该矩阵项(x64 wheel 已成功交付), 待 action 修复后
+  恢复; 已在 workflow 注释记录
+- **macOS CI 集成测试 SIGABRT(栈溢出)**: 解析器表达式递归守卫上限 64
+  层, 但每层守卫计数对应约 40KB 栈帧的递归链 —— 64 层需 ~2.5MB 栈,
+  macOS CI 测试线程 512KB 栈下直接溢出(fuzz 回归用例 1572 个 `[`
+  触发)。上限降至 **10 层**(≈400KB, 384KB 栈实测安全; 真实 SQL 表达
+  式嵌套极少超过 5 层), 本地以 RUST_MIN_STACK=393216/524288 双档验证
+  + 默认栈全回归通过
+- crates.io 的 0.12.3(内容同 0.12.4 代码)不受影响; PyPI 首个版本由
+  本 tag 发布
+
 ## [0.12.3] — 2026-10-08
 
 外部生产测评（隔离 PoC 评审）两项阻断性发现修复。
