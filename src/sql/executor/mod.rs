@@ -1931,6 +1931,42 @@ thread_local! {
     static TEXT_MATCH_MEMO: std::cell::RefCell<
         std::collections::HashMap<String, Arc<std::collections::HashSet<u64>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// 🔓 v2 CTE materialization: name → (columns, rows). Every CTE — plain
+    /// or recursive — is evaluated ONCE when the WITH clause is applied and
+    /// registered here; FROM references to the name resolve from this map
+    /// (shadowing any real table, per SQL scoping). Cleared at the start of
+    /// each top-level statement (CTE_EVAL_DEPTH == 0), so it never leaks
+    /// across statements.
+    static MATERIALIZED_CTES: std::cell::RefCell<
+        std::collections::HashMap<String, MaterializedCte>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Re-entrancy guard: recursive-CTE evaluation itself calls
+    /// execute_streaming_ref, which must NOT clear MATERIALIZED_CTES.
+    static CTE_EVAL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A materialized CTE: output column names + rows (shared, cheap clones).
+#[derive(Clone)]
+struct MaterializedCte {
+    columns: Vec<String>,
+    rows: Arc<Vec<Row>>,
+}
+
+/// How a CTE is presented to referencing statements during the WITH-apply
+/// rewrite: an inlinable body (derived-table substitution).
+#[derive(Clone)]
+enum VisibleCte {
+    Inlined(Statement),
+}
+
+/// Dedup key for UNION (non-ALL) recursive CTEs. Debug formatting of Value is
+/// injective across variants (Integer(1) vs Text("1") differ).
+fn row_dedup_key(r: &Row) -> String {
+    let mut s = String::with_capacity(r.len() * 8);
+    for v in r.iter() {
+        s.push_str(&format!("{:?}|", v));
+    }
+    s
 }
 
 /// Determine if a CASE WHEN condition value is "true".
@@ -2030,8 +2066,15 @@ impl QueryExecutor {
 
     pub fn execute(&self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
-            Statement::Select { stmt: s, ctes } => {
-                let s = self.apply_ctes_for_select(s, &ctes)?;
+            Statement::Select {
+                stmt: s,
+                ctes,
+                with_recursive,
+            } => {
+                if CTE_EVAL_DEPTH.get() == 0 {
+                    MATERIALIZED_CTES.with(|m| m.borrow_mut().clear());
+                }
+                let s = self.apply_ctes_for_select(s, &ctes, with_recursive)?;
                 self.execute_select(s)
             }
             Statement::SetOp {
@@ -2040,15 +2083,25 @@ impl QueryExecutor {
                 op,
                 all,
                 ctes,
+                with_recursive,
                 order_by,
                 limit,
                 offset,
             } => {
+                if CTE_EVAL_DEPTH.get() == 0 {
+                    MATERIALIZED_CTES.with(|m| m.borrow_mut().clear());
+                }
                 // Execute the outermost set op, then apply the trailing
                 // ORDER BY / LIMIT / OFFSET carried by this node (per SQL
                 // standard these apply to the whole set result).
-                let mut result =
-                    self.execute_set_op(left.as_ref(), right.as_ref(), op.clone(), all, &ctes)?;
+                let mut result = self.execute_set_op(
+                    left.as_ref(),
+                    right.as_ref(),
+                    op.clone(),
+                    all,
+                    &ctes,
+                    with_recursive,
+                )?;
                 if order_by.is_some() || limit.is_some() || offset.is_some() {
                     result = self.apply_set_op_trailing(result, &order_by, limit, offset)?;
                 }
@@ -2444,8 +2497,15 @@ impl QueryExecutor {
         // column segments on every call (20ms+ for 2M-row segments).
 
         let result = match stmt {
-            Statement::Select { stmt: s, ctes } => {
-                let s = self.apply_ctes_for_select(s.clone(), ctes)?;
+            Statement::Select {
+                stmt: s,
+                ctes,
+                with_recursive,
+            } => {
+                if CTE_EVAL_DEPTH.get() == 0 {
+                    MATERIALIZED_CTES.with(|m| m.borrow_mut().clear());
+                }
+                let s = self.apply_ctes_for_select(s.clone(), ctes, *with_recursive)?;
                 self.execute_select_streaming_ref(&s)?
             }
             Statement::SetOp {
@@ -2454,12 +2514,22 @@ impl QueryExecutor {
                 op,
                 all,
                 ctes,
+                with_recursive,
                 order_by,
                 limit,
                 offset,
             } => {
-                let mut result =
-                    self.execute_set_op(left.as_ref(), right.as_ref(), op.clone(), *all, ctes)?;
+                if CTE_EVAL_DEPTH.get() == 0 {
+                    MATERIALIZED_CTES.with(|m| m.borrow_mut().clear());
+                }
+                let mut result = self.execute_set_op(
+                    left.as_ref(),
+                    right.as_ref(),
+                    op.clone(),
+                    *all,
+                    ctes,
+                    *with_recursive,
+                )?;
                 if order_by.is_some() || limit.is_some() || offset.is_some() {
                     result = self.apply_set_op_trailing(result, order_by, *limit, *offset)?;
                 }
@@ -2706,256 +2776,680 @@ impl QueryExecutor {
         self.execute_select_internal(&stmt)
     }
 
-    /// Rewrite a SELECT's FROM clause so that any reference to a CTE name
-    /// becomes a `TableRef::Subquery` over the CTE's body.
+    /// 🔓 v2 CTE application — uniform MATERIALIZATION.
     ///
-    /// This is the heart of WITH/CTE support: by the time the executor sees
-    /// the statement, CTE references have been inlined as derived tables,
-    /// which `execute_from_with_limit` already knows how to materialize
-    /// (`executor.rs:12252`). No storage or executor core changes needed.
+    /// Every CTE (plain or recursive) is evaluated ONCE, in definition order,
+    /// and its result registered in the thread-local MATERIALIZED_CTES map.
+    /// FROM references to a CTE name resolve from that map at scan time (see
+    /// `execute_from_with_limit` and the streaming dispatch), shadowing any
+    /// real table per SQL scoping. The statement itself is returned
+    /// unchanged — no AST rewriting. This replaces the v1 inline-subquery
+    /// rewrite, which could not represent UNION bodies and could not do
+    /// fixed-point evaluation.
     ///
-    /// **Lexical scoping**: CTEs are processed in definition order. Each CTE's
-    /// body is rewritten against the set of *preceding* CTEs (so a later CTE
-    /// can reference an earlier one); the main statement is rewritten against
-    /// *all* CTEs.
-    ///
-    /// **RECURSIVE**: v1 does not implement fixed-point evaluation. If a CTE
-    /// body references a CTE of the same name (direct self-reference) we
-    /// return an explicit error rather than silently producing wrong results.
-    /// Forward references to not-yet-defined CTEs are also rejected.
-    fn apply_ctes_for_select(&self, mut stmt: SelectStmt, ctes: &[CteDef]) -> Result<SelectStmt> {
+    /// **Recursive CTEs** (`WITH RECURSIVE`): the body must be
+    /// `<anchor> UNION [ALL] <recursive part>` where only the recursive part
+    /// references the CTE name. Evaluation is the standard semi-naive
+    /// iteration: the anchor seeds the working table; each round evaluates
+    /// the recursive part against the PREVIOUS round's rows only, until it
+    /// produces no (new) rows. UNION deduplicates across rounds; UNION ALL
+    /// appends everything. Guards: ≤10k iterations, ≤1M accumulated rows.
+    fn apply_ctes_for_select(
+        &self,
+        mut stmt: SelectStmt,
+        ctes: &[CteDef],
+        with_recursive: bool,
+    ) -> Result<SelectStmt> {
         if ctes.is_empty() {
             return Ok(stmt);
         }
-
-        // Accumulate visible CTE bodies as we go (name -> cloned body).
-        // Stored as Vec to preserve insertion order for diagnostics.
-        let mut visible: Vec<(String, CteDef)> = Vec::with_capacity(ctes.len());
+        // How each CTE is presented to later references:
+        // - Inlined(body): the body (with earlier CTE refs already substituted)
+        //   replaces the reference as a derived table — same zero-overhead
+        //   strategy as v1, now also covering UNION bodies.
+        // - NameOnly: leave the bare name; it resolves from MATERIALIZED_CTES
+        //   at scan time (used when the recursive result is too large to
+        //   synthesize, or empty).
+        let mut visible: Vec<(String, VisibleCte)> = Vec::with_capacity(ctes.len());
 
         for cte in ctes {
-            // Detect direct self-reference / forward reference.
-            if let Some(from) = &cte.query.from {
-                Self::check_recursive_ref(
-                    from,
-                    &cte.name,
-                    &visible.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-                )?;
+            let self_ref = Self::statement_references_table(&cte.body, &cte.name);
+            if self_ref && !with_recursive {
+                return Err(MoteDBError::Query(format!(
+                    "recursive CTE '{}' requires WITH RECURSIVE",
+                    cte.name
+                )));
             }
-
-            // Rewrite this CTE's body against previously-defined CTEs.
-            let mut body = cte.query.clone();
-            if let Some(from) = body.from.as_mut() {
-                Self::rewrite_from_cte_refs(from, &visible, &cte.columns, &cte.name);
+            if self_ref {
+                let (columns, rows) = self.evaluate_recursive_cte(cte)?;
+                match Self::rows_to_union_statement(&rows, &columns) {
+                    Some(synth) => visible.push((cte.name.clone(), VisibleCte::Inlined(synth))),
+                    None if rows.len() > 10_000 => {
+                        return Err(MoteDBError::Query(format!(
+                            "recursive CTE '{}' produced more than 10000 rows — results beyond that are not yet supported; filter inside the recursion or query it in batches",
+                            cte.name
+                        )))
+                    }
+                    None => {
+                        return Err(MoteDBError::Query(format!(
+                            "recursive CTE '{}' produced non-scalar values (vector/tensor/spatial) which cannot be referenced as a table",
+                            cte.name
+                        )))
+                    }
+                }
+            } else {
+                // Inline: clone the body, substitute earlier CTE references,
+                // then apply explicit column aliases.
+                let mut body = cte.body.clone();
+                Self::rewrite_statement_cte_refs(&mut body, &visible);
+                // 🔑 A UNION body with explicit column aliases can't be
+                // renamed in place — evaluate it once and synthesize with the
+                // alias names (same path recursive CTEs use).
+                let needs_synth = cte.columns.is_some() && matches!(body, Statement::SetOp { .. });
+                let body = if needs_synth {
+                    let (mut columns, rows) = self.eval_cte_statement(&body)?;
+                    Self::apply_cte_aliases(&mut columns, &cte.columns)?;
+                    match Self::rows_to_union_statement(&rows, &columns) {
+                        Some(synth) => synth,
+                        None => {
+                            return Err(MoteDBError::Query(format!(
+                                "CTE '{}' with column aliases produced more than 10000 rows — not yet supported",
+                                cte.name
+                            )))
+                        }
+                    }
+                } else {
+                    Self::wrap_cte_aliases(body, &cte.columns, &cte.name)?
+                };
+                visible.push((cte.name.clone(), VisibleCte::Inlined(body)));
             }
-            // Apply explicit column aliases (WITH x(a, b) AS (...)).
-            if let Some(cols) = &cte.columns {
-                Self::apply_cte_column_aliases(&mut body, cols);
-            }
-
-            visible.push((
-                cte.name.clone(),
-                CteDef {
-                    name: cte.name.clone(),
-                    columns: cte.columns.clone(),
-                    query: body,
-                },
-            ));
         }
 
-        // Rewrite the main statement's FROM against all CTEs.
+        // Rewrite the main statement's FROM + expression subqueries.
         if let Some(from) = stmt.from.as_mut() {
-            Self::rewrite_from_cte_refs(from, &visible, &None, "");
+            Self::rewrite_from_visible(from, &visible);
         }
-
-        // 🔑 Rewrite CTE references inside subqueries that appear in the
-        // WHERE / SELECT-list / HAVING (e.g. `WHERE v IN (SELECT ... FROM x)`).
-        // These Expr::Subquery nodes have their own FROM that must see the
-        // outer CTEs per SQL scoping. The FROM-level rewrite above only
-        // touches the main FROM clause, not expression subqueries.
         if let Some(wc) = stmt.where_clause.as_mut() {
-            Self::rewrite_subquery_cte_refs(wc, &visible);
+            Self::rewrite_expr_cte_refs(wc, &visible);
         }
         if let Some(hv) = stmt.having.as_mut() {
-            Self::rewrite_subquery_cte_refs(hv, &visible);
+            Self::rewrite_expr_cte_refs(hv, &visible);
         }
         for col in stmt.columns.iter_mut() {
             if let crate::sql::ast::SelectColumn::Expr(e, _) = col {
-                Self::rewrite_subquery_cte_refs(e, &visible);
+                Self::rewrite_expr_cte_refs(e, &visible);
             }
         }
 
         Ok(stmt)
     }
 
-    /// Recursively walk an expression and rewrite CTE references inside any
-    /// `Expr::Subquery`'s FROM clause (so subqueries in WHERE/SELECT/HAVING
-    /// can reference outer-query CTEs).
-    fn rewrite_subquery_cte_refs(expr: &mut Expr, visible: &[(String, CteDef)]) {
-        match expr {
-            Expr::Subquery(sub) => {
-                if let Some(inner_from) = sub.from.as_mut() {
-                    Self::rewrite_from_cte_refs(inner_from, visible, &None, "");
+    /// Synthesize a `SELECT <row0> UNION ALL SELECT <row1> ...` statement from
+    /// materialized rows, so a recursive CTE result can be inlined as a
+    /// derived table exactly like a plain CTE. Returns None when the result
+    /// is too large to synthesize (> 10k rows) or empty (an empty UNION chain
+    /// is unrepresentable) — callers fall back to name-based resolution.
+    fn rows_to_union_statement(rows: &[Row], columns: &[String]) -> Option<Statement> {
+        const SYNTH_LIMIT: usize = 10_000;
+        if rows.len() > SYNTH_LIMIT {
+            return None;
+        }
+        if rows.is_empty() {
+            // Zero rows: `SELECT NULL AS c1, ... WHERE 1 = 0` — a statement
+            // with the right shape and no rows.
+            return Some(Statement::Select {
+                stmt: SelectStmt {
+                    distinct: false,
+                    columns: columns
+                        .iter()
+                        .map(|c| {
+                            crate::sql::ast::SelectColumn::Expr(
+                                Expr::Literal(Value::Null),
+                                Some(c.clone()),
+                            )
+                        })
+                        .collect(),
+                    from: None,
+                    where_clause: Some(Expr::BinaryOp {
+                        left: Box::new(Expr::Literal(Value::Integer(1))),
+                        op: crate::sql::ast::BinaryOperator::Eq,
+                        right: Box::new(Expr::Literal(Value::Integer(0))),
+                    }),
+                    group_by: None,
+                    having: None,
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                    limit_param: None,
+                    offset_param: None,
+                    latest_by: None,
+                },
+                ctes: Vec::new(),
+                with_recursive: false,
+            });
+        }
+        // 🔑 Only scalar values are synthesizable. A Vector / Tensor /
+        // Spatial / TextDoc payload has no literal form — silently
+        // stringifying it would corrupt data, so refuse the whole synthesis
+        // (callers error with a clear message).
+        let scalarizable = |v: &Value| {
+            matches!(
+                v,
+                Value::Integer(_)
+                    | Value::Float(_)
+                    | Value::Text(_)
+                    | Value::Bool(_)
+                    | Value::Timestamp(_)
+            )
+        };
+        if rows.iter().flatten().any(|v| !scalarizable(v)) {
+            return None;
+        }
+        let make_select = |r: &Row| -> SelectStmt {
+            SelectStmt {
+                distinct: false,
+                columns: r
+                    .iter()
+                    .zip(columns.iter())
+                    .map(|(v, name)| {
+                        // Project the value as its canonical literal, renamed
+                        // to the CTE's column name.
+                        let lit = match v {
+                            Value::Integer(i) => Expr::Literal(Value::Integer(*i)),
+                            Value::Float(f) => Expr::Literal(Value::Float(*f)),
+                            Value::Text(t) => Expr::Literal(Value::text(t.to_string())),
+                            Value::Bool(b) => Expr::Literal(Value::Bool(*b)),
+                            Value::Timestamp(t) => Expr::Literal(Value::Timestamp(*t)),
+                            _ => unreachable!("pre-checked scalarizable"),
+                        };
+                        crate::sql::ast::SelectColumn::Expr(lit, Some(name.clone()))
+                    })
+                    .collect(),
+                from: None,
+                where_clause: None,
+                group_by: None,
+                having: None,
+                order_by: None,
+                limit: None,
+                offset: None,
+                limit_param: None,
+                offset_param: None,
+                latest_by: None,
+            }
+        };
+        // 🔑 Balanced binary UNION ALL tree (depth log₂N). A left-leaning
+        // chain made execute_set_op's left-recursion overflow the stack at a
+        // few thousand rows.
+        fn build(rows: &[&Row], make: &dyn Fn(&Row) -> SelectStmt) -> Statement {
+            if rows.len() == 1 {
+                return Statement::Select {
+                    stmt: make(rows[0]),
+                    ctes: Vec::new(),
+                    with_recursive: false,
+                };
+            }
+            let mid = rows.len() / 2;
+            Statement::SetOp {
+                left: Box::new(build(&rows[..mid], make)),
+                right: Box::new(build(&rows[mid..], make)),
+                op: crate::sql::ast::SetOp::Union,
+                all: true,
+                ctes: Vec::new(),
+                with_recursive: false,
+                order_by: None,
+                limit: None,
+                offset: None,
+            }
+        }
+        let refs: Vec<&Row> = rows.iter().collect();
+        Some(build(&refs, &make_select))
+    }
+
+    /// Apply `WITH x(a, b)` column aliases to an inlined CTE body. Plain
+    /// SELECT bodies keep their shape with each projected column renamed;
+    /// set-op bodies are wrapped in an outer SELECT when possible.
+    fn wrap_cte_aliases(
+        body: Statement,
+        aliases: &Option<Vec<String>>,
+        name: &str,
+    ) -> Result<Statement> {
+        let aliases = match aliases {
+            Some(a) => a,
+            None => return Ok(body),
+        };
+        match body {
+            Statement::Select { mut stmt, .. } => {
+                if stmt.columns.len() == aliases.len()
+                    && !stmt
+                        .columns
+                        .iter()
+                        .any(|c| matches!(c, crate::sql::ast::SelectColumn::Star))
+                {
+                    for (c, alias) in stmt.columns.iter_mut().zip(aliases.iter()) {
+                        match c {
+                            crate::sql::ast::SelectColumn::ColumnWithAlias(_, a) => {
+                                *a = alias.clone()
+                            }
+                            crate::sql::ast::SelectColumn::Column(n) => {
+                                *c = crate::sql::ast::SelectColumn::ColumnWithAlias(
+                                    n.clone(),
+                                    alias.clone(),
+                                )
+                            }
+                            crate::sql::ast::SelectColumn::Expr(_, a) => *a = Some(alias.clone()),
+                            crate::sql::ast::SelectColumn::Star => {}
+                        }
+                    }
+                    Ok(Statement::Select {
+                        stmt,
+                        ctes: Vec::new(),
+                        with_recursive: false,
+                    })
+                } else {
+                    Err(MoteDBError::Query(format!(
+                        "CTE '{}' column list has {} names but the body projects {} columns",
+                        name,
+                        aliases.len(),
+                        stmt.columns.len()
+                    )))
                 }
-                // Recurse into the subquery's own WHERE/SELECT for nested subs.
-                if let Some(wc) = sub.where_clause.as_mut() {
-                    Self::rewrite_subquery_cte_refs(wc, visible);
+            }
+            other => {
+                let _ = other;
+                Err(MoteDBError::Query(format!(
+                    "CTE '{}': explicit column aliases on a UNION body are not supported",
+                    name
+                )))
+            }
+        }
+    }
+
+    /// Rewrite CTE references in a whole statement (FROM of a Select, or both
+    /// halves of a set-op chain).
+    fn rewrite_statement_cte_refs(stmt: &mut Statement, visible: &[(String, VisibleCte)]) {
+        match stmt {
+            Statement::Select { stmt: s, .. } => {
+                if let Some(from) = s.from.as_mut() {
+                    Self::rewrite_from_visible(from, visible);
                 }
-                for col in sub.columns.iter_mut() {
-                    if let crate::sql::ast::SelectColumn::Expr(e, _) = col {
-                        Self::rewrite_subquery_cte_refs(e, visible);
+                if let Some(wc) = s.where_clause.as_mut() {
+                    Self::rewrite_expr_cte_refs(wc, visible);
+                }
+                for c in s.columns.iter_mut() {
+                    if let crate::sql::ast::SelectColumn::Expr(e, _) = c {
+                        Self::rewrite_expr_cte_refs(e, visible);
                     }
                 }
             }
-            Expr::BinaryOp { left, right, .. } => {
-                Self::rewrite_subquery_cte_refs(left, visible);
-                Self::rewrite_subquery_cte_refs(right, visible);
-            }
-            Expr::UnaryOp { expr, .. } => Self::rewrite_subquery_cte_refs(expr, visible),
-            Expr::In { expr, list, .. } => {
-                Self::rewrite_subquery_cte_refs(expr, visible);
-                for item in list.iter_mut() {
-                    Self::rewrite_subquery_cte_refs(item, visible);
-                }
-            }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                Self::rewrite_subquery_cte_refs(expr, visible);
-                Self::rewrite_subquery_cte_refs(low, visible);
-                Self::rewrite_subquery_cte_refs(high, visible);
-            }
-            Expr::Like { expr, pattern, .. } => {
-                Self::rewrite_subquery_cte_refs(expr, visible);
-                Self::rewrite_subquery_cte_refs(pattern, visible);
-            }
-            Expr::IsNull { expr, .. } => Self::rewrite_subquery_cte_refs(expr, visible),
-            Expr::FunctionCall { args, .. } => {
-                for a in args.iter_mut() {
-                    Self::rewrite_subquery_cte_refs(a, visible);
-                }
-            }
-            Expr::Case { whens, else_expr } => {
-                for (c, v) in whens.iter_mut() {
-                    Self::rewrite_subquery_cte_refs(c, visible);
-                    Self::rewrite_subquery_cte_refs(v, visible);
-                }
-                if let Some(e) = else_expr.as_mut() {
-                    Self::rewrite_subquery_cte_refs(e, visible);
-                }
+            Statement::SetOp { left, right, .. } => {
+                Self::rewrite_statement_cte_refs(left, visible);
+                Self::rewrite_statement_cte_refs(right, visible);
             }
             _ => {}
         }
     }
 
-    /// Walk a `TableRef` tree and replace `Table { name: cte_name, .. }` with
-    /// `Subquery { query: <cloned body>, alias }` for every name in `visible`.
-    ///
-    /// `owner_name` / `owner_aliases` are used to apply CTE-level column
-    /// aliases when the CTE itself is referenced (rare; usually None / "").
-    fn rewrite_from_cte_refs(
-        table_ref: &mut TableRef,
-        visible: &[(String, CteDef)],
-        _owner_aliases: &Option<Vec<String>>,
-        _owner_name: &str,
-    ) {
+    /// FROM-level substitution: `Table{name}` → `Subquery{inlined body}`.
+    fn rewrite_from_visible(table_ref: &mut TableRef, visible: &[(String, VisibleCte)]) {
         match table_ref {
             TableRef::Table { name, alias } => {
-                if let Some((_, cte)) = visible.iter().find(|(n, _)| n == name) {
+                if let Some((_, VisibleCte::Inlined(body))) =
+                    visible.iter().find(|(n, _)| n == name)
+                {
                     let new_alias = alias.clone().unwrap_or_else(|| name.clone());
                     *table_ref = TableRef::Subquery {
-                        query: Box::new(cte.query.clone()),
+                        query: Box::new(body.clone()),
                         alias: new_alias,
                     };
                 }
             }
             TableRef::Subquery { query, .. } => {
-                // 🔑 Rewrite CTE references inside nested subqueries too. Per
-                // SQL scoping, a CTE defined in the outer query is visible to
-                // subqueries (e.g. `WITH x AS (...) SELECT ... WHERE v IN
-                // (SELECT MAX(s) FROM x)`). Previously this was skipped, so the
-                // inner `FROM x` raised "Table 'x' not found". We recurse into
-                // the subquery's own FROM clause with the same visible CTEs.
-                if let Some(inner_from) = query.from.as_mut() {
-                    Self::rewrite_from_cte_refs(inner_from, visible, &None, "");
-                }
+                Self::rewrite_statement_cte_refs(query, visible);
             }
-            TableRef::Join {
-                left,
-                right,
-                join_type: _,
-                on_condition: _,
-            } => {
-                Self::rewrite_from_cte_refs(left, visible, &None, "");
-                Self::rewrite_from_cte_refs(right, visible, &None, "");
+            TableRef::Join { left, right, .. } => {
+                Self::rewrite_from_visible(left, visible);
+                Self::rewrite_from_visible(right, visible);
             }
         }
     }
 
-    /// Detect direct self-reference (the CTE body names itself) or forward
-    /// reference (names a CTE defined later). Both are unsupported in v1.
-    fn check_recursive_ref(
-        table_ref: &TableRef,
-        self_name: &str,
-        defined_so_far: &[&str],
-    ) -> Result<()> {
-        match table_ref {
-            TableRef::Table { name, .. } => {
-                if name == self_name {
+    /// Expression walker: rewrite CTE references inside subqueries in
+    /// WHERE / HAVING / SELECT-list expressions.
+    fn rewrite_expr_cte_refs(expr: &mut Expr, visible: &[(String, VisibleCte)]) {
+        match expr {
+            Expr::Subquery(s) => {
+                if let Some(from) = s.from.as_mut() {
+                    Self::rewrite_from_visible(from, visible);
+                }
+                if let Some(wc) = s.where_clause.as_mut() {
+                    Self::rewrite_expr_cte_refs(wc, visible);
+                }
+                for col in s.columns.iter_mut() {
+                    if let crate::sql::ast::SelectColumn::Expr(e, _) = col {
+                        Self::rewrite_expr_cte_refs(e, visible);
+                    }
+                }
+            }
+            Expr::Exists(inner) => {
+                if let Statement::Select { stmt: s, .. } = inner.as_mut() {
+                    if let Some(from) = s.from.as_mut() {
+                        Self::rewrite_from_visible(from, visible);
+                    }
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::rewrite_expr_cte_refs(left, visible);
+                Self::rewrite_expr_cte_refs(right, visible);
+            }
+            Expr::UnaryOp { expr: inner, .. } => Self::rewrite_expr_cte_refs(inner, visible),
+            Expr::In { expr, list, .. } => {
+                Self::rewrite_expr_cte_refs(expr, visible);
+                for item in list.iter_mut() {
+                    Self::rewrite_expr_cte_refs(item, visible);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                Self::rewrite_expr_cte_refs(expr, visible);
+                Self::rewrite_expr_cte_refs(low, visible);
+                Self::rewrite_expr_cte_refs(high, visible);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args.iter_mut() {
+                    Self::rewrite_expr_cte_refs(a, visible);
+                }
+            }
+            Expr::Case { whens, else_expr } => {
+                for (c, v) in whens.iter_mut() {
+                    Self::rewrite_expr_cte_refs(c, visible);
+                    Self::rewrite_expr_cte_refs(v, visible);
+                }
+                if let Some(e) = else_expr.as_mut() {
+                    Self::rewrite_expr_cte_refs(e, visible);
+                }
+            }
+            Expr::Like {
+                expr: e, pattern, ..
+            } => {
+                Self::rewrite_expr_cte_refs(e, visible);
+                Self::rewrite_expr_cte_refs(pattern, visible);
+            }
+            Expr::IsNull { expr: e, .. } => Self::rewrite_expr_cte_refs(e, visible),
+            _ => {}
+        }
+    }
+
+    /// Evaluate a recursive CTE by semi-naive fixed-point iteration.
+    /// Returns the final (columns, rows) — also registered in
+    /// MATERIALIZED_CTES so NameOnly references resolve.
+    fn evaluate_recursive_cte(&self, cte: &CteDef) -> Result<(Vec<String>, Arc<Vec<Row>>)> {
+        const MAX_ITERS: usize = 10_000;
+        const MAX_ROWS: usize = 1_000_000;
+
+        let (anchor, recursive, dedup) = match &cte.body {
+            Statement::SetOp {
+                left,
+                right,
+                op: crate::sql::ast::SetOp::Union,
+                all,
+                ..
+            } => (left.as_ref(), right.as_ref(), !*all),
+            _ => {
+                return Err(MoteDBError::Query(format!(
+                    "recursive CTE '{}' body must be <anchor> UNION [ALL] <recursive part>",
+                    cte.name
+                )))
+            }
+        };
+        if Self::statement_references_table(anchor, &cte.name) {
+            return Err(MoteDBError::Query(format!(
+                "recursive CTE '{}': the anchor (left of UNION) may not reference the CTE itself",
+                cte.name
+            )));
+        }
+
+        let (mut columns, anchor_rows) = self.eval_cte_statement(anchor)?;
+        Self::apply_cte_aliases(&mut columns, &cte.columns)?;
+        let width = columns.len();
+        for r in anchor_rows.iter() {
+            if r.len() != width {
+                return Err(MoteDBError::Query(format!(
+                    "recursive CTE '{}': anchor produces {} columns, expected {}",
+                    cte.name,
+                    r.len(),
+                    width
+                )));
+            }
+        }
+        let _ = &columns;
+
+        let mut all_rows: Vec<Row> = anchor_rows.to_vec();
+        let mut seen: std::collections::HashSet<String> = if dedup {
+            all_rows.iter().map(row_dedup_key).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut working: Vec<Row> = anchor_rows.to_vec();
+
+        // 🔑 The recursive step's self-reference (`FROM c`) is satisfied by
+        // INLINING the working set as a synthetic UNION-chain derived table —
+        // no name-based resolution, so none of the executor's table fast
+        // paths can trip over the CTE name. Frontier cap = synth limit.
+        const FRONTIER_LIMIT: usize = 10_000;
+        for _ in 0..MAX_ITERS {
+            if working.is_empty() {
+                break;
+            }
+            if working.len() > FRONTIER_LIMIT {
+                return Err(MoteDBError::Query(format!(
+                    "recursive CTE '{}': a single iteration produced more than {} rows (unsupported)",
+                    cte.name, FRONTIER_LIMIT
+                )));
+            }
+            let working_synth =
+                Self::rows_to_union_statement(&working, &columns).ok_or_else(|| {
+                    MoteDBError::Query(format!(
+                        "recursive CTE '{}': working set cannot be inlined",
+                        cte.name
+                    ))
+                })?;
+            let mut step = recursive.clone();
+            Self::substitute_cte_self_ref(&mut step, &cte.name, working_synth);
+            // Also expose the working set by name for shapes the substitution
+            // can't reach (e.g. self-reference inside an expression subquery).
+            MATERIALIZED_CTES.with(|m| {
+                m.borrow_mut().insert(
+                    cte.name.clone(),
+                    MaterializedCte {
+                        columns: columns.clone(),
+                        rows: Arc::new(working.clone()),
+                    },
+                );
+            });
+            let (_cols, new_rows) = self.eval_cte_statement(&step)?;
+            for r in new_rows.iter() {
+                if r.len() != width {
                     return Err(MoteDBError::Query(format!(
-                        "Recursive CTE '{}' is not supported (self-reference in FROM)",
-                        self_name
+                        "recursive CTE '{}': recursive part produces {} columns, expected {}",
+                        cte.name,
+                        r.len(),
+                        width
                     )));
                 }
-                // A name that looks like a CTE but isn't yet defined is a
-                // forward reference — only flag if it matches a CTE defined
-                // later. We can't see "later" here, so we check: if the name
-                // isn't a real table AND isn't an already-defined CTE, the
-                // normal "no such table" error from execute_from will surface
-                // it. So no extra check here.
-                let _ = defined_so_far;
             }
+            let fresh: Vec<Row> = if dedup {
+                new_rows
+                    .iter()
+                    .filter(|r| seen.insert(row_dedup_key(r)))
+                    .cloned()
+                    .collect()
+            } else {
+                new_rows.to_vec()
+            };
+            if fresh.is_empty() {
+                break;
+            }
+            if all_rows.len() + fresh.len() > MAX_ROWS {
+                return Err(MoteDBError::Query(format!(
+                    "recursive CTE '{}' exceeded {} accumulated rows (guard)",
+                    cte.name, MAX_ROWS
+                )));
+            }
+            all_rows.extend(fresh.iter().cloned());
+            working = fresh;
+        }
+
+        let rows = Arc::new(all_rows);
+        MATERIALIZED_CTES.with(|m| {
+            m.borrow_mut().insert(
+                cte.name.clone(),
+                MaterializedCte {
+                    columns: columns.clone(),
+                    rows: Arc::clone(&rows),
+                },
+            );
+        });
+        Ok((columns, rows))
+    }
+
+    /// Replace every `FROM <cte_name>` self-reference in a recursive step
+    /// with a Subquery over the synthesized working set.
+    fn substitute_cte_self_ref(stmt: &mut Statement, name: &str, synth: Statement) {
+        match stmt {
+            Statement::Select { stmt: s, .. } => {
+                if let Some(from) = s.from.as_mut() {
+                    Self::substitute_from(from, name, synth.clone());
+                }
+            }
+            Statement::SetOp { left, right, .. } => {
+                Self::substitute_cte_self_ref(left, name, synth.clone());
+                Self::substitute_cte_self_ref(right, name, synth);
+            }
+            _ => {}
+        }
+    }
+
+    fn substitute_from(t: &mut TableRef, name: &str, synth: Statement) {
+        match t {
+            TableRef::Table { name: n, alias } if n == name => {
+                let new_alias = alias.clone().unwrap_or_else(|| name.to_string());
+                *t = TableRef::Subquery {
+                    query: Box::new(synth),
+                    alias: new_alias,
+                };
+            }
+            TableRef::Subquery { query, .. } => Self::substitute_cte_self_ref(query, name, synth),
             TableRef::Join { left, right, .. } => {
-                Self::check_recursive_ref(left, self_name, defined_so_far)?;
-                Self::check_recursive_ref(right, self_name, defined_so_far)?;
+                Self::substitute_from(left, name, synth.clone());
+                Self::substitute_from(right, name, synth);
             }
-            TableRef::Subquery { .. } => {}
+            _ => {}
+        }
+    }
+
+    /// Execute a CTE body statement (SELECT or UNION chain) to completion.
+    /// Returns its output column names + rows. Re-entrancy guarded so the
+    /// nested execution does not clear MATERIALIZED_CTES.
+    fn eval_cte_statement(&self, body: &Statement) -> Result<(Vec<String>, Arc<Vec<Row>>)> {
+        CTE_EVAL_DEPTH.with(|d| d.set(d.get() + 1));
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                CTE_EVAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        let _guard = DepthGuard;
+        let result = self.execute_streaming_ref(body)?.materialize()?;
+        match result {
+            QueryResult::Select { columns, rows } => Ok((columns, Arc::new(rows))),
+            _ => Err(MoteDBError::Query("CTE body must be a SELECT".into())),
+        }
+    }
+
+    /// Override a CTE's output column names from `WITH x(a, b) AS (...)`.
+    fn apply_cte_aliases(columns: &mut Vec<String>, aliases: &Option<Vec<String>>) -> Result<()> {
+        if let Some(aliases) = aliases {
+            if aliases.len() != columns.len() {
+                return Err(MoteDBError::Query(format!(
+                    "CTE column list has {} names but the body produces {} columns",
+                    aliases.len(),
+                    columns.len()
+                )));
+            }
+            *columns = aliases.clone();
         }
         Ok(())
     }
 
-    /// Apply CTE-level column aliases: `WITH x(a, b) AS (SELECT id, name ...)`
-    /// → make the body emit columns named a, b without changing source names.
-    ///
-    /// Strategy: if the body uses `SELECT *`, leave it (can't reliably map).
-    /// Otherwise rewrite each `SelectColumn` to carry the alias from position
-    /// `i` in `aliases` while preserving the source column / expression.
-    fn apply_cte_column_aliases(body: &mut SelectStmt, aliases: &[String]) {
-        // Only rewrite if column count matches and body isn't SELECT *.
-        if body.columns.len() != aliases.len() {
-            return;
-        }
-        if body.columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
-            return;
-        }
-        for (col, alias) in body.columns.iter_mut().zip(aliases.iter()) {
-            match col {
-                // SELECT col  →  SELECT col AS alias
-                SelectColumn::Column(name) => {
-                    let name = name.clone();
-                    *col = SelectColumn::ColumnWithAlias(name, alias.clone());
-                }
-                // SELECT col AS x  →  SELECT col AS alias (override)
-                SelectColumn::ColumnWithAlias(name, _) => {
-                    let name = name.clone();
-                    *col = SelectColumn::ColumnWithAlias(name, alias.clone());
-                }
-                // SELECT expr [AS x]  →  SELECT expr AS alias
-                SelectColumn::Expr(e, _) => {
-                    let e = e.clone();
-                    *col = SelectColumn::Expr(e, Some(alias.clone()));
-                }
-                SelectColumn::Star => {}
+    /// Does a statement reference the given table name anywhere in its FROM
+    /// clauses (including set-op halves and expression subqueries)?
+    fn statement_references_table(stmt: &Statement, name: &str) -> bool {
+        match stmt {
+            Statement::Select { stmt: s, .. } => Self::select_references_table(s, name),
+            Statement::SetOp { left, right, .. } => {
+                Self::statement_references_table(left, name)
+                    || Self::statement_references_table(right, name)
             }
+            _ => false,
+        }
+    }
+
+    fn select_references_table(s: &SelectStmt, name: &str) -> bool {
+        let from = match &s.from {
+            Some(f) => f,
+            None => return false,
+        };
+        if Self::table_ref_references(from, name) {
+            return true;
+        }
+        // Expression subqueries (WHERE / HAVING / SELECT list) also scope the
+        // CTE name.
+        let mut found = false;
+        if let Some(w) = &s.where_clause {
+            found = found || Self::expr_references_subquery_table(w, name);
+        }
+        if let Some(h) = &s.having {
+            found = found || Self::expr_references_subquery_table(h, name);
+        }
+        for c in &s.columns {
+            if let crate::sql::ast::SelectColumn::Expr(e, _) = c {
+                found = found || Self::expr_references_subquery_table(e, name);
+            }
+        }
+        found
+    }
+
+    fn expr_references_subquery_table(e: &Expr, name: &str) -> bool {
+        match e {
+            Expr::Subquery(s) => Self::select_references_table(s, name),
+            Expr::BinaryOp { left, right, .. } => {
+                Self::expr_references_subquery_table(left, name)
+                    || Self::expr_references_subquery_table(right, name)
+            }
+            Expr::UnaryOp { expr, .. } => Self::expr_references_subquery_table(expr, name),
+            Expr::FunctionCall { args, .. } => args
+                .iter()
+                .any(|a| Self::expr_references_subquery_table(a, name)),
+            Expr::Case { whens, else_expr } => {
+                whens.iter().any(|(c, v)| {
+                    Self::expr_references_subquery_table(c, name)
+                        || Self::expr_references_subquery_table(v, name)
+                }) || else_expr
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_references_subquery_table(e, name))
+            }
+            _ => false,
+        }
+    }
+
+    fn table_ref_references(t: &TableRef, name: &str) -> bool {
+        match t {
+            TableRef::Table { name: n, .. } => n == name,
+            TableRef::Join { left, right, .. } => {
+                Self::table_ref_references(left, name) || Self::table_ref_references(right, name)
+            }
+            TableRef::Subquery { query, .. } => Self::statement_references_table(query, name),
         }
     }
 
@@ -2968,6 +3462,7 @@ impl QueryExecutor {
         &self,
         branch: &Statement,
         inherited_ctes: &[CteDef],
+        inherited_recursive: bool,
     ) -> Result<QueryResult> {
         match branch {
             Statement::SetOp {
@@ -2976,6 +3471,7 @@ impl QueryExecutor {
                 op: o,
                 all: a,
                 ctes,
+                with_recursive,
                 order_by,
                 limit,
                 offset,
@@ -2989,7 +3485,13 @@ impl QueryExecutor {
                 } else {
                     ctes
                 };
-                let mut result = self.execute_set_op(l, r, o.clone(), *a, effective_ctes)?;
+                let effective_recursive = if ctes.is_empty() {
+                    inherited_recursive
+                } else {
+                    *with_recursive
+                };
+                let mut result =
+                    self.execute_set_op(l, r, o.clone(), *a, effective_ctes, effective_recursive)?;
                 // Apply this node's own trailing ORDER BY/LIMIT/OFFSET (only the
                 // outermost carries them; nested nodes have None).
                 if order_by.is_some() || limit.is_some() || offset.is_some() {
@@ -2997,7 +3499,11 @@ impl QueryExecutor {
                 }
                 Ok(result)
             }
-            Statement::Select { stmt, ctes } => {
+            Statement::Select {
+                stmt,
+                ctes,
+                with_recursive,
+            } => {
                 // 🔑 Apply CTEs to the Select. Prefer the Select's own CTEs
                 // (parser clones the full WITH list into branches); fall back to
                 // inherited for chained unions where branches have empty ctes.
@@ -3006,7 +3512,13 @@ impl QueryExecutor {
                 } else {
                     ctes
                 };
-                let s = self.apply_ctes_for_select(stmt.clone(), effective_ctes)?;
+                let effective_recursive = if ctes.is_empty() {
+                    inherited_recursive
+                } else {
+                    *with_recursive
+                };
+                let s =
+                    self.apply_ctes_for_select(stmt.clone(), effective_ctes, effective_recursive)?;
                 self.execute_select_internal(&s)
             }
             _ => Err(MoteDBError::Query(
@@ -3086,6 +3598,7 @@ impl QueryExecutor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_set_op(
         &self,
         left: &Statement,
@@ -3093,10 +3606,12 @@ impl QueryExecutor {
         op: crate::sql::ast::SetOp,
         all: bool,
         inherited_ctes: &[CteDef],
+        inherited_recursive: bool,
     ) -> Result<QueryResult> {
         // left can be a nested SetOp (chained) or a Select — execute accordingly.
-        let left_result = self.execute_set_op_branch(left, inherited_ctes)?;
-        let right_result = self.execute_set_op_branch(right, inherited_ctes)?;
+        let left_result = self.execute_set_op_branch(left, inherited_ctes, inherited_recursive)?;
+        let right_result =
+            self.execute_set_op_branch(right, inherited_ctes, inherited_recursive)?;
         let (columns, left_rows) = match left_result {
             QueryResult::Select { columns, rows } => (columns, rows),
             _ => {
@@ -3176,9 +3691,118 @@ impl QueryExecutor {
     /// Execute a query with window functions (ROW_NUMBER/RANK/DENSE_RANK).
     /// Strategy: build a base stmt (window cols → NULL placeholder), execute it
     /// to get all data rows, then compute window values in-place.
+    /// Window source rows for non-aggregated queries: a real table (store
+    /// re-scan for FULL rows — the base result only holds SELECT columns)
+    /// or a derived table / inlined CTE (executed directly; bare-name
+    /// schema inferred from the result, single-source so no JOIN prefix
+    /// disambiguation is needed).
+    fn window_raw_source(
+        &self,
+        stmt: &SelectStmt,
+    ) -> Result<(crate::types::TableSchema, Vec<Vec<Value>>)> {
+        match stmt.from.as_ref() {
+            Some(crate::sql::ast::TableRef::Table { name, .. }) => {
+                let schema = self.db.get_table_schema(name)?;
+                // 🔓 TimeSeries tables live in the ColumnarStore (no
+                // ColSegmentStore) — route them through the generic executor
+                // instead of failing ("not a ColSeg", v1 hard error).
+                if schema.table_type == crate::types::TableType::TimeSeries {
+                    let inner = SelectStmt {
+                        distinct: false,
+                        columns: vec![crate::sql::ast::SelectColumn::Star],
+                        from: stmt.from.clone(),
+                        where_clause: None,
+                        group_by: None,
+                        having: None,
+                        order_by: None,
+                        limit: None,
+                        offset: None,
+                        limit_param: None,
+                        offset_param: None,
+                        latest_by: None,
+                    };
+                    let r = self.execute_select_internal(&inner)?;
+                    match r {
+                        QueryResult::Select { columns, rows } => {
+                            let mut cols = Vec::with_capacity(columns.len());
+                            for (idx, cname) in columns.iter().enumerate() {
+                                let bare = cname.rsplit('.').next().unwrap_or(cname);
+                                cols.push(crate::types::ColumnDef::new(
+                                    bare.to_string(),
+                                    ColumnType::Text, // names only matter here
+                                    idx,
+                                ));
+                            }
+                            return Ok((TableSchema::new("window_source".to_string(), cols), rows));
+                        }
+                        _ => {
+                            return Err(MoteDBError::Query(
+                                "Window source over TimeSeries failed".into(),
+                            ))
+                        }
+                    }
+                }
+                let store = self
+                    .db
+                    .get_or_create_col_segment_store(name, schema.col_types())?;
+                let _ = store.flush_buffer();
+                let scan_pos: Vec<usize> = (0..schema.columns.len()).collect();
+                let scanned = store.scan_projected_filtered(None, &scan_pos, &|_| true);
+                Ok((
+                    schema.as_ref().clone(),
+                    scanned.into_iter().map(|(_, r)| r).collect(),
+                ))
+            }
+            Some(crate::sql::ast::TableRef::Subquery { query, .. }) => {
+                let result = self.execute_from_subquery_statement(query)?;
+                match result {
+                    QueryResult::Select { columns, rows } => {
+                        let mut cols = Vec::with_capacity(columns.len());
+                        for (idx, cname) in columns.iter().enumerate() {
+                            let bare = cname.rsplit('.').next().unwrap_or(cname);
+                            let col_type = rows
+                                .first()
+                                .and_then(|r| r.get(idx))
+                                .map(|v| match v {
+                                    Value::Integer(_) => ColumnType::Integer,
+                                    Value::Float(_) => ColumnType::Float,
+                                    Value::Text(_) | Value::TextDoc(_) => ColumnType::Text,
+                                    Value::Bool(_) => ColumnType::Boolean,
+                                    Value::Timestamp(_) => ColumnType::Timestamp,
+                                    Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
+                                    Value::Spatial(_) => ColumnType::Spatial,
+                                    Value::Vector(v) => ColumnType::Tensor(v.len()),
+                                    Value::Null => ColumnType::Text,
+                                })
+                                .unwrap_or(ColumnType::Text);
+                            cols.push(crate::types::ColumnDef::new(
+                                bare.to_string(),
+                                col_type,
+                                idx,
+                            ));
+                        }
+                        let schema = TableSchema::new("window_source".to_string(), cols);
+                        Ok((schema, rows))
+                    }
+                    _ => Err(MoteDBError::Query(
+                        "Window query FROM must be a table or subquery".into(),
+                    )),
+                }
+            }
+            _ => Err(MoteDBError::Query("Window query needs FROM table".into())),
+        }
+    }
+
     fn execute_window_query(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
         use crate::sql::ast::{Expr, OrderByExpr, SelectColumn, WindowFunc};
-        // Collect window column specs and build base stmt (replace window cols with NULL).
+        // 🔓 v2 collection: rewrite EVERY WindowFunction node anywhere in the
+        // select list (top-level `SUM(v) OVER (...)` or nested inside an
+        // expression `SUM(v) OVER () + 1`) into a synthetic column reference
+        // `__winval_k`. Values for those positions are appended by
+        // compute_window; the unified projection then evaluates the original
+        // expression per row, so nested windows resolve like any column.
+        // (v1 only recognized top-level window columns and evaluated nested
+        // ones to silent NULLs.)
         let mut base_stmt = stmt.clone();
         let mut win_specs: Vec<(
             usize,
@@ -3186,57 +3810,197 @@ impl QueryExecutor {
             Option<Vec<String>>,
             Option<Vec<OrderByExpr>>,
         )> = Vec::new();
-        for (i, col) in base_stmt.columns.iter_mut().enumerate() {
-            if let SelectColumn::Expr(
+        // 🔑 Two-track rewriting, ONE spec collection (from the marker pass):
+        //   proj_columns — stmt.columns with every WindowFunction node →
+        //     Column(__winval_k) markers; specs are collected here, k in
+        //     traversal order across ALL select columns (distinct markers for
+        //     `SELECT COUNT(*) OVER (), COUNT(v) OVER ()` and for several
+        //     windows inside one expression).
+        //   base_stmt — every WindowFunction node → NULL literal, so the
+        //     base runs GROUP BY validation cleanly (markers are not source
+        //     columns). No specs recorded.
+        fn windows_to_null(e: &mut Expr) {
+            match e {
+                Expr::WindowFunction { .. } => *e = Expr::Literal(Value::Null),
+                Expr::BinaryOp { left, right, .. } => {
+                    windows_to_null(left);
+                    windows_to_null(right);
+                }
+                Expr::UnaryOp { expr, .. } => windows_to_null(expr),
+                Expr::FunctionCall { args, .. } => {
+                    for a in args.iter_mut() {
+                        windows_to_null(a);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn windows_to_markers(
+            e: &mut Expr,
+            next: &mut usize,
+            specs: &mut Vec<(
+                usize,
+                WindowFunc,
+                Option<Vec<String>>,
+                Option<Vec<OrderByExpr>>,
+            )>,
+            marker_names: &mut Vec<String>,
+        ) {
+            match e {
                 Expr::WindowFunction {
                     func,
                     partition_by,
                     order_by,
-                },
-                alias,
-            ) = col
-            {
-                win_specs.push((i, func.clone(), partition_by.clone(), order_by.clone()));
-                *col = SelectColumn::Expr(Expr::Literal(Value::Null), alias.clone());
+                } => {
+                    let k = *next;
+                    *next += 1;
+                    specs.push((k, func.clone(), partition_by.clone(), order_by.clone()));
+                    // 🔑 Pick a marker name that does NOT collide with a real
+                    // column — a user table with a literal `__winval_0` column
+                    // used to be silently OVERWRITTEN by the window value.
+                    let mut name = format!("__winval_{}", k);
+                    while marker_names.contains(&name) {
+                        name.push('_');
+                    }
+                    marker_names.push(name.clone());
+                    *e = Expr::Column(name);
+                }
+                Expr::BinaryOp { left, right, .. } => {
+                    windows_to_markers(left, next, specs, marker_names);
+                    windows_to_markers(right, next, specs, marker_names);
+                }
+                Expr::UnaryOp { expr, .. } => windows_to_markers(expr, next, specs, marker_names),
+                Expr::FunctionCall { args, .. } => {
+                    for a in args.iter_mut() {
+                        windows_to_markers(a, next, specs, marker_names);
+                    }
+                }
+                _ => {}
             }
         }
-        // Execute base query (gets all non-window data columns).
+        for col in base_stmt.columns.iter_mut() {
+            if let SelectColumn::Expr(e, _) = col {
+                windows_to_null(e);
+            }
+        }
+        // Execute base query. For GROUP BY / HAVING queries the base result IS        // Execute base query. For GROUP BY / HAVING queries the base result IS        // Execute base query. For GROUP BY / HAVING queries the base result IS        // Execute base query. For GROUP BY / HAVING queries the base result IS
+        // the window source (windows run over aggregated rows, per SQL
+        // standard); its __winval_k projections evaluate to NULL against the
+        // base source, which is fine — they are recomputed below.
         let base = self.materialize_as_streaming(&base_stmt)?;
-        let (_base_cols, _base_rows) = match base.materialize()? {
+        let (base_cols, base_rows) = match base.materialize()? {
             QueryResult::Select { columns, rows } => (columns, rows),
             _ => return Err(MoteDBError::Query("Window base query failed".into())),
         };
         // We need the schema to resolve partition/order column positions.
         // Get it from the base query's columns (they correspond to stmt.columns).
-        let table_name = match stmt.from.as_ref() {
-            Some(crate::sql::ast::TableRef::Table { name, .. }) => name.clone(),
-            _ => return Err(MoteDBError::Query("Window query needs FROM table".into())),
-        };
-        let schema = self.db.get_table_schema(&table_name)?;
-        // The base query's rows only have the SELECT columns, not all schema columns.
-        // We need the full row data for partition/order columns that may not be in SELECT.
-        // Re-scan to get full rows, compute windows, then project.
-        let store = self
-            .db
-            .get_or_create_col_segment_store(&table_name, schema.col_types())?;
-        let _ = store.flush_buffer();
-        let scan_pos: Vec<usize> = (0..schema.columns.len()).collect();
-        let scanned = store.scan_projected_filtered(None, &scan_pos, &|_| true);
-        let mut full_rows: Vec<Vec<Value>> = scanned.into_iter().map(|(_, r)| r).collect();
-        // Apply WHERE
-        if let Some(ref wc) = stmt.where_clause {
-            full_rows.retain(|row| {
-                Self::eval_expr_on_row(wc, row, &schema)
-                    .map(|v| match v {
-                        Value::Bool(true) => true,
-                        Value::Integer(n) => n != 0,
-                        _ => false,
-                    })
-                    .unwrap_or(false)
-            });
+        //
+        // 🔓 v2: a derived-table FROM (inlined CTE / parenthesized subquery) is
+        // served by EXECUTING it — columns + type-inferred schema from the
+        // result rows (bare names: the window path is single-source, no JOIN
+        // prefix disambiguation needed). Real tables keep the store re-scan.
+        // 🔓 v2 GROUP BY + window: the window runs over AGGREGATED rows — the
+        // base result IS the source (v1 rejected the shape outright with
+        // "non-aggregate expressions ... must be in GROUP BY"). Column names
+        // come from the base output; partition/order keys resolve by name.
+        let (mut schema, mut full_rows): (crate::types::TableSchema, Vec<Vec<Value>>) =
+            if stmt.group_by.is_some() || stmt.having.is_some() {
+                let mut cols = Vec::with_capacity(base_cols.len());
+                for (idx, cname) in base_cols.iter().enumerate() {
+                    let col_type = base_rows
+                        .first()
+                        .and_then(|r| r.get(idx))
+                        .map(|v| match v {
+                            Value::Integer(_) => ColumnType::Integer,
+                            Value::Float(_) => ColumnType::Float,
+                            Value::Text(_) | Value::TextDoc(_) => ColumnType::Text,
+                            Value::Bool(_) => ColumnType::Boolean,
+                            Value::Timestamp(_) => ColumnType::Timestamp,
+                            Value::Vector(v) => ColumnType::Tensor(v.len()),
+                            Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
+                            Value::Spatial(_) => ColumnType::Spatial,
+                            Value::Null => ColumnType::Text,
+                        })
+                        .unwrap_or(ColumnType::Text);
+                    cols.push(crate::types::ColumnDef::new(cname.clone(), col_type, idx));
+                }
+                (
+                    TableSchema::new("window_source".to_string(), cols),
+                    base_rows.clone(),
+                )
+            } else {
+                self.window_raw_source(stmt)?
+            };
+        // 🔓 v2: pre-resolve non-correlated subqueries in WHERE before the
+        // per-row filter (v1 evaluated them to NULL → EVERY row filtered →
+        // silently empty result for `... WHERE v IN (SELECT ...)`). GROUP BY
+        // queries already applied WHERE inside the base.
+        if stmt.group_by.is_none() {
+            if let Some(wc) = stmt.where_clause.as_ref() {
+                let effective = if Self::expr_contains_subquery(wc) {
+                    self.materialize_subqueries_checked(wc, Some(&schema))?
+                } else {
+                    wc.clone()
+                };
+                full_rows.retain(|row| {
+                    Self::eval_expr_on_row(&effective, row, &schema)
+                        .map(|v| match v {
+                            Value::Bool(b) => b,
+                            Value::Integer(n) => n != 0,
+                            _ => false,
+                        })
+                        .unwrap_or(false)
+                });
+            }
         }
-        // Compute each window function, appending result as extra column.
-        for (_col_idx, func, partition_by, order_by) in &win_specs {
+        // 🔑 Marker pass runs AFTER the source schema exists: marker names
+        // avoid collisions with real source columns (a user column literally
+        // named `__winval_0` used to be silently OVERWRITTEN by the window
+        // value). Spec order == traversal order across all select columns.
+        let mut next_k = 0usize;
+        let mut marker_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let marker_base = marker_names.len();
+        let mut proj_columns: Vec<SelectColumn> = stmt.columns.clone();
+        for col in proj_columns.iter_mut() {
+            if let SelectColumn::Expr(e, _) = col {
+                windows_to_markers(e, &mut next_k, &mut win_specs, &mut marker_names);
+            }
+        }
+
+        // 🔑 Aggregate ORDER BY keys (`OVER (ORDER BY SUM(v) DESC)`) must
+        // resolve to the base's OUTPUT column: `SUM(v) AS s` is emitted as
+        // "s", so display-name matching against the schema misses and the
+        // ordering silently degraded to GROUP BY output order — which is
+        // hash-unstable (same query returned different rn across runs).
+        // Rewrite each non-column key to the aliased output column name.
+        for (_k, _func, _part, order_by) in win_specs.iter_mut() {
+            if let Some(ords) = order_by {
+                for oe in ords.iter_mut() {
+                    if matches!(oe.expr, Expr::Column(_)) {
+                        continue;
+                    }
+                    let disp = Self::display_expr_name(&oe.expr);
+                    let out_name = stmt.columns.iter().find_map(|c| match c {
+                        SelectColumn::Expr(e2, Some(alias))
+                            if Self::display_expr_name(e2) == disp =>
+                        {
+                            Some(alias.clone())
+                        }
+                        _ => None,
+                    });
+                    if let Some(name) = out_name {
+                        oe.expr = Expr::Column(name);
+                    }
+                }
+            }
+        }
+
+        // Compute each window function, appending its value as an extra
+        // column; register the __winval_k positions in the schema so the
+        // unified expression projection (below) resolves the marker columns
+        // like any other reference — nested windows (`SUM(v) OVER () + 1`)
+        // evaluate through the same path.
+        for (_k, func, partition_by, order_by) in &win_specs {
             Self::compute_window(
                 &mut full_rows,
                 &schema,
@@ -3245,13 +4009,36 @@ impl QueryExecutor {
                 order_by.as_ref(),
             );
         }
-        // Build output rows: for each SELECT column, pull from schema cols or window cols.
         let num_schema = schema.columns.len();
-        let out_rows: Vec<Vec<Value>> = full_rows
+        if !win_specs.is_empty() {
+            // 🔑 Rebuild the schema instead of pushing: TableSchema's
+            // name→position map is built by ::new and NOT updated by column
+            // pushes (projection lookups silently returned NULL). Names come
+            // from the collision-safe marker pass (marker_names[k]).
+            let mut cols = schema.columns.clone();
+            for (k, _, _, _) in &win_specs {
+                cols.push(crate::types::ColumnDef::new(
+                    marker_names[marker_base + k].clone(),
+                    ColumnType::Text, // value shapes vary; projection only copies
+                    num_schema + k,
+                ));
+            }
+            schema = TableSchema::new("window_source".to_string(), cols);
+        }
+        // Build output rows: every SELECT item resolves against the extended
+        // schema (plain columns by position, expressions by evaluation —
+        // window markers included).
+        // 🔑 Project from proj_columns — expressions carry the __winval_k
+        // markers (stmt.columns still holds the raw WindowFunction nodes,
+        // which evaluate to NULL). In the GROUP BY branch the source rows ARE
+        // the base (aggregated) result, so aggregate output columns resolve
+        // by their base output name instead of row-level evaluation (an
+        // aggregate expression cannot be re-evaluated against one row).
+        let grouped = stmt.group_by.is_some() || stmt.having.is_some();
+        let mut out_rows: Vec<Vec<Value>> = full_rows
             .iter()
             .map(|row| {
-                let mut win_idx = 0usize;
-                stmt.columns
+                proj_columns
                     .iter()
                     .map(|c| match c {
                         SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
@@ -3262,14 +4049,23 @@ impl QueryExecutor {
                                 .unwrap_or(Value::Null)
                         }
                         SelectColumn::Star => row.first().cloned().unwrap_or(Value::Null),
-                        SelectColumn::Expr(expr, _) => {
-                            if let Expr::WindowFunction { .. } = expr {
-                                let v = row
-                                    .get(num_schema + win_idx)
-                                    .cloned()
-                                    .unwrap_or(Value::Null);
-                                win_idx += 1;
-                                v
+                        SelectColumn::Expr(expr, alias) => {
+                            if grouped && !matches!(expr, Expr::Column(_)) {
+                                // aggregate / group-key output column: take the
+                                // value computed by the base, resolved by its
+                                // output name (alias or canonical display name)
+                                let name = alias
+                                    .clone()
+                                    .unwrap_or_else(|| Self::display_expr_name(expr));
+                                schema
+                                    .get_column_position(&name)
+                                    .or_else(|| {
+                                        schema.get_column_position(
+                                            name.rsplit('.').next().unwrap_or(&name),
+                                        )
+                                    })
+                                    .and_then(|p| row.get(p).cloned())
+                                    .unwrap_or(Value::Null)
                             } else {
                                 Self::eval_expr_on_row(expr, row, &schema).unwrap_or(Value::Null)
                             }
@@ -3284,39 +4080,67 @@ impl QueryExecutor {
             .map(|c| match c {
                 SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => n.clone(),
                 SelectColumn::Expr(_, Some(a)) => a.clone(),
-                SelectColumn::Expr(e, None) => format!("{:?}", e),
+                SelectColumn::Expr(e, None) => Self::display_expr_name(e),
                 SelectColumn::Star => "*".to_string(),
             })
             .collect();
-        let mut out_rows = out_rows;
-        // Apply outer ORDER BY (resolve column by alias or position in output)
+        // 🔑 Apply outer ORDER BY with DUAL key resolution: output column
+        // first (alias / computed name — `ORDER BY rn`), then the full schema
+        // row (columns not in the SELECT list — `ORDER BY id`). Sorting by
+        // output name alone used to degrade non-projected keys to "sort by
+        // column 0"; sorting by schema alone broke alias ordering.
         if let Some(ref ob) = stmt.order_by {
-            if !ob.is_empty() {
-                // Build sort keys from output columns (match by alias name)
-                let col_names = &final_cols;
-                let sort_plan: Vec<(usize, bool)> = ob
+            if !ob.is_empty() && !out_rows.is_empty() {
+                let n_full = full_rows.len();
+                let n_out = out_rows.len();
+                debug_assert_eq!(n_full, n_out);
+                let order = n_full.min(n_out);
+                let mut idx: Vec<usize> = (0..order).collect();
+                // Key kind: Output(pos) | Full(pos)
+                enum KeyRef {
+                    Output(usize),
+                    Full(usize),
+                }
+                let plan: Vec<(KeyRef, bool)> = ob
                     .iter()
                     .map(|oe| {
-                        let pos = if let Expr::Column(cn) = &oe.expr {
-                            let bare = cn.rsplit('.').next().unwrap_or(cn);
-                            // Try output column name match
-                            col_names
-                                .iter()
-                                .position(|n| n == bare)
-                                .or_else(|| schema.get_column_position(bare))
-                                .unwrap_or(0)
-                        } else if let Expr::Literal(Value::Integer(n)) = &oe.expr {
-                            (*n as usize).saturating_sub(1)
-                        } else {
-                            0
+                        let k = match &oe.expr {
+                            Expr::Column(cn) => {
+                                let bare = cn.rsplit('.').next().unwrap_or(cn);
+                                // Output name match first (alias wins)
+                                let out_pos = final_cols
+                                    .iter()
+                                    .position(|n| n == bare || n.rsplit('.').next() == Some(bare));
+                                if let Some(p) = out_pos {
+                                    KeyRef::Output(p)
+                                } else {
+                                    KeyRef::Full(
+                                        schema.get_column_position(bare).unwrap_or(usize::MAX),
+                                    )
+                                }
+                            }
+                            Expr::Literal(Value::Integer(n)) if *n >= 1 => {
+                                KeyRef::Output((*n as usize).saturating_sub(1))
+                            }
+                            _ => KeyRef::Full(usize::MAX),
                         };
-                        (pos, oe.asc)
+                        (k, oe.asc)
                     })
                     .collect();
-                out_rows.sort_by(|a, b| {
-                    for &(pos, asc) in &sort_plan {
-                        let av = a.get(pos).cloned().unwrap_or(Value::Null);
-                        let bv = b.get(pos).cloned().unwrap_or(Value::Null);
+                idx.sort_by(|&a, &b| {
+                    for &(ref k, asc) in &plan {
+                        let av = match k {
+                            KeyRef::Output(p) => {
+                                out_rows[a].get(*p).cloned().unwrap_or(Value::Null)
+                            }
+                            KeyRef::Full(p) => full_rows[a].get(*p).cloned().unwrap_or(Value::Null),
+                        };
+                        let bv = match k {
+                            KeyRef::Output(p) => {
+                                out_rows[b].get(*p).cloned().unwrap_or(Value::Null)
+                            }
+                            KeyRef::Full(p) => full_rows[b].get(*p).cloned().unwrap_or(Value::Null),
+                        };
                         let cmp = order_by_cmp(&av, &bv);
                         if cmp != std::cmp::Ordering::Equal {
                             return if asc { cmp } else { cmp.reverse() };
@@ -3324,8 +4148,12 @@ impl QueryExecutor {
                     }
                     std::cmp::Ordering::Equal
                 });
+                let sorted_out: Vec<Vec<Value>> =
+                    idx.iter().map(|&i| out_rows[i].clone()).collect();
+                out_rows = sorted_out;
             }
         }
+
         // Apply OFFSET then LIMIT
         if let Some(off) = stmt.offset {
             if off >= out_rows.len() {
@@ -3341,6 +4169,100 @@ impl QueryExecutor {
             columns: final_cols,
             rows: out_rows,
         })
+    }
+
+    /// Human-readable output name for an unaliased SELECT expression —
+    /// window functions render as `SUM(v) OVER (...)` instead of a raw Debug
+    /// dump.
+    fn display_expr_name(e: &Expr) -> String {
+        if let Expr::WindowFunction {
+            func,
+            partition_by,
+            order_by,
+        } = e
+        {
+            use crate::sql::ast::WindowFunc;
+            let fname = match func {
+                WindowFunc::RowNumber => "ROW_NUMBER()".into(),
+                WindowFunc::Rank => "RANK()".into(),
+                WindowFunc::DenseRank => "DENSE_RANK()".into(),
+                WindowFunc::Lag { expr, .. } => {
+                    format!("LAG({})", Self::display_expr_name(expr))
+                }
+                WindowFunc::Lead { expr, .. } => {
+                    format!("LEAD({})", Self::display_expr_name(expr))
+                }
+                WindowFunc::FirstValue { expr } => {
+                    format!("FIRST_VALUE({})", Self::display_expr_name(expr))
+                }
+                WindowFunc::LastValue { expr } => {
+                    format!("LAST_VALUE({})", Self::display_expr_name(expr))
+                }
+                WindowFunc::Agg {
+                    func,
+                    arg,
+                    distinct,
+                } => {
+                    use crate::sql::ast::WindowAggFunc as A;
+                    let fname = match func {
+                        A::Sum => "SUM",
+                        A::Count => "COUNT",
+                        A::Avg => "AVG",
+                        A::Min => "MIN",
+                        A::Max => "MAX",
+                    };
+                    let d = if *distinct { "DISTINCT " } else { "" };
+                    match arg {
+                        Some(a) => format!("{}({}{})", fname, d, Self::display_expr_name(a)),
+                        None => format!("{}(*)", fname),
+                    }
+                }
+            };
+            let mut s = fname;
+            if let Some(parts) = partition_by {
+                if !parts.is_empty() {
+                    s.push_str(&format!(" PARTITION BY {}", parts.join(", ")));
+                }
+            }
+            if let Some(ords) = order_by {
+                if !ords.is_empty() {
+                    let keys: Vec<String> = ords
+                        .iter()
+                        .map(|o| {
+                            format!(
+                                "{}{}",
+                                Self::display_expr_name(&o.expr),
+                                if o.asc { "" } else { " DESC" }
+                            )
+                        })
+                        .collect();
+                    s.push_str(&format!(" ORDER BY {}", keys.join(", ")));
+                }
+            }
+            return s;
+        }
+        match e {
+            Expr::Column(n) => n.clone(),
+            Expr::Literal(v) => match v {
+                Value::Integer(i) => i.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Text(t) => format!("'{}'", t),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => "NULL".into(),
+                other => format!("{:?}", other),
+            },
+            Expr::BinaryOp { left, op, right } => format!(
+                "{} {:?} {}",
+                Self::display_expr_name(left),
+                op,
+                Self::display_expr_name(right)
+            ),
+            Expr::FunctionCall { name, args, .. } => {
+                let args: Vec<String> = args.iter().map(Self::display_expr_name).collect();
+                format!("{}({})", name, args.join(", "))
+            }
+            _ => format!("{:?}", e),
+        }
     }
 
     /// Compute a window function over rows, appending the result column.
@@ -3363,7 +4285,9 @@ impl QueryExecutor {
                     .collect()
             })
             .unwrap_or_default();
-        // Resolve order key positions + directions
+        // Resolve order key positions + directions. Keys may be arbitrary
+        // expressions (`ORDER BY SUM(v)` over a GROUP BY source) — matched by
+        // their display name against the source schema's output columns.
         let order_keys: Vec<(usize, bool)> = order_by
             .map(|ords| {
                 ords.iter()
@@ -3372,7 +4296,15 @@ impl QueryExecutor {
                             let bare = cn.rsplit('.').next().unwrap_or(cn);
                             schema.get_column_position(bare).map(|p| (p, oe.asc))
                         } else {
-                            None
+                            let name = Self::display_expr_name(&oe.expr);
+                            schema
+                                .get_column_position(&name)
+                                .or_else(|| {
+                                    schema.get_column_position(
+                                        name.rsplit('.').next().unwrap_or(&name),
+                                    )
+                                })
+                                .map(|p| (p, oe.asc))
                         }
                     })
                     .collect()
@@ -3403,6 +4335,35 @@ impl QueryExecutor {
                     std::cmp::Ordering::Equal
                 });
             }
+            // 🔑 Peer-group frame boundaries (partition-level): with ORDER BY,
+            // the frame ends at the current row's PEER GROUP (RANGE UNBOUNDED
+            // PRECEDING TO CURRENT ROW — the SQL default); without ORDER BY,
+            // the whole partition. Shared by aggregates and LAST_VALUE.
+            let boundary: Vec<usize> = if order_keys.is_empty() {
+                let end = indices.len().saturating_sub(1);
+                vec![end; indices.len()]
+            } else {
+                let key_of = |pos: usize| -> Vec<Value> {
+                    order_keys
+                        .iter()
+                        .map(|&(p, _)| rows[indices[pos]].get(p).cloned().unwrap_or(Value::Null))
+                        .collect()
+                };
+                let mut boundary = Vec::with_capacity(indices.len());
+                let mut pos = 0usize;
+                while pos < indices.len() {
+                    let mut end = pos;
+                    let cur_key = key_of(pos);
+                    while end + 1 < indices.len() && key_of(end + 1) == cur_key {
+                        end += 1;
+                    }
+                    for _ in pos..=end {
+                        boundary.push(end);
+                    }
+                    pos = end + 1;
+                }
+                boundary
+            };
             // Compute window values
             match func {
                 WindowFunc::RowNumber => {
@@ -3503,6 +4464,232 @@ impl QueryExecutor {
                         rows[idx].push(v);
                     }
                 }
+                WindowFunc::FirstValue { expr } => {
+                    let first = indices
+                        .first()
+                        .and_then(|&idx| Self::eval_expr_on_row(expr, &rows[idx], schema).ok())
+                        .unwrap_or(Value::Null);
+                    for &idx in &indices {
+                        rows[idx].push(first.clone());
+                    }
+                }
+                WindowFunc::LastValue { expr } => {
+                    // 🔑 Standard default frame (RANGE UNBOUNDED PRECEDING TO
+                    // CURRENT ROW): the value at the END of the current row's
+                    // peer group — NOT the partition's last row (v1 returned
+                    // partition-last, so `LAST_VALUE(v) OVER (ORDER BY id)`
+                    // showed the final row's value on every row).
+                    let vals: Vec<Value> = indices
+                        .iter()
+                        .map(|&idx| {
+                            Self::eval_expr_on_row(expr, &rows[idx], schema).unwrap_or(Value::Null)
+                        })
+                        .collect();
+                    for (pos, &idx) in indices.iter().enumerate() {
+                        let v = vals[boundary[pos]].clone();
+                        rows[idx].push(v);
+                    }
+                }
+                WindowFunc::Agg {
+                    func,
+                    arg,
+                    distinct,
+                } => {
+                    use crate::sql::ast::WindowAggFunc as A;
+                    // NULL handling matches bare aggregates: SUM/AVG/MIN/MAX
+                    // skip NULLs (SUM over no non-NULL ⇒ NULL); COUNT(expr)
+                    // counts non-NULL; COUNT(*) counts rows.
+                    let is_count_star = matches!(arg.as_deref(),
+                        Some(Expr::Column(n)) if n == "*")
+                        || arg.is_none();
+                    let vals: Vec<Value> = indices
+                        .iter()
+                        .map(|&idx| {
+                            if is_count_star {
+                                Value::Bool(true) // COUNT(*): every row counts
+                            } else {
+                                Self::eval_expr_on_row(arg.as_ref().unwrap(), &rows[idx], schema)
+                                    .unwrap_or(Value::Null)
+                            }
+                        })
+                        .collect();
+
+                    // 🔑 DISTINCT aggregates: recompute the frame exactly —
+                    // dedup inside [partition start .. peer-group end] (an
+                    // incremental accumulator can't un-count rows). O(frame²)
+                    // worst case, acceptable for the small frames DISTINCT
+                    // windows are used on.
+                    if *distinct {
+                        for (pos, &idx) in indices.iter().enumerate() {
+                            let frame = &vals[..boundary[pos] + 1];
+                            let mut seen = std::collections::HashSet::new();
+                            let mut sum_i: i64 = 0;
+                            let mut sum_f: f64 = 0.0;
+                            let mut any_float = false;
+                            let mut count_non_null: i64 = 0;
+                            let mut min_v: Option<Value> = None;
+                            let mut max_v: Option<Value> = None;
+                            for v in frame.iter() {
+                                if matches!(v, Value::Null) {
+                                    continue;
+                                }
+                                let one = vec![v.clone()];
+                                if !seen.insert(row_dedup_key(&one)) {
+                                    continue;
+                                }
+                                match v {
+                                    Value::Integer(i) => {
+                                        sum_i += *i;
+                                        sum_f += *i as f64;
+                                    }
+                                    Value::Float(f) => {
+                                        any_float = true;
+                                        sum_f += *f;
+                                    }
+                                    Value::Bool(b) => {
+                                        sum_i += *b as i64;
+                                        sum_f += *b as i64 as f64;
+                                    }
+                                    _ => {}
+                                }
+                                count_non_null += 1;
+                                if min_v.as_ref().is_none_or(|m| {
+                                    order_by_cmp(m, v) == std::cmp::Ordering::Greater
+                                }) {
+                                    min_v = Some(v.clone());
+                                }
+                                if max_v
+                                    .as_ref()
+                                    .is_none_or(|m| order_by_cmp(m, v) == std::cmp::Ordering::Less)
+                                {
+                                    max_v = Some(v.clone());
+                                }
+                            }
+                            let out = match func {
+                                A::Sum => {
+                                    if count_non_null == 0 {
+                                        Value::Null
+                                    } else if any_float {
+                                        Value::Float(sum_f)
+                                    } else {
+                                        Value::Integer(sum_i)
+                                    }
+                                }
+                                A::Count => Value::Integer(count_non_null),
+                                A::Avg => {
+                                    if count_non_null == 0 {
+                                        Value::Null
+                                    } else if any_float {
+                                        Value::Float(sum_f / count_non_null as f64)
+                                    } else {
+                                        // 🔑 整数列: 用精确 i64 和转 f64 再除 —
+                                        // sum_f 在 2^53 量级累计丢精度
+                                        // (fuzz 实抓: AVG 差 0.5)。
+                                        Value::Float(sum_i as f64 / count_non_null as f64)
+                                    }
+                                }
+                                A::Min => min_v.clone().unwrap_or(Value::Null),
+                                A::Max => max_v.clone().unwrap_or(Value::Null),
+                            };
+                            rows[idx].push(out);
+                        }
+                    } else {
+                        // Running accumulators: exact SUM (i64 + f64), COUNT,
+                        // MIN/MAX scan. Recomputed per peer group boundary.
+                        let mut sum_i: i64 = 0;
+                        let mut sum_f: f64 = 0.0;
+                        let mut any_float = false;
+                        let mut count_non_null: i64 = 0;
+                        let mut min_v: Option<Value> = None;
+                        let mut max_v: Option<Value> = None;
+                        let mut upto: usize = 0; // next frame position to fold in
+
+                        let fold_next =
+                            |upto: &mut usize,
+                             end_excl: usize,
+                             sum_i: &mut i64,
+                             sum_f: &mut f64,
+                             any_float: &mut bool,
+                             count_non_null: &mut i64,
+                             min_v: &mut Option<Value>,
+                             max_v: &mut Option<Value>| {
+                                while *upto < end_excl {
+                                    let v = &vals[*upto];
+                                    let is_null = matches!(v, Value::Null);
+                                    match v {
+                                        Value::Integer(i) => {
+                                            *sum_i += *i;
+                                            *sum_f += *i as f64;
+                                        }
+                                        Value::Float(f) => {
+                                            *any_float = true;
+                                            *sum_f += *f;
+                                        }
+                                        Value::Bool(b) => {
+                                            let i = *b as i64;
+                                            *sum_i += i;
+                                            *sum_f += i as f64;
+                                        }
+                                        _ => {}
+                                    }
+                                    if !is_null {
+                                        *count_non_null += 1;
+                                        if min_v.as_ref().is_none_or(|m| {
+                                            order_by_cmp(m, v) == std::cmp::Ordering::Greater
+                                        }) {
+                                            *min_v = Some(v.clone());
+                                        }
+                                        if max_v.as_ref().is_none_or(|m| {
+                                            order_by_cmp(m, v) == std::cmp::Ordering::Less
+                                        }) {
+                                            *max_v = Some(v.clone());
+                                        }
+                                    }
+                                    *upto += 1;
+                                }
+                            };
+
+                        for (pos, &idx) in indices.iter().enumerate() {
+                            fold_next(
+                                &mut upto,
+                                boundary[pos] + 1,
+                                &mut sum_i,
+                                &mut sum_f,
+                                &mut any_float,
+                                &mut count_non_null,
+                                &mut min_v,
+                                &mut max_v,
+                            );
+                            let out = match func {
+                                A::Sum => {
+                                    if count_non_null == 0 {
+                                        Value::Null
+                                    } else if any_float {
+                                        Value::Float(sum_f)
+                                    } else {
+                                        Value::Integer(sum_i)
+                                    }
+                                }
+                                A::Count => Value::Integer(count_non_null),
+                                A::Avg => {
+                                    if count_non_null == 0 {
+                                        Value::Null
+                                    } else if any_float {
+                                        Value::Float(sum_f / count_non_null as f64)
+                                    } else {
+                                        // 🔑 整数列: 用精确 i64 和转 f64 再除 —
+                                        // sum_f 在 2^53 量级累计丢精度
+                                        // (fuzz 实抓: AVG 差 0.5)。
+                                        Value::Float(sum_i as f64 / count_non_null as f64)
+                                    }
+                                }
+                                A::Min => min_v.clone().unwrap_or(Value::Null),
+                                A::Max => max_v.clone().unwrap_or(Value::Null),
+                            };
+                            rows[idx].push(out);
+                        }
+                    } // !distinct
+                }
             }
         }
         // Ensure rows without a window value (shouldn't happen) get NULL
@@ -3510,6 +4697,40 @@ impl QueryExecutor {
             while row.len() <= schema.columns.len() {
                 row.push(Value::Null);
             }
+        }
+    }
+
+    /// Execute a `TableRef::Subquery` body — any query `Statement` shape
+    /// (plain SELECT or a UNION chain inlined from a CTE body).
+    fn execute_from_subquery_statement(&self, query: &Statement) -> Result<QueryResult> {
+        match query {
+            Statement::Select {
+                stmt: s,
+                ctes,
+                with_recursive,
+            } => {
+                let s = self.apply_ctes_for_select(s.clone(), ctes, *with_recursive)?;
+                self.execute_select_internal(&s)
+            }
+            Statement::SetOp {
+                left,
+                right,
+                op,
+                all,
+                ctes,
+                with_recursive,
+                order_by,
+                limit,
+                offset,
+            } => {
+                let mut result =
+                    self.execute_set_op(left, right, op.clone(), *all, ctes, *with_recursive)?;
+                if order_by.is_some() || limit.is_some() || offset.is_some() {
+                    result = self.apply_set_op_trailing(result, order_by, *limit, *offset)?;
+                }
+                Ok(result)
+            }
+            _ => Err(MoteDBError::Query("Subquery must be a SELECT".into())),
         }
     }
 
@@ -3556,6 +4777,14 @@ impl QueryExecutor {
         } else {
             stmt
         };
+        // 🔓 v2 CTE: a single-table FROM naming a materialized CTE must take
+        // the generic materialized path — the columnar/optimizer fast paths
+        // below resolve names against real storage only.
+        if let Some(TableRef::Table { name, .. }) = stmt.from.as_ref() {
+            if MATERIALIZED_CTES.with(|m| m.borrow().contains_key(name)) {
+                return self.materialize_as_streaming(stmt);
+            }
+        }
         // 🔑 Read-your-writes: when inside a transaction with buffered writes for
         // this table, ensure the ColSegmentStore exists so downstream paths
         // (full scan, aggregate) take the txn-merge route. Without this, a table
@@ -3659,16 +4888,17 @@ impl QueryExecutor {
                 rows,
             });
         }
-        // 🔑 Window functions: route to specialized executor.
-        let has_window = stmt.columns.iter().any(|c| {
-            matches!(
-                c,
-                crate::sql::ast::SelectColumn::Expr(
-                    crate::sql::ast::Expr::WindowFunction { .. },
-                    _
-                )
-            )
-        });
+        // 🔑 Window functions: route to specialized executor. Detection must
+        // cover windows NESTED in expressions (`SUM(v) OVER () + 1`) — v1 only
+        // matched top-level window columns, so nested ones evaluated to
+        // silent NULLs on the generic path.
+        let has_window = stmt.columns.iter().any(|c| match c {
+            crate::sql::ast::SelectColumn::Expr(e, _) => Self::expr_contains_window(e),
+            _ => false,
+        }) || stmt
+            .order_by
+            .as_ref()
+            .is_some_and(|ob| ob.iter().any(|o| Self::expr_contains_window(&o.expr)));
         if has_window {
             return self.execute_window_query(stmt);
         }
@@ -11859,6 +13089,60 @@ impl QueryExecutor {
     }
 
     /// 🚀 P0 OPTIMIZATION: Execute FROM clause with limit passed to storage layer
+    /// Serve a FROM reference to a materialized CTE: build SqlRows + a
+    /// schema with the same `table.`-prefix conventions as a real-table scan
+    /// (so JOINs and qualified column references work unchanged).
+    fn materialized_cte_scan(
+        mat: &MaterializedCte,
+        table: &str,
+        alias: Option<&str>,
+    ) -> FromScanResult {
+        let prefix = alias.unwrap_or(table);
+        // Infer column types from the first row (mirrors the Subquery arm).
+        let mut schema_cols = Vec::with_capacity(mat.columns.len());
+        for (idx, col_name) in mat.columns.iter().enumerate() {
+            let col_type = mat
+                .rows
+                .first()
+                .and_then(|r| r.get(idx))
+                .map(|v| match v {
+                    Value::Integer(_) => ColumnType::Integer,
+                    Value::Float(_) => ColumnType::Float,
+                    Value::Text(_) | Value::TextDoc(_) => ColumnType::Text,
+                    Value::Bool(_) => ColumnType::Boolean,
+                    Value::Timestamp(_) => ColumnType::Timestamp,
+                    Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
+                    Value::Spatial(_) => ColumnType::Spatial,
+                    Value::Vector(v) => ColumnType::Tensor(v.len()),
+                    Value::Null => ColumnType::Text,
+                })
+                .unwrap_or(ColumnType::Text);
+            schema_cols.push(crate::types::ColumnDef::new(
+                col_name.clone(),
+                col_type,
+                idx,
+            ));
+        }
+        let mut schema = TableSchema::new(prefix.to_string(), schema_cols);
+
+        let mut sql_rows = Vec::with_capacity(mat.rows.len());
+        for (row_id, row) in mat.rows.iter().enumerate() {
+            let mut sql_row = SqlRow::with_capacity(mat.columns.len() + 2);
+            sql_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
+            sql_row.insert("__table__".to_string(), Value::text(table.to_string()));
+            for (col_name, value) in mat.columns.iter().zip(row.iter()) {
+                let base = col_name.rsplit('.').next().unwrap_or(col_name);
+                sql_row.insert(format!("{}.{}", prefix, base), value.clone());
+            }
+            sql_rows.push((row_id as u64, sql_row));
+        }
+        for col in &mut schema.columns {
+            let base = col.name.rsplit('.').next().unwrap_or(&col.name).to_string();
+            col.name = format!("{}.{}", prefix, base);
+        }
+        Ok((sql_rows, Arc::new(schema)))
+    }
+
     fn execute_from_with_limit(
         &self,
         table_ref: &TableRef,
@@ -11867,6 +13151,11 @@ impl QueryExecutor {
     ) -> FromScanResult {
         match table_ref {
             TableRef::Table { name, alias } => {
+                // 🔓 v2 CTE: a name registered in MATERIALIZED_CTES shadows any
+                // real table (SQL scoping). Serve the materialized rows.
+                if let Some(mat) = MATERIALIZED_CTES.with(|m| m.borrow().get(name).cloned()) {
+                    return Self::materialized_cte_scan(&mat, name, alias.as_deref());
+                }
                 // Single table - use table-specific scan with limit
                 let schema = self.db.get_table_schema(name)?;
 
@@ -11897,8 +13186,9 @@ impl QueryExecutor {
                 Ok((sql_rows, Arc::new(prefixed_schema)))
             }
             TableRef::Subquery { query, alias } => {
-                // Execute subquery
-                let subquery_result = self.execute_select_internal(query)?;
+                // Execute subquery (a plain SELECT or an inlined UNION-chain
+                // CTE body — v2 TableRef::Subquery carries a Statement).
+                let subquery_result = self.execute_from_subquery_statement(query)?;
 
                 // Convert QueryResult to (Vec<(u64, SqlRow)>, TableSchema)
                 match subquery_result {
@@ -13466,6 +14756,9 @@ impl QueryExecutor {
                     None => Ok(Value::Null),
                 }
             }
+            // 🔓 v2 窗口路径: base 把窗口列改写为 NULL 字面量 — 常量在
+            // GROUP BY 上下文合法(每个输出行都是这个常量)。
+            Expr::Literal(v) => Ok(v.clone()),
             _ => {
                 // Non-aggregate expression in GROUP BY context
                 Err(MoteDBError::Query(
@@ -13588,6 +14881,19 @@ impl QueryExecutor {
     /// (`a + b`, `CONCAT(...)`, `IF(...)`, `-v`, scalar subqueries, …) must go
     /// through the materialized path where `eval_expr_on_row` evaluates them.
     /// `Star` and `Column`/`ColumnWithAlias` are NOT computed.
+    /// Does an expression tree contain a WindowFunction node at any depth?
+    fn expr_contains_window(e: &Expr) -> bool {
+        match e {
+            Expr::WindowFunction { .. } => true,
+            Expr::BinaryOp { left, right, .. } => {
+                Self::expr_contains_window(left) || Self::expr_contains_window(right)
+            }
+            Expr::UnaryOp { expr, .. } => Self::expr_contains_window(expr),
+            Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_contains_window),
+            _ => false,
+        }
+    }
+
     fn select_has_computed_expression(columns: &[SelectColumn]) -> bool {
         columns.iter().any(|col| match col {
             SelectColumn::Star | SelectColumn::Column(_) | SelectColumn::ColumnWithAlias(_, _) => {

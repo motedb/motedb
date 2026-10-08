@@ -2290,6 +2290,12 @@ impl TextFTSIndex {
             avg_doc_length: self.avg_doc_length,
         }
     }
+
+    /// Read-only structural audit of the backing B+Tree (page table,
+    /// overflow classification, tree walkability) — used by `doctor()`.
+    pub fn verify_integrity(&self) -> crate::index::btree_generic::BTreeIntegrity {
+        self.btree.read().verify_integrity()
+    }
 }
 
 /// Statistics for TextFTSIndex

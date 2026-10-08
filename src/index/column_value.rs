@@ -1112,6 +1112,12 @@ impl ColumnValueIndex {
         }
     }
 
+    /// Read-only structural audit of the backing B+Tree (page table,
+    /// overflow classification, tree walkability) — used by `doctor()`.
+    pub fn verify_integrity(&self) -> crate::index::btree_generic::BTreeIntegrity {
+        self.btree.read().verify_integrity()
+    }
+
     /// Returns true if this index needs to be rebuilt by the async pipeline.
     /// Newly created indexes or those that missed synchronous updates need rebuilding.
     pub fn needs_rebuild(&self) -> bool {

@@ -351,7 +351,7 @@ impl LeafStore {
     }
 
     fn read_slot(file: &File, leaf_id: u64) -> Result<Vec<IndexedPoint3D>> {
-        use std::os::unix::fs::FileExt;
+        use crate::platform_io::PositionalRead as _;
         let offset = Self::slot_offset(leaf_id);
 
         let mut buf = [0u8; SLOT_SIZE];

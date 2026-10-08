@@ -57,6 +57,13 @@ struct FastPkMeta {
     is_star: bool,
     /// Only for SELECT: column positions to project
     select_col_positions: Vec<usize>,
+    /// 🔑 Only for SELECT (non-star): OUTPUT column names, one per projected
+    /// position. The fast path used to return the full table's column_names
+    /// while emitting only the projected VALUES — `SELECT v FROM t WHERE
+    /// id = ?` came back as columns=['id','v','s'] with data=[v_value],
+    /// silently mislabeling every partial projection (BUG #46, found by an
+    /// external production review). Must stay 1:1 with select_col_positions.
+    select_col_names: Vec<String>,
     /// Only for UPDATE: (col_position, param_idx) for SET col = ?
     set_param_positions: Vec<(usize, usize)>,
     /// Only for UPDATE: (col_position, literal) for SET col = <literal>.
@@ -1131,28 +1138,72 @@ impl Database {
             return Ok(None);
         }
 
+        // 🔒 SELECT-shape guard (BUG #46, external review): the fast path
+        // returns the point row (projected or whole). It must NOT claim
+        // statements whose result shape depends on more than that one row:
+        //   - aggregates / GROUP BY / HAVING / LATEST BY re-shape the output;
+        //   - OFFSET > 0 (or LIMIT ?/OFFSET ? — value unknown at detect
+        //     time) must yield zero rows for a single-row point query;
+        //   - LIMIT 0 must yield zero rows.
+        // Any of these defers to the full executor.
+        if stmt_type == "select" {
+            if let S::Select { stmt: s, .. } = statement {
+                if s.group_by.is_some()
+                    || s.having.is_some()
+                    || s.latest_by.is_some()
+                    || s.limit == Some(0)
+                    || s.offset.is_some_and(|o| o > 0)
+                    || s.limit_param.is_some()
+                    || s.offset_param.is_some()
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
         let is_star = select_cols
             .is_some_and(|cols| cols.len() == 1 && matches!(cols[0], SelectColumn::Star));
 
+        // 🔒 Strict projection validation (BUG #46): every select item must be
+        // a bare (optionally qualified / aliased) column that exists in the
+        // schema. Anything else — expressions (`v + 1`), aggregates
+        // (`COUNT(*)`), literals, a `*` mixed with columns, or an unknown
+        // column — must defer to the full executor. The old filter_map
+        // silently DROPPED unresolvable items, so `SELECT COUNT(*) ... WHERE
+        // id = ?` returned a whole mislabeled row instead of one aggregate.
+        let mut select_col_names: Vec<String> = Vec::new();
         let select_col_positions: Vec<usize> = if let Some(cols) = select_cols {
             if is_star {
                 vec![]
             } else {
-                cols.iter()
-                    .filter_map(|col_spec| {
-                        let cname = match col_spec {
-                            SelectColumn::Column(n) => n.as_str(),
-                            SelectColumn::ColumnWithAlias(n, _) => n.as_str(),
-                            _ => return None,
-                        };
-                        let lookup = if cname.contains('.') {
-                            cname.rsplit('.').next().unwrap_or(cname)
-                        } else {
-                            cname
-                        };
-                        schema.get_column_position(lookup)
-                    })
-                    .collect()
+                let mut positions = Vec::with_capacity(cols.len());
+                for col_spec in cols {
+                    match col_spec {
+                        SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => {
+                            let lookup = if n.contains('.') {
+                                n.rsplit('.').next().unwrap_or(n)
+                            } else {
+                                n
+                            };
+                            let pos = match schema.get_column_position(lookup) {
+                                Some(p) => p,
+                                None => return Ok(None), // unknown column → full path errors properly
+                            };
+                            let out_name = match col_spec {
+                                SelectColumn::ColumnWithAlias(_, alias) => alias.as_str(),
+                                // Keep the user-written form (incl. qualifier)
+                                // — matches build_select_columns naming.
+                                _ => n.as_str(),
+                            };
+                            select_col_names.push(out_name.to_string());
+                            positions.push(pos);
+                        }
+                        // Expr / bare Star mixed with columns → full path
+                        // (eval_expr_on_row / star expansion live there).
+                        _ => return Ok(None),
+                    }
+                }
+                positions
             }
         } else {
             vec![]
@@ -1215,6 +1266,7 @@ impl Database {
             param_idx,
             is_star,
             select_col_positions,
+            select_col_names,
             set_param_positions,
             set_literal_positions,
             is_auto_increment: schema.is_primary_key_auto_increment(),
@@ -1253,9 +1305,24 @@ impl Database {
         let row_id = match Self::resolve_fast_pk_row_id(self, meta, pk_value) {
             FastPkRowId::Resolved(rid) => rid,
             FastPkRowId::Absent => {
+                // 🔑 A PK value that can never match (e.g. `WHERE id = ?`
+                // bound to NULL on an AUTO_INCREMENT table) must still answer
+                // a SELECT with an EMPTY result set — returning Modification
+                // here made Python query() raise "expects a SELECT
+                // statement" instead of `[]`.
+                if meta.stmt_type == "select" {
+                    return Ok(Some(StreamingQueryResult::SelectReady {
+                        columns: if meta.is_star {
+                            (*meta.column_names).clone()
+                        } else {
+                            meta.select_col_names.clone()
+                        },
+                        rows: vec![],
+                    }));
+                }
                 return Ok(Some(StreamingQueryResult::Modification {
                     affected_rows: 0,
-                }))
+                }));
             }
             FastPkRowId::Defer => return Ok(None), // PK cache miss — fall back to full path
         };
@@ -1327,6 +1394,13 @@ impl Database {
                         .query_executor
                         .txn_lookup_row_pub(&meta.table_name, row_id)
                     {
+                        // 🔑 BUG #46: non-star output must carry the PROJECTED
+                        // column names — full table names mislabeled the row.
+                        let out_columns: Vec<String> = if meta.is_star {
+                            (*meta.column_names).clone()
+                        } else {
+                            meta.select_col_names.clone()
+                        };
                         let result_vec: Vec<Vec<Value>> = match txn_row {
                             Some(row) => {
                                 if meta.is_star {
@@ -1342,7 +1416,7 @@ impl Database {
                             None => vec![],
                         };
                         return Ok(Some(StreamingQueryResult::SelectReady {
-                            columns: (*meta.column_names).clone(),
+                            columns: out_columns,
                             rows: result_vec,
                         }));
                     }
@@ -1359,7 +1433,9 @@ impl Database {
                             store.get_projected_multi(composite, &meta.select_col_positions)
                         {
                             return Ok(Some(StreamingQueryResult::SelectReady {
-                                columns: (*meta.column_names).clone(),
+                                // 🔑 BUG #46: values here are the projected
+                                // subset — the labels must be too.
+                                columns: meta.select_col_names.clone(),
                                 rows: vec![vals],
                             }));
                         }
@@ -1385,7 +1461,12 @@ impl Database {
                     None => vec![],
                 };
                 Ok(Some(StreamingQueryResult::SelectReady {
-                    columns: (*meta.column_names).clone(),
+                    columns: if meta.is_star {
+                        (*meta.column_names).clone()
+                    } else {
+                        // 🔑 BUG #46: projected values + projected names.
+                        meta.select_col_names.clone()
+                    },
                     rows: result_vec,
                 }))
             }
@@ -1610,6 +1691,7 @@ impl Database {
             param_idx: pk_param_idx,
             is_star: false,
             select_col_positions: Vec::new(),
+            select_col_names: Vec::new(),
             set_param_positions: Vec::new(),
             set_literal_positions: Vec::new(),
             is_auto_increment: schema.is_primary_key_auto_increment(),
@@ -2126,6 +2208,20 @@ impl Database {
         // Fall through to the full parser which applies DISTINCT correctly.
         if Self::find_keyword_ci(select_part, "distinct").is_some() {
             return Ok(None);
+        }
+
+        // 🔒 Strict select-list validation (BUG #46 class): every projected
+        // column below is built with filter_map/get_column on this comma
+        // split. An item that doesn't resolve (unknown column, qualified
+        // `t.v`, alias, function call) used to be SILENTLY DROPPED — the
+        // output kept the full column_names but rows had fewer values.
+        // Validate up front and defer the whole statement to the full parser.
+        if !is_star {
+            for item in select_part.split(',').map(|s| s.trim()) {
+                if schema.get_column_position(item).is_none() {
+                    return Ok(None);
+                }
+            }
         }
 
         // 🚀 ColSegmentStore PK point query: route directly to store.get() →

@@ -634,7 +634,7 @@ impl BTree {
         let file = self.storage_file.read();
 
         // Read header to get content_len using positional read (no seek needed)
-        use std::os::unix::fs::FileExt;
+        use crate::platform_io::PositionalRead as _;
         let mut header_buf = [0u8; 15];
         file.read_exact_at(&mut header_buf, file_offset)?;
         let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;

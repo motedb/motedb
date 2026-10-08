@@ -41,8 +41,7 @@ impl Parser {
     pub fn parse(&mut self) -> Result<Statement> {
         // 🆕 WITH clause — parsed once at the top so the CTEs are visible to
         // both halves of a UNION. Returns (ctes, is_recursive_marker).
-        let (mut ctes, _recursive_marker) = if matches!(self.current().token_type, TokenType::With)
-        {
+        let (mut ctes, with_recursive) = if matches!(self.current().token_type, TokenType::With) {
             self.parse_with_clause()?
         } else {
             (Vec::new(), false)
@@ -91,6 +90,7 @@ impl Parser {
                             op,
                             all,
                             ctes: Vec::new(),
+                            with_recursive: false,
                             order_by: None,
                             limit: None,
                             offset: None,
@@ -130,6 +130,7 @@ impl Parser {
                     Statement::Select {
                         stmt: select,
                         ctes: std::mem::take(&mut ctes),
+                        with_recursive,
                     }
                 } else {
                     // First was an INTERSECT chain (no UNION/EXCEPT): attach
@@ -298,6 +299,7 @@ impl Parser {
         let mut right: Statement = Statement::Select {
             stmt: self.parse_select_core()?,
             ctes: Vec::new(),
+            with_recursive: false,
         };
         // INTERSECT is left-associative within its own precedence level.
         while matches!(self.current().token_type, TokenType::Intersect) {
@@ -311,9 +313,11 @@ impl Parser {
                 right: Box::new(Statement::Select {
                     stmt: next,
                     ctes: Vec::new(),
+                    with_recursive: false,
                 }),
                 op: SetOp::Intersect,
                 all: false,
+                with_recursive: false,
                 ctes: Vec::new(),
                 order_by: None,
                 limit: None,
@@ -392,8 +396,13 @@ impl Parser {
     /// `QueryExecutor::apply_ctes`.
     /// Parse OVER (...) for window functions. Converts FunctionCall → WindowFunction.
     fn parse_window_spec(&mut self, fc: Expr) -> Result<Expr> {
-        let (name, args) = match &fc {
-            Expr::FunctionCall { name, args, .. } => (name.clone(), args.clone()),
+        let (name, args, fc_distinct) = match &fc {
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                ..
+            } => (name.clone(), args.clone(), *distinct),
             _ => return Ok(fc),
         };
         let func = match name.to_uppercase().as_str() {
@@ -431,8 +440,29 @@ impl Parser {
                     crate::sql::ast::WindowFunc::Lead { expr, offset, default }
                 }
             }
+            "SUM" | "TOTAL" => Self::parse_window_agg(&args, crate::sql::ast::WindowAggFunc::Sum, fc_distinct),
+            "COUNT" => Self::parse_window_agg(&args, crate::sql::ast::WindowAggFunc::Count, fc_distinct),
+            "AVG" | "MEAN" => Self::parse_window_agg(&args, crate::sql::ast::WindowAggFunc::Avg, fc_distinct),
+            "MIN" => Self::parse_window_agg(&args, crate::sql::ast::WindowAggFunc::Min, fc_distinct),
+            "MAX" => Self::parse_window_agg(&args, crate::sql::ast::WindowAggFunc::Max, fc_distinct),
+            "FIRST_VALUE" => {
+                if args.len() != 1 {
+                    return Err(self.error("FIRST_VALUE requires exactly 1 argument"));
+                }
+                crate::sql::ast::WindowFunc::FirstValue {
+                    expr: Box::new(args[0].clone()),
+                }
+            }
+            "LAST_VALUE" => {
+                if args.len() != 1 {
+                    return Err(self.error("LAST_VALUE requires exactly 1 argument"));
+                }
+                crate::sql::ast::WindowFunc::LastValue {
+                    expr: Box::new(args[0].clone()),
+                }
+            }
             other => return Err(self.error(&format!(
-                "Unsupported window function '{}' (supported: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD)", other
+                "Unsupported window function '{}' (supported: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM, COUNT, AVG, MIN, MAX)", other
             ))),
         };
         self.expect(TokenType::Over)?;
@@ -505,7 +535,7 @@ impl Parser {
         loop {
             // CTE name
             let name = self.parse_identifier()?;
-            // Optional column list: ( col, col, ... )
+            // Optional column list: ( col1, col2, ... )
             let columns = if self.match_token(TokenType::LParen) {
                 let cols = self.parse_identifier_list()?;
                 self.expect(TokenType::RParen)?;
@@ -515,18 +545,22 @@ impl Parser {
             };
             // AS
             self.expect(TokenType::As)?;
-            // ( SELECT ... )
+            // ( SELECT ... [UNION [ALL] SELECT ...] )
             self.expect(TokenType::LParen)?;
             if !matches!(self.current().token_type, TokenType::Select) {
                 return Err(self.error("Expected SELECT inside CTE body"));
             }
-            let query = self.parse_select()?;
+            // 🔓 v2 CTE bodies may be a UNION/EXCEPT chain, not just a bare
+            // SELECT (`WITH x AS (a UNION ALL b)` previously failed to parse
+            // with "Expected RParen"). Same precedence folding as the
+            // top-level statement parser.
+            let body = self.parse_cte_body()?;
             self.expect(TokenType::RParen)?;
 
             ctes.push(CteDef {
                 name,
                 columns,
-                query,
+                body,
             });
 
             // Another CTE?
@@ -536,6 +570,96 @@ impl Parser {
         }
 
         Ok((ctes, is_recursive))
+    }
+
+    /// Window-aggregate argument parsing: SUM(v) / MIN(v) / COUNT(*) /
+    /// COUNT(DISTINCT v) etc. `distinct` mirrors the parsed function call's
+    /// own flag (v1 dropped it — COUNT(DISTINCT v) OVER () silently counted
+    /// duplicates).
+    fn parse_window_agg(
+        args: &[Expr],
+        func: crate::sql::ast::WindowAggFunc,
+        distinct: bool,
+    ) -> crate::sql::ast::WindowFunc {
+        // COUNT(*) has no argument — args.first() is None.
+        let arg = args.first().map(|e| Box::new(e.clone()));
+        crate::sql::ast::WindowFunc::Agg {
+            func,
+            arg,
+            distinct,
+        }
+    }
+
+    /// Parse a CTE body: a SELECT / INTERSECT chain, optionally folded with
+    /// left-associative UNION [ALL] / EXCEPT, plus trailing ORDER BY / LIMIT /
+    /// OFFSET that belong to the body itself (inside the parens).
+    fn parse_cte_body(&mut self) -> Result<Statement> {
+        let first = self.parse_intersect_seq()?;
+        if !matches!(
+            self.current().token_type,
+            TokenType::Union | TokenType::Except | TokenType::Order | TokenType::Limit
+        ) {
+            return Ok(first);
+        }
+        let mut left_stmt = first;
+        while matches!(
+            self.current().token_type,
+            TokenType::Union | TokenType::Except
+        ) {
+            let (op, all) = match self.current().token_type {
+                TokenType::Union => {
+                    self.advance();
+                    let all = if matches!(self.current().token_type, TokenType::All) {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    (SetOp::Union, all)
+                }
+                TokenType::Except => {
+                    self.advance();
+                    (SetOp::Except, false)
+                }
+                _ => unreachable!(),
+            };
+            let right = self.parse_intersect_seq()?;
+            left_stmt = Statement::SetOp {
+                left: Box::new(left_stmt),
+                right: Box::new(right),
+                op,
+                all,
+                ctes: Vec::new(),
+                with_recursive: false,
+                order_by: None,
+                limit: None,
+                offset: None,
+            };
+        }
+        // Trailing clauses inside the CTE body parens attach to the body.
+        let (order_by, limit, offset, lp, op) = self.parse_trailing_clauses()?;
+        if lp.is_some() || op.is_some() {
+            return Err(self.error("parameterized LIMIT/OFFSET is not supported inside a CTE body"));
+        }
+        match &mut left_stmt {
+            Statement::Select { stmt, .. } => {
+                stmt.order_by = order_by;
+                stmt.limit = limit;
+                stmt.offset = offset;
+            }
+            Statement::SetOp {
+                order_by: o,
+                limit: l,
+                offset: off,
+                ..
+            } => {
+                *o = order_by;
+                *l = limit;
+                *off = offset;
+            }
+            _ => {}
+        }
+        Ok(left_stmt)
     }
 
     fn parse_column_list(&mut self) -> Result<Vec<String>> {
@@ -759,7 +883,11 @@ impl Parser {
             };
 
             return Ok(TableRef::Subquery {
-                query: Box::new(subquery),
+                query: Box::new(crate::sql::ast::Statement::Select {
+                    stmt: subquery,
+                    ctes: Vec::new(),
+                    with_recursive: false,
+                }),
                 alias,
             });
         }
@@ -1649,6 +1777,7 @@ impl Parser {
                 Ok(Expr::Exists(Box::new(crate::sql::ast::Statement::Select {
                     stmt: sub,
                     ctes: Vec::new(),
+                    with_recursive: false,
                 })))
             }
             // CASE WHEN ... THEN ... [WHEN ... THEN ...] [ELSE ...] END

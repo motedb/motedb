@@ -225,6 +225,79 @@ impl MoteDB {
             detail: format!("{build_errors} background index build errors"),
         });
 
+        // ── On-disk index file integrity (B+Tree page table + overflow
+        // classification + tree walkability). 🔑 External review: an FTS
+        // index that logged "skipping corrupt page during flush" still
+        // reported PASS because no check looked at the index files.
+        let mut idx_fail = 0usize;
+        let mut idx_warn = 0usize;
+        let mut idx_checked = 0usize;
+        for e in self.text_indexes.iter() {
+            idx_checked += 1;
+            let r = e.value().read().verify_integrity();
+            if !r.problems.is_empty() {
+                idx_fail += 1;
+                checks.push(DoctorCheck {
+                    name: format!("index.{}.integrity", e.key()),
+                    status: DoctorStatus::Fail,
+                    detail: format!(
+                        "{} problem(s): {}",
+                        r.problems.len(),
+                        r.problems.first().cloned().unwrap_or_default()
+                    ),
+                });
+            } else if r.orphan_pages > 0 {
+                idx_warn += 1;
+                checks.push(DoctorCheck {
+                    name: format!("index.{}.integrity", e.key()),
+                    status: DoctorStatus::Warn,
+                    detail: format!(
+                        "healthy tree ({} pages reachable, {} overflow) with {} orphan page(s) — residue of deleted subtrees; queries never touch them, they only cost disk space (rebuild the index to reclaim)",
+                        r.reachable_pages, r.overflow_pages, r.orphan_pages
+                    ),
+                });
+            }
+        }
+        for e in self.column_indexes.iter() {
+            idx_checked += 1;
+            let r = e.value().verify_integrity();
+            if !r.problems.is_empty() {
+                idx_fail += 1;
+                checks.push(DoctorCheck {
+                    name: format!("index.{}.integrity", e.key()),
+                    status: DoctorStatus::Fail,
+                    detail: format!(
+                        "{} problem(s): {}",
+                        r.problems.len(),
+                        r.problems.first().cloned().unwrap_or_default()
+                    ),
+                });
+            } else if r.orphan_pages > 0 {
+                idx_warn += 1;
+                checks.push(DoctorCheck {
+                    name: format!("index.{}.integrity", e.key()),
+                    status: DoctorStatus::Warn,
+                    detail: format!(
+                        "healthy tree ({} pages reachable, {} overflow) with {} orphan page(s) — residue of deleted subtrees; queries never touch them, they only cost disk space (rebuild the index to reclaim)",
+                        r.reachable_pages, r.overflow_pages, r.orphan_pages
+                    ),
+                });
+            }
+        }
+        checks.push(DoctorCheck {
+            name: "index.files_integrity".into(),
+            status: if idx_fail > 0 {
+                DoctorStatus::Fail
+            } else if idx_warn > 0 {
+                DoctorStatus::Warn
+            } else {
+                DoctorStatus::Pass
+            },
+            detail: format!(
+                "{idx_checked} on-disk index file(s) audited: {idx_fail} structural failure(s), {idx_warn} with orphans"
+            ),
+        });
+
         // ── Memory rollup ──
         checks.push(DoctorCheck {
             name: "memory.col_cache_total".into(),

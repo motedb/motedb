@@ -1569,22 +1569,30 @@ impl ColumnarSSTable {
     /// Release mmap pages from RSS (MADV_DONTNEED). Pages are re-faulted
     /// on next access. No-op for heap-backed segments.
     pub fn release_pages(&self) {
+        #[cfg(unix)]
         if let Some(ref m) = self.mmap {
             unsafe {
                 libc::madvise(m.as_ptr() as *mut _, m.len(), libc::MADV_DONTNEED);
             }
         }
+        // 🔧 Windows: no madvise — the OS reclaims file-backed pages under
+        // pressure on its own; this hint is an optimization only.
+        #[cfg(not(unix))]
+        let _ = &self.mmap;
     }
 
     /// Hint OS to read-ahead sequentially (MADV_SEQUENTIAL). Call before bulk
     /// sequential scans (compaction/merge) so the kernel prefetches pages,
     /// reducing page-fault stalls. No-op for heap-backed segments.
     pub fn advise_sequential(&self) {
+        #[cfg(unix)]
         if let Some(ref m) = self.mmap {
             unsafe {
                 libc::madvise(m.as_ptr() as *mut _, m.len(), libc::MADV_SEQUENTIAL);
             }
         }
+        #[cfg(not(unix))]
+        let _ = &self.mmap;
     }
 
     /// Check if a file is a columnar SSTable by reading its magic.

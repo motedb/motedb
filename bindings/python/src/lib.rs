@@ -131,7 +131,6 @@ fn extract_column_values(
     obj: &Bound<'_, pyo3::types::PyAny>,
 ) -> PyResult<Vec<motedb_core::types::Value>> {
     use motedb_core::types::Value as MValue;
-    use pyo3::types::PyAnyMethods as _;
 
     // 1) numpy 风格数组: tobytes() 一次 memcpy 出原始 C 序字节 (abi3 无
     //    buffer 协议 — PyBuffer 需要完整 API), dtype/shape 自省解码。
@@ -260,7 +259,6 @@ fn frombuffer_or_bytes(
     buf: &[u8],
     dtype: &str,
 ) -> PyObject {
-    use pyo3::types::PyAnyMethods as _;
     if let Some(np) = np {
         let bytes = pyo3::types::PyBytes::new_bound(py, buf);
         if let Ok(arr) = np.call_method1("frombuffer", (bytes, dtype)) {
@@ -271,7 +269,6 @@ fn frombuffer_or_bytes(
 }
 
 fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
-    use pyo3::types::PyAnyMethods as _;
     if v.is_none() {
         return Ok(MValue::Null);
     }
@@ -567,7 +564,7 @@ impl PyDatabase {
         for (row, hit) in rows.iter().zip(hits.iter()) {
             let dict = pyo3::types::PyDict::new_bound(py);
             for (key, val) in keys.iter().zip(row.iter()) {
-                dict.set_item(key.clone(), mote_to_py_cached(val, &mut text_cache))?;
+                dict.set_item(key, mote_to_py_cached(val, &mut text_cache))?;
             }
             dict.set_item("__rrf__", hit.rrf)?;
             dict.set_item("__bm25__", hit.bm25)?;
@@ -588,7 +585,6 @@ impl PyDatabase {
     ) -> PyResult<PyObject> {
         let result = self.run(py, sql, params)?;
         Python::with_gil(|py| -> PyResult<PyObject> {
-            use pyo3::types::PyAnyMethods as _;
             match result {
                 motedb_core::QueryResult::Select { columns, rows } => {
                     // 🚀 Create (and hash) each column-name PyString ONCE per
@@ -605,7 +601,7 @@ impl PyDatabase {
                     for row in rows {
                         let dict = pyo3::types::PyDict::new_bound(py);
                         for (key, val) in keys.iter().zip(row.iter()) {
-                            dict.set_item(key.clone(), mote_to_py_cached(val, &mut text_cache))?;
+                            dict.set_item(key, mote_to_py_cached(val, &mut text_cache))?;
                         }
                         list.append(dict)?;
                     }
@@ -630,7 +626,6 @@ impl PyDatabase {
     ) -> PyResult<PyObject> {
         let result = self.run(py, sql, params)?;
         Python::with_gil(|py| -> PyResult<PyObject> {
-            use pyo3::types::PyAnyMethods as _;
             match result {
                 motedb_core::QueryResult::Select { columns, rows } => {
                     let cols: Vec<String> = columns;
@@ -676,7 +671,6 @@ impl PyDatabase {
         let result = self.run(py, sql, params)?;
         match result {
             motedb_core::QueryResult::Select { columns, rows } => {
-                use pyo3::types::PyAnyMethods as _;
                 let np = numpy_module(py);
                 let dict = pyo3::types::PyDict::new_bound(py);
                 let mut text_cache: InternMap = std::collections::HashMap::default();
@@ -808,7 +802,6 @@ impl PyDatabase {
         columns: Bound<'_, pyo3::types::PyDict>,
     ) -> PyResult<u64> {
         use motedb_core::types::Value as MValue;
-        use pyo3::types::PyAnyMethods as _;
 
         // 🔑 按 schema 位置放置列值。旧实现按字典序转置 — 字典序 ≠ schema
         // 序时值静默落错列 (TEXT 列收到 Float 被清成空串), 省略前导自增 PK
@@ -881,7 +874,6 @@ impl PyDatabase {
 
     #[pyo3(signature = (sql, params))]
     fn executemany(&self, py: Python<'_>, sql: &str, params: Bound<'_, PyAny>) -> PyResult<usize> {
-        use pyo3::types::PyAnyMethods as _;
         let list = params
             .extract::<Vec<Bound<'_, PyAny>>>()
             .map_err(|_| PyValueError::new_err("params must be a list of parameter lists"))?;
@@ -917,12 +909,24 @@ impl PyDatabase {
         self.db.checkpoint().map_err(py_err)
     }
 
+    /// Online backup: copy a consistent point-in-time snapshot of the whole
+    /// database directory to `dest` while the database stays open. Every
+    /// transaction COMMITted before the call is present in the snapshot;
+    /// concurrent autocommit writes queue on the write lock for the duration.
+    /// `dest` must not already exist; restore is simply
+    /// `motedb.Database(dest)`.
+    #[pyo3(signature = (dest))]
+    fn backup_to(&self, py: Python<'_>, dest: &str) -> PyResult<()> {
+        // Release the GIL for the copy — it can take seconds on large DBs and
+        // blocks all write stripes server-side.
+        py.allow_threads(|| self.db.backup_to(dest)).map_err(py_err)
+    }
+
     /// Operational self-check: list of {"name", "status", "detail"} dicts
     /// plus a "verdict" ("PASS" | "WARN" | "FAIL").
     fn doctor(&self) -> PyResult<PyObject> {
         let report = self.db.doctor();
         Python::with_gil(|py| -> PyResult<PyObject> {
-            use pyo3::types::PyAnyMethods as _;
             let list = pyo3::types::PyList::empty_bound(py);
             for c in &report.checks {
                 let dict = pyo3::types::PyDict::new_bound(py);
@@ -967,7 +971,6 @@ impl PyDatabase {
         let streaming = match params {
             None => py.allow_threads(|| self.db.execute(sql)).map_err(py_err)?,
             Some(p) => {
-                use pyo3::types::PyAnyMethods as _;
                 let list = p
                     .extract::<Vec<Bound<'_, PyAny>>>()
                     .map_err(|_| PyValueError::new_err("params must be a list"))?;

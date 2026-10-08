@@ -388,9 +388,13 @@ impl SQ8Vectors {
     /// steady-state). Pages are file-backed and reclaimable — this prepones
     /// cost the steady state pays anyway, it does not grow the ceiling.
     pub fn warm_page_cache(&self) {
+        // 🔧 Windows: memmap2::advise is unix-only — no readahead hint there.
+        #[cfg(unix)]
         if let Some(m) = self.data_mmap.read().as_ref() {
             let _ = m.advise(memmap2::Advice::WillNeed);
         }
+        #[cfg(not(unix))]
+        let _ = &self.data_mmap;
     }
 
     pub fn read_guard(&self) -> SQ8ReadGuard<'_> {

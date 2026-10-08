@@ -22,6 +22,15 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-latest
             target: x86_64-apple-darwin
+          # 🔑 External review: no Windows wheel existed at all. The core lib
+          # now cross-compiles (platform_io::PositionalRead replaces
+          # unix-only FileExt; tikv-jemalloc crates are target-gated off
+          # msvc, where its C code cannot build — Windows uses the system
+          # allocator).
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +48,22 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: bindings/python/dist/*.whl
 
+  # 🔑 External review: PyPI shipped wheels only — no sdist, so
+  # `pip install motedb-python --no-binary` (source builds, downstream
+  # packaging, distro maintainers) had nothing to fetch.
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          args: sdist --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: bindings/python/dist/*.tar.gz
+
   # 🔑 Import + functional smoke on NATIVE runners. The two Linux-fatal
   # packaging bugs shipped because nothing ever imported the wheel:
   #   1. build.rs passed macOS's `-undefined dynamic_lookup` to Linux ldd
@@ -50,7 +75,7 @@ jobs:
   # natively; the native pairs below cover each OS + the linker/TLS class
   # of failure per libc.
   smoke:
-    needs: build
+    needs: [build, sdist]
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +87,9 @@ jobs:
             wheel-pattern: "*manylinux*x86_64*"
           - os: macos-latest
             wheel-pattern: "*arm64*"
+          # Native Windows import + functional smoke for the new wheels.
+          - os: windows-latest
+            wheel-pattern: "*win_amd64*"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +100,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Install built wheel
+      - name: Install built wheel (posix)
+        if: runner.os != 'Windows'
         run: |
           # 🔑 Shell-expand the pattern into an array (pip ≥22 does NOT glob
           # file arguments itself: it saw the literal `dist/*x86_64*.whl` and
@@ -95,21 +124,59 @@ jobs:
             echo "::error::pip install failed rc=$RC :: $TAIL"
             exit 1
           fi
+      - name: Install built wheel (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wheels = Get-ChildItem -Path dist -Filter ($env:WHEEL_PATTERN + ".whl")
+          if (-not $wheels) {
+            Write-Error "no wheel matches dist/$env:WHEEL_PATTERN.whl"; Get-ChildItem dist; exit 1
+          }
+          Write-Host "installing: $($wheels.FullName)"
+          python -m pip install $wheels.FullName
+        env:
+          WHEEL_PATTERN: ${{ matrix.wheel-pattern }}
       - name: Import + version smoke
         run: python -c "import motedb; print('motedb', motedb.__version__)"
       # 🔑 e2e 的 errors/cli 套件需要 motedb-cli 二进制 — 本地构建并经
       # MOTE_CLI 指定 (wheel 不携带 CLI; 此前 CI 上 FileNotFoundError 崩
-      # errors 套件, v0.11.0 smoke 双双挂在这)。
+      # errors 套件, v0.11.0 smoke 双双挂在这)。Windows 冒烟只跑功能子集:
+      # e2e_workload 的 errors 套件依赖 POSIX shell 脚本约定。
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Windows'
       - name: Build motedb-cli for e2e
+        if: runner.os != 'Windows'
         run: cargo build --release --bin motedb-cli
       - name: Functional E2E smoke (11 suites, small data)
+        if: runner.os != 'Windows'
         run: python bindings/python/e2e/e2e_workload.py --root /tmp/e2e
         env:
           MOTE_CLI: ${{ github.workspace }}/target/release/motedb-cli
+      - name: Functional smoke (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -c @'
+          import motedb, tempfile, os
+          root = tempfile.mkdtemp()
+          db = motedb.Database(os.path.join(root, "smoke.mote"))
+          db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT, s TEXT)")
+          db.execute("INSERT INTO t VALUES (1, 7, 'hello')")
+          assert db.execute("SELECT v FROM t WHERE id = ?", params=[1]) == [{"v": 7}]
+          cols, rows = db.query("SELECT v FROM t WHERE id = ?", params=[1])
+          assert cols == ["v"] and rows == [(7,)]
+          db.execute("CREATE TEXT INDEX ti ON t(s)")
+          assert db.execute("SELECT COUNT(*) AS n FROM t WHERE MATCH(s, 'hello')")[0]["n"] == 1
+          dest = os.path.join(root, "backup.mote")
+          db.backup_to(dest)
+          db2 = motedb.Database(dest)
+          assert db2.execute("SELECT v FROM t WHERE id = 1") == [{"v": 7}]
+          db.close(); db2.close()
+          print("windows functional smoke OK")
+          '@
 
   publish:
-    needs: [build, smoke]
+    needs: [build, sdist, smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi
@@ -123,4 +190,6 @@ jobs:
       - name: Publish to PyPI (trusted publisher)
         # Requires the repo to be registered as a Trusted Publisher at
         # https://pypi.org/manage/account/publishing/ — no API token secret.
+        # dist/ now carries every wheel (linux x86_64/aarch64, macOS
+        # x86_64/arm64, Windows amd64/arm64) PLUS the sdist tarball.
         uses: pypa/gh-action-pypi-publish@release/v1

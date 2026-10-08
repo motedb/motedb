@@ -88,6 +88,27 @@ impl MoteDB {
             )));
         }
 
+        // 🔒 A destination INSIDE the database directory would make the
+        // recursive copy ingest its own growing output (path length blows up
+        // with ENAMETOOLONG / infinite growth). Refuse up front.
+        let src_canon = std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let dest_canon = {
+            // dest doesn't exist yet — canonicalize its parent + file name
+            match dest.parent() {
+                Some(p) => std::fs::canonicalize(p)
+                    .map(|cp| cp.join(dest.file_name().unwrap_or_default()))
+                    .unwrap_or_else(|_| dest.clone()),
+                None => dest.clone(),
+            }
+        };
+        if dest_canon.starts_with(&src_canon) {
+            return Err(StorageError::InvalidData(format!(
+                "backup destination must be outside the database directory: {} is inside {}",
+                dest.display(),
+                self.path.display()
+            )));
+        }
+
         // Same discipline as flush(): CAS the reentrancy flag, then hold
         // checkpoint_mutex so auto-checkpoint/compaction can't rewrite
         // segment files mid-copy.
@@ -121,17 +142,53 @@ impl MoteDB {
             self.autocommit_locks.iter().map(|s| s.lock()).collect();
         let _write_guard = self.write_lock.lock();
 
-        // Drain all in-memory write buffers to disk BEFORE copying, then
-        // truncate the WAL: everything it still holds is now flushed into
-        // segments and would otherwise be REPLAYED ON TOP of the flushed
-        // data when the snapshot is opened (doubled TimeSeries rows).
+        // Drain all in-memory write buffers to disk BEFORE copying, flush the
+        // derived indexes into the snapshot (see flush_all_indexes_for_backup
+        // — text/vector pending state used to be silently dropped from the
+        // copy), then truncate the WAL: everything it still holds is now
+        // flushed into segments and would otherwise be REPLAYED ON TOP of the
+        // flushed data when the snapshot is opened (doubled TimeSeries rows).
         let flush_result = self.flush_impl().and_then(|()| {
-            self.wal.checkpoint_all()?;
-            Ok(())
+            self.flush_all_indexes_for_backup()?;
+            self.wal.checkpoint_all()
         });
 
+        // 🔒 A writer thread whose flush_buffer was ALREADY in flight when
+        // backup acquired the write stripes can finish DURING the copy —
+        // atomically adding its new segment and deleting the retired one
+        // (read_dir lists the old file, metadata/open misses it). That
+        // in-flight window can't be closed by locks, so retry the whole copy:
+        // by the retry the in-flight writer has settled (new writes queue on
+        // the stripes we still hold). NotFound is retried; any other error
+        // fails immediately.
         let result = match flush_result {
-            Ok(()) => Self::copy_dir_durable(&self.path, &dest),
+            Ok(()) => {
+                let mut out = Ok(());
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let _ = std::fs::remove_dir_all(&dest);
+                    }
+                    match Self::copy_dir_durable(&self.path, &dest) {
+                        Ok(()) => {
+                            out = Ok(());
+                            break;
+                        }
+                        Err(e) => {
+                            let retryable = matches!(
+                                &e,
+                                StorageError::Io(io_e)
+                                    if io_e.kind() == std::io::ErrorKind::NotFound
+                            );
+                            out = Err(e);
+                            if !retryable {
+                                break;
+                            }
+                        }
+                    }
+                }
+                out
+            }
             Err(e) => Err(e),
         };
 
@@ -151,6 +208,18 @@ impl MoteDB {
             let name = entry.file_name();
             // The flock file is process-local state, not database data.
             if name == ".lock" {
+                continue;
+            }
+            // 🔒 Atomic-write staging files (`.sst.tmp`, `.writebuf.tmp`, …):
+            // short-lived by design — a writer thread whose flush_buffer was
+            // already in flight when backup acquired the write stripes can
+            // still be renaming its `.tmp` to the final name DURING the copy
+            // (read_dir lists the tmp, metadata misses it → NotFound, found
+            // by the concurrency stress test). The durable form of that data
+            // is the FINAL file, which backup's own locked flush_impl wrote
+            // out before the copy started — skipping staging files loses
+            // nothing.
+            if name.to_string_lossy().ends_with(".tmp") {
                 continue;
             }
             let from = entry.path();
@@ -591,6 +660,43 @@ impl MoteDB {
             index.flush()?;
         }
 
+        Ok(())
+    }
+
+    /// 🔁 backup 专用索引 flush: 与 checkpoint/Drop 不同, backup_to 不能停掉
+    /// async 管线(备份完库还要继续服务), 而快照文件必须反映当前索引状态——
+    /// 否则 FTS 的内存 pending posting lists(以及 builder 未落盘的批次)不进
+    /// 快照, 备份里的全文检索静默缺数据(实测 500 行快照只含 396)。
+    ///
+    /// 锁安全: 调用方(backup_to)已持有全部 autocommit 写条带 + 全局写锁 +
+    /// checkpoint_mutex —— 没有新写能入队 index batch。pending_index_batches
+    /// 的记账在 BatchGuard::Drop(批次完全处理完、索引写锁已释放)时递减,
+    /// 因此先排空队列 ⇒ flush 时 builder 不持任何索引写锁, 无锁竞争。
+    fn flush_all_indexes_for_backup(&self) -> Result<()> {
+        if self.has_pending_index_batches() {
+            let drained = self.wait_for_indexes_ready_timeout(std::time::Duration::from_secs(10));
+            if !drained {
+                // 🔒 Proceeding while a builder sub-thread may still hold an
+                // index write lock is the historical close/checkpoint deadlock
+                // shape — fail the backup instead (indexes are derived data;
+                // the caller can retry once the builder catches up).
+                return Err(StorageError::InvalidData(
+                    "index builder still busy after 10s — retry backup".into(),
+                ));
+            }
+        }
+        self.timestamp_index.write().flush()?;
+        self.flush_vector_indexes()?;
+        self.flush_text_indexes()?;
+        self.flush_ioctree_indexes()?;
+        let indexes_to_flush: Vec<_> = self
+            .column_indexes
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        for index in indexes_to_flush {
+            index.flush()?;
+        }
         Ok(())
     }
 }

@@ -190,6 +190,7 @@ pub mod catalog;
 pub mod config;
 pub mod distance;
 pub mod index;
+pub mod platform_io;
 pub mod sql;
 pub mod storage;
 pub mod txn;

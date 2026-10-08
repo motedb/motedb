@@ -1,5 +1,264 @@
 # Changelog
 
+## [0.12.3] — 2026-10-08
+
+外部生产测评（隔离 PoC 评审）两项阻断性发现修复。
+
+### 🔒 参数化主键点查静默错标列（测评 P0）
+
+- **`SELECT v FROM t WHERE id = ?` 非 `SELECT *` 投影错位**:
+  `execute_prepared` 的 fast-PK 快路径缓存了投影下标
+  （select_col_positions）但三个 SELECT 返回点全部回填**全表列名**
+  （`['id','v','s']`）而数据只有投影值（`[7]`）—— Python 层 zip 后
+  `execute()` 变成 `{'id': 7}`、`fetch_arrays()` 生成 `id=[7]` 其余
+  列 None。字面量查询走另一条路径正常，`AND 1=1` 迫使回退全路径也正常
+- 修复: FastPkMeta 新增 `select_col_names`（与 build_select_columns
+  同名规则），非 `*` 时三个返回点（txn 读己之写 / 投影 store 读取 /
+  整行读取）统一返回投影列名
+- 🔒 **静默丢列同源加固**: detect_fast_pk_pattern 旧 filter_map 会把
+  不可解析的 SELECT 项**静默丢弃** —— `SELECT COUNT(*) ... WHERE id = ?`
+  曾返回整行错标数据；现在表达式/聚合/混入 `*`/未知列/GROUP BY/
+  HAVING/LATEST BY/OFFSET>0/LIMIT 0/LIMIT ? 一律拒绝快路径回退全路径
+- 回归: test_bug_hunt_v99（8 用例 — 原始复现 / 多列乱序别名限定名 /
+  参数化 vs 字面量对拍 / 缺失行列名 / 事务内 / TEXT 主键 / 重开 /
+  形状回退），无修复时 5 例失败
+- Python 层验证: execute/query/fetch_arrays/query_arrow 四面全部正确
+
+### 🔒 全文索引 flush 误报 corrupt page 并真实丢页（测评 P1）
+
+- **现象**: 3000 行 TEXT INDEX → checkpoint/close → reopen → 新增 →
+  close 打出多条 `[MoteDB] Warning: skipping corrupt page ... during
+  flush`，doctor() 仍 PASS；本机复现更严重 —— 第三次重开后 MATCH 直接
+  抛 `Corruption("Overflow page N not found in page table")`
+- **根因**: overflow 页与普通 B+Tree 页共用 page_offsets 表，重开时
+  `reconstruct_overflow_ids` 只看 bytes[13..15] 的 content_len 是否
+  < 16 —— overflow 页那两个字节是**数据字节**，≥16 即被误判为普通页；
+  随后 flush() 按普通页反序列化失败 → 告警并**从重写中直接丢页** →
+  overflow 链断裂（大 posting list 永久丢失）
+- 修复:
+  - 确定性 16 字节 header 分类器 `header_looks_regular`: overflow 页
+    bytes[5..13] 按 u64 读恒 ≥ 2^24（data_len≥1 落在 [24,56) 位段），
+    普通页 next_leaf 恒为小页 id 或 u64::MAX —— 在页数 < 2^24 的物理
+    约束下无歧义；另校验 is_leaf∈{0,1}/num_keys≤PAGE_SIZE/reserved==0
+  - flush() 自愈: 反序列式失败且 header 非普通页且整页符合 overflow
+    形状（next 合法 / data_len∈[1,4084] / 尾部零填充）的按 overflow
+    原样重写并修正内存分类 —— **永不静默丢页**（对升级前旧文件同样
+    自愈）
+  - on-disk 页格式与 superblock 布局不变，新旧版本文件互通
+- **doctor() 索引文件完整性审计**: GenericBTree::verify_integrity()
+  （页表全量分类校验 + overflow 集合一致性 + 根可达性游走 + 环检测），
+  TextFTSIndex / ColumnValueIndex 暴露，doctor 新增
+  `index.<name>.integrity` 与汇总 `index.files_integrity` 检查 ——
+  "索引报损坏但 doctor PASS" 不再可能
+- 回归: test_bug_hunt_v100（3 用例 — 测评原始场景含第三/四次重开 /
+  4 轮增量重开循环 / B+Tree 级 overflow 链 + 人为 torn-write 破坏
+  必须 VALIDATE 出 problems），无修复时测评场景实测丢页 + MATCH 报错
+
+### 🔓 SQL 兼容性: WITH RECURSIVE + CTE 体 UNION + 窗口聚合（测评"SQL 缺失"项）
+
+- **修复面比测评报告更大**: 实测不仅 `WITH RECURSIVE` 被拒, 连非递归的
+  `WITH x AS (a UNION ALL b)` 都解析失败(v1 CTE 体只存 SelectStmt)
+- **CTE 体升级为 Statement**(可含 UNION/EXCEPT 链): `TableRef::Subquery`
+  的 query 同步从 SelectStmt 升级, 非递归 CTE 保持 v1 的派生表内联策略
+  (零开销), 显式列别名 `WITH x(a,b)` 由包装应用
+- **WITH RECURSIVE 半朴素迭代**: anchor 种子 → 每轮把工作集合成为
+  **平衡 UNION 子查询**内联进递归步(左嵌套链在 ~5000 行栈溢出, 平衡树
+  深度 log₂N); UNION 跨轮去重 / UNION ALL 全量; 锚点自引用与缺
+  RECURSIVE 标记明确报错; 守卫: ≤10k 迭代 / ≤1M 累计行 / 结果 ≤10k 行
+  (超出明确报错而非静默); 层级遍历(JOIN)/fib/级数/子查询内引用全支持
+- **窗口聚合函数**: SUM/COUNT/AVG/MIN/MAX/FIRST_VALUE/LAST_VALUE OVER
+  (PARTITION BY ... [ORDER BY ...]), SQL 默认帧语义(无 ORDER BY=全分区,
+  有 ORDER BY=RANGE 到当前同行组——并列行同值), NULL 语义与裸聚合一致
+  (SUM/AVG/MIN/MAX 跳过, COUNT(*) 计行), 运行式累加 O(分区) 单遍
+- **窗口查询 ORDER BY 双重解析**: 输出列(别名/计算列)优先 + schema 列
+  兜底 —— `ORDER BY rn`(别名) 与 `ORDER BY id`(未投影列) 均正确
+  (此前别名排序会退化为按输出第 0 列); 未别名窗口列输出名从 Debug 转储
+  改为 `SUM(v) PARTITION BY cat ORDER BY v` 可读形式
+- 回归: test_bug_hunt_v101(14 用例) + v17_cte 35 + v62 26 全过;
+  Python 层实测新功能正常
+
+#### 复审补修（对抗形状实抓 ×2）
+
+- **非递归 UNION 体 + 显式列别名** (`WITH x(a) AS (SELECT … UNION ALL …)`)
+  此前直接报错"not supported" — 现在走求值+平衡合成(与递归 CTE 同路径)
+- **窗口函数 over CTE / 派生表 / 递归 CTE**: execute_window_query 原本
+  硬性要求 FROM 真表(内联后 FROM 是 Subquery 即报 "Window query needs
+  FROM table")— 现在派生表分支直接执行子查询, 列名取裸名(窗口路径单源,
+  无 JOIN 前缀消歧需求), 类型从首行推断
+- 交叉验证: 事务内 CTE 读己之写/回滚、prepared 语句缓存二次执行、
+  双线程并发 CTE(thread-local 物化表隔离)、CTE 同名遮蔽真表(标量子查
+  询返回 CTE 值)全部正确; 固化 4 个新回归用例(v101 共 18 用例)
+
+#### 复审#2 补修（组合形状实抓 ×7, 含 1 个非确定性 bug）
+
+- **窗口嵌在表达式里静默求值 NULL**: `SELECT SUM(v) OVER () + 1` 返回全
+  NULL（v1 只识别顶层窗口列）。现在任意深度的 WindowFunction 节点统一
+  改写为 `__winval_k` 标记列, 值由 compute_window 追加后走同一投影路径
+- **GROUP BY + 窗口直接报错** → 现在按标准语义支持: 窗口作用于聚合后
+  的行, base 结果即窗口源; 聚合输出列按 base 列名取值（不可逐行重求值）
+- **🔑 GROUP BY+窗口的 ORDER BY 聚合键非确定性**: `OVER (ORDER BY
+  SUM(v) DESC)` 的键按显示名匹配不到带别名的输出列（SUM(v) AS s）,
+  排序退化为 GROUP BY 哈希输出序 —— **同一查询跨运行返回不同 rn**。
+  现在键先解析到带别名的输出列; 10 次重跑值绑定确定
+- **窗口 + WHERE 子查询静默空结果**: 子查询逐行求值为 NULL → 全部行被
+  过滤。现在先物化非相关子查询再过滤
+- **LAST_VALUE 默认帧语义偏离标准**: 返回了分区末行的值; 标准默认帧
+  (RANGE UNBOUNDED PRECEDING..CURRENT ROW) 应为当前行所在同行组末尾
+- **COUNT(DISTINCT v) OVER 静默按 COUNT(v) 计**: parser 丢弃了
+  DISTINCT 标志。现在 SUM/COUNT/AVG/MIN/MAX OVER 均支持 DISTINCT
+  （帧内精确去重重算）
+- **递归 CTE 产生非标量值(向量等)静默字符串化** → 明确报错;
+  **backup 索引排空超时(10s)** 由"继续 flush(历史死锁形状)"改为报错
+  重试
+- 窗口输出列名: FunctionCall 显示名 SUM(v) 而非 Debug 转储
+- 回归: v101 新增 5 用例(共 23) — 表达式内窗口/GROUP BY+窗口确定性/
+  WHERE 子查询/DISTINCT+LAST_VALUE 帧/非标量递归报错
+
+#### 复审#3 补修（命名冲突 + 特殊表型 ×2）
+
+- **窗口标记名撞用户列时静默错值**: 用户表列恰好叫 `__winval_0` 时,
+  SELECT 该列返回的是窗口值而非列值(999/888 → 1/2)。标记名生成改为
+  以源 schema 列名为种子做动态避让; 标记 pass 移到源选择之后(种子
+  才能覆盖真实列名)
+- **窗口 over 时序表直接报错** ("served by the ColumnarStore, not a
+  ColSeg") → 时序表经通用执行器物化后参与窗口(ROW_NUMBER 按 ts、
+  SUM PARTITION BY dev 均正确)
+- 交叉复核确认无问题: MATERIALIZED_CTES 清理时序(语句入口清一次,
+  apply 后不会被内层调用误清)、SELECT * + 窗口、EXPLAIN、prepared
+  缓存; PARTITION BY ? 参数化暂不支持(明确解析错误, 非静默)
+- 回归: v101 新增 2 用例(共 25)
+
+### 🧪 组合差分 fuzz + 并发覆盖（长效防线, 首跑即实抓 ×4）
+
+- **新增 tests/test_fuzz_sql_combinations.rs**: 20 类随机模板(CTE 普通/
+  UNION 体/RECURSIVE/别名/链式 × 11 种窗口函数 × 分区/排序/DISTINCT/嵌
+  表达式/GROUP BY 联用 × JOIN × 子查询)× 随机变异(INSERT/UPDATE/DELETE)
+  × 3 轮 × SQLite 精确对拍(无序按多重集、有序模板显式 tie-break)。
+  作为 cargo 集成测试自动进入已硬化的 CI 门禁。首跑实抓并修复:
+  - **上轮"聚合 ORDER BY 键改写"修复被后续标记重构静默回退**(单测因
+    退化行序碰巧稳定而漏网; GROUP BY+窗口多键场景 rn 错序)
+  - **窗口 AVG 大整数精度**: 无浮点输入时误用 f64 累计副本(sum_f 在
+    2^53 量级丢精度, AVG 偏差 0.5)——改用精确 i64 和
+  - 模板自身教训: JOIN 输出重复 id 间序不定 → 多重集比较; SQLite 不
+    支持窗口内 DISTINCT(MoteDB 超集能力, 单测按值断言)
+- **新增 tests/test_concurrent_sql_features.rs**: 4 读线程(递归 CTE/
+  窗口/JOIN CTE/参数化点查)× 2 写线程(churn)× 在线 backup 线程并发,
+  断言读零错误、快照可开、重开一致、doctor 无 FAIL。首跑实抓并修复
+  backup 并发缺陷 ×2:
+  - **backup 目标位于库目录内 → 递归复制自吞噬**(路径逐层加深直至
+    ENAMETOOLONG)——现前置拒绝并明确报错(test_backup 回归用例)
+  - **飞行中的写线程 flush_buffer 与 copy 竞态**: backup 拿写条带前已
+    起飞的 segment 替换(写新 .sst + 删旧)落在 copy 期间 → NotFound。
+    该窗口无法用锁关闭——copy 跳过 `.tmp` 原子写中间产物 + 整体重试
+    (仅 NotFound 可重试, 最多 3 次 × 50ms 退避; 重试时飞行写已落定)
+  - 连续 12 次压测通过
+- 工程教训入档: 一次正则批改误伤带插值的 format!(模板静默退化成字面
+  量, fuzz 变成"两边都报错"的空转)——已全部恢复并抽查 9 类模板在双
+  引擎的合法性, fuzz 确认真对拍
+
+### 🔍 性能项核查: 首开 PK 点查 "10× 慢于重开"（测评数字）
+
+- 测评环境(Linux x86_64)报告 0.093ms vs 0.009ms; 本机无法复现 ——
+  官方 compete_bench: 4µs/4µs 持平; 等构 Rust 微基准
+  (tests/repro_point_gap.rs, 100K 行+FTS+checkpoint 全流程):
+  首开 0.5µs vs 重开 0.3µs(1.6×, 均亚微秒)。Linux 容器无法装
+  numpy 做官方脚本复现(网络受限)。保留 repro 测试供 Linux x86_64 CI
+  复核; 93µs 级点查更像测评环境特性(虚拟化/频率调控)而非代码路径差异
+- **供应链核查**: `cargo deny check advisories` 通过 —— 4 个
+  unmaintained 公告(bincode 1.x + jieba-rs 传递 ×3)已在 deny.toml
+  记录性豁免, 无新增公告、无漏洞
+
+### 🔒 复审补充修复（同源正确性缺陷 ×2）
+
+- **快路径 PK 点查 Absent-for-SELECT**: `WHERE id = ?` 绑定 NULL（或
+  AUTO_INCREMENT 表绑定非整型）时 `FastPkRowId::Absent` 对 SELECT 也
+  返回 `Modification`—— Python `query()` 直接抛 "expects a SELECT
+  statement"，而语义应为空结果集（SQL 三值逻辑 id = NULL → 0 行）。
+  现返回带投影列名的空 SelectReady
+- **非 PK 字面量快路径静默丢列（BUG #46 同类）**: `WHERE 索引列 = 字面量`
+  的 4 处投影构造点用 filter_map 建列下标，SELECT 列表里的未知列 /
+  限定名（t.v）/ 别名 / 函数调用被静默丢弃，返回列名与数据错位的行
+  （`SELECT nosuch FROM t WHERE cat='a'` 曾返回空投影行而不报错）。
+  现在进入快路径前严格校验 SELECT 列表，全部可解析才走快路径，
+  否则回退全路径（未知列报错、限定名/别名由全路径正确处理）
+- **doctor orphan 文案修正**: flush 保留页表中全部页（不做可达性
+  回收），orphan 页 WARN 文案不再声称 "CHECKPOINT reclaims them"，
+  改为准确说明（删除子树残留，查询不可达，仅占磁盘，重建索引可回收）
+- 回归: test_bug_hunt_v99 新增 2 用例（Absent-for-SELECT 空结果 +
+  字面量索引路径严格 SELECT 列表），后者已反向验证（无修复即失败）
+
+### 📦 Python 包元数据接入（测评"PyPI 元数据缺失"项）
+
+- pyproject 补齐: `[project.urls]`（Homepage/Repository/Source/Issues/
+  Changelog/Documentation → github.com/motedb/motedb，与 Cargo.toml
+  一致）、`readme = "README.md"`（PyPI 页面长描述正文）、完整
+  classifiers（Development Status/受众/OS/Python 3.9-3.13/主题）、
+  keywords
+- **license 入 wheel**: `license-files = ["LICENSE"]` + LICENSE 副本，
+  构建产物 dist-info/licenses/LICENSE 携带完整 MIT 文本（此前 wheel
+  不含许可证文件）
+- 验证: 重建 wheel 检查 METADATA（Project-URL ×6 / License-File /
+  Description-Content-Type GFM），pip show Home-page 正确；4 种子
+  SQLite 差分对拍（800 查询/种子）+ 8000 行大表 fuzz 全部通过
+
+### 📦 Windows 支持（测评"没有 Windows wheel"项）
+
+此前 **默认特性在任何 Windows 目标上都无法编译**，这是缺失 wheel 的
+根因，不是没配 CI：
+
+- 🔒 **tikv-jemalloc 目标门控**: tikv-jemalloc-sys 的 C 代码在 MSVC 上
+  不可编译，`jemalloc` 特性仍可全局启用但两个 crate 移入
+  `[target.'cfg(not(target_env = "msvc"))'.dependencies]` —— Windows
+  静默回退系统分配器（`#[global_allocator]` 的 msvc 门控早已就位）
+- 🔒 **跨平台 positional read**: 新增 `platform_io::PositionalRead`
+  trait（unix `FileExt::read_at` / windows `seek_read` / 其它目标
+  clone+seek 兜底），替换 btree_generic（×6）、btree、ioctree/leaf_store
+  的 `std::os::unix::fs::FileExt` 直接依赖 —— 调用点方法语法不变
+- 🔒 **mmap/madvise 门控**: mingw 交叉编译实抓 8 个错误 —— vamana
+  disk_graph/sq8_vectors 的 `memmap2::Advice::WillNeed`（unix-only API）
+  与 columnar.rs 的 `libc::madvise`(MADV_DONTNEED/SEQUENTIAL) 补
+  `#[cfg(unix)]` 门控，Windows 下 no-op（均为性能提示，非正确性）
+- ✅ 验证: `cargo check --lib --bins --target x86_64-pc-windows-gnu`
+  （mingw-w64 真实交叉编译，含 zstd C 代码）全通过
+
+### 📦 发布工作流: Windows wheel + sdist（python-wheels.yml）
+
+- build matrix 增加 `x86_64-pc-windows-msvc` + `aarch64-pc-windows-msvc`
+- 新增 `sdist` job（`maturin sdist`）——此前 PyPI 只有 wheel，
+  `--no-binary` 源码安装无从获取
+- smoke matrix 增加 windows-latest（原生 import + 功能冒烟：CRUD/
+  参数化点查/FTS/backup_to 恢复环）；publish 依赖补 sdist
+- 🔑 许可证入产物: `license-files = ["licenses/LICENSE"]`（副本置于
+  子目录 —— 顶层副本与 maturin 自动打入 sdist 的工作区根 LICENSE
+  同路径冲突，`maturin sdist` 直接失败；子目录错开后 wheel 携带
+  dist-info/licenses/、sdist 同时含根 LICENSE 与 licenses/），
+  本地实测 wheel/sdist 双产物均含 MIT 全文
+
+### 🔒 backup_to 快照丢派生索引数据（暴露 Python 绑定时实抓）
+
+- **现象**: Python 暴露 backup_to 后回归实测，500 行 FTS 表的在线快照
+  MATCH 只命中 396 —— backup 只跑 flush_impl（有意不碰 text/vector
+  索引避免与 async index-builder 死锁），FTS 内存 pending posting
+  lists 与 builder 未落盘批次都不进快照；checkpoint/Drop 路径无此问题
+- 修复: `flush_all_indexes_for_backup` —— 先排空 index-builder 队列
+  （pending 记账在 BatchGuard::Drop 即批次完全处理完、索引写锁已释放时
+  递减 ⇒ pending==0 时 builder 不持锁），再无条件 flush 全部索引；
+  调用方已持全部写条带+写锁+checkpoint_mutex，无新批次可入队
+- 回归: test_backup.rs 新增用例（快照行数/FTS 完整性/源库重开对照，
+  修复前快照 FTS 396/500）；Python tests/test_backup.py（在线备份/
+  备份后源库可写/快照独立打开/目标已存在报错）
+
+### 📦 Python backup_to 绑定（测评"未暴露 backup_to"项）
+
+- `Database.backup_to(dest)`: 在线一致性快照，拷贝期间释放 GIL（大库
+  拷贝可达秒级且服务端阻塞全部写条带）；恢复即 `motedb.Database(dest)`
+
+### 🔧 CI: Rust 集成测试升级为硬门禁（测评"advisory 非门禁"项）
+
+- ci.yml `integration-test` 移除 `continue-on-error: true` —— 两次
+  重试均失败即 FAIL（此前失败仅记录日志不阻断合并/发布）；硬件阈值类
+  测试仍按既定清单跳过
+
 ## [0.12.2] — 2026-10-07
 
 时序 top-k 崩溃修复 + 一键复现基准套件。

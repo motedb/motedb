@@ -161,3 +161,66 @@ fn test_backup_of_database_with_upserts_and_ts() {
     assert_eq!(r[0][0], live_c);
     assert_eq!(count(&restored, "m"), 20);
 }
+
+// 🔁 外部测评后回归: backup_to 快照必须包含派生索引的当前状态。
+// 修复前: backup 只跑 flush_impl(有意不碰 text/vector 索引), FTS 的内存
+// pending posting lists 与 index-builder 未落盘批次都不进快照 ——
+// 500 行快照的 MATCH 只命中 396。flush_all_indexes_for_backup 先排空
+// builder 队列再无条件 flush(锁安全论证见 persistence.rs)。
+#[test]
+fn backup_snapshot_contains_text_index_state() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
+    db.execute("CREATE TEXT INDEX ti ON t(s)").unwrap();
+    for i in 0..500 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, 'doc {} common')", i, i))
+            .unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    let snap = TempDir::new().unwrap();
+    db.backup_to(snap.path()).unwrap();
+
+    // 源库继续写不受影响
+    db.execute("INSERT INTO t VALUES (9999, 'after backup common')")
+        .unwrap();
+    assert_eq!(count(&db, "t"), 501);
+
+    // 快照 = 备份时刻状态: 行数与全文检索都完整
+    let restored = Database::open(snap.path()).unwrap();
+    assert_eq!(count(&restored, "t"), 500);
+    let n = rows(&restored, "SELECT COUNT(*) FROM t WHERE MATCH(s, 'common')");
+    match &n[0][0] {
+        Value::Integer(c) => assert_eq!(*c, 500, "快照 FTS 缺数据"),
+        other => panic!("expected INTEGER, got {:?}", other),
+    }
+    // 源库重开同样完整
+    drop(db);
+    let db2 = Database::open(dir.path()).unwrap();
+    let n = rows(&db2, "SELECT COUNT(*) FROM t WHERE MATCH(s, 'common')");
+    match &n[0][0] {
+        Value::Integer(c) => assert_eq!(*c, 501),
+        other => panic!("expected INTEGER, got {:?}", other),
+    }
+}
+
+// 🔁 复审#4/fuzz 实抓: backup 目标位于库目录内部时, 递归复制自吞噬
+// (路径逐层加深 → ENAMETOOLONG)。现应明确拒绝。
+#[test]
+fn backup_destination_inside_db_dir_rejected() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path().join("inner.mote")).unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY)").unwrap();
+    let dest = dir.path().join("inner.mote/nested/snap.mote");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let e = match db.backup_to(&dest) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("库内目标应报错"),
+    };
+    assert!(e.contains("outside"), "{}", e);
+    // 平级/外部目标仍正常
+    let ok_dest = dir.path().join("snap.mote");
+    db.backup_to(&ok_dest).unwrap();
+}

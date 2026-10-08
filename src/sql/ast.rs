@@ -11,6 +11,10 @@ pub enum Statement {
         /// Visible to `stmt` (including all UNION branches when `stmt` is the
         /// left side of a top-level SetOp assembled by the parser).
         ctes: Vec<CteDef>,
+        /// WITH **RECURSIVE** marker. Required for CTE bodies that reference
+        /// their own name (self-reference without the marker is an error,
+        /// matching SQLite).
+        with_recursive: bool,
     },
     /// UNION / UNION ALL / INTERSECT / EXCEPT
     SetOp {
@@ -23,6 +27,8 @@ pub enum Statement {
         all: bool,
         /// WITH clause CTEs — visible to both `left` and `right`.
         ctes: Vec<CteDef>,
+        /// WITH RECURSIVE marker (see [`Statement::Select`]).
+        with_recursive: bool,
         /// Trailing ORDER BY / LIMIT / OFFSET that apply to the entire set
         /// result (only on the outermost SetOp). Per SQL standard these clauses
         /// belong to the whole query, not to the rightmost SELECT.
@@ -56,15 +62,18 @@ pub enum Statement {
 
 /// Common Table Expression definition (`WITH name [(cols)] AS ( SELECT ... )`).
 ///
-/// Non-recursive in v1. The body is a `SelectStmt`; subsequent CTEs and the
-/// main query may reference `name` in their FROM clause.
+/// The body is a `Statement` — a plain SELECT or a UNION/UNION ALL chain
+/// (v1 stored only a SelectStmt, so even non-recursive `WITH x AS (a UNION
+/// b)` failed to parse). A body that references the CTE's own name is a
+/// recursive CTE: the statement must carry `with_recursive` (WITH RECURSIVE)
+/// and is evaluated by fixed-point iteration in the executor.
 #[derive(Debug, Clone)]
 pub struct CteDef {
     pub name: String,
     /// Optional explicit column aliases: `WITH x(a, b) AS (...)`.
     /// When present, overrides the body's projected column names.
     pub columns: Option<Vec<String>>,
-    pub query: SelectStmt,
+    pub body: Statement,
 }
 
 /// Set operations for combining query results.
@@ -111,7 +120,9 @@ pub enum TableRef {
     ///
     /// Example: FROM (SELECT id, name FROM users WHERE age > 18) AS adults
     Subquery {
-        query: Box<SelectStmt>,
+        /// v2: holds any query `Statement` — a plain SELECT or a UNION /
+        /// UNION ALL chain (CTE bodies with set operators are inlined here).
+        query: Box<Statement>,
         alias: String, // Alias is required for subqueries in FROM
     },
 }
@@ -576,4 +587,32 @@ pub enum WindowFunc {
         offset: Option<usize>,      // Default: 1
         default: Option<Box<Expr>>, // Default: NULL
     },
+    /// FIRST_VALUE(expr) — first row of the partition (in window order)
+    FirstValue { expr: Box<Expr> },
+    /// LAST_VALUE(expr) — last row of the partition (in window order)
+    LastValue { expr: Box<Expr> },
+    /// Aggregate as a window function: SUM/COUNT/AVG/MIN/MAX over the frame.
+    /// `arg` is None only for COUNT(*). `distinct` mirrors
+    /// COUNT(DISTINCT v) / SUM(DISTINCT v).
+    ///
+    /// Frame semantics (SQL default, no explicit frame support yet):
+    /// - no ORDER BY → the whole partition for every row;
+    /// - with ORDER BY → running aggregate over rows from the partition start
+    ///   through the current row's PEER GROUP (RANGE UNBOUNDED PRECEDING TO
+    ///   CURRENT ROW), matching SQLite/PostgreSQL defaults.
+    Agg {
+        func: WindowAggFunc,
+        arg: Option<Box<Expr>>,
+        distinct: bool,
+    },
+}
+
+/// Aggregate kinds usable with `OVER ()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAggFunc {
+    Sum,
+    Count,
+    Avg,
+    Min,
+    Max,
 }

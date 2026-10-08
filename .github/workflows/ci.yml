@@ -92,13 +92,13 @@ jobs:
           CI: "1"
         run: cargo test --lib --all-features
 
-  # ── Integration tests (ADVISORY): the full tests/ matrix ─────────────────
+  # ── Integration tests (HARD gate): the full tests/ matrix ────────────────
   # `cargo test --workspace` compiles 64 test binaries (~40min cold) and runs
-  # them. This is too slow to be the primary gate, and some integration tests
-  # have hardware-dependent thresholds or Linux-specific timing races that
-  # don't reproduce locally. Kept as advisory (continue-on-error) so failures
-  # are surfaced in the log for investigation without blocking merges. The
-  # hard correctness gate is the unit-test job above.
+  # them. 🔑 External production review (0.12.2 evaluation): this job was
+  # advisory (`continue-on-error`) — a failing integration suite did not
+  # block a release. It is now a hard gate: both retry attempts must pass.
+  # Hardware/timing-dependent tests stay excluded (resource/IO thresholds
+  # flap on shared runners; perf numbers are tracked in BENCHMARK.md).
   integration-test:
     name: integration (${{ matrix.os }})
     strategy:
@@ -107,7 +107,6 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -117,8 +116,8 @@ jobs:
       # 🔑 Release-blocker fix: macos arm64 shared runners flap (capacity
       # notices + stale-artifact binary launch failures "exit 101, never
       # executed" after cache restore). The suite itself passes locally on
-      # identical hardware (3956 passed / 0 failed). Retry once before
-      # surfacing; job remains advisory (continue-on-error).
+      # identical hardware (3956 passed / 0 failed). Retry once; the verdict
+      # step below fails the JOB when both attempts fail (hard gate).
       - name: cargo test (workspace, hardware-threshold tests skipped) [attempt 1]
         id: ci1
         continue-on-error: true

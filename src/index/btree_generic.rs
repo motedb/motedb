@@ -160,6 +160,22 @@ impl Default for GenericBTreeConfig {
     }
 }
 
+/// Result of [`GenericBTree::verify_integrity`] — surfaced by `doctor()`.
+#[derive(Debug, Default, Clone)]
+pub struct BTreeIntegrity {
+    /// B+Tree pages that parse cleanly from the page table
+    pub regular_pages: usize,
+    /// Overflow pages that validate against the overflow-page shape
+    pub overflow_pages: usize,
+    /// Regular pages reachable by walking the tree from the root
+    pub reachable_pages: usize,
+    /// Regular pages NOT reachable from the root (pre-flush rewrite residue;
+    /// informational — a flush reclaims them)
+    pub orphan_pages: usize,
+    /// Structural violations, one line each. Empty = healthy.
+    pub problems: Vec<String>,
+}
+
 /// Trait for B+Tree keys (must be fixed-size)
 pub trait BTreeKey: Clone + Ord + Sized {
     /// Serialize key to fixed-size bytes
@@ -1434,6 +1450,160 @@ impl<K: BTreeKey> GenericBTree<K> {
         }
     }
 
+    /// Read-only structural audit of the on-disk tree (for `doctor`).
+    ///
+    /// Validates: (1) every page table entry loads and classifies — regular
+    /// pages must `Page::deserialize` cleanly, overflow pages must match the
+    /// `[next_page_id:8][data_len:4][data][zero pad]` shape; (2) the
+    /// classification agrees with the in-memory overflow set; (3) the tree is
+    /// fully walkable from the root — every child / next_leaf id resolves to a
+    /// loadable regular page, with no cycles.
+    pub fn verify_integrity(&self) -> BTreeIntegrity {
+        use crate::platform_io::PositionalRead as _;
+
+        let mut out = BTreeIntegrity::default();
+        let offsets = self.page_offsets.read().clone();
+        let next_pid_bound = {
+            let live = *self.next_page_id.read();
+            // Superblock-loaded counter could be stale vs page_offsets grown
+            // this session; the max of both is the true bound.
+            live.max(offsets.len() as u64)
+        };
+        let overflow_ids = self.overflow_page_ids.read().clone();
+
+        let file = self.storage_file.read();
+
+        // (1) + (2): every page table entry classifies and parses.
+        let mut regular_ids: Vec<u64> = Vec::new();
+        for (page_id, &file_offset) in offsets.iter().enumerate() {
+            if file_offset == 0 || page_id == 0 {
+                continue;
+            }
+            let pid = page_id as u64;
+            let mut header = [0u8; HEADER_SIZE];
+            if file.read_exact_at(&mut header, file_offset).is_err() {
+                out.problems
+                    .push(format!("page {pid}: unreadable at offset {file_offset}"));
+                continue;
+            }
+            let header_regular = Self::header_looks_regular(&header, next_pid_bound);
+            if !header_regular {
+                let mut raw = [0u8; PAGE_SIZE];
+                if file.read_exact_at(&mut raw, file_offset).is_err()
+                    || !Self::looks_like_overflow_page(&raw, next_pid_bound)
+                {
+                    out.problems.push(format!(
+                        "page {pid}: neither a parseable B+Tree page nor a valid overflow page"
+                    ));
+                    continue;
+                }
+                out.overflow_pages += 1;
+                if !overflow_ids.contains(&pid) {
+                    out.problems.push(format!(
+                        "page {pid}: valid overflow page not tracked in the overflow set"
+                    ));
+                }
+            } else {
+                let content_len = u16::from_le_bytes([header[13], header[14]]) as usize;
+                let mut buf = vec![0u8; content_len];
+                let parsed = file
+                    .read_exact_at(&mut buf, file_offset)
+                    .map_err(StorageError::from)
+                    .and_then(|_| Page::<K>::deserialize(pid, &buf, self.key_size).map(|_| ()));
+                match parsed {
+                    Ok(()) => {
+                        out.regular_pages += 1;
+                        if overflow_ids.contains(&pid) {
+                            out.problems.push(format!(
+                                "page {pid}: tracked as overflow but holds a B+Tree page"
+                            ));
+                        }
+                        regular_ids.push(pid);
+                    }
+                    Err(e) => out.problems.push(format!(
+                        "page {pid}: regular header but body fails to parse: {e}"
+                    )),
+                }
+            }
+        }
+
+        // (3): walk from the root; every referenced page must be a live,
+        // loadable regular page. Unreachable regular pages are reported as a
+        // count (not a problem) — pre-flush versions of rewritten leaves are
+        // normal transient state.
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut stack = vec![*self.root_page_id.read()];
+        if *self.root_page_id.read() != 0
+            && (offsets
+                .get(*self.root_page_id.read() as usize)
+                .copied()
+                .unwrap_or(0)
+                == 0)
+        {
+            out.problems
+                .push("root page has no entry in the page table".into());
+        }
+        while let Some(pid) = stack.pop() {
+            if pid == 0 || pid == INVALID_PAGE_ID {
+                continue;
+            }
+            if !visited.insert(pid) {
+                continue; // DAG revisit, fine
+            }
+            if offsets.get(pid as usize).copied().unwrap_or(0) == 0 {
+                out.problems.push(format!(
+                    "page {pid}: referenced by the tree but absent from the page table"
+                ));
+                continue;
+            }
+            if overflow_ids.contains(&pid) {
+                out.problems.push(format!(
+                    "page {pid}: referenced by the tree but tracked as overflow"
+                ));
+                continue;
+            }
+            // Load the page for its child pointers / leaf chain link.
+            let off = offsets[pid as usize];
+            let mut header = [0u8; HEADER_SIZE];
+            if file.read_exact_at(&mut header, off).is_err() {
+                out.problems
+                    .push(format!("page {pid}: unreadable during walk"));
+                continue;
+            }
+            let content_len = u16::from_le_bytes([header[13], header[14]]) as usize;
+            let mut buf = vec![0u8; content_len];
+            let parsed = file
+                .read_exact_at(&mut buf, off)
+                .map_err(StorageError::from)
+                .and_then(|_| Page::<K>::deserialize(pid, &buf, self.key_size));
+            match parsed {
+                Ok(page) => {
+                    if page.is_leaf {
+                        stack.push(page.next_leaf);
+                    } else {
+                        for &c in &page.children {
+                            stack.push(c);
+                        }
+                    }
+                }
+                Err(e) => out
+                    .problems
+                    .push(format!("page {pid}: fails to parse during walk: {e}")),
+            }
+            if visited.len() > 1_000_000 {
+                out.problems
+                    .push("tree walk exceeded 1M pages — cycle suspected".into());
+                break;
+            }
+        }
+        out.reachable_pages = visited.len();
+        if out.reachable_pages < regular_ids.len() {
+            out.orphan_pages = regular_ids.len() - out.reachable_pages;
+        }
+
+        out
+    }
+
     /// Sync superblock to disk
     fn sync_superblock(&self) -> Result<()> {
         let root_id = *self.root_page_id.read();
@@ -1568,7 +1738,7 @@ impl<K: BTreeKey> GenericBTree<K> {
                 offsets[idx]
             };
 
-            use std::os::unix::fs::FileExt;
+            use crate::platform_io::PositionalRead as _;
             let file = self.storage_file.read();
 
             let mut page_buf = vec![0u8; PAGE_SIZE];
@@ -1866,11 +2036,29 @@ impl<K: BTreeKey> GenericBTree<K> {
     }
 
     /// Reconstruct overflow_page_ids by scanning page_offsets on file load.
-    /// Overflow pages have format [next_page_id:8][data_len:4][data...].
-    /// B+Tree pages have content_len at bytes[13..15] in [HEADER_SIZE, PAGE_SIZE].
+    ///
+    /// 🔑 BUG #47 (external production review): the old heuristic classified a
+    /// page as overflow ONLY when `content_len` (u16 at bytes[13..15]) was
+    /// outside [16, 65535]. Overflow pages share page_offsets but their bytes
+    /// [13..15] are DATA bytes — any posting-list chunk with those two bytes
+    /// ≥ 16 was misclassified as a regular B+Tree page. A later flush() then
+    /// failed `Page::deserialize` on it, printed "skipping corrupt page", and
+    /// DROPPED the overflow page from the rewrite — silently losing large
+    /// posting lists ("Overflow page N not found in page table" after the
+    /// next reopen).
+    ///
+    /// The classification below is deterministic from the 16-byte header:
+    /// for an overflow page `[next_page_id:8][data_len:4][data...]` with
+    /// data_len ∈ [1, 4084], bytes[5..13] read as u64 are
+    /// `(data_len as u64) << 24 | (data[0] as u64) << 56` ≥ 2^24, while a
+    /// regular page's next_leaf is always a small page id (< next_page_id,
+    /// the file's page counter) or INVALID_PAGE_ID (u64::MAX). While the file
+    /// holds fewer than 2^24 pages (67 GB of index — impossible today), no
+    /// overflow page can fake a legal next_leaf and vice versa.
     fn reconstruct_overflow_ids(&self) {
-        use std::os::unix::fs::FileExt;
+        use crate::platform_io::PositionalRead as _;
         let offsets = self.page_offsets.read();
+        let next_pid_bound = *self.next_page_id.read();
         let file = self.storage_file.read();
         let mut overflow_ids = HashSet::new();
 
@@ -1882,14 +2070,66 @@ impl<K: BTreeKey> GenericBTree<K> {
             if file.read_exact_at(&mut buf, file_offset).is_err() {
                 continue;
             }
-            let content_len = u16::from_le_bytes([buf[13], buf[14]]) as usize;
-            if !(HEADER_SIZE..=65536).contains(&content_len) {
-                // Not a valid B+Tree page — must be an overflow page
+            if !Self::header_looks_regular(&buf, next_pid_bound) {
+                // Not a valid B+Tree page header — must be an overflow page
                 overflow_ids.insert(page_id as u64);
             }
         }
 
         *self.overflow_page_ids.write() = overflow_ids;
+    }
+
+    /// Deterministic 16-byte-header classifier shared by the reopen scan and
+    /// the flush self-heal. Returns true only if the bytes could have been
+    /// written by `Page::serialize` (or bulk_load's inline leaf writer, same
+    /// layout). See `reconstruct_overflow_ids` for why this is exact.
+    fn header_looks_regular(buf: &[u8; HEADER_SIZE], next_pid_bound: u64) -> bool {
+        let is_leaf = buf[0];
+        if is_leaf > 1 {
+            return false;
+        }
+        let num_keys = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        // A serialized page holds at most (PAGE_SIZE - HEADER) / (key_size + 4)
+        // entries; key_size ≥ 1, so num_keys > PAGE_SIZE is impossible. Also
+        // rejects the huge garbage counts parsed from overflow payload.
+        if num_keys > PAGE_SIZE {
+            return false;
+        }
+        let next_leaf = u64::from_le_bytes([
+            buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12],
+        ]);
+        if next_leaf != INVALID_PAGE_ID && next_leaf >= next_pid_bound {
+            return false;
+        }
+        let content_len = u16::from_le_bytes([buf[13], buf[14]]) as usize;
+        if content_len < HEADER_SIZE {
+            return false;
+        }
+        // serialize()/bulk_load always write 0 in the reserved byte.
+        buf[15] == 0
+    }
+
+    /// Full-buffer overflow-page validator (flush self-heal defense). Layout:
+    /// `[next_page_id:8][data_len:4][data chunk][zero padding to PAGE_SIZE]`.
+    fn looks_like_overflow_page(buf: &[u8], next_pid_bound: u64) -> bool {
+        if buf.len() < PAGE_SIZE {
+            return false;
+        }
+        let next_page_id = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        // Chain: 0 = end, otherwise a page id allocated from the counter.
+        if next_page_id != 0 && next_page_id >= next_pid_bound {
+            return false;
+        }
+        let data_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+        if data_len == 0 || data_len > OVERFLOW_DATA_SIZE {
+            return false;
+        }
+        // write_overflow_chain zero-pads the tail of the PAGE_SIZE buffer.
+        buf[OVERFLOW_PAGE_HEADER + data_len..PAGE_SIZE]
+            .iter()
+            .all(|&b| b == 0)
     }
 
     /// Get the next page ID (for checking if tree is empty).
@@ -2087,6 +2327,12 @@ impl<K: BTreeKey> GenericBTree<K> {
         // Load all pages from cache or disk.
         // Cache hit: use in-memory copy. Cache miss: try disk. Disk failure: skip.
         let mut pages: Vec<(u64, Page<K>)> = Vec::with_capacity(all_page_ids.len());
+        // 🔑 BUG #47 self-heal: ids the reopen scan misclassified as regular
+        // pages (legacy files written before the deterministic classifier)
+        // that are actually overflow pages, re-identified here by full-buffer
+        // shape validation and rewritten as raw overflow data instead of
+        // being dropped.
+        let mut healed_overflow: Vec<(u64, [u8; PAGE_SIZE])> = Vec::new();
         for page_id in &all_page_ids {
             let page_opt = {
                 let mut cache = self.page_cache.write();
@@ -2109,7 +2355,7 @@ impl<K: BTreeKey> GenericBTree<K> {
 
             // Load from disk using positional read (no write lock)
             match (|| -> Result<Page<K>> {
-                use std::os::unix::fs::FileExt;
+                use crate::platform_io::PositionalRead as _;
                 let file = self.storage_file.read();
 
                 let mut header_buf = [0u8; HEADER_SIZE];
@@ -2124,12 +2370,43 @@ impl<K: BTreeKey> GenericBTree<K> {
             })() {
                 Ok(page) => pages.push((*page_id, page)),
                 Err(e) => {
-                    // Page was on disk but failed to load — log warning
-                    // Don't fail the entire flush; skip this page to avoid checkpoint crash
-                    eprintln!(
-                        "[MoteDB] Warning: skipping corrupt page {} during flush: {}",
-                        page_id, e
-                    );
+                    // 🔑 BUG #47: before dropping the page, re-validate the
+                    // bytes as an OVERFLOW page. Legacy files (written before
+                    // the deterministic reopen classifier) can carry overflow
+                    // pages the old heuristic misfiled as regular — skipping
+                    // them here used to destroy large posting lists. The live
+                    // next_page_id counter bounds every id this file ever
+                    // allocated, including pages appended this session.
+                    // Order matters: a page whose 16-byte header still LOOKS
+                    // regular is a genuinely corrupt regular page (keep the
+                    // warn+skip); only header-not-regular + valid overflow
+                    // shape is healed as an overflow page.
+                    let next_pid_bound = *self.next_page_id.read();
+                    let mut raw = [0u8; PAGE_SIZE];
+                    let overflow_ok = {
+                        let file = self.storage_file.read();
+                        file.read_exact_at(&mut raw, file_offset).is_ok()
+                            && !Self::header_looks_regular(
+                                &{
+                                    let mut h = [0u8; HEADER_SIZE];
+                                    h.copy_from_slice(&raw[..HEADER_SIZE]);
+                                    h
+                                },
+                                next_pid_bound,
+                            )
+                            && Self::looks_like_overflow_page(&raw, next_pid_bound)
+                    };
+                    if overflow_ok {
+                        healed_overflow.push((*page_id, raw));
+                        self.overflow_page_ids.write().insert(*page_id);
+                    } else {
+                        // Page was on disk but failed to load — log warning
+                        // Don't fail the entire flush; skip this page to avoid checkpoint crash
+                        eprintln!(
+                            "[MoteDB] Warning: skipping corrupt page {} during flush: {}",
+                            page_id, e
+                        );
+                    }
                 }
             }
         }
@@ -2159,7 +2436,7 @@ impl<K: BTreeKey> GenericBTree<K> {
         // overflow data and corrupted every large value ("Invalid overflow
         // data_len …" / "Overflow page N not found in page table" after the
         // next open).
-        use std::os::unix::fs::FileExt;
+        use crate::platform_io::PositionalRead as _;
         let mut overflow_pages: Vec<(u64, [u8; PAGE_SIZE])> =
             Vec::with_capacity(overflow_ids.len());
         {
@@ -2207,7 +2484,7 @@ impl<K: BTreeKey> GenericBTree<K> {
 
         // Write the pre-read overflow pages at their new positions.
         // Overflow pages are PAGE_SIZE bytes with format [next_page_id:8][data_len:4][data...].
-        for (overflow_id, page_buf) in overflow_pages {
+        for (overflow_id, page_buf) in overflow_pages.into_iter().chain(healed_overflow) {
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(page_buf.as_slice())?;
             let idx = overflow_id as usize;
@@ -2340,7 +2617,7 @@ impl<K: BTreeKey> GenericBTree<K> {
         // Use positional read (pread) instead of seek+read to avoid holding
         // the write lock on the storage file. This allows concurrent B+Tree reads
         // to proceed in parallel without serializing on the file lock.
-        use std::os::unix::fs::FileExt;
+        use crate::platform_io::PositionalRead as _;
         let file = self.storage_file.read();
 
         // Read header to get content_len

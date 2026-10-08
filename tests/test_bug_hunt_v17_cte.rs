@@ -370,15 +370,29 @@ fn recursive_keyword_accepted_for_non_self_ref() {
 
 #[test]
 fn recursive_self_reference_rejected() {
+    // v2: WITH RECURSIVE is now IMPLEMENTED. The v1 rejection survives for
+    // (a) self-reference without the RECURSIVE marker, and
+    // (b) a self-referencing body that is not <anchor> UNION [ALL] <step>.
     let (db, _dir) = sales_db();
-    let result = db.execute("WITH RECURSIVE r AS (SELECT * FROM r) SELECT * FROM r");
+    let result = db.execute("WITH r AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT * FROM r");
     let err = match result {
-        Ok(_) => panic!("expected error for recursive self-reference"),
+        Ok(_) => panic!("expected error: self-reference without RECURSIVE marker"),
         Err(e) => format!("{}", e),
     };
     assert!(
-        err.contains("Recursive") || err.contains("self-reference"),
-        "error should mention recursion: {}",
+        err.contains("RECURSIVE"),
+        "error should mention WITH RECURSIVE: {}",
+        err
+    );
+
+    let result = db.execute("WITH RECURSIVE r AS (SELECT * FROM r) SELECT * FROM r");
+    let err = match result {
+        Ok(_) => panic!("expected error: recursive body must be anchor UNION step"),
+        Err(e) => format!("{}", e),
+    };
+    assert!(
+        err.contains("UNION"),
+        "error should mention the UNION shape requirement: {}",
         err
     );
 }

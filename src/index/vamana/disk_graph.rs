@@ -431,9 +431,13 @@ impl DiskGraph {
 
     /// 🔑 F1: same as SQ8Vectors::warm_page_cache, for the adjacency file.
     pub fn warm_page_cache(&self) {
+        // 🔧 Windows: memmap2::advise is unix-only — no readahead hint there.
+        #[cfg(unix)]
         if let Some(m) = self.mmap.read().as_ref() {
             let _ = m.advise(memmap2::Advice::WillNeed);
         }
+        #[cfg(not(unix))]
+        let _ = &self.mmap;
     }
 
     /// Look up file offset: tombstone check → LRU → mmap binary search →

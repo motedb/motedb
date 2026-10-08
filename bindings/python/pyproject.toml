@@ -4,18 +4,60 @@ build-backend = "maturin"
 
 [project]
 name = "motedb-python"
-version = "0.12.2"
-description = "AI-native embedded multimodal database — vectors, full-text, spatial, time-series in one ACID engine."
+version = "0.12.3"
+description = "AI-native embedded multimodal database — SQL, vectors, full-text, spatial and time-series in one ACID engine, with edge presets for robots and edge devices."
+readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
+license-files = ["licenses/LICENSE"]
+keywords = [
+    "database",
+    "embedded-database",
+    "vector-search",
+    "full-text-search",
+    "spatial",
+    "time-series",
+    "rag",
+    "robotics",
+    "edge-ai",
+    "sql",
+]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Homepage = "https://github.com/motedb/motedb"
+Repository = "https://github.com/motedb/motedb"
+Source = "https://github.com/motedb/motedb"
+Issues = "https://github.com/motedb/motedb/issues"
+Changelog = "https://github.com/motedb/motedb/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/motedb/motedb/tree/main/bindings/python"
 
 [tool.maturin]
 # Mixed layout: the Rust extension ships as motedb._native; the real Python
 # package (motedb/__init__.py) wraps it with Arrow/pandas interop.
 python-source = "python"
 module-name = "motedb._native"
+# 🔑 licenses/LICENSE is a COPY of the repo-root MIT license, placed in a
+# subdir so `license-files` can carry it into the WHEEL's
+# dist-info/licenses/. A top-level copy collides with maturin's automatic
+# workspace-root LICENSE inclusion in the SDIST (same archive path); the
+# subdir keeps the two apart — the sdist ends up with BOTH the root
+# LICENSE and licenses/LICENSE.
