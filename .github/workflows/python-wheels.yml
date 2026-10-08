@@ -125,7 +125,7 @@ jobs:
           fi
           echo "installing: ${wheels[*]}"
           set +e
-          python -m pip install "${wheels[@]}" 2>&1 | tee /tmp/pipinstall.log
+          python -m pip install --no-deps "${wheels[@]}" 2>&1 | tee /tmp/pipinstall.log
           RC=${PIPESTATUS[0]}
           set -e
           if [ "$RC" != "0" ]; then
@@ -142,7 +142,7 @@ jobs:
             Write-Error "no wheel matches dist/$env:WHEEL_PATTERN.whl"; Get-ChildItem dist; exit 1
           }
           Write-Host "installing: $($wheels.FullName)"
-          python -m pip install $wheels.FullName
+          python -m pip install --no-deps $wheels.FullName
         env:
           WHEEL_PATTERN: ${{ matrix.wheel-pattern }}
       - name: Import + version smoke

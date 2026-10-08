@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.5] — 2026-10-09
+
+- **Windows 冒烟修复**: smoke 的 pip install 未加 `--no-deps`, pip 连
+  PyPI 做依赖解析被 runner 代理拒绝(ConnectionError: Access denied,
+  v0.12.4 实抓)—— wheel 本无 Python 运行时依赖, posix/windows 两处
+  安装统一加 `--no-deps`。(v0.12.4 全部构建含 Windows x64 wheel 与
+  sdist 已成功, 仅冒烟步骤拦住了 publish)
+
 ## [0.12.4] — 2026-10-09
 
 v0.12.3 发布流水线修复(首次 CI 实跑抓出 ×3)。
