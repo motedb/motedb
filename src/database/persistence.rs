@@ -235,8 +235,18 @@ impl MoteDB {
             }
         }
         // Directory fsync makes the created entries themselves durable.
-        let dir = std::fs::File::open(dest).map_err(StorageError::Io)?;
-        dir.sync_all().map_err(StorageError::Io)?;
+        // 🔧 Windows: std::fs::File::open on a DIRECTORY fails with
+        // Access Denied (needs FILE_FLAG_BACKUP_SEMANTICS, not exposed by
+        // std) — the Windows smoke's backup_to tripped exactly here
+        // (os error 5, v0.12.4/v0.12.5). Skip the dir-fsync there; NTFS
+        // metadata journaling provides a weaker-but-reasonable guarantee.
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(dest).map_err(StorageError::Io)?;
+            dir.sync_all().map_err(StorageError::Io)?;
+        }
+        #[cfg(not(unix))]
+        let _ = dest;
         Ok(())
     }
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.6] — 2026-10-09
+
+- **backup_to 在 Windows 上失败修复**: copy_dir_durable 末尾对快照目录做
+  `File::open` + `sync_all` —— Windows 的 std 打开目录需要
+  FILE_FLAG_BACKUP_SEMANTICS(std 未暴露), 直接 Access Denied(os error 5,
+  Windows 冒烟的 backup 环节实抓)。目录 fsync 改为 unix-only; mingw 交叉
+  编译 + 全量 backup 回归通过
+
 ## [0.12.5] — 2026-10-09
 
 - **Windows 冒烟修复**: smoke 的 pip install 未加 `--no-deps`, pip 连
