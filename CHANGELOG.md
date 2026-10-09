@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.12.8] — 2026-10-09
+
+- **🔑 kill -9 崩溃后全文索引静默滞后修复(PyPI 包压测实抓)**: 崩溃发生在
+  表数据已 checkpoint、文本索引 pending posting(纯内存)未落盘之间时,
+  表行恢复完整但索引落后 —— 已 checkpoint 的表无 WAL 回放, 既有重建
+  触发条件(replayed/corrupt)不覆盖 → MATCH 静默缺行(实测 198/300,
+  doctor 仍 PASS), 6 次崩溃 3 次命中。修复: open 时对每个文本索引
+  检测 `segment 行数 > index total_docs` 的滞后并走既有重建通道
+  (检测在 row_count 初始化之前, 直接读 segment store 权威计数)。
+  修复后 kill -9 ×8 全部恢复一致; 新增 bindings/python/tests/
+  test_crash_recovery.py(子进程 kill + 恢复断言)入库
+- **0.12.7(PyPI 实装)多轮压测其余结论**: 官方套件 3 轮零偶发;
+  6 线程混合负载(递归 CTE/窗口/FTS/点查 × 写 churn)零错误、重开一致、
+  doctor PASS; 60 轮 open/seed/query/close RSS 增量 +8MB(无泄漏);
+  跨进程同库正确拒绝、释放后可开; 4 种 preset 全通; query_arrow 聚合
+  正确; 15 轮重开耐久循环 FTS 全量同步; SQLite 差分对拍 800q/种子
+  ×4 通过
+
 ## [0.12.7] — 2026-10-09
 
 - **`motedb.__version__` 双源不同步修复(0.12.6 PyPI 验收实抓)**: 用户

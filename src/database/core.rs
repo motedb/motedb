@@ -1862,7 +1862,32 @@ impl MoteDB {
             for name in txt_idx {
                 if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
                     let corrupt = corrupt_loaded.iter().any(|n| n == &name);
-                    if !replayed_tables.contains(&table) && !corrupt {
+                    // 🔒 Stale-index detection (kill -9 recovery audit, v0.12.8):
+                    // a crash between table-data durability and text-index
+                    // flush leaves the index VALID but BEHIND (pending posting
+                    // lists are memory-only). No WAL replay happens for
+                    // already-checkpointed tables, so the v1 rebuild trigger
+                    // (replayed/corrupt only) skipped them — MATCH silently
+                    // missed rows (measured 198/300 after kill, doctor PASS).
+                    // Rebuild whenever the index's doc count trails the table.
+                    let stale = {
+                        // NOTE: this runs BEFORE table_row_count is
+                        // initialized in open() — count live rows straight
+                        // from the segment store (the authoritative source
+                        // for ColSegmentStore tables).
+                        let table_rows = db
+                            .col_segment_stores
+                            .get(&table)
+                            .map(|s| s.count_live_rows() as u64)
+                            .unwrap_or(0);
+                        let indexed = db
+                            .text_indexes
+                            .get(&name)
+                            .map(|i| i.read().stats().total_docs)
+                            .unwrap_or(0);
+                        table_rows > 0 && indexed < table_rows
+                    };
+                    if !replayed_tables.contains(&table) && !corrupt && !stale {
                         continue;
                     }
                     if let Ok(schema) = db.table_registry.get_table(&table) {

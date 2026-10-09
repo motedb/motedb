@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "motedb-python"
-version = "0.12.7"
+version = "0.12.8"
 description = "AI-native embedded multimodal database — SQL, vectors, full-text, spatial and time-series in one ACID engine, with edge presets for robots and edge devices."
 readme = "README.md"
 requires-python = ">=3.9"
