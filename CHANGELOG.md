@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.12.7] — 2026-10-09
+
+- **`motedb.__version__` 双源不同步修复(0.12.6 PyPI 验收实抓)**: 用户
+  `pip install motedb-python==0.12.6` 后 `__version__` 报 **0.12.2** ——
+  wheel 文件名来自 pyproject.toml, 而 `CARGO_PKG_VERSION`(→
+  `_native.__version__` → `motedb.__version__`)来自
+  bindings/python/Cargo.toml, 后者自 0.12.2 起未随发版 bump。三处版本
+  统一为单一发版动作, 并在 wheels 流水线新增 **version-guard** 硬门禁
+  (三处不一致即构建失败)
+- 其余验收结论(官方 PyPI 0.12.6 全新环境实测): 元数据(主页/许可/
+  dist-info 内 LICENSE)✓、测评 P0/P1 场景 ✓、新特性(递归 CTE/窗口聚合/
+  backup_to/doctor)✓、官方套件(E2E 51/51、SQLite 差分 4 种子、
+  fetch_arrays/backup/feature_selfcheck/insert_arrays)✓、sdist 源码
+  构建安装可用 ✓
+
 ## [0.12.6] — 2026-10-09
 
 - **backup_to 在 Windows 上失败修复**: copy_dir_durable 末尾对快照目录做

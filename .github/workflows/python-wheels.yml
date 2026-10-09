@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   build:
+    needs: version-guard
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +53,24 @@ jobs:
   # 🔑 External review: PyPI shipped wheels only — no sdist, so
   # `pip install motedb-python --no-binary` (source builds, downstream
   # packaging, distro maintainers) had nothing to fetch.
+  # 🔒 v0.12.6 验收实抓: wheel 文件名(pyproject)与 CARGO_PKG_VERSION
+  # (bindings/python/Cargo.toml)双源不同步 —— 用户装 0.12.6 却报
+  # __version__=0.12.2。三处版本必须一致才允许构建。
+  version-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify version sync (root Cargo.toml / binding Cargo.toml / pyproject.toml)
+        run: |
+          V1=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          V2=$(grep -m1 '^version' bindings/python/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          V3=$(grep -m1 '^version' bindings/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "root=$V1 binding=$V2 pyproject=$V3"
+          if [ "$V1" != "$V2" ] || [ "$V2" != "$V3" ]; then
+            echo "::error::version mismatch — bump ALL THREE files together"
+            exit 1
+          fi
+
   sdist:
     runs-on: ubuntu-latest
     steps:
