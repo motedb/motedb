@@ -33,3 +33,4 @@ benchmark_results/
 __pycache__/
 *.pyc
 bindings/python/dist/
+_native.abi3.so

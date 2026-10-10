@@ -358,4 +358,26 @@ impl MoteDB {
 
         Ok(())
     }
+
+    /// 🔒 Drop-path bounded flush (v0.12.9): the index-builder thread was
+    /// asked to stop before this runs, but a wedged sub-thread could still
+    /// hold an index write lock (join timeout edge). A blocking `write()`
+    /// here could hang Drop forever; try-bounded instead and report whether
+    /// EVERY index flushed — the caller only stamps the clean-close marker
+    /// on `true` (no marker ⇒ next open runs the crash-verify path, which
+    /// is correct, merely slower).
+    pub fn try_flush_text_indexes_bounded(&self, timeout: std::time::Duration) -> bool {
+        let mut all_flushed = true;
+        for entry in self.text_indexes.iter() {
+            match entry.value().try_write_for(timeout) {
+                Some(mut index) => {
+                    if index.flush().is_err() {
+                        all_flushed = false;
+                    }
+                }
+                None => all_flushed = false,
+            }
+        }
+        all_flushed
+    }
 }

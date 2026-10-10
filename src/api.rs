@@ -533,6 +533,15 @@ impl Database {
         self.inner
             .is_closed
             .store(true, std::sync::atomic::Ordering::Release);
+        // 🔒 v0.12.9: stamp the FTS freshness marker while we still hold the
+        // exclusive lock (release_lock is below). Stamping here — not only in
+        // MoteDB::Drop — makes the marker prompt for explicit close() users
+        // (the Python binding's primary path; Drop may wait for GC), and the
+        // lock ordering guarantees no NEW instance can have opened yet, so
+        // the marker can never attest freshness for someone else's session.
+        if result.is_ok() {
+            self.inner.stamp_fts_freshness_marker("[close]");
+        }
         // Release the exclusive flock so a subsequent open() on the same
         // directory (or another process) can acquire it. Without this, the
         // lock is held until the MoteDB is dropped — which may be much later

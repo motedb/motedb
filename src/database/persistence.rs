@@ -112,11 +112,26 @@ impl MoteDB {
         // Same discipline as flush(): CAS the reentrancy flag, then hold
         // checkpoint_mutex so auto-checkpoint/compaction can't rewrite
         // segment files mid-copy.
-        if self
-            .is_flushing
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        // 🔒 v0.12.9: auto-checkpoint holds this flag for its whole run
+        // (index flush + WAL truncation + segment compaction — seconds under
+        // load). Erroring on first collision made concurrent backup+checkpoint
+        // flaky at full-suite parallelism; retry the CAS briefly before
+        // surfacing the "retry backup" contract error.
+        let mut acquired = false;
+        for attempt in 0..6 {
+            if self
+                .is_flushing
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                acquired = true;
+                break;
+            }
+            if attempt < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+        if !acquired {
             return Err(StorageError::InvalidData(
                 "a flush/checkpoint is in progress — retry backup".into(),
             ));
@@ -164,9 +179,16 @@ impl MoteDB {
         let result = match flush_result {
             Ok(()) => {
                 let mut out = Ok(());
-                for attempt in 0..3 {
+                // 🔒 The copy can race a writer whose flush_buffer (or a
+                // background lsm-flush) was ALREADY in flight when the write
+                // stripes were taken: it finishes during the copy, atomically
+                // swapping segment files. NotFound is transient by
+                // construction — retry with enough patience to ride out a
+                // loaded runner (3×50ms escaped under full-suite parallelism;
+                // 10×100ms measured sufficient with margin).
+                for attempt in 0..10 {
                     if attempt > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                         let _ = std::fs::remove_dir_all(&dest);
                     }
                     match Self::copy_dir_durable(&self.path, &dest) {
@@ -457,6 +479,16 @@ impl MoteDB {
             for entry in self.col_segment_stores.iter() {
                 let _ = entry.flush_buffer();
             }
+            // 🔒 v0.12.9: same FTS-before-truncation discipline as
+            // checkpoint_impl — UPDATE-class text staleness is invisible to
+            // count-based recovery checks, so it must never outlive the WAL
+            // records that could replay it.
+            if !self.try_flush_text_indexes_bounded(std::time::Duration::from_secs(2)) {
+                warn_log!(
+                    "[VACUUM] FTS flush skipped (index lock contention) — \
+                     text index may lag until close"
+                );
+            }
             if let Err(e) = self.wal.checkpoint_all() {
                 warn_log!("[VACUUM] WAL truncation failed (non-fatal): {}", e);
             }
@@ -560,6 +592,20 @@ impl MoteDB {
 
         if let Err(e) = self.columnar_store.flush_all() {
             warn_log!("[Flush] Columnar store flush failed: {}", e);
+        }
+
+        // 🔒 v0.12.9: persist FTS in-memory state (tombstones + pending
+        // postings) BEFORE the WAL truncation below. The truncation removes
+        // the replay that would otherwise re-apply text mutations on reopen,
+        // and an UPDATE changes total_docs by ZERO — the open-time count
+        // predicate cannot see the lost tombstone/re-post. Bounded try-write
+        // past the drain wait above: if the builder still holds a lock, skip
+        // — same exposure as before this fix, never worse.
+        if !self.try_flush_text_indexes_bounded(std::time::Duration::from_secs(2)) {
+            warn_log!(
+                "[checkpoint] FTS flush skipped (index lock contention) — \
+                 text index may lag until close"
+            );
         }
 
         let checkpoint_done = if immutable_queue_len == 0 || !self.col_segment_stores.is_empty() {

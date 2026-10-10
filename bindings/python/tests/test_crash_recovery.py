@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""kill -9 崩溃恢复回归: 表数据连续无缺口 + FTS 完整。
-v0.12.8 修复前: 已 checkpoint 的表崩溃后无 WAL 回放 → 文本索引的内存
+"""kill -9 崩溃恢复回归: 表数据连续无缺口 + FTS 完整(双向)。
+v0.12.8 修复: 已 checkpoint 的表崩溃后无 WAL 回放 → 文本索引的内存
 pending 丢失且无人重建 → MATCH 静默缺行(实测 198/300, doctor 仍 PASS)。
-修复: open 时检测 index total_docs < 表行数 → 走既有重建通道。"""
+v0.12.9 修复两个残余缺口:
+  (a) 重建在旧索引上追加而非重置 → total_docs/TF 膨胀(BM25 漂移);
+  (b) 墓碑丢失方向: crash 前 DELETE 的内存 tombstone 未落盘 → 磁盘索引
+      total_docs > 表行数, 旧 `<` 谓词不触发重建 → MATCH 幻影多计。
+偶数轮 kill@CKPT 打插入丢失窗口, 奇数轮 kill@DELCKPT 打墓碑丢失窗口;
+两方向都断言 MATCH 计数与活行精确一致。"""
 import os
 import shutil
 import subprocess
@@ -25,6 +30,8 @@ WRITER = textwrap.dedent("""
         db.execute("INSERT INTO c VALUES (?, ?)", params=[i, f"post {i}"])
         if i % 50 == 0:
             db.checkpoint(); print(f"CKPT{i}", flush=True)
+    db.execute("DELETE FROM c WHERE id >= 400")
+    db.checkpoint(); print("DELCKPT", flush=True)
 """)
 
 
@@ -32,7 +39,7 @@ def main():
     tmp = tempfile.mkdtemp()
     path = os.path.join(tmp, "crash.mote")
     fails = 0
-    trials = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    trials = int(sys.argv[1]) if len(sys.argv) > 1 else 6
     try:
         for t in range(trials):
             if os.path.isdir(path):
@@ -42,12 +49,17 @@ def main():
             proc = subprocess.Popen(
                 [sys.executable, "-c", WRITER, path],
                 stdout=subprocess.PIPE, text=True)
+            # Even trials: kill in the post-checkpoint INSERT window
+            # (index behind). Odd trials: kill right after the post-DELETE
+            # checkpoint (tombstones still memory-only → index ahead).
+            want = "DELCKPT" if t % 2 else "CKPT"
             killed = None
             for line in proc.stdout:
-                if line.strip().startswith("CKPT"):
-                    proc.kill()
-                    killed = line.strip()
-                    break
+                s = line.strip()
+                if s.startswith("CKPT") and want == "CKPT":
+                    proc.kill(); killed = s; break
+                if s == "DELCKPT" and want == "DELCKPT":
+                    proc.kill(); killed = s; break
             proc.wait()
             db = motedb.Database(path)
             n = db.execute("SELECT COUNT(*) AS n FROM c")[0]["n"]
@@ -55,10 +67,16 @@ def main():
             cnt = db.execute("SELECT COUNT(DISTINCT id) AS d FROM c")[0]["d"]
             fts = db.execute(
                 "SELECT COUNT(*) AS n FROM c WHERE MATCH(v, 'common')")[0]["n"]
+            post_live = db.execute(
+                "SELECT COUNT(*) AS n FROM c WHERE id >= 300")[0]["n"]
+            post_fts = db.execute(
+                "SELECT COUNT(*) AS n FROM c WHERE MATCH(v, 'post')")[0]["n"]
             db.close()
-            ok = cnt == mx + 1 and fts == 300
+            ok = (cnt == mx + 1 and fts == 300
+                  and post_fts == post_live)  # exact: no missing, no phantoms
             print(f"{'ok  ' if ok else 'FAIL'} trial{t} kill@{killed} "
-                  f"rows={n} contiguous={cnt == mx + 1} fts={fts}/300")
+                  f"rows={n} contiguous={cnt == mx + 1} fts={fts}/300 "
+                  f"post fts={post_fts}/live{post_live}")
             if not ok:
                 fails += 1
     finally:

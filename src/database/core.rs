@@ -891,6 +891,14 @@ impl MoteDB {
         // 🔒 Acquire exclusive file lock to prevent concurrent opens
         let lock_file = Self::acquire_lock(&db_path)?;
 
+        // 🔒 Crash-evidence gate (v0.12.9): a clean Drop flushes the FTS
+        // indexes and stamps this marker. Its absence ⇒ index durability is
+        // suspect (crash / kill -9) ⇒ the stale-count check in the rebuild
+        // loop below runs and rebuilds on mismatch. Captured BEFORE removal
+        // (a crash mid-open must never leave a stale marker behind).
+        let clean_close = db_path.join("fts_indexes.fresh").exists();
+        let _ = std::fs::remove_file(db_path.join("fts_indexes.fresh"));
+
         // 🎯 统一目录结构：从 {name}.mote/ 目录读取
         let wal_path = db_path.join("wal");
         let lsm_dir = db_path.join("lsm");
@@ -1862,15 +1870,25 @@ impl MoteDB {
             for name in txt_idx {
                 if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
                     let corrupt = corrupt_loaded.iter().any(|n| n == &name);
-                    // 🔒 Stale-index detection (kill -9 recovery audit, v0.12.8):
-                    // a crash between table-data durability and text-index
-                    // flush leaves the index VALID but BEHIND (pending posting
-                    // lists are memory-only). No WAL replay happens for
-                    // already-checkpointed tables, so the v1 rebuild trigger
-                    // (replayed/corrupt only) skipped them — MATCH silently
-                    // missed rows (measured 198/300 after kill, doctor PASS).
-                    // Rebuild whenever the index's doc count trails the table.
-                    let stale = {
+                    // 🔒 Stale-index detection (kill -9 recovery audit,
+                    // v0.12.8/v0.12.9): a crash between table-data durability
+                    // and text-index flush leaves the index VALID but WRONG in
+                    // EITHER direction — pending posting lists are memory-only
+                    // (index BEHIND: MATCH silently missed rows, measured
+                    // 198/300 after kill) and in-memory tombstones are equally
+                    // volatile (index AHEAD: postings still reference deleted
+                    // rows, phantom MATCH hits / COUNT overcount). No WAL
+                    // replay happens for already-checkpointed tables, so the
+                    // v1 trigger (replayed/corrupt only) skipped both classes.
+                    // Rebuild on ANY count mismatch. NULL texts are legitimately
+                    // unindexed, so mismatched-but-clean tables (NULL-bearing)
+                    // also rebuild here — that is crash-path-only work: a clean
+                    // Drop stamps `fts_indexes.fresh`, and open skips this
+                    // check entirely when the marker was present (marker is
+                    // consumed at open start, above). Replayed/corrupt triggers
+                    // stay live regardless of the marker — they carry their own
+                    // evidence.
+                    let stale = !clean_close && {
                         // NOTE: this runs BEFORE table_row_count is
                         // initialized in open() — count live rows straight
                         // from the segment store (the authoritative source
@@ -1885,10 +1903,50 @@ impl MoteDB {
                             .get(&name)
                             .map(|i| i.read().stats().total_docs)
                             .unwrap_or(0);
-                        table_rows > 0 && indexed < table_rows
+                        indexed != table_rows
                     };
                     if !replayed_tables.contains(&table) && !corrupt && !stale {
                         continue;
+                    }
+                    // 🔒 v0.12.9: HARD RESET before rebuilding. The rebuild
+                    // used to APPEND into the loaded (possibly stale) index:
+                    // batch_insert is not idempotent — total_docs += n
+                    // unconditionally and PostingList::add bumps TF for
+                    // already-present docs — so a rebuild over surviving state
+                    // inflated total_docs (~2×) and doubled term frequencies
+                    // (silent BM25 drift, permanent until a full reset).
+                    // Mirror the load path's reset (drop both on-disk dirs,
+                    // start a fresh index) so rebuilt == exactly the live
+                    // rows. Re-resetting an already-fresh index (replayed /
+                    // corrupt paths reset during load) is harmless.
+                    //
+                    // 🔒 ORDER MATTERS (Windows): TextFTSIndex::new is
+                    // create-OR-OPEN — it loads whatever files still exist.
+                    // The map entry is therefore removed FIRST so the last
+                    // Arc (and its open handles into text_*.fts.d) drops
+                    // BEFORE remove_dir_all: with the loaded index still
+                    // alive, Windows sharing violations make the removal
+                    // fail and new() would re-load the stale state, silently
+                    // reviving the append bug. (The builder pipeline starts
+                    // only after this loop, so the map is the sole holder.)
+                    db.text_indexes.remove(&name);
+                    let fts_dir = indexes_dir.join(format!("text_{}.fts.d", name));
+                    let dict_dir = indexes_dir.join(format!("text_{}.dict.d", name));
+                    let _ = std::fs::remove_dir_all(&fts_dir);
+                    let _ = std::fs::remove_dir_all(&dict_dir);
+                    match TextFTSIndex::new(indexes_dir.join(format!("text_{}", name))) {
+                        Ok(fresh) => {
+                            db.text_indexes.insert(
+                                name.clone(),
+                                std::sync::Arc::new(parking_lot::RwLock::new(fresh)),
+                            );
+                        }
+                        Err(e) => warn_log!(
+                            "[Recovery] ⚠️ text index '{}' reset failed ({:?}) — \
+                             index left absent; queries on it error until re-created",
+                            name,
+                            e
+                        ),
                     }
                     if let Ok(schema) = db.table_registry.get_table(&table) {
                         if let Some(col_def) = schema.columns.iter().find(|c| c.name == column) {
@@ -3074,9 +3132,69 @@ impl Drop for MoteDB {
             warn_log!("[Drop] Final checkpoint failed: {:?}", e);
             warn_log!("[Drop] WAL files may not be cleaned up");
         } else {
+            // 🔒 v0.12.9 clean-close marker (Drop path — covers handles that
+            // were never explicitly closed). Gated on the exclusive flock:
+            // close() releases the lock but the object may stay alive until
+            // GC — a zombie Drop stamping AFTER a new instance opened would
+            // fake freshness for that new session's mid-flight state.
+            // close() itself stamps under the lock before releasing it.
+            if self.holds_exclusive_lock() {
+                self.stamp_fts_freshness_marker("[MoteDB::Drop]");
+            }
             debug_log!("[MoteDB::Drop] ✅ Final checkpoint complete, WAL cleaned");
         }
 
         debug_log!("[MoteDB::Drop] 👋 Database closed cleanly");
+    }
+}
+
+impl MoteDB {
+    /// True while this instance still owns the exclusive directory lock,
+    /// i.e. `close()` has not run (`release_lock` takes the File).
+    fn holds_exclusive_lock(&self) -> bool {
+        self._lock_file
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
+    /// 🔒 v0.12.9 clean-close marker: flush the FTS indexes (bounded — never
+    /// hang the caller on a wedged index write lock; skipping the marker
+    /// just means the next open pays the crash-verify path) and durably
+    /// stamp `fts_indexes.fresh`. CALLER MUST HOLD THE EXCLUSIVE LOCK — see
+    /// `holds_exclusive_lock`.
+    pub(crate) fn stamp_fts_freshness_marker(&self, who: &str) {
+        if !self.try_flush_text_indexes_bounded(std::time::Duration::from_secs(2)) {
+            warn_log!(
+                "{who} ⚠️ FTS flush not confirmed — skipping fts_indexes.fresh stamp \
+                 (next open pays crash-verify)"
+            );
+            return;
+        }
+        // Durable stamp (fs::write alone is page-cache only): fsync the
+        // file, rename, then fsync the dir (unix-only — Windows opens on
+        // directories return Access Denied, v0.12.6). This orders the marker
+        // STRICTLY AFTER the flushed index data so a power loss can never
+        // leave the marker claiming freshness for postings that didn't
+        // survive.
+        let marker = self.path.join("fts_indexes.fresh");
+        let tmp = self.path.join(".fts_indexes.fresh.tmp");
+        let stamped = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(b"v1")?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, &marker)?;
+            #[cfg(unix)]
+            std::fs::File::open(&self.path)?.sync_all()?;
+            Ok(())
+        })();
+        match stamped {
+            Ok(()) => debug_log!("{who} ✅ FTS flushed, freshness marker stamped"),
+            Err(e) => warn_log!(
+                "{who} ⚠️ fts_indexes.fresh stamp failed ({e:?}) — next open pays crash-verify"
+            ),
+        }
     }
 }

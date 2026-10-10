@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.12.9] — 2026-10-10
+
+- **🔑 崩溃恢复审计三连修(0.12.8 stale 检测的边界补全)**:
+  - **重建不清空旧索引 → 统计膨胀**: 恢复重建在已加载的(可能滞后的)
+    索引上**追加**而非重置 —— `batch_insert` 不幂等(total_docs 无条件
+    自增、`PostingList::add` 对已有 doc 抬 TF), 一次重建即 total_docs
+    翻倍 + 词频加倍(BM25 静默漂移, MATCH 成员正确所以压测没抓到)。
+    修复: 重建前硬重置(删除 text_{name}.fts.d 与 dict.d 目录、新建空
+    索引, 与 load 路径同构), 重建后 total_docs 精确等于活行探针实测
+    80/80。回归: tests/test_fts_recovery_staleness.rs(UPDATE/DELETE/
+    NULL 混合 + 标记契约 + 恢复幂等)
+  - **NULL 文本行 → 每次全量重建**: NULL 不入索引是常态, 但 0.12.8 的
+    `indexed < table_rows` 谓词把含 NULL 的表判为永久 stale → 每次
+    open 全量重建(且触发上面的追加膨胀)。修复: 引入**干净关闭标记**
+    `fts_indexes.fresh` —— Drop 时 flush 全部文本索引(有界锁等待,
+    builder 卡死则跳过标记而非卡死 Drop)并原子写标记; open 起始消费
+    标记, 标记在位 → 干净重开零校验零重建, 标记缺失(崩溃证据)→ 才
+    跑计数校验。干净重开实测零重建
+  - **墓碑丢失方向 → MATCH 幻影**: crash 前 DELETE 的内存 tombstone
+    未落盘 → 磁盘索引 total_docs **大于**表行数, 旧 `<` 谓词不触发
+    重建 → posting 残留已删行, `COUNT(*) WHERE MATCH` 快路径按索引
+    计数会多计。修复: 谓词改 `indexed != table_rows`(双向); 实证中
+    干净关闭/WAL 回放通常兜底此窗口, `!=` 为纵深防御。回归:
+    test_crash_recovery.py 扩展奇数轮 kill@DELCKPT(删除后 checkpoint
+    即杀), 断言 MATCH 与活行精确一致
+- 详查结论: UPDATE 后多 segment 无同 key 双活(重建计数精确); 文本
+  索引磁盘产物全部位于 fts.d/dict.d 两目录(重置完整)
+- **WAL 截断点 durability 对齐(纵深防御)**: checkpoint_impl 与 vacuum
+  在 `wal.checkpoint_all()` 截断前新增有界(2s try-write)FTS flush。
+  原理: UPDATE 的 term 级墓碑(deleted_term_docs)纯内存, 计数谓词
+  (total_docs 净变化为零)天然看不见内容级漂移; 截断 WAL 会移除本可
+  回放重放的索引变更。实测该窗口被 WAL 回放兜住(不 flush 崩溃结果
+  也正确), 此为原理性对齐而非实测缺陷修复; 锁竞争时跳过(不劣于
+  修复前)
+- **🔑 在线 backup 竞态修复(全套件并行实抓, 上项改动的连带暴露)**:
+  backup 拷贝与"已 in-flight 的段交换"竞态时 NotFound 只重试 3×50ms
+  — 全套件并行负载下逃逸(backup_to 报 Io NotFound)。且 auto-checkpoint
+  持 is_flushing 的临界区因上面的 FTS flush 变长, backup 的 CAS 冲突
+  从"立即报错"概率上升。修复: 拷贝重试 3×50ms → 10×100ms; is_flushing
+  CAS 冲突内部重试 ~2.5s 后才上抛 "retry backup"。因果验证: 去 FTS
+  flush 的全套件 exit 0, 带上后 2/2 失败, 加宽重试后收敛
+- **标记契约加固(二轮自查)**:
+  - **重置顺序(Windows 关键)**: `TextFTSIndex::new` 是 create-or-OPEN,
+    会加载残留文件; 旧索引对象持着 fts.d 内文件句柄时 Windows 删除目录
+    因共享冲突失败 → new() 会加载旧状态、追加膨胀复活。修复: 先从 map
+    移除旧条目(释放句柄)再删目录再新建(macOS 上不可测, 代码序保证)
+  - **盖章归属与僵尸句柄**: close() 释放 flock 后对象可存活到 GC ——
+    僵尸 Drop 在新实例 open 之后再盖章 = 给新会话中途状态谎报"干净"。
+    修复: close() 在**持锁期间**(release_lock 之前)盖章(Python 主路径
+    即时生效, 不依赖 GC); Drop 路径仅在仍持锁(从未 close)时盖章
+  - **标记持久化**: fsync 文件 + rename + unix 目录 fsync, 标记严格
+    排在被 flush 的索引数据之后(断电不出现"标记在、数据不在")
+
 ## [0.12.8] — 2026-10-09
 
 - **🔑 kill -9 崩溃后全文索引静默滞后修复(PyPI 包压测实抓)**: 崩溃发生在
