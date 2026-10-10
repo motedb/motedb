@@ -20,7 +20,8 @@ fn multirow_update_fts_exact_matches() {
     let mut config = DBConfig::for_testing();
     config.auto_checkpoint = None;
     let db = Database::create_with_config(dir.path().join("x.mote"), config).unwrap();
-    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("CREATE TEXT INDEX ci ON c(v)").unwrap();
     for i in 0..300 {
         db.execute(&format!("INSERT INTO c VALUES ({i}, 'alpha beta {i}')"))
@@ -31,11 +32,15 @@ fn multirow_update_fts_exact_matches() {
     let pre = n(&db, "SELECT COUNT(*) FROM c WHERE MATCH(v, 'alpha')");
     assert_eq!(pre, 300, "pre-update sanity");
 
-    db.execute("UPDATE c SET v = 'gamma delta' WHERE id < 150").unwrap();
+    db.execute("UPDATE c SET v = 'gamma delta' WHERE id < 150")
+        .unwrap();
 
     let post = n(&db, "SELECT COUNT(*) FROM c WHERE MATCH(v, 'alpha')");
     let gamma = n(&db, "SELECT COUNT(*) FROM c WHERE MATCH(v, 'gamma')");
     println!("post-update: alpha={post} (want 150) gamma={gamma} (want 150)");
     assert_eq!(gamma, 150, "updated rows must match the new text");
-    assert_eq!(post, 150, "only untouched rows may still match the old text");
+    assert_eq!(
+        post, 150,
+        "only untouched rows may still match the old text"
+    );
 }

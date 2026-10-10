@@ -29,7 +29,10 @@ fn verify_matches(db: &Database, label: &str) {
     assert_eq!(live, 85, "[{label}] live rows");
     assert_eq!(m_doc, 30, "[{label}] never-updated rows must match 'doc'");
     assert_eq!(m_delta, 50, "[{label}] updated rows must match 'delta'");
-    assert_eq!(m_beta, 30, "[{label}] never-updated rows still match 'beta'");
+    assert_eq!(
+        m_beta, 30,
+        "[{label}] never-updated rows still match 'beta'"
+    );
 }
 
 #[test]
@@ -42,7 +45,8 @@ fn probe_total_docs_vs_live_rows() {
         let mut config = DBConfig::for_testing();
         config.auto_checkpoint = None;
         let db = Database::create_with_config(&db_path, config).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
         db.execute("CREATE TEXT INDEX t_body ON t(body)").unwrap();
         for i in 0..100 {
             db.execute(&format!(
@@ -60,12 +64,13 @@ fn probe_total_docs_vs_live_rows() {
             }
         }
         for i in 80..100 {
-            db.execute(&format!("DELETE FROM t WHERE id = {i}")).unwrap();
+            db.execute(&format!("DELETE FROM t WHERE id = {i}"))
+                .unwrap();
         }
         // Five NULL-body rows: legitimately unindexed (live 85, indexed 80).
         for i in 100..105 {
             db.execute(&format!("INSERT INTO t (id, body) VALUES ({i}, NULL)"))
-            .unwrap();
+                .unwrap();
         }
         verify_matches(&db, "pre-close");
     } // clean Drop → flush + marker
