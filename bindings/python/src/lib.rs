@@ -117,6 +117,9 @@ fn mote_to_py(v: &MValue) -> PyObject {
                     }
                 }
             }
+            MValue::Blob(b) => pyo3::types::PyBytes::new_bound(py, b.as_slice())
+                .into_any()
+                .unbind(),
             // Tensor / TextDoc: not first-class in Python yet — render as a
             // tag so users see WHAT it is instead of garbage.
             MValue::Tensor(_) => "<tensor>".into_py(py),
@@ -319,6 +322,11 @@ fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
     }
     if let Ok(s) = v.extract::<String>() {
         return Ok(MValue::Text(s.into()));
+    }
+    // 🔖 bytes / bytearray → BLOB (must be AFTER String: PyBytes doesn't
+    // extract as str, so ordering only guards intent).
+    if let Ok(b) = v.extract::<Vec<u8>>() {
+        return Ok(MValue::Blob(motedb_core::types::ArcBytes::new(b)));
     }
     // dict with "type" Point/Point3D/LineString/Polygon → geometry
     if let Ok(dict) =
@@ -945,6 +953,126 @@ impl PyDatabase {
     /// Reclaim disk space (full compaction).
     fn vacuum(&self) -> PyResult<()> {
         self.db.vacuum().map_err(py_err)
+    }
+
+    /// Import an MCAP robotics bag: one table per topic with
+    /// `_uid PK, log_time, publish_time, data BLOB` (+ any columns the
+    /// `decode` callback returns). `decode: {topic: callable}` receives
+    /// `(log_time_ns: int, raw: bytes)` and returns a dict of extra columns
+    /// (values: int/float/str/bytes/list[float]) — ROS2 CDR/protobuf
+    /// decoding stays at the Python boundary.
+    #[pyo3(signature = (path, *, include=None, exclude=None, prefix="topic", decode=None))]
+    fn import_mcap(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        prefix: &str,
+        decode: Option<pyo3::Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
+        self.db
+            .execute("SELECT 1")
+            .map_err(py_err)? // ensure_open side effect
+            .materialize()
+            .map_err(py_err)?;
+        let mut hooks: Vec<(String, pyo3::Bound<'_, PyAny>)> = Vec::new();
+        if let Some(d) = &decode {
+            let dict = d
+                .downcast::<pyo3::types::PyDict>()
+                .map_err(|_| PyValueError::new_err("decode must be a {topic: callable} dict"))?;
+            for (k, v) in dict.iter() {
+                let topic: String = k.extract()?;
+                hooks.push((topic, v.clone()));
+            }
+        }
+        let has_hooks = !hooks.is_empty();
+        let mut current_txn: Option<(String, pyo3::Bound<'_, PyAny>)> = None;
+        let mut hook_fn = move |topic: &str, log_time: u64, raw: &[u8]| -> Vec<(
+            String,
+            motedb_core::types::Value,
+        )> {
+            // Bind the matching callback (exact topic match; first call wins).
+            if current_txn.is_none() {
+                current_txn = hooks.iter().find(|(t, _)| t == topic).cloned();
+            }
+            let Some((_, cb)) = &current_txn else {
+                return Vec::new();
+            };
+            let out: pyo3::PyObject = Python::with_gil(|py| {
+                let raw_b = pyo3::types::PyBytes::new_bound(py, raw);
+                match cb.call((log_time, raw_b), None) {
+                    Ok(v) => v.into_any().unbind(),
+                    Err(e) => {
+                        e.print(py);
+                        py.None()
+                    }
+                }
+            });
+            Python::with_gil(|py| -> Vec<(String, motedb_core::types::Value)> {
+                let bound = out.into_bound(py);
+                let dict = match bound.downcast::<pyo3::types::PyDict>() {
+                    Ok(d) => d,
+                    Err(_) => return Vec::new(),
+                };
+                let mut cols = Vec::new();
+                for (k, v) in dict.iter() {
+                    let name: String = match k.extract() {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    if let Some(val) = py_to_mote(&v).ok() {
+                        cols.push((name, val));
+                    }
+                }
+                cols
+            })
+        };
+
+        let opts = motedb_core::mcap_import::McapImportOptions {
+            prefix: prefix.to_string(),
+            include: include.unwrap_or_default(),
+            exclude: exclude.unwrap_or_default(),
+            ..Default::default()
+        };
+        // No decode hooks → the whole import runs GIL-free; with hooks the
+        // callback re-acquires the GIL per message, so keep it held throughout.
+        let summary = if has_hooks {
+            motedb_core::mcap_import::import_mcap_file(
+                &self.db,
+                std::path::Path::new(path),
+                &opts,
+                &mut hook_fn,
+            )
+            .map_err(py_err)?
+        } else {
+            py.allow_threads(|| {
+                let mut noop =
+                    |_: &str, _: u64, _: &[u8]| -> Vec<(String, motedb_core::types::Value)> {
+                        Vec::new()
+                    };
+                motedb_core::mcap_import::import_mcap_file(
+                    &self.db,
+                    std::path::Path::new(path),
+                    &opts,
+                    &mut noop,
+                )
+            })
+            .map_err(py_err)?
+        };
+
+        let out = pyo3::types::PyDict::new_bound(py);
+        let topics = pyo3::types::PyList::empty_bound(py);
+        for (topic, table, rows) in &summary.topics {
+            let d = pyo3::types::PyDict::new_bound(py);
+            d.set_item("topic", topic).ok();
+            d.set_item("table", table).ok();
+            d.set_item("rows", rows).ok();
+            topics.append(d).ok();
+        }
+        out.set_item("topics", topics).ok();
+        out.set_item("filtered_out", summary.filtered_out).ok();
+        Ok(out.into_any().unbind())
     }
 
     /// Close the database (also happens on GC/drop).

@@ -79,6 +79,7 @@ impl FastKey {
             Value::Tensor(_) => FastKey::Complex(8),
             Value::Spatial(_) => FastKey::Complex(9),
             Value::TextDoc(_) => FastKey::Complex(10),
+            Value::Blob(_) => FastKey::Complex(11),
         }
     }
 }

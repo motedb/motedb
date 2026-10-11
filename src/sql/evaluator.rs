@@ -1050,12 +1050,14 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
-                if let Value::Text(s) = val {
-                    Ok(Value::Integer(s.chars().count() as i64))
-                } else {
-                    Err(MoteDBError::TypeError(
-                        "length() requires text argument".to_string(),
-                    ))
+                match val {
+                    Value::Text(s) => Ok(Value::Integer(s.chars().count() as i64)),
+                    // 🔖 BLOB: byte length (SQLite semantics — LENGTH(X''..)
+                    // counts bytes, not chars).
+                    Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
+                    _ => Err(MoteDBError::TypeError(
+                        "length() requires text or blob argument".to_string(),
+                    )),
                 }
             }
 
@@ -1661,6 +1663,108 @@ impl ExprEvaluator {
                 }
             }
 
+            // 🔖 snippet(text, query[, width=64]) — FTS5-style excerpt:
+            // char-window around the first query-term hit, every term in the
+            // window wrapped in <b></b>, "…" markers on truncation.
+            "snippet" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(MoteDBError::InvalidArgument(
+                        "snippet() takes (text, query[, width])".to_string(),
+                    ));
+                }
+                let text_v = self.eval(&args[0], row)?;
+                let query_v = self.eval(&args[1], row)?;
+                let width = if args.len() == 3 {
+                    match self.eval(&args[2], row)? {
+                        Value::Integer(w) if w > 0 => w as usize,
+                        _ => {
+                            return Err(MoteDBError::InvalidArgument(
+                                "snippet width must be a positive integer".to_string(),
+                            ))
+                        }
+                    }
+                } else {
+                    64
+                };
+                let (Value::Text(text), Value::Text(query)) = (text_v, query_v) else {
+                    return Err(MoteDBError::TypeError(
+                        "snippet() requires text arguments".to_string(),
+                    ));
+                };
+                let text = text.as_str();
+                let terms: Vec<String> = query
+                    .split_whitespace()
+                    .map(|t| t.to_lowercase())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if terms.is_empty() || text.is_empty() {
+                    return Ok(Value::text(head_window(text, width)));
+                }
+                let chars: Vec<char> = text.chars().collect();
+                let lower: Vec<char> = chars
+                    .iter()
+                    .map(|c| c.to_lowercase().next().unwrap_or(*c))
+                    .collect();
+                // First char index matching the start of ANY term.
+                let mut hit_char: Option<usize> = None;
+                for start in 0..lower.len() {
+                    for t in &terms {
+                        let tc: Vec<char> = t.chars().collect();
+                        if lower[start..].starts_with(&tc[..]) {
+                            hit_char = Some(start);
+                            break;
+                        }
+                    }
+                    if hit_char.is_some() {
+                        break;
+                    }
+                }
+                let Some(hc) = hit_char else {
+                    return Ok(Value::text(head_window(text, width)));
+                };
+                let lead = width / 4;
+                let start_char = hc.saturating_sub(lead);
+                let end_char = (start_char + width).min(chars.len());
+                // Highlight terms within the window (char-wise, case-insensitive).
+                let mut hl = String::new();
+                let mut i = start_char;
+                while i < end_char {
+                    let mut matched: Option<usize> = None; // term char length
+                    for t in &terms {
+                        let tc: Vec<char> = t.chars().collect();
+                        if i + tc.len() <= end_char && lower[i..i + tc.len()] == tc[..] {
+                            let better = match matched {
+                                Some(m) => tc.len() > m,
+                                None => true,
+                            };
+                            if better {
+                                matched = Some(tc.len());
+                            }
+                        }
+                    }
+                    match matched {
+                        Some(m) => {
+                            hl.push_str("<b>");
+                            hl.extend(&chars[i..i + m]);
+                            hl.push_str("</b>");
+                            i += m;
+                        }
+                        None => {
+                            hl.push(chars[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                let mut out = String::new();
+                if start_char > 0 {
+                    out.push('…');
+                }
+                out.push_str(&hl);
+                if end_char < chars.len() {
+                    out.push('…');
+                }
+                Ok(Value::text(out))
+            }
             "coalesce" => {
                 // COALESCE(val1, val2, ...) - return first non-NULL value
                 if args.is_empty() {
@@ -3395,4 +3499,14 @@ mod tests {
         let result = eval(&expr, &r).unwrap();
         assert_eq!(result, Value::Integer(0), "i64::MIN % -1 should be 0");
     }
+}
+
+/// Head window used by snippet() when no term matches.
+fn head_window(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width).collect();
+    out.push('…');
+    out
 }

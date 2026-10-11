@@ -2,7 +2,7 @@ use super::ast::*;
 /// SQL Parser - converts tokens into AST
 use super::token::{Token, TokenType};
 use crate::error::{MoteDBError, Result};
-use crate::types::Value;
+use crate::types::{ArcBytes, Value};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -896,6 +896,17 @@ impl Parser {
             });
         }
 
+        // 🔖 Table function: RRF((subquery1), (subquery2)[, k = n][, rrk = n][, wN = f])
+        // — hybrid-search rank fusion over 2..=4 ranked subqueries.
+        if let TokenType::Identifier(name) = &self.current().token_type {
+            if name.eq_ignore_ascii_case("RRF")
+                && matches!(self.peek_token_type(), TokenType::LParen)
+            {
+                self.advance(); // RRF
+                return self.parse_rrf_table_fn();
+            }
+        }
+
         // Regular table
         let name = self.parse_identifier()?;
 
@@ -1372,6 +1383,61 @@ impl Parser {
         Ok(columns)
     }
 
+    /// RRF((sub1), (sub2)[, k = n][, rrk = n][, wN = f]) — args are
+    /// parenthesized subqueries plus optional named parameters. Subqueries
+    /// need NO alias (unlike bare derived tables).
+    fn parse_rrf_table_fn(&mut self) -> Result<TableRef> {
+        self.expect(TokenType::LParen)?;
+        let mut args: Vec<crate::sql::ast::TableFnArg> = Vec::new();
+        loop {
+            if matches!(self.current().token_type, TokenType::RParen) {
+                break;
+            }
+            if matches!(self.current().token_type, TokenType::LParen) {
+                self.advance();
+                if !matches!(self.current().token_type, TokenType::Select) {
+                    return Err(self.error("Expected SELECT in RRF subquery argument"));
+                }
+                let sub = self.parse_select()?;
+                self.expect(TokenType::RParen)?;
+                args.push(crate::sql::ast::TableFnArg::Subquery(Box::new(
+                    crate::sql::ast::Statement::Select {
+                        stmt: sub,
+                        ctes: Vec::new(),
+                        with_recursive: false,
+                    },
+                )));
+            } else if let TokenType::Identifier(name) = &self.current().token_type {
+                // named arg: k = 10 / rrk = 60 / w1 = 0.5
+                let key = name.to_ascii_lowercase();
+                self.advance();
+                self.expect(TokenType::Eq)?;
+                let val = match self.current().token_type.clone() {
+                    TokenType::Number(n) => {
+                        self.advance();
+                        Value::Float(n)
+                    }
+                    TokenType::PureInteger(i) => {
+                        self.advance();
+                        Value::Integer(i)
+                    }
+                    _ => return Err(self.error("Expected numeric value in RRF named argument")),
+                };
+                args.push(crate::sql::ast::TableFnArg::Named(key, val));
+            } else {
+                return Err(self.error("Expected (SELECT …) or name = value in RRF args"));
+            }
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenType::RParen)?;
+        Ok(TableRef::TableFn {
+            name: "rrf".to_string(),
+            args,
+        })
+    }
+
     fn parse_data_type(&mut self) -> Result<DataType> {
         let data_type = match &self.current().token_type {
             TokenType::Integer => DataType::Integer,
@@ -1382,6 +1448,7 @@ impl Parser {
             TokenType::Timestamp => DataType::Timestamp,
             TokenType::Geometry => DataType::Geometry,
             TokenType::Identifier(name) if name.to_uppercase() == "POINT3D" => DataType::Geometry,
+            TokenType::Identifier(name) if name.to_uppercase() == "BLOB" => DataType::Blob,
             TokenType::Vector => {
                 self.advance();
                 if self.match_token(TokenType::LParen) {
@@ -1927,6 +1994,22 @@ impl Parser {
                 result
             }
 
+            // 🔖 BLOB hex literal X'0aff00' (SQLite-compatible): the lexer
+            // emits Identifier("X") + String — consume the pair here.
+            TokenType::Identifier(name)
+                if name.eq_ignore_ascii_case("X")
+                    && matches!(self.peek_token_type(), TokenType::String(_)) =>
+            {
+                self.advance(); // X
+                let hex = match self.current().token_type.clone() {
+                    TokenType::String(s) => s,
+                    _ => return Err(self.error("Expected hex string after X")),
+                };
+                self.advance();
+                let bytes = decode_hex_literal(&hex)
+                    .map_err(|e| self.error(&format!("Invalid hex blob literal: {e}")))?;
+                Ok(Expr::Literal(Value::Blob(ArcBytes::new(bytes))))
+            }
             // Literals
             TokenType::OverflowInteger(big) => {
                 // A pure-integer literal that overflowed i64 (e.g. 2^63).
@@ -3144,4 +3227,21 @@ mod tests {
             _ => panic!("Expected CREATE TABLE statement"),
         }
     }
+}
+
+/// Decode a hex string (X'0aff00' body) into bytes. Accepts an even number
+/// of hex digits; empty is a valid zero-length blob.
+fn decode_hex_literal(s: &str) -> std::result::Result<Vec<u8>, String> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err("odd number of hex digits".into());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    for i in (0..b.len()).step_by(2) {
+        let hi = (b[i] as char).to_digit(16).ok_or("non-hex digit")?;
+        let lo = (b[i + 1] as char).to_digit(16).ok_or("non-hex digit")?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Ok(out)
 }

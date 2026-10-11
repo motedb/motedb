@@ -70,6 +70,48 @@ impl<'de> Deserialize<'de> for ArcVec {
     }
 }
 
+/// Arc-wrapped immutable bytes for `Value::Blob` — cheap clone like
+/// `ArcString`/`ArcVec` (sensor payloads, serialized messages, image frames).
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct ArcBytes(pub Arc<[u8]>);
+
+impl ArcBytes {
+    pub fn new(vec: Vec<u8>) -> Self {
+        ArcBytes(Arc::from(vec))
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Serialize for ArcBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ArcBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec = Vec::<u8>::deserialize(deserializer)?;
+        Ok(ArcBytes(Arc::from(vec)))
+    }
+}
+
 /// Arc-wrapped str for cheap cloning in Value::Text.
 /// Uses `Arc<str>` (1 allocation) instead of `Arc<String>` (2 allocations).
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -168,6 +210,11 @@ pub enum Value {
     /// Text document for full-text search (boxed to reduce enum size)
     TextDoc(Box<Text>),
 
+    /// Binary large object — raw bytes (sensor payloads, serialized
+    /// messages, image frames). Equality bytewise; ordering/indexing
+    /// intentionally unsupported.
+    Blob(ArcBytes),
+
     /// Timestamp data
     Timestamp(Timestamp),
 
@@ -207,6 +254,7 @@ impl PartialOrd for Value {
             (Value::Integer(a), Value::Integer(b)) => a.partial_cmp(b),
             (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
             (Value::Text(a), Value::Text(b)) => a.partial_cmp(b),
+            (Value::Blob(a), Value::Blob(b)) => Some(a.as_slice().cmp(b.as_slice())),
             (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
             (Value::Integer(a), Value::Float(b)) => int_float_cmp(*a, *b),
@@ -272,6 +320,7 @@ impl PartialEq for Value {
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => float_eq(*a, *b),
             (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Blob(a), Value::Blob(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
@@ -308,6 +357,10 @@ impl std::hash::Hash for Value {
             Value::Text(s) => {
                 state.write_u8(1);
                 s.hash(state);
+            }
+            Value::Blob(b) => {
+                state.write_u8(6);
+                b.hash(state);
             }
             Value::Bool(b) => {
                 state.write_u8(2);

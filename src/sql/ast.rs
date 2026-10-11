@@ -125,6 +125,19 @@ pub enum TableRef {
         query: Box<Statement>,
         alias: String, // Alias is required for subqueries in FROM
     },
+    /// Table function in FROM: `RRF((SELECT …), (SELECT …)[, k = n]…)`.
+    /// Currently the only supported function is `rrf` (Reciprocal Rank
+    /// Fusion over 2..=4 ranked single-column subqueries).
+    TableFn { name: String, args: Vec<TableFnArg> },
+}
+
+/// One argument of a FROM table function.
+#[derive(Debug, Clone)]
+pub enum TableFnArg {
+    /// Parenthesized subquery (a ranked candidate list).
+    Subquery(Box<Statement>),
+    /// `name = numeric-literal` parameter (k, rrk, w1..w4).
+    Named(String, Value),
 }
 
 /// JOIN types
@@ -247,6 +260,8 @@ pub enum DataType {
     Timestamp,
     Vector(Option<usize>), // Vector dimension
     Geometry,
+    /// Binary large object — raw bytes (X'0aff' literals, sensor payloads).
+    Blob,
 }
 
 /// CREATE INDEX statement

@@ -244,26 +244,15 @@ impl<'a> Lexer<'a> {
         if self.is_eof() {
             return '\0';
         }
-        // Decode from the raw byte slice at `position`. We must NOT slice
-        // `self.input[..]` (a &str) by a byte index — if `position` lands in
-        // the middle of a multi-byte UTF-8 sequence (which happens whenever a
-        // caller advances past a non-ASCII byte one byte at a time), str
-        // slicing panics. Decoding from bytes is panic-free: a lone
-        // continuation byte decodes to a replacement char, which is harmless
-        // for lexing (it just yields an Unexpected-token error).
+        // Decode ONLY the first code point (≤4 bytes). The old path ran
+        // `str::from_utf8(rest)` — which validates the ENTIRE remaining
+        // input — once per character, making every long literal quadratic:
+        // a 16 MiB string/X'' literal took ~1h of pure validation. Behavior
+        // is unchanged: decode_first_codepoint decodes the leading sequence
+        // leniently (a lone continuation byte yields that byte as a char).
         let rest = &self.bytes[self.position..];
-        match std::str::from_utf8(rest) {
-            Ok(s) => s.chars().next().unwrap_or('\0'),
-            Err(_) => {
-                // `rest` starts with invalid UTF-8. If the first byte is a
-                // leading byte of a valid sequence that's simply truncated,
-                // decode just that byte's expected length; otherwise treat the
-                // single byte as a byte char.
-                let b = rest[0];
-                // Decode the first code point from up to 4 bytes.
-                decode_first_codepoint(rest).unwrap_or(b as char)
-            }
-        }
+        let b = rest[0];
+        decode_first_codepoint(rest).unwrap_or(b as char)
     }
 
     /// Advance past the current UTF-8 character (1-4 bytes).

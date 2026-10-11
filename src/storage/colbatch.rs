@@ -282,7 +282,9 @@ impl ColumnVector {
             ColumnType::Float => ColData::F64(Vec::with_capacity(cap)),
             ColumnType::Boolean => ColData::Bool(Vec::with_capacity(cap.div_ceil(64))),
             ColumnType::Text => ColData::Utf8(Vec::with_capacity(cap)),
-            ColumnType::Tensor(_) | ColumnType::Spatial => ColData::Values(Vec::with_capacity(cap)),
+            ColumnType::Tensor(_) | ColumnType::Spatial | ColumnType::Blob => {
+                ColData::Values(Vec::with_capacity(cap))
+            }
         };
         Self {
             data,

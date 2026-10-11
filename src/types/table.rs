@@ -85,6 +85,9 @@ pub enum ColumnType {
     Boolean,
     /// Spatial (Geometry type for 2D/3D points, polygons, etc.)
     Spatial,
+    /// Binary large object — raw bytes (sensor payloads, serialized
+    /// messages, image frames). Equality-only: no ordering, no indexing.
+    Blob,
 }
 
 /// Column definition
@@ -469,6 +472,20 @@ impl TableSchema {
                     true
                 }
                 (ColumnType::Spatial, crate::types::Value::Spatial(_)) => true,
+
+                // BLOB: bytes verbatim. 16 MiB default cap — protects the
+                // row buffer from accidental whole-file inserts.
+                (ColumnType::Blob, crate::types::Value::Blob(b)) => {
+                    const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+                    if b.len() > MAX_BLOB_BYTES {
+                        return Err(format!(
+                            "Column '{}': BLOB value of {} bytes exceeds the 16 MiB limit",
+                            col.name,
+                            b.len()
+                        ));
+                    }
+                    true
+                }
 
                 // Legacy types
                 (ColumnType::Timestamp, crate::types::Value::Timestamp(_)) => true,

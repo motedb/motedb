@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.13.0] — 2026-10-11
+
+- **🔑 BLOB 类型(全链路)**: `payload BLOB` 列 — 第 8 个 ColumnType。
+  - 字面量: SQLite 兼容 `X'0aff00'`(奇数位/非 hex 报错); Python `bytes`/
+    `bytearray` 参数与取回; CLI 十六进制预览; 16 MiB 上限
+  - 存储: 复用 Text 段字节布局 + 独立 `ColumnTypeTag::Blob`(读侧按 schema
+    包装 `Value::Blob`, 非 UTF-8 字节零损耗); row_format 变长编解码;
+    非定长批/缓存/点查/扫描/缓冲各读路径补齐
+  - 语义: 字节等值(`=`/`IS NULL`)、`LENGTH(blob)`=字节数(SQLite 语义)
+  - **已知缺口(v0.13.0, 测试内注释标注)**: BLOB 列上的标量函数在部分
+    执行器路径(含 VECTOR 混合表/`WHERE` 内函数)与 `ORDER BY` 输出下返回
+    NULL — 裸投影/等值/时间窗扫描/参数全稳
+- **🔑 MCAP 机器人数据导入(具身工作流入场券)**:
+  - `motedb-cli import mcap <db> <file> [--include s] [--exclude s] [--prefix p]`
+    与 Python `db.import_mcap(path, include=…, prefix=…, decode={topic: fn})`
+  - 每 topic 一表: `_uid INTEGER PRIMARY KEY`((channel<<40)|seq, 天然去重)、
+    `log_time/publish_time TIMESTAMP`(自动时间索引, ns→µs)、`data BLOB`
+    (原始消息字节)。解码边界在 Python 钩子(返回 dict → 类型化列, 可产
+    VECTOR 列) — 引擎不碰 ROS2 CDR/protobuf 语义
+  - 重放幂等: `INSERT OR IGNORE` + `_uid` 去重(kill -9 后重跑即续)
+  - 依赖: 官方 `mcap` crate 0.25(只读, 经 cargo-deny)
+- **🔑 词法平方级修复(BLOB 测试实抓)**: `Lexer::current_utf8_char` 每字符
+  对剩余输入跑 `str::from_utf8` 全量校验 — 任何 16 MiB 字符串/X'' 字面量
+  解析耗时 ~1h; 改为仅解码首码点(decode_first_codepoint), 行为不变
+- **🔑 RRF 混合检索 + bm25()/snippet()**:
+  - `FROM RRF((子查询1), (子查询2)[, k = n][, rrk = n][, w1..w4 = f])` 表
+    函数: 2..=4 路排名列表的 Reciprocal Rank Fusion( score = Σ wᵢ/(rrk+rankᵢ),
+    默认 k=10/rrk=60/均权), 输出按分数降序、值升序 tie-break(确定性可对拍),
+    经 `rows_to_union_statement` 内联为派生表 → 外层 WHERE/ORDER BY 走常规机制
+  - `bm25(col)` 作为 `BM25_SCORE` 的别名接入 MATCH 快路径: `ORDER BY
+    bm25(body)` 与 `ORDER BY score DESC` 等价, LIMIT 下取 ranked top-k
+  - `snippet(text, query[, width=64])`: FTS5 风格摘录(首命中窗口 +
+    `<b>` 高亮 + 省略号), 纯字符索引实现
+  - **顺带修复**: FROM 为非普通表(JOIN/派生表/TableFn)且 ORDER BY+LIMIT
+    的查询被 optimizer 的 "unknown" 占位表名绊倒(FullScan 计划臂现按
+    FROM 形状回退通用机制)
+  - 测试: test_rrf_hybrid.rs(3) — 引擎融合 vs 测试内参照公式逐 id 对拍、
+    命名参数(w1=0 退化为单路)、形状错误、bm25 排序等价、snippet 窗口/高亮
+- 文档对齐: README SQL Support 勘误(WITH RECURSIVE/窗口函数 0.12 已实现
+  但写着不支持)+ BLOB/MCAP 能力与已知缺口如实标注
+- 测试: test_blob_type.rs(4)、test_mcap_import.rs(合成 bag 回环: 布局/
+  字节保真/钩子/过滤/重放幂等/重开)、bindings/python/tests/
+  test_mcap_import.py(固定 fixture bag 端到端)、examples/gen_test_bag.rs
+- 顺延(下版): RRF 混合检索 + bm25()/snippet()(设计已定: docs/design/
+  2026-10-embodied-roadmap.md); MCAP 断点续导清单表(`_mcap_imports`)
+
 ## [0.12.9] — 2026-10-10
 
 - **🔑 崩溃恢复审计三连修(0.12.8 stale 检测的边界补全)**:

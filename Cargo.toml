@@ -1,6 +1,6 @@
 [package]
 name = "motedb"
-version = "0.12.9"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.87"
 description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
@@ -41,6 +41,7 @@ name = "motedb-cli"
 path = "src/bin/motedb-cli.rs"
 
 [dependencies]
+mcap = { version = "0.25.0", default-features = false }
 # Memory-mapped file I/O (used by: spatial_hybrid, diskann/sst)
 memmap2 = "0.9"
 

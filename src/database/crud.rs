@@ -4288,10 +4288,24 @@ impl Iterator for TableRowStreamingIterator {
                                 _ => f.get_i64(idx).map(crate::types::Value::Integer),
                             }
                             .unwrap_or(crate::types::Value::Null),
-                            ColumnarSegment::Text(t) => t
-                                .get_str(idx)
-                                .map(|s| crate::types::Value::Text(s.into()))
-                                .unwrap_or(crate::types::Value::Null),
+                            ColumnarSegment::Text(t) => {
+                                // 🔖 BLOB-tagged columns ride the text layout;
+                                // decode verbatim bytes (no lossy UTF-8).
+                                if matches!(col_types.get(ci), Some(crate::types::ColumnType::Blob))
+                                {
+                                    t.get_bytes(idx)
+                                        .map(|b| {
+                                            crate::types::Value::Blob(crate::types::ArcBytes::new(
+                                                b.to_vec(),
+                                            ))
+                                        })
+                                        .unwrap_or(crate::types::Value::Null)
+                                } else {
+                                    t.get_str(idx)
+                                        .map(|s| crate::types::Value::Text(s.into()))
+                                        .unwrap_or(crate::types::Value::Null)
+                                }
+                            }
                             ColumnarSegment::Vector(cols) => cols
                                 .get(idx)
                                 .cloned()
@@ -4470,6 +4484,9 @@ fn build_column_segment(
             Ok(ColumnarSegment::Spatial(per_row))
         }
         Some(ColumnTypeTag::Text) => Ok(ColumnarSegment::Text(col_sst.read_text(col_idx)?)),
+        // 🔖 BLOB rides the text layout; consumers dispatch on the schema's
+        // ColumnType::Blob to decode verbatim bytes (see the Text arms above).
+        Some(ColumnTypeTag::Blob) => Ok(ColumnarSegment::Text(col_sst.read_binary(col_idx)?)),
         // 🚨 Column doesn't exist in this SSTable (e.g. it was added by a prior
         // ALTER TABLE ADD COLUMN, but this on-disk SSTable predates it). Reading
         // it via read_text/read_fixed would OOB column_index or misinterpret an
@@ -4551,12 +4568,24 @@ impl ColumnarScanIterator {
                     _ => None,
                 }
                 .unwrap_or(crate::types::Value::Null),
-                ColumnarSegment::Text(t) => t
-                    .get_str(idx)
-                    .map(|s| {
-                        crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))
-                    })
-                    .unwrap_or(crate::types::Value::Null),
+                ColumnarSegment::Text(t) => {
+                    // 🔖 BLOB columns ride the text layout — verbatim bytes.
+                    if matches!(ct, crate::types::ColumnType::Blob) {
+                        t.get_bytes(idx)
+                            .map(|b| {
+                                crate::types::Value::Blob(crate::types::ArcBytes::new(b.to_vec()))
+                            })
+                            .unwrap_or(crate::types::Value::Null)
+                    } else {
+                        t.get_str(idx)
+                            .map(|s| {
+                                crate::types::Value::Text(crate::types::ArcString(
+                                    std::sync::Arc::from(s),
+                                ))
+                            })
+                            .unwrap_or(crate::types::Value::Null)
+                    }
+                }
                 ColumnarSegment::Vector(cols) => cols
                     .get(idx)
                     .cloned()

@@ -170,7 +170,7 @@ fn encode_column_raw(
                 buf.extend_from_slice(&[0u8; 8]);
             }
             Some(ColumnType::Boolean) => buf.push(0u8),
-            Some(ColumnType::Text) => buf.extend_from_slice(&0u32.to_le_bytes()),
+            Some(ColumnType::Text | ColumnType::Blob) => buf.extend_from_slice(&0u32.to_le_bytes()),
             _ => buf.extend_from_slice(&0xFFFFu16.to_le_bytes()),
         }
         row_nulls.push(true);
@@ -202,6 +202,11 @@ fn encode_column_raw(
             buf.extend_from_slice(ts.as_bytes());
             false
         }
+        Value::Blob(b) => {
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b.as_slice());
+            false
+        }
         Value::Vector(v) => {
             // [dim:u16][f32×dim le] — one block copy: on LE targets the
             // f32 bit pattern IS the encoded form (per-element to_le_bytes
@@ -228,7 +233,7 @@ fn encode_column_raw(
                     buf.extend_from_slice(&[0u8; 8])
                 }
                 ColumnType::Boolean => buf.push(0u8),
-                ColumnType::Text => buf.extend_from_slice(&0u32.to_le_bytes()),
+                ColumnType::Text | ColumnType::Blob => buf.extend_from_slice(&0u32.to_le_bytes()),
                 _ => buf.extend_from_slice(&0u16.to_le_bytes()),
             }
             true
@@ -264,6 +269,26 @@ fn decode_buffered_value(
     let tag = buf.column_tags.get(col_idx).copied();
     let raw = &buf.column_buffers[col_idx];
     match tag {
+        // 🔒 BLOB: same builder layout as Text ([u32 len][bytes] rows) but
+        // bytes verbatim — no UTF-8 lossy conversion.
+        Some(ColumnTypeTag::Blob) => {
+            let mut pos = 0usize;
+            let mut r = 0usize;
+            while pos + 4 <= raw.len() {
+                let len = u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]])
+                    as usize;
+                pos += 4;
+                if r == row_idx {
+                    if pos + len > raw.len() {
+                        return Value::Null;
+                    }
+                    return Value::Blob(crate::types::ArcBytes::new(raw[pos..pos + len].to_vec()));
+                }
+                pos += len;
+                r += 1;
+            }
+            Value::Null
+        }
         Some(ColumnTypeTag::Integer) => {
             let off = row_idx * 8;
             if off + 8 > raw.len() {
@@ -1274,7 +1299,15 @@ impl ColSegmentStore {
                                 _ => None,
                             }
                         } else if let Some(ref t) = fcol_text {
-                            t.get_str(i).map(|s| Value::Text(s.into()))
+                            // 🔖 BLOB filter column: verbatim bytes — get_str
+                            // lossy-NULLs non-UTF-8 payloads, silently failing
+                            // every WHERE over a blob column.
+                            if matches!(fcol_type, Some(ColumnType::Blob)) {
+                                t.get_bytes(i)
+                                    .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec())))
+                            } else {
+                                t.get_str(i).map(|s| Value::Text(s.into()))
+                            }
                         } else {
                             None
                         };
@@ -1325,6 +1358,18 @@ impl ColSegmentStore {
                                 // Was decoded as text → NULL: `WHERE … ORDER BY …
                                 // LIMIT k` never returned an embedding.
                                 Some(seg.read_var_value_at(pc, i))
+                            } else if matches!(seg.sst.column_tags[pc], ColumnTypeTag::Blob) {
+                                // 🔖 BLOB: same layout as text, verbatim bytes.
+                                match seg
+                                    .read_text_cached(pc)
+                                    .as_ref()
+                                    .and_then(|t| t.get_bytes(i))
+                                {
+                                    Some(b) => {
+                                        Some(Value::Blob(crate::types::ArcBytes::new(b.to_vec())))
+                                    }
+                                    None => Some(Value::Null),
+                                }
                             } else {
                                 match seg
                                     .read_text_cached(pc)
@@ -1408,6 +1453,11 @@ impl ColSegmentStore {
                                         t.get_str(i).map(|s| Value::Text(s.into()))
                                     }
                                 }
+                                // 🔖 BLOB rides ptext (same layout); verbatim
+                                // bytes — get_str would lossy-NULL non-UTF-8.
+                                (_, Some(Some(t)), ColumnType::Blob) => t
+                                    .get_bytes(i)
+                                    .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec()))),
                                 _ => Some(Value::Null),
                             }
                         } else {

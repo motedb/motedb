@@ -45,6 +45,9 @@ fn run() -> Result<()> {
         3 if args[1] == "doctor" => {
             doctor_command(&args[2])?;
         }
+        _ if args.len() >= 4 && args[1] == "import" && args[2] == "mcap" => {
+            import_mcap_command(&args[3..])?;
+        }
         _ => {
             print_help();
             return Err(StorageError::InvalidData("Invalid arguments".to_string()));
@@ -67,6 +70,65 @@ fn doctor_command(path: &str) -> Result<()> {
     }
 }
 
+/// `motedb import mcap <db> <file.mcap> [--include substr]... [--exclude substr]... [--prefix p]`
+fn import_mcap_command(args: &[String]) -> Result<()> {
+    let mut db_path: Option<&String> = None;
+    let mut file_path: Option<&String> = None;
+    let mut opts = motedb::mcap_import::McapImportOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--include" if i + 1 < args.len() => {
+                opts.include.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--exclude" if i + 1 < args.len() => {
+                opts.exclude.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--prefix" if i + 1 < args.len() => {
+                opts.prefix = args[i + 1].clone();
+                i += 2;
+            }
+            _ if db_path.is_none() => {
+                db_path = Some(&args[i]);
+                i += 1;
+            }
+            _ if file_path.is_none() => {
+                file_path = Some(&args[i]);
+                i += 1;
+            }
+            _ => {
+                return Err(StorageError::InvalidData(format!(
+                    "unexpected arg: {}",
+                    args[i]
+                )));
+            }
+        }
+    }
+    let (Some(db_path), Some(file_path)) = (db_path, file_path) else {
+        return Err(StorageError::InvalidData(
+            "usage: motedb import mcap <db> <file.mcap> [--include s] [--exclude s] [--prefix p]"
+                .into(),
+        ));
+    };
+    let db = Database::create(db_path).or_else(|_| Database::open(db_path))?;
+    let summary = motedb::mcap_import::import_mcap_file(
+        &db,
+        std::path::Path::new(file_path),
+        &opts,
+        |_, _, _| Vec::new(),
+    )?;
+    println!("MCAP import: {}", file_path);
+    for (topic, table, rows) in &summary.topics {
+        println!("  {topic:<40} → {table} ({rows} rows)");
+    }
+    if summary.filtered_out > 0 {
+        println!("  ({} messages filtered out)", summary.filtered_out);
+    }
+    Ok(())
+}
+
 fn print_help() {
     println!(
         r#"
@@ -76,6 +138,8 @@ MoteDB v{} - 高性能嵌入式数据库引擎
   motedb                启动交互式 SQL shell (默认数据库: ./motedb_data)
   motedb <db_path>      打开指定数据库
   motedb doctor <path>  运维自检（表布局/内存/索引覆盖/磁盘），退出码 0/1/2
+  motedb import mcap <db> <file> [--include s] [--exclude s] [--prefix p]
+                        导入 MCAP 机器人数据包（每 topic 一表，raw BLOB + 时间戳）
   motedb --version      显示版本信息
   motedb --help         显示此帮助信息
 
@@ -271,6 +335,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
                 Value::Float(f) => format!("{:.2}", f).len(),
                 Value::Text(s) => s.len().min(50),
                 Value::Bool(b) => b.to_string().len(),
+                Value::Blob(b) => (b.len() * 2).min(50),
                 Value::Vector(_) => 12,
                 Value::Tensor(_) => 12,
                 Value::Spatial(_) => 12,
@@ -318,6 +383,19 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
         for (i, value) in row.iter().enumerate() {
             let width = widths.get(i).unwrap_or(&10);
             let s = match value {
+                Value::Blob(b) => {
+                    // Hex preview, e.g. X'0aff…' (truncated for display).
+                    let n = b.len().min(24);
+                    let hex: String = b.as_slice()[..n]
+                        .iter()
+                        .map(|x| format!("{x:02x}"))
+                        .collect();
+                    if b.len() > n {
+                        format!("X'{}…'", hex)
+                    } else {
+                        format!("X'{}'", hex)
+                    }
+                }
                 Value::Null => "NULL".to_string(),
                 Value::Integer(n) => n.to_string(),
                 Value::Float(f) => format!("{:.2}", f),

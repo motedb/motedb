@@ -370,7 +370,11 @@ impl QueryExecutor {
                                             ));
                                         }
                                     } else if let Ok(seg) = col_sst.read_text(ci) {
-                                        segments.push(ColumnarSeg::Text(seg));
+                                        segments.push(text_or_blob_seg(
+                                            &col_sst.column_tags,
+                                            ci,
+                                            seg,
+                                        ));
                                     }
                                 }
                                 return Ok(StreamingQueryResult::SelectColumnar {
@@ -462,7 +466,11 @@ impl QueryExecutor {
                                                 ));
                                             }
                                         } else if let Ok(seg) = col_sst.read_text(ci) {
-                                            segments.push(ColumnarSeg::Text(seg));
+                                            segments.push(text_or_blob_seg(
+                                                &col_sst.column_tags,
+                                                ci,
+                                                seg,
+                                            ));
                                         }
                                     }
                                     return Ok(StreamingQueryResult::SelectColumnar {
@@ -509,7 +517,11 @@ impl QueryExecutor {
                                                         ));
                                                     }
                                                 } else if let Ok(seg) = col_sst.read_text(ci) {
-                                                    segments.push(ColumnarSeg::Text(seg));
+                                                    segments.push(text_or_blob_seg(
+                                                        &col_sst.column_tags,
+                                                        ci,
+                                                        seg,
+                                                    ));
                                                 }
                                             }
                                             return Ok(StreamingQueryResult::SelectColumnar {
@@ -1161,7 +1173,7 @@ impl QueryExecutor {
                             }
                         } else if pc < sst.column_tags.len() {
                             if let Ok(t) = sst.read_text(pc) {
-                                col_segs.push(ColumnarSeg::Text(t));
+                                col_segs.push(text_or_blob_seg(&sst.column_tags, pc, t));
                             }
                         }
                     }
@@ -1233,7 +1245,7 @@ impl QueryExecutor {
                             }
                         } else if pc < sst.column_tags.len() {
                             if let Ok(t) = sst.read_text(pc) {
-                                col_segs.push(ColumnarSeg::Text(t));
+                                col_segs.push(text_or_blob_seg(&sst.column_tags, pc, t));
                             }
                         }
                     }
@@ -1588,7 +1600,7 @@ impl QueryExecutor {
                                                 ));
                                             }
                                         } else if let Ok(t) = segs[0].sst.read_text(pc) {
-                                            col_segs.push(ColumnarSeg::Text(t));
+                                            col_segs.push(text_or_blob_seg(&seg0_tags, pc, t));
                                         }
                                     }
                                     return Ok(StreamingQueryResult::SelectColumnar {
@@ -1744,7 +1756,7 @@ impl QueryExecutor {
                                                     ));
                                                 }
                                             } else if let Ok(t) = segs[0].sst.read_text(pc) {
-                                                col_segs.push(ColumnarSeg::Text(t));
+                                                col_segs.push(text_or_blob_seg(&seg0_tags, pc, t));
                                             }
                                         }
                                         return Ok(StreamingQueryResult::SelectColumnar {
@@ -2727,5 +2739,20 @@ impl QueryExecutor {
             .take(limit)
             .map(|(_, row)| row)
             .collect())
+    }
+}
+
+/// Wrap a text-layout segment for a column whose SEGMENT TAG decides its
+/// value type: BLOB-tagged columns wrap as Blob (verbatim bytes on
+/// materialize), everything else as Text.
+fn text_or_blob_seg(
+    tags: &[crate::storage::lsm::columnar::ColumnTypeTag],
+    ci: usize,
+    seg: crate::storage::lsm::columnar::TextSegment,
+) -> ColumnarSeg {
+    if matches!(tags.get(ci), Some(t) if *t == crate::storage::lsm::columnar::ColumnTypeTag::Blob) {
+        ColumnarSeg::Blob(seg)
+    } else {
+        ColumnarSeg::Text(seg)
     }
 }

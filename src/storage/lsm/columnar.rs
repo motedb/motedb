@@ -178,6 +178,10 @@ pub enum ColumnTypeTag {
     Text = 4,
     Vector = 5,
     Spatial = 6,
+    /// Raw bytes — rides the TEXT on-disk layout (null bitmap + u32 offsets
+    /// + byte payload; UTF-8 agnostic). Distinct tag so decode paths wrap
+    /// values as Value::Blob instead of lossy Value::Text.
+    Blob = 7,
 }
 
 impl ColumnTypeTag {
@@ -190,6 +194,7 @@ impl ColumnTypeTag {
             ColumnType::Text => Self::Text,
             ColumnType::Tensor(_) => Self::Vector,
             ColumnType::Spatial => Self::Spatial,
+            ColumnType::Blob => Self::Blob,
         }
     }
 
@@ -202,6 +207,7 @@ impl ColumnTypeTag {
             Self::Text => ColumnType::Text,
             Self::Vector => ColumnType::Tensor(0), // dim reconstructed from segment header
             Self::Spatial => ColumnType::Spatial,
+            Self::Blob => ColumnType::Blob,
         }
     }
 
@@ -1308,6 +1314,20 @@ impl TextSegment {
         }
     }
 
+    /// Raw byte access for BLOB columns riding the text layout — no UTF-8
+    /// validation (payloads may be arbitrary binary).
+    pub fn get_bytes(&self, row_idx: usize) -> Option<&[u8]> {
+        if self.is_null(row_idx) {
+            return None;
+        }
+        let start = self.get_offset(row_idx) as usize;
+        let end = self.get_offset(row_idx + 1) as usize;
+        if start > end {
+            return None;
+        }
+        Some(self.string_data.slice(start, end - start))
+    }
+
     /// Fast string access: skips null check and boundary check.
     /// Only safe when has_any_null() returned false and data was self-encoded.
     /// Reads offsets directly from the slice (inlined, no function call).
@@ -2385,6 +2405,12 @@ impl ColumnarSSTable {
         TextSegment::from_owned(raw, self.num_rows)
     }
 
+    /// Read a BLOB column — identical on-disk layout to text; the bytes are
+    /// exposed verbatim (see `TextSegment::get_bytes`).
+    pub fn read_binary(&self, col_idx: usize) -> Result<TextSegment> {
+        self.read_text(col_idx)
+    }
+
     /// Read a column segment's payload (after the flag byte) into an owned Vec.
     /// Handles Snappy decompression. The returned Vec is the raw segment payload
     /// WITHOUT the flag byte — ready for from_owned.
@@ -3003,6 +3029,22 @@ impl ColumnarSSTableBuilder {
                     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     buf.extend_from_slice(s.as_bytes());
                 }
+                ColumnTypeTag::Blob => {
+                    // Same builder layout as Text, but the bytes come from
+                    // Value::Blob verbatim (no UTF-8 requirement).
+                    let b: &[u8] = match value {
+                        Value::Blob(b) => b.as_slice(),
+                        _ => &[],
+                    };
+                    if b.len() > u32::MAX as usize {
+                        return Err(StorageError::InvalidData(format!(
+                            "Blob value of {} bytes exceeds the u32 length prefix",
+                            b.len()
+                        )));
+                    }
+                    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(b);
+                }
                 ColumnTypeTag::Vector => {
                     // Vector column: [dim:u16][f32×dim] per row (matches
                     // read_vectors: [null_bitmap][dim:u16][f32×dim per row]).
@@ -3201,6 +3243,14 @@ impl ColumnarSSTableBuilder {
                     }
                     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     buf.extend_from_slice(s.as_bytes());
+                }
+                ColumnTypeTag::Blob => {
+                    let b: Vec<u8> = match value {
+                        Value::Blob(b) => b.as_slice().to_vec(),
+                        _ => Vec::new(),
+                    };
+                    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&b);
                 }
                 ColumnTypeTag::Vector => {
                     let bytes = match value {
@@ -3417,6 +3467,36 @@ impl ColumnarSSTableBuilder {
                         }
                         row.push(found.unwrap_or(Value::Null));
                     }
+                    ColumnTypeTag::Blob => {
+                        // Same builder layout as Text; bytes verbatim (no
+                        // UTF-8 lossy conversion).
+                        let buf = &self.column_buffers[ci];
+                        let is_null = self.null_flags.get(ci).and_then(|f| f.get(i)) == Some(&true);
+                        let mut p = 0usize;
+                        let mut r = 0usize;
+                        let mut found = None;
+                        while p + 4 <= buf.len() {
+                            let len =
+                                u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]])
+                                    as usize;
+                            p += 4;
+                            if r == i {
+                                if is_null {
+                                    found = Some(Value::Null);
+                                } else if p + len <= buf.len() {
+                                    found = Some(Value::Blob(crate::types::ArcBytes::new(
+                                        buf[p..p + len].to_vec(),
+                                    )));
+                                } else {
+                                    found = Some(Value::Null);
+                                }
+                                break;
+                            }
+                            p += len;
+                            r += 1;
+                        }
+                        row.push(found.unwrap_or(Value::Null));
+                    }
                     ColumnTypeTag::Vector => {
                         // Vector layout: [dim:u16][f32×dim] per row, concatenated.
                         let buf = &self.column_buffers[ci];
@@ -3564,8 +3644,9 @@ impl ColumnarSSTableBuilder {
                 }
                 seg.extend_from_slice(&nulls);
                 seg.extend_from_slice(raw);
-            } else if matches!(tag, ColumnTypeTag::Text) {
+            } else if matches!(tag, ColumnTypeTag::Text | ColumnTypeTag::Blob) {
                 // Text segment: [null_bitmap] [offsets] [string_data]
+                // (Blob rides the same layout — bytes are bytes)
                 // Raw buffer format: [(len: u32 LE, bytes)] repeated (the
                 // builder's in-memory layout). NULLness is authoritative in
                 // null_flags (tracked at add_values/add_row time), so NULL

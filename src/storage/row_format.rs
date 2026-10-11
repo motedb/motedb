@@ -113,6 +113,8 @@ pub enum ColDecoder {
     FixedBool,
     FixedTimestamp,
     VarText,
+    /// Raw bytes column (BLOB) — var region holds verbatim bytes.
+    VarBlob,
     VarGeneric,
 }
 
@@ -190,6 +192,10 @@ impl SchemaDecodeContext {
                 ColumnType::Text => {
                     var_col_count += 1;
                     col_decoders.push(ColDecoder::VarText);
+                }
+                ColumnType::Blob => {
+                    var_col_count += 1;
+                    col_decoders.push(ColDecoder::VarBlob);
                 }
                 ColumnType::Tensor(_) | ColumnType::Spatial => {
                     var_col_count += 1;
@@ -345,6 +351,22 @@ impl SchemaDecodeContext {
                                 })?
                             };
                             out.push(Value::Text(ArcString(self.pool.intern(s))));
+                        } else {
+                            out.push(Value::Null);
+                        }
+                    } else {
+                        out.push(Value::Null);
+                    }
+                }
+                ColDecoder::VarBlob => {
+                    if var_idx < var_entry_count {
+                        let (v_off, v_len) = var_entries[var_idx];
+                        var_idx += 1;
+                        let abs_off = var_data_start + v_off;
+                        if abs_off + v_len <= data.len() {
+                            out.push(Value::Blob(crate::types::ArcBytes::new(
+                                data[abs_off..abs_off + v_len].to_vec(),
+                            )));
                         } else {
                             out.push(Value::Null);
                         }
@@ -535,6 +557,22 @@ impl SchemaDecodeContext {
                         self.row_buf.push(Value::Null);
                     }
                 }
+                ColDecoder::VarBlob => {
+                    if var_idx < var_entry_count {
+                        let (v_off, v_len) = var_entries[var_idx];
+                        var_idx += 1;
+                        let abs_off = var_data_start + v_off;
+                        if abs_off + v_len <= data.len() {
+                            self.row_buf.push(Value::Blob(crate::types::ArcBytes::new(
+                                data[abs_off..abs_off + v_len].to_vec(),
+                            )));
+                        } else {
+                            self.row_buf.push(Value::Null);
+                        }
+                    } else {
+                        self.row_buf.push(Value::Null);
+                    }
+                }
                 ColDecoder::VarGeneric => {
                     if var_idx < var_entry_count {
                         let (v_off, v_len) = var_entries[var_idx];
@@ -635,7 +673,9 @@ impl ColumnarRowSet {
                 ColumnType::Text => ColumnArray::Texts(Vec::new()),
                 ColumnType::Timestamp => ColumnArray::Timestamps(Vec::new()),
                 ColumnType::Boolean => ColumnArray::Bools(Vec::new()),
-                ColumnType::Tensor(_) | ColumnType::Spatial => ColumnArray::Values(Vec::new()),
+                ColumnType::Tensor(_) | ColumnType::Spatial | ColumnType::Blob => {
+                    ColumnArray::Values(Vec::new())
+                }
             })
             .collect();
         Self {
@@ -863,6 +903,20 @@ pub fn decode_row_into_columns(
                     }
                 }
             }
+            ColDecoder::VarBlob => {
+                if var_idx < var_entry_count {
+                    let (v_off, v_len) = var_entries[var_idx];
+                    var_idx += 1;
+                    let abs_off = var_data_start + v_off;
+                    if abs_off + v_len <= data.len() {
+                        if let ColumnArray::Values(ref mut v) = col_arr {
+                            v.push(Value::Blob(crate::types::ArcBytes::new(
+                                data[abs_off..abs_off + v_len].to_vec(),
+                            )));
+                        }
+                    }
+                }
+            }
             ColDecoder::VarGeneric => {
                 if var_idx < var_entry_count {
                     let (v_off, v_len) = var_entries[var_idx];
@@ -960,6 +1014,11 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
                 let off = var_data.len() as u32;
                 var_data.extend_from_slice(t.as_bytes());
                 var_entries.push((i, off, t.len() as u32));
+            }
+            (Value::Blob(b), ColumnType::Blob) => {
+                let off = var_data.len() as u32;
+                var_data.extend_from_slice(b.as_slice());
+                var_entries.push((i, off, b.len() as u32));
             }
             (Value::Vector(v), _) => {
                 if v.len() > u16::MAX as usize {
@@ -1063,6 +1122,9 @@ pub fn encode_into(row: &[Value], col_types: &[ColumnType], buf: &mut Vec<u8>) -
             }
             (Value::Text(t), ColumnType::Text) => {
                 var_entries.push((i, t.as_bytes().to_vec()));
+            }
+            (Value::Blob(b), ColumnType::Blob) => {
+                var_entries.push((i, b.as_slice().to_vec()));
             }
             (Value::Vector(v), _) => {
                 if v.len() > u16::MAX as usize {

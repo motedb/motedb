@@ -114,3 +114,22 @@ let schema = TableSchema::new("users")
 ---
 
 - Related docs: [07~11 Index Topics](./07-column-index.md), [05 Transaction Management](./05-transactions.md)
+
+
+## BLOB (v0.13)
+
+Binary large object — raw bytes for sensor payloads, serialized messages
+(MCAP `data` column) and image frames.
+
+```sql
+CREATE TABLE frames (id INTEGER PRIMARY KEY, ts TIMESTAMP, payload BLOB);
+INSERT INTO frames VALUES (1, 1700000000000000, X'00fffe0a0b');
+SELECT COUNT(*) FROM frames WHERE payload = X'00fffe0a0b';  -- 字节等值
+```
+
+- Python: `params=[..., b"\x00\xff"]` / 取回为 `bytes`;`bytearray` 亦可
+- `LENGTH(blob)` 返回**字节数**(SQLite 语义)
+- 上限 16 MiB/值(防止误将整文件写入行缓冲)
+- 已知 v0.13 缺口: BLOB 列上的标量函数(如 `WHERE LENGTH(payload) = 3`)
+  与 `ORDER BY` 输出在部分执行器路径下返回 NULL;裸投影/等值/时间窗
+  扫描/参数稳定。不可索引

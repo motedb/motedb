@@ -252,6 +252,9 @@ pub enum ColumnarSeg {
         crate::types::ColumnType,
     ),
     Text(crate::storage::lsm::columnar::TextSegment),
+    /// BLOB column riding the text layout — consumed as verbatim bytes
+    /// (Value::Blob), never lossy-UTF8'd into Value::Text.
+    Blob(crate::storage::lsm::columnar::TextSegment),
 }
 
 /// Query result
@@ -487,6 +490,11 @@ impl StreamingQueryResult {
                                     .unwrap_or(Value::Null),
                                 );
                             }
+                            ColumnarSeg::Blob(t) => row.push(
+                                t.get_bytes(idx)
+                                    .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec())))
+                                    .unwrap_or(Value::Null),
+                            ),
                             ColumnarSeg::Text(t) => {
                                 let val = if let Some(s) = t.get_str(idx) {
                                     let arc = string_pool.get(s).cloned().unwrap_or_else(|| {
@@ -747,6 +755,11 @@ impl StreamingQueryResult {
                                     .unwrap_or(Value::Null),
                                 );
                             }
+                            ColumnarSeg::Blob(t) => row.push(
+                                t.get_bytes(idx)
+                                    .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec())))
+                                    .unwrap_or(Value::Null),
+                            ),
                             ColumnarSeg::Text(t) => row.push(
                                 t.get_str(idx)
                                     .map(|s| {
@@ -3092,6 +3105,14 @@ impl QueryExecutor {
     /// FROM-level substitution: `Table{name}` → `Subquery{inlined body}`.
     fn rewrite_from_visible(table_ref: &mut TableRef, visible: &[(String, VisibleCte)]) {
         match table_ref {
+            // 🔖 RRF subqueries see the enclosing statement's CTEs.
+            TableRef::TableFn { args, .. } => {
+                for a in args.iter_mut() {
+                    if let crate::sql::ast::TableFnArg::Subquery(q) = a {
+                        Self::rewrite_statement_cte_refs(q, visible);
+                    }
+                }
+            }
             TableRef::Table { name, alias } => {
                 if let Some((_, VisibleCte::Inlined(body))) =
                     visible.iter().find(|(n, _)| n == name)
@@ -3450,6 +3471,10 @@ impl QueryExecutor {
                 Self::table_ref_references(left, name) || Self::table_ref_references(right, name)
             }
             TableRef::Subquery { query, .. } => Self::statement_references_table(query, name),
+            TableRef::TableFn { args, .. } => args.iter().any(|a| {
+                matches!(a, crate::sql::ast::TableFnArg::Subquery(q)
+                    if Self::statement_references_table(q, name))
+            }),
         }
     }
 
@@ -3771,6 +3796,7 @@ impl QueryExecutor {
                                     Value::Timestamp(_) => ColumnType::Timestamp,
                                     Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
                                     Value::Spatial(_) => ColumnType::Spatial,
+                                    Value::Blob(_) => ColumnType::Blob,
                                     Value::Vector(v) => ColumnType::Tensor(v.len()),
                                     Value::Null => ColumnType::Text,
                                 })
@@ -3919,6 +3945,7 @@ impl QueryExecutor {
                             Value::Vector(v) => ColumnType::Tensor(v.len()),
                             Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
                             Value::Spatial(_) => ColumnType::Spatial,
+                            Value::Blob(_) => ColumnType::Blob,
                             Value::Null => ColumnType::Text,
                         })
                         .unwrap_or(ColumnType::Text);
@@ -5600,6 +5627,13 @@ impl QueryExecutor {
                 post_filters,
             ),
             super::optimizer::ScanMethod::FullScan { ref table } => {
+                // 🔖 Non-Table FROM (JOIN / Subquery / TableFn): the optimizer
+                // emits a placeholder "unknown" table for these shapes — the
+                // table-specific fast paths below would error on it. Route to
+                // the general FROM machinery, which handles every shape.
+                if !matches!(stmt.from, Some(TableRef::Table { .. })) {
+                    return self.materialize_as_streaming(stmt);
+                }
                 // 🚀 DISTINCT via column value index: SELECT DISTINCT col FROM table
                 // without WHERE — iterate index keys directly (O(unique) vs O(N) scan).
                 // 🚨 Guard LIMIT/OFFSET: this fast path returns ALL distinct values
@@ -9261,6 +9295,10 @@ impl QueryExecutor {
                         "rtrim" => Ok(Value::text(s.trim_end().to_string())),
                         _ => Ok(Value::text(s.to_string())),
                     },
+                    // 🔖 LENGTH(BLOB) = byte count (SQLite semantics).
+                    Value::Blob(b) if fname.eq_ignore_ascii_case("length") => {
+                        Ok(Value::Integer(b.len() as i64))
+                    }
                     _ => Ok(Value::Null),
                 }
             }
@@ -9782,6 +9820,10 @@ impl QueryExecutor {
                                 "rtrim" => Ok(Value::text(s.trim_end().to_string())),
                                 _ => Ok(Value::text(s.to_string())),
                             },
+                            // 🔖 LENGTH(BLOB) = byte count (SQLite semantics).
+                            Value::Blob(b) if fname.eq_ignore_ascii_case("length") => {
+                                Ok(Value::Integer(b.len() as i64))
+                            }
                             _ => Ok(Value::Null),
                         }
                     }
@@ -13113,6 +13155,7 @@ impl QueryExecutor {
                     Value::Timestamp(_) => ColumnType::Timestamp,
                     Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
                     Value::Spatial(_) => ColumnType::Spatial,
+                    Value::Blob(_) => ColumnType::Blob,
                     Value::Vector(v) => ColumnType::Tensor(v.len()),
                     Value::Null => ColumnType::Text,
                 })
@@ -13141,6 +13184,121 @@ impl QueryExecutor {
             col.name = format!("{}.{}", prefix, base);
         }
         Ok((sql_rows, Arc::new(schema)))
+    }
+
+    /// 🔖 RRF (Reciprocal Rank Fusion) over 2..=4 ranked single-column
+    /// subqueries: score(d) = Σ wᵢ / (rrk + rankᵢ(d)), ranks 1-based.
+    /// Output: one column (named after subquery 1's column), ordered by
+    /// score DESC with a value-ASC tie-break (deterministic for diffs).
+    fn execute_rrf_table_fn(
+        &self,
+        name: &str,
+        args: &[crate::sql::ast::TableFnArg],
+    ) -> Result<QueryResult> {
+        use crate::sql::ast::TableFnArg;
+        if !name.eq_ignore_ascii_case("rrf") {
+            return Err(StorageError::InvalidData(format!(
+                "unknown table function '{name}' (supported: RRF)"
+            )));
+        }
+        let mut subqueries: Vec<&Statement> = Vec::new();
+        let mut k = 10usize;
+        let mut rrk = 60usize;
+        let mut weights: Vec<Option<f64>> = Vec::new();
+        for a in args {
+            match a {
+                TableFnArg::Subquery(q) => subqueries.push(q),
+                TableFnArg::Named(key, val) => match key.as_str() {
+                    "k" => k = val_as_usize(val)?,
+                    "rrk" => rrk = val_as_usize(val)?,
+                    w if w.len() >= 2
+                        && w.starts_with('w')
+                        && w[1..].chars().all(|c| c.is_ascii_digit()) =>
+                    {
+                        let idx: usize = w[1..].parse().unwrap_or(0);
+                        if idx == 0 || idx > 4 {
+                            return Err(StorageError::InvalidData("RRF weights are w1..w4".into()));
+                        }
+                        let f = match val {
+                            Value::Float(f) => *f,
+                            Value::Integer(i) => *i as f64,
+                            _ => {
+                                return Err(StorageError::InvalidData(
+                                    "RRF weight must be numeric".into(),
+                                ))
+                            }
+                        };
+                        if weights.len() < idx {
+                            weights.resize(idx, None);
+                        }
+                        weights[idx - 1] = Some(f);
+                    }
+                    _ => {
+                        return Err(StorageError::InvalidData(format!(
+                            "unknown RRF parameter '{key}' (k, rrk, w1..w4)"
+                        )));
+                    }
+                },
+            }
+        }
+        if subqueries.len() < 2 || subqueries.len() > 4 {
+            return Err(StorageError::InvalidData(
+                "RRF takes 2..=4 subquery arguments".into(),
+            ));
+        }
+        let mut w: Vec<f64> = (0..subqueries.len()).map(|_| 1.0).collect();
+        for (i, wi) in weights.into_iter().enumerate().take(subqueries.len()) {
+            if let Some(f) = wi {
+                w[i] = f;
+            }
+        }
+
+        // Run each candidate list; every subquery must project one column.
+        let mut col_name: Option<String> = None;
+        let mut lists: Vec<Vec<Value>> = Vec::with_capacity(subqueries.len());
+        for q in &subqueries {
+            let r = self.execute_from_subquery_statement(q)?;
+            let QueryResult::Select { columns, rows } = r else {
+                return Err(StorageError::InvalidData(
+                    "RRF subqueries must be SELECTs".into(),
+                ));
+            };
+            if columns.len() != 1 || rows.iter().any(|row| row.len() != 1) {
+                return Err(StorageError::InvalidData(
+                    "each RRF subquery must project exactly one column".into(),
+                ));
+            }
+            if col_name.is_none() {
+                col_name = columns.into_iter().next();
+            }
+            lists.push(
+                rows.into_iter()
+                    .map(|mut row| row.pop().unwrap_or(Value::Null))
+                    .collect(),
+            );
+        }
+
+        let rrk_f = rrk.max(1) as f64;
+        let mut fused: std::collections::HashMap<Value, f64> = std::collections::HashMap::new();
+        for (i, list) in lists.iter().enumerate() {
+            for (rank0, v) in list.iter().enumerate() {
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                *fused.entry(v.clone()).or_insert(0.0) += w[i] / (rrk_f + rank0 as f64 + 1.0);
+            }
+        }
+        let mut scored: Vec<(Value, f64)> = fused.into_iter().collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        scored.truncate(k.max(1));
+        Ok(QueryResult::Select {
+            columns: vec![col_name.unwrap_or_else(|| "id".to_string())],
+            rows: scored.into_iter().map(|(v, _)| vec![v]).collect(),
+        })
     }
 
     fn execute_from_with_limit(
@@ -13185,6 +13343,32 @@ impl QueryExecutor {
 
                 Ok((sql_rows, Arc::new(prefixed_schema)))
             }
+            // 🔖 FROM table function — currently RRF (hybrid-search rank
+            // fusion). Evaluated eagerly, then inlined as a synthesized
+            // UNION ALL derived table so the outer query's WHERE/ORDER BY
+            // resolve through the regular derived-table machinery.
+            TableRef::TableFn { name, args } => {
+                let fused = self.execute_rrf_table_fn(name, args)?;
+                let QueryResult::Select { columns, rows } = fused else {
+                    return Err(StorageError::InvalidData(
+                        "RRF must produce a SELECT result".into(),
+                    ));
+                };
+                match Self::rows_to_union_statement(&rows, &columns) {
+                    Some(st) => {
+                        let sub = TableRef::Subquery {
+                            query: Box::new(st),
+                            alias: name.clone(),
+                        };
+                        return self.execute_from_with_limit(&sub, limit, push);
+                    }
+                    None => {
+                        return Err(StorageError::InvalidData(
+                            "RRF result exceeds the 10k inline limit — lower k".into(),
+                        ));
+                    }
+                }
+            }
             TableRef::Subquery { query, alias } => {
                 // Execute subquery (a plain SELECT or an inlined UNION-chain
                 // CTE body — v2 TableRef::Subquery carries a Statement).
@@ -13207,6 +13391,7 @@ impl QueryExecutor {
                                         Value::Timestamp(_) => ColumnType::Timestamp,
                                         Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
                                         Value::Spatial(_) => ColumnType::Spatial,
+                                        Value::Blob(_) => ColumnType::Blob,
                                         Value::Vector(v) => ColumnType::Tensor(v.len()),
                                         Value::Null => ColumnType::Text, // Default for NULL
                                     }
@@ -18399,6 +18584,9 @@ impl QueryExecutor {
                 Some(crate::types::ColumnType::Integer) => {}
                 Some(crate::types::ColumnType::Float) => {}
                 Some(crate::types::ColumnType::Boolean) => {}
+                // 🔖 BLOB decodes through the text-layout reader (verbatim
+                // bytes) — same eligibility as Text.
+                Some(crate::types::ColumnType::Blob) => {}
                 _ => return None,
             }
         }
@@ -18479,16 +18667,27 @@ impl QueryExecutor {
                             _ => f.get_i64(i).map(Value::Integer).unwrap_or(Value::Null),
                         },
                         ColScanCol::Text(t, ..) => {
-                            let st = if text_has_null[ci] {
-                                t.get_str(i).map(|x| x as &str)
+                            // 🔖 BLOB-tagged column: verbatim bytes (get_str
+                            // would lossy-NULL non-UTF-8 payloads).
+                            if matches!(
+                                seg.sst.column_tags.get(*pos),
+                                Some(crate::storage::lsm::columnar::ColumnTypeTag::Blob)
+                            ) {
+                                t.get_bytes(i)
+                                    .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec())))
+                                    .unwrap_or(Value::Null)
                             } else {
-                                Some(t.get_str_fast(i) as &str)
-                            };
-                            match st {
-                                Some(st) => {
-                                    Value::Text(crate::types::ArcString(std::sync::Arc::from(st)))
+                                let st = if text_has_null[ci] {
+                                    t.get_str(i).map(|x| x as &str)
+                                } else {
+                                    Some(t.get_str_fast(i) as &str)
+                                };
+                                match st {
+                                    Some(st) => Value::Text(crate::types::ArcString(
+                                        std::sync::Arc::from(st),
+                                    )),
+                                    None => Value::Null,
                                 }
-                                None => Value::Null,
                             }
                         }
                     };
@@ -19899,6 +20098,7 @@ impl QueryExecutor {
                     DataType::Timestamp => ColumnType::Timestamp,
                     DataType::Vector(dim) => ColumnType::Tensor(dim.unwrap_or(128)),
                     DataType::Geometry => ColumnType::Spatial,
+                    DataType::Blob => ColumnType::Blob,
                 };
 
                 let mut col_def = crate::types::ColumnDef::new(col.name.clone(), column_type, pos);
@@ -20546,6 +20746,7 @@ impl QueryExecutor {
                     super::ast::DataType::Timestamp => ColumnType::Timestamp,
                     super::ast::DataType::Vector(dim) => ColumnType::Tensor(dim.unwrap_or(128)),
                     super::ast::DataType::Geometry => ColumnType::Spatial,
+                    super::ast::DataType::Blob => ColumnType::Blob,
                 };
                 // Verify table exists.
                 let _schema = self.db.get_table_schema(&stmt.table)?;
@@ -21313,13 +21514,21 @@ impl QueryExecutor {
         let wants_scores = stmt.columns.iter().any(|c| match c {
             SelectColumn::Expr(Expr::Match { .. }, _) => true,
             SelectColumn::Expr(Expr::FunctionCall { name, .. }, _) => {
-                name.eq_ignore_ascii_case("BM25_SCORE")
+                name.eq_ignore_ascii_case("BM25_SCORE") || name.eq_ignore_ascii_case("bm25")
             }
             _ => false,
         });
+        // 🔖 ORDER BY bm25(col) / bm25_score() — function-form score keys
+        // rank exactly like a `score` column (ranked top-k, keep order).
         let orders_by_score = stmt.order_by.as_ref().is_some_and(|ob| {
             ob.len() == 1
-                && matches!(&ob[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
+                && match &ob[0].expr {
+                    Expr::Column(c) => c.to_lowercase().contains("score"),
+                    Expr::FunctionCall { name, .. } => {
+                        name.eq_ignore_ascii_case("BM25_SCORE") || name.eq_ignore_ascii_case("bm25")
+                    }
+                    _ => false,
+                }
         });
         if in_txn && (phrase || wants_scores || orders_by_score) {
             return Ok(None);
@@ -21413,7 +21622,13 @@ impl QueryExecutor {
         // those columns after projection (handles the common ORDER BY id case).
         let needs_resort = stmt.order_by.as_ref().is_some_and(|ob| {
             !(ob.len() == 1
-                && matches!(&ob[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
+                && match &ob[0].expr {
+                    Expr::Column(c) => c.to_lowercase().contains("score"),
+                    Expr::FunctionCall { name, .. } => {
+                        name.eq_ignore_ascii_case("BM25_SCORE") || name.eq_ignore_ascii_case("bm25")
+                    }
+                    _ => false,
+                }
                 && !ob[0].asc)
         });
 
@@ -21504,7 +21719,8 @@ impl QueryExecutor {
                                 .unwrap_or(Value::Float(0.0));
                         }
                         SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _)
-                            if name.eq_ignore_ascii_case("BM25_SCORE") =>
+                            if name.eq_ignore_ascii_case("BM25_SCORE")
+                                || name.eq_ignore_ascii_case("bm25") =>
                         {
                             // BM25_SCORE() [zero-arg — the shape paired with
                             // `WHERE MATCH(col, 'q')`] is the score of the
@@ -25397,5 +25613,15 @@ mod tests {
             "predicate coverage too small: {compiled_forms}"
         );
         assert!(checked >= 1000, "row-level checks too small: {checked}");
+    }
+}
+
+fn val_as_usize(v: &Value) -> Result<usize> {
+    match v {
+        Value::Integer(i) if *i >= 0 => Ok(*i as usize),
+        Value::Float(f) if *f >= 0.0 && f.fract() == 0.0 => Ok(*f as usize),
+        _ => Err(StorageError::InvalidData(
+            "RRF numeric parameters must be non-negative integers".into(),
+        )),
     }
 }

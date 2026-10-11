@@ -160,6 +160,32 @@ See [`examples/logging.rs`](examples/logging.rs) for a runnable demo.
 
 - 🔍 **运维自检** — `db.doctor()` / `motedb-cli doctor <path>`：表布局、内存预算、索引覆盖率、磁盘占用逐项 PASS/WARN 报告。
 
+### Hybrid search (new in v0.13.1)
+
+```sql
+SELECT id FROM RRF(
+  (SELECT id FROM docs WHERE MATCH(body, 'grasp failure') ORDER BY bm25(body) LIMIT 100),
+  (SELECT id FROM docs ORDER BY emb <-> ? LIMIT 100)
+);
+```
+
+One-SQL BM25 ⊕ vector fusion (Reciprocal Rank Fusion, `k`/`rrk`/`w1..w4`
+tunable). `snippet(body, 'grasp failure', 80)` renders FTS5-style excerpts
+with `<b>` highlights.
+
+### Robotics data on-ramp (new in v0.13)
+
+```bash
+motedb import mcap robot.mote recording.mcap        # CLI
+# 或 Python:
+db.import_mcap("recording.mcap", decode={"/joint_states": my_decoder})
+```
+
+One table per topic (`_uid` PK, `log_time`/`publish_time` TIMESTAMP + auto
+index, raw message `data BLOB`); a per-topic Python decode hook adds typed
+columns (e.g. decoded `emb VECTOR`) at import time. Re-imports are no-ops
+(`_uid` dedup) — crash-safe resumes.
+
 ### Multimodal
 
 | Modality | Index | Query |
@@ -253,8 +279,11 @@ EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`
 - `UNION` / `UNION ALL`
 - `CASE WHEN ... THEN ... ELSE ... END`
-- `WITH` / Common Table Expressions (non-recursive; `WITH name [(cols)] AS
-  (SELECT ...), ... <main query>`)
+- `WITH` / Common Table Expressions incl. **`WITH RECURSIVE`** (semi-naive
+  fixed-point, UNION ALL bodies, chained CTEs)
+- Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`,
+  `LEAD`, `FIRST_VALUE`, `LAST_VALUE` + aggregates `OVER (PARTITION BY …
+  ORDER BY …)` (RANGE peer-group default frame)
 - Scalar functions: `UPPER`/`LOWER`/`LENGTH`/`TRIM`/`SUBSTR`/`REPLACE`/`CONCAT` (skips NULL args, SQLite/Postgres semantics; `||` propagates NULL)/`INSTR`/`COALESCE`/`ROUND` (binary-exact decimal rounding)/`ABS`/arithmetic
 - Multimodal predicates: `MATCH(col) AGAINST('q')` (BM25 ranked FTS;
   multi-word default is AND, explicit `a OR b` unions — FTS5-compatible),
@@ -263,9 +292,15 @@ EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints, read-your-writes
   visibility inside a transaction
 
-**Not yet supported:** `WITH RECURSIVE` (the keyword is accepted but
-self-referencing CTEs error out), `DECIMAL`/`DATE`/`BLOB` types, window
-functions, and cross-statement server-side cursors.
+**BLOB type:** `payload BLOB` columns with SQLite-style `X'0aff00'` hex
+literals and Python `bytes` parameters (byte-exact round-trip, 16 MiB
+cap). Known v0.13 gaps: scalar functions over BLOB columns
+(`LENGTH(payload)`) and BLOB output under `ORDER BY` are not yet wired
+through all executor paths — bare projection, equality (`WHERE payload =
+X'…'`), time-window scans and parameters are solid.
+
+**Not yet supported:** `DECIMAL`/`DATE` types, cross-statement server-side
+cursors, and explicit window frames (`ROWS`/`RANGE` specs).
 
 ## Documentation
 

@@ -358,7 +358,30 @@ impl Segment {
                 }
                 Some(ColumnVector {
                     data: ColData::Utf8(buf),
-                    valid,
+                    valid: valid,
+                })
+            }
+            ColumnType::Blob => {
+                let ts = self.sst.read_binary(col_idx).ok()?;
+                let mut valid = ValidityBitmap::with_capacity(n);
+                let mut vals: Vec<crate::types::Value> = Vec::with_capacity(n);
+                for i in 0..n {
+                    match ts.get_bytes(i) {
+                        Some(b) => {
+                            vals.push(crate::types::Value::Blob(crate::types::ArcBytes::new(
+                                b.to_vec(),
+                            )));
+                            valid.push(true);
+                        }
+                        None => {
+                            vals.push(crate::types::Value::Null);
+                            valid.push(false);
+                        }
+                    }
+                }
+                Some(ColumnVector {
+                    data: ColData::Values(vals),
+                    valid: valid,
                 })
             }
             ColumnType::Tensor(_) | ColumnType::Spatial => {
@@ -554,6 +577,19 @@ impl Segment {
             };
         }
 
+        // 🔒 BLOB: full-column decode + verbatim byte slice (no page-level
+        // path, no col_cache — payloads can be large and caching them would
+        // break the query memory budget; blob point reads are rare).
+        if matches!(tag, Some(ColumnTypeTag::Blob)) {
+            return match self.sst.read_binary(ci) {
+                Ok(t) => match t.get_bytes(idx) {
+                    Some(b) => Value::Blob(crate::types::ArcBytes::new(b.to_vec())),
+                    None => Value::Null,
+                },
+                Err(_) => Value::Null,
+            };
+        }
+
         if matches!(
             tag,
             Some(ColumnTypeTag::Vector) | Some(ColumnTypeTag::Spatial)
@@ -693,6 +729,27 @@ impl Segment {
                 Some(ColumnTypeTag::Vector) | Some(ColumnTypeTag::Spatial)
             ) {
                 row.push(self.read_var_value_at(ci, idx));
+                continue;
+            }
+
+            // 🔖 BLOB: same layout as Text. Scan path shares the col_cache
+            // (decode once per column); no page-level path — blob point
+            // reads are rare and payloads don't deserve paged caching.
+            if matches!(tag, Some(ColumnTypeTag::Blob)) {
+                {
+                    let mut cache = self.col_cache.lock();
+                    if let Some(cached) = cache.get(ci) {
+                        row.push(decode_cached_value(cached, idx, ct));
+                        continue;
+                    }
+                }
+                let decoded = self.sst.read_binary(ci).ok().map(CachedCol::Text);
+                if let Some(d) = decoded {
+                    row.push(decode_cached_value(&d, idx, ct));
+                    self.col_cache.lock().insert(ci, d);
+                } else {
+                    row.push(Value::Null);
+                }
                 continue;
             }
 
@@ -966,6 +1023,12 @@ fn decode_cached_value(
         (CachedCol::Text(t), ColumnType::Text) => t
             .get_str(idx)
             .map(|s| Value::Text(s.into()))
+            .unwrap_or(Value::Null),
+        // 🔖 BLOB columns cache as Text segments (same byte layout); decode
+        // verbatim bytes — no UTF-8 lossy conversion.
+        (CachedCol::Text(t), ColumnType::Blob) => t
+            .get_bytes(idx)
+            .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec())))
             .unwrap_or(Value::Null),
         _ => Value::Null,
     }
