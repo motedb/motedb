@@ -9,7 +9,9 @@ mod timestamp;
 pub use spatial::{BoundingBox, BoundingBox3D, Geometry, Point, Point3D};
 mod comp_sum;
 pub use comp_sum::CompSum;
-pub use table::{ColumnDef, ColumnType, IndexDef, IndexType, TTLDuration, TableSchema, TableType};
+pub use table::{
+    ColumnDef, ColumnType, EpisodeConfig, IndexDef, IndexType, TTLDuration, TableSchema, TableType,
+};
 pub use tensor::Tensor;
 pub use text::{Text, TextDoc};
 pub use timestamp::Timestamp;

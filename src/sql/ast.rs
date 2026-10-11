@@ -136,7 +136,9 @@ pub enum TableRef {
 pub enum TableFnArg {
     /// Parenthesized subquery (a ranked candidate list).
     Subquery(Box<Statement>),
-    /// `name = numeric-literal` parameter (k, rrk, w1..w4).
+    /// Bare identifier — a table name (EPISODES(teleop)).
+    Table(String),
+    /// `name = literal` parameter (RRF: k, rrk, w1..w4 — numeric).
     Named(String, Value),
 }
 
@@ -233,6 +235,17 @@ pub struct CreateTableStmt {
     /// 🆕 `CREATE TABLE IF NOT EXISTS` — if true, silently no-op when the
     /// table already exists instead of erroring.
     pub if_not_exists: bool,
+    /// 🔖 `EPISODE BY (key_col, ts_col) GAP d` — episode-segmented table.
+    pub episode: Option<EpisodeCfg>,
+}
+
+/// Episode segmentation config: rows sharing `key_col` form episodes split
+/// whenever consecutive `ts_col` values gap more than `gap_micros`.
+#[derive(Debug, Clone)]
+pub struct EpisodeCfg {
+    pub key_col: String,
+    pub ts_col: String,
+    pub gap_micros: i64,
 }
 
 #[derive(Debug, Clone)]

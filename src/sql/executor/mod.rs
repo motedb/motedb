@@ -2903,6 +2903,19 @@ impl QueryExecutor {
     /// is too large to synthesize (> 10k rows) or empty (an empty UNION chain
     /// is unrepresentable) — callers fall back to name-based resolution.
     fn rows_to_union_statement(rows: &[Row], columns: &[String]) -> Option<Statement> {
+        Self::rows_to_union_statement_ex(rows, columns, false)
+    }
+
+    /// Vector-literal variant (EPISODES inline): with `allow_vectors`, a
+    /// `Value::Vector` row value synthesizes as `Expr::Literal(Vector)` —
+    /// the AST carries it fine (each row appears exactly once, no
+    /// duplication); the scalarizable restriction stays the default for the
+    /// recursive-CTE path whose consumers assume scalar columns.
+    fn rows_to_union_statement_ex(
+        rows: &[Row],
+        columns: &[String],
+        allow_vectors: bool,
+    ) -> Option<Statement> {
         const SYNTH_LIMIT: usize = 10_000;
         if rows.len() > SYNTH_LIMIT {
             return None;
@@ -2953,6 +2966,7 @@ impl QueryExecutor {
                     | Value::Text(_)
                     | Value::Bool(_)
                     | Value::Timestamp(_)
+                    | Value::Vector(_) if allow_vectors || !matches!(v, Value::Vector(_))
             )
         };
         if rows.iter().flatten().any(|v| !scalarizable(v)) {
@@ -2973,6 +2987,9 @@ impl QueryExecutor {
                             Value::Text(t) => Expr::Literal(Value::text(t.to_string())),
                             Value::Bool(b) => Expr::Literal(Value::Bool(*b)),
                             Value::Timestamp(t) => Expr::Literal(Value::Timestamp(*t)),
+                            Value::Vector(vec) if allow_vectors => Expr::Literal(Value::Vector(
+                                crate::types::ArcVec(std::sync::Arc::from(vec.to_vec())),
+                            )),
                             _ => unreachable!("pre-checked scalarizable"),
                         };
                         crate::sql::ast::SelectColumn::Expr(lit, Some(name.clone()))
@@ -3105,11 +3122,22 @@ impl QueryExecutor {
     /// FROM-level substitution: `Table{name}` → `Subquery{inlined body}`.
     fn rewrite_from_visible(table_ref: &mut TableRef, visible: &[(String, VisibleCte)]) {
         match table_ref {
-            // 🔖 RRF subqueries see the enclosing statement's CTEs.
+            // 🔖 RRF subqueries see the enclosing statement's CTEs; an
+            // EPISODES(cte_name) table arg inlines the same way.
             TableRef::TableFn { args, .. } => {
                 for a in args.iter_mut() {
-                    if let crate::sql::ast::TableFnArg::Subquery(q) = a {
-                        Self::rewrite_statement_cte_refs(q, visible);
+                    match a {
+                        crate::sql::ast::TableFnArg::Subquery(q) => {
+                            Self::rewrite_statement_cte_refs(q, visible);
+                        }
+                        crate::sql::ast::TableFnArg::Table(tn) => {
+                            if let Some((_, VisibleCte::Inlined(body))) =
+                                visible.iter().find(|(n, _)| n == tn)
+                            {
+                                *a = crate::sql::ast::TableFnArg::Subquery(Box::new(body.clone()));
+                            }
+                        }
+                        crate::sql::ast::TableFnArg::Named(_, _) => {}
                     }
                 }
             }
@@ -3471,9 +3499,12 @@ impl QueryExecutor {
                 Self::table_ref_references(left, name) || Self::table_ref_references(right, name)
             }
             TableRef::Subquery { query, .. } => Self::statement_references_table(query, name),
-            TableRef::TableFn { args, .. } => args.iter().any(|a| {
-                matches!(a, crate::sql::ast::TableFnArg::Subquery(q)
-                    if Self::statement_references_table(q, name))
+            TableRef::TableFn { args, .. } => args.iter().any(|a| match a {
+                crate::sql::ast::TableFnArg::Subquery(q) => {
+                    Self::statement_references_table(q, name)
+                }
+                crate::sql::ast::TableFnArg::Table(t) => t == name,
+                crate::sql::ast::TableFnArg::Named(_, _) => false,
             }),
         }
     }
@@ -9785,6 +9816,16 @@ impl QueryExecutor {
             }
             Expr::FunctionCall { name, args, .. } => {
                 let fname = name.to_lowercase();
+                if fname == "traj_sim" {
+                    if args.len() != 2 {
+                        return Err(MoteDBError::InvalidArgument(
+                            "traj_sim() takes (trajectory, demo)".to_string(),
+                        ));
+                    }
+                    let a = Self::eval_expr_simple(&args[0], row)?;
+                    let b = Self::eval_expr_simple(&args[1], row)?;
+                    return crate::sql::evaluator::traj_sim_values(a, b);
+                }
                 match fname.as_str() {
                     "concat" => {
                         let mut result = String::new();
@@ -13208,6 +13249,11 @@ impl QueryExecutor {
         for a in args {
             match a {
                 TableFnArg::Subquery(q) => subqueries.push(q),
+                TableFnArg::Table(t) => {
+                    return Err(StorageError::InvalidData(format!(
+                        "RRF takes subquery arguments, not table '{t}'"
+                    )));
+                }
                 TableFnArg::Named(key, val) => match key.as_str() {
                     "k" => k = val_as_usize(val)?,
                     "rrk" => rrk = val_as_usize(val)?,
@@ -13301,6 +13347,136 @@ impl QueryExecutor {
         })
     }
 
+    /// 🔖 FROM EPISODES(table) — episode segmentation view over a table
+    /// declared with `CREATE EPISODE TABLE … EPISODE BY (key, ts) GAP d`.
+    /// Episodes are DERIVED data: segmentation is a pure function of
+    /// (key, ts, gap) — no physical registry to persist or invalidate.
+    /// Output columns: `<key>`, `t0`, `t1`, `n_rows`, `traj_<vcol>`…
+    /// (each VECTOR column as a flattened, uniformly resampled
+    /// 64×dim trajectory — the traj_sim representation).
+    fn execute_episodes_table_fn(
+        &self,
+        fname: &str,
+        args: &[crate::sql::ast::TableFnArg],
+    ) -> Result<QueryResult> {
+        use crate::sql::ast::TableFnArg;
+        if !fname.eq_ignore_ascii_case("episodes") {
+            return Err(StorageError::InvalidData(format!(
+                "unknown table function '{fname}' (supported: RRF, EPISODES)"
+            )));
+        }
+        let table = match args {
+            [TableFnArg::Table(t)] => t.clone(),
+            _ => {
+                return Err(StorageError::InvalidData(
+                    "EPISODES takes exactly one table argument: EPISODES(t)".into(),
+                ))
+            }
+        };
+        let schema = self.db.get_table_schema(&table)?;
+        let Some(cfg) = schema.episode_config.clone() else {
+            return Err(StorageError::InvalidData(format!(
+                "table '{table}' is not an episode table (declare with CREATE EPISODE TABLE)"
+            )));
+        };
+        let key_pos = schema.get_column_position(&cfg.key_col).ok_or_else(|| {
+            StorageError::InvalidData(format!("episode key '{}' missing", cfg.key_col))
+        })?;
+        let ts_pos = schema.get_column_position(&cfg.ts_col).ok_or_else(|| {
+            StorageError::InvalidData(format!("episode ts '{}' missing", cfg.ts_col))
+        })?;
+        let vec_cols: Vec<(String, usize)> = schema
+            .columns
+            .iter()
+            .filter(|c| matches!(c.col_type, crate::types::ColumnType::Tensor(_)))
+            .map(|c| (format!("traj_{}", c.name), c.position))
+            .collect();
+
+        // Gather rows grouped by key (first-seen key order → deterministic
+        // output). Memory: key + ts + VECTOR columns only.
+        let iter = self.db.scan_table_rows_streaming(&table)?;
+        let mut key_order: Vec<Value> = Vec::new();
+        let mut slot: std::collections::HashMap<Value, usize> = std::collections::HashMap::new();
+        let mut groups: Vec<Vec<(i64, Vec<Option<Vec<f32>>>)>> = Vec::new();
+        for item in iter {
+            let (_rid, row) = item?;
+            let Some(kv) = row.get(key_pos).cloned() else {
+                continue;
+            };
+            if matches!(kv, Value::Null) {
+                continue;
+            }
+            let ts = match row.get(ts_pos) {
+                Some(Value::Timestamp(t)) => t.as_micros(),
+                Some(Value::Integer(i)) => *i,
+                _ => continue,
+            };
+            let vecs: Vec<Option<Vec<f32>>> = vec_cols
+                .iter()
+                .map(|(_, p)| match row.get(*p) {
+                    Some(Value::Vector(v)) => Some(v.to_vec()),
+                    _ => None,
+                })
+                .collect();
+            let idx = match slot.get(&kv) {
+                Some(i) => *i,
+                None => {
+                    key_order.push(kv.clone());
+                    groups.push(Vec::new());
+                    slot.insert(kv, groups.len() - 1);
+                    groups.len() - 1
+                }
+            };
+            groups[idx].push((ts, vecs));
+        }
+
+        // Segment + emit.
+        let mut columns = vec![
+            cfg.key_col.clone(),
+            "t0".into(),
+            "t1".into(),
+            "n_rows".into(),
+        ];
+        columns.extend(vec_cols.iter().map(|(n, _)| n.clone()));
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for (ki, items) in groups.iter_mut().enumerate() {
+            items.sort_by_key(|(t, _)| *t);
+            let mut seg_start = 0usize;
+            for i in 1..=items.len() {
+                let boundary = i == items.len() || (items[i].0 - items[i - 1].0) > cfg.gap_micros;
+                if !boundary {
+                    continue;
+                }
+                let seg = &items[seg_start..i];
+                seg_start = i;
+                let t0 = seg[0].0;
+                let t1 = seg[seg.len() - 1].0;
+                let mut out_row = vec![
+                    key_order[ki].clone(),
+                    Value::Timestamp(crate::types::Timestamp::from_micros(t0)),
+                    Value::Timestamp(crate::types::Timestamp::from_micros(t1)),
+                    Value::Integer(seg.len() as i64),
+                ];
+                for (ci, _) in vec_cols.iter().enumerate() {
+                    let pts: Vec<(i64, &Vec<f32>)> = seg
+                        .iter()
+                        .filter_map(|(t, vs)| vs[ci].as_ref().map(|v| (*t, v)))
+                        .collect();
+                    if pts.is_empty() {
+                        out_row.push(Value::Null);
+                    } else {
+                        let dim = pts[0].1.len();
+                        out_row.push(Value::Vector(crate::types::ArcVec::new(
+                            resample_trajectory(&pts, dim, TRAJ_SAMPLES),
+                        )));
+                    }
+                }
+                rows.push(out_row);
+            }
+        }
+        Ok(QueryResult::Select { columns, rows })
+    }
+
     fn execute_from_with_limit(
         &self,
         table_ref: &TableRef,
@@ -13348,13 +13524,17 @@ impl QueryExecutor {
             // UNION ALL derived table so the outer query's WHERE/ORDER BY
             // resolve through the regular derived-table machinery.
             TableRef::TableFn { name, args } => {
-                let fused = self.execute_rrf_table_fn(name, args)?;
+                let fused = if name.eq_ignore_ascii_case("episodes") {
+                    self.execute_episodes_table_fn(name, args)?
+                } else {
+                    self.execute_rrf_table_fn(name, args)?
+                };
                 let QueryResult::Select { columns, rows } = fused else {
                     return Err(StorageError::InvalidData(
-                        "RRF must produce a SELECT result".into(),
+                        "table function must produce a SELECT result".into(),
                     ));
                 };
-                match Self::rows_to_union_statement(&rows, &columns) {
+                match Self::rows_to_union_statement_ex(&rows, &columns, true) {
                     Some(st) => {
                         let sub = TableRef::Subquery {
                             query: Box::new(st),
@@ -13364,7 +13544,7 @@ impl QueryExecutor {
                     }
                     None => {
                         return Err(StorageError::InvalidData(
-                            "RRF result exceeds the 10k inline limit — lower k".into(),
+                            "table-function result exceeds the 10k inline limit".into(),
                         ));
                     }
                 }
@@ -20157,6 +20337,20 @@ impl QueryExecutor {
         if let Some(ref ttl) = stmt.ttl {
             schema = schema.with_ttl(*ttl);
         }
+        // 🔖 Episode config (validate columns exist; persist on the schema).
+        if let Some(ep) = &stmt.episode {
+            schema.get_column_position(&ep.key_col).ok_or_else(|| {
+                StorageError::InvalidData(format!("episode key column '{}' not found", ep.key_col))
+            })?;
+            schema.get_column_position(&ep.ts_col).ok_or_else(|| {
+                StorageError::InvalidData(format!("episode ts column '{}' not found", ep.ts_col))
+            })?;
+            schema.episode_config = Some(crate::types::EpisodeConfig {
+                key_col: ep.key_col.clone(),
+                ts_col: ep.ts_col.clone(),
+                gap_micros: ep.gap_micros,
+            });
+        }
 
         self.db.create_table(schema.clone())?;
 
@@ -25624,4 +25818,40 @@ fn val_as_usize(v: &Value) -> Result<usize> {
             "RRF numeric parameters must be non-negative integers".into(),
         )),
     }
+}
+
+/// traj_sim resample length (samples per episode trajectory).
+pub(crate) const TRAJ_SAMPLES: usize = 64;
+
+/// Uniformly resample a time-stamped multi-dim trajectory to `n` samples
+/// (linear interpolation per dimension). `pts` must be ts-ascending.
+fn resample_trajectory(pts: &[(i64, &Vec<f32>)], dim: usize, n: usize) -> Vec<f32> {
+    let t0 = pts[0].0;
+    let t1 = pts[pts.len() - 1].0;
+    let span = (t1 - t0).max(1);
+    let denom = (n as i64 - 1).max(1);
+    let mut out = Vec::with_capacity(n * dim);
+    for j in 0..n {
+        let tt = t0 + span * j as i64 / denom;
+        let idx = pts.partition_point(|(t, _)| *t < tt);
+        let (ia, ib, frac) = if idx == 0 {
+            (0usize, 0usize, 0f32)
+        } else if idx >= pts.len() {
+            (pts.len() - 1, pts.len() - 1, 0f32)
+        } else {
+            let a = &pts[idx - 1];
+            let b = &pts[idx];
+            let f = if b.0 == a.0 {
+                0f32
+            } else {
+                ((tt - a.0) as f64 / (b.0 - a.0) as f64) as f32
+            };
+            (idx - 1, idx, f)
+        };
+        let (a, b) = (&pts[ia].1, &pts[ib].1);
+        for d in 0..dim {
+            out.push(a[d] + (b[d] - a[d]) * frac);
+        }
+    }
+    out
 }

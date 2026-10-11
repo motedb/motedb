@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.14.0] — unreleased (W6 in flight)
+
+- **🔑 Episode 数据模型(W6, v0.14 第一块)**:
+  - `CREATE EPISODE TABLE … EPISODE BY (key_col, ts_col) GAP '5s'|'100ms'|
+    microseconds` — 列存在性校验, 配置持久化在 TableSchema(serde 兼容旧库)
+  - `FROM EPISODES(t)` 表函数: 按 key 分组 → ts 排序 → gap 分片, 每片段一行
+    (`<key>`, `t0`, `t1`, `n_rows`), 且每个 VECTOR 列派生 `traj_<col>` —
+    统一 64 采样线性插值重采样的展平轨迹(64×dim)。Episode 为**派生数据**
+    (分片是 key/ts/gap 的纯函数) — 无注册表需持久化, 重开一致性免费
+  - `traj_sim(traj_col, demo)` — 64×dim DTW 距离(demo 任意采样数, 内部
+    重采样到 64); W5 spike 决议的两段式架构(无物理倒排, PAA 短名单化
+    为后续优化), evaluator/positional/simple 三求值表接线
+  - 基建: 表函数参数支持裸表名 + 字符串字面量; UNION 合成支持 Vector
+    字面量(EPISODES 内联通道, 递归 CTE 路径保持标量限制)
+  - 测试: test_episodes.rs(3) — 分片正确性/形状、traj_sim vs 测试内
+    暴力 DTW 对拍、重开耐久
+
 ## [0.13.0] — 2026-10-11
 
 - **🔑 BLOB 类型(全链路)**: `payload BLOB` 列 — 第 8 个 ColumnType。

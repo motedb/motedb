@@ -173,6 +173,27 @@ One-SQL BM25 ⊕ vector fusion (Reciprocal Rank Fusion, `k`/`rrk`/`w1..w4`
 tunable). `snippet(body, 'grasp failure', 80)` renders FTS5-style excerpts
 with `<b>` highlights.
 
+### Episode model + trajectory search (v0.14 work-in-progress)
+
+```sql
+CREATE EPISODE TABLE teleop (
+  session TEXT, ts TIMESTAMP, joint VECTOR(7), gripper FLOAT
+) EPISODE BY (session, ts) GAP '5s';
+
+-- One row per episode: bounds, row count, and a 64-sample resampled
+-- trajectory per VECTOR column (flattened 64×dim).
+SELECT session, t0, t1, n_rows FROM EPISODES(teleop);
+
+-- Trajectory similarity (DTW over the resampled series; two-stage
+-- PAA-shortlist design validated in docs/design/2026-10-traj-spike.md):
+SELECT session, t0 FROM EPISODES(teleop)
+ORDER BY traj_sim(traj_joint, [0.0, 0.1, …]) LIMIT 10;
+```
+
+Episodes are **derived data** — segmentation is a pure function of
+`(key, ts, gap)`, so there is no registry to persist or invalidate and
+reopen consistency is free.
+
 ### Robotics data on-ramp (new in v0.13)
 
 ```bash

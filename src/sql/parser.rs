@@ -896,14 +896,15 @@ impl Parser {
             });
         }
 
-        // 🔖 Table function: RRF((subquery1), (subquery2)[, k = n][, rrk = n][, wN = f])
-        // — hybrid-search rank fusion over 2..=4 ranked subqueries.
+        // 🔖 Table functions: RRF((sub1),(sub2)[, k = n]…) — hybrid-search
+        // rank fusion; EPISODES(table) — episode segmentation view.
         if let TokenType::Identifier(name) = &self.current().token_type {
-            if name.eq_ignore_ascii_case("RRF")
+            let fname = name.to_ascii_uppercase();
+            if matches!(fname.as_str(), "RRF" | "EPISODES")
                 && matches!(self.peek_token_type(), TokenType::LParen)
             {
-                self.advance(); // RRF
-                return self.parse_rrf_table_fn();
+                self.advance();
+                return self.parse_table_fn(&fname);
             }
         }
 
@@ -1145,6 +1146,12 @@ impl Parser {
                 let id_upper = id.to_uppercase();
                 if id_upper == "SPATIAL" || id_upper == "OCTREE" {
                     Ok(Statement::CreateIndex(self.parse_create_index()?))
+                } else if id_upper == "EPISODE"
+                    && matches!(self.peek_token_type(), TokenType::Table)
+                {
+                    // 🔖 CREATE EPISODE TABLE … EPISODE BY (col, ts) GAP '5s'
+                    self.advance(); // EPISODE
+                    Ok(Statement::CreateTable(self.parse_create_table()?))
                 } else {
                     Err(self.error("Expected TABLE or INDEX after CREATE"))
                 }
@@ -1208,14 +1215,74 @@ impl Parser {
             ttl = Some(self.parse_ttl_duration()?);
         }
 
+        // 🔖 Optional EPISODE BY (key_col, ts_col) GAP '5s' — declares the
+        // table episode-segmented: rows sharing the key column form episodes
+        // split whenever ts gaps exceed the duration.
+        let mut episode = None;
+        if let TokenType::Identifier(id) = &self.current().token_type {
+            if id.eq_ignore_ascii_case("EPISODE") && matches!(self.peek_token_type(), TokenType::By)
+            {
+                self.advance(); // EPISODE
+                self.expect(TokenType::By)?;
+                self.expect(TokenType::LParen)?;
+                let key_col = self.parse_identifier()?;
+                self.expect(TokenType::Comma)?;
+                let ts_col = self.parse_identifier()?;
+                self.expect(TokenType::RParen)?;
+                if !self.match_token(TokenType::Identifier("GAP".into())) {
+                    return Err(self.error("Expected GAP after EPISODE BY (...)"));
+                }
+                let gap = self.parse_gap_duration()?;
+                episode = Some(crate::sql::ast::EpisodeCfg {
+                    key_col,
+                    ts_col,
+                    gap_micros: gap,
+                });
+            }
+        }
+
         Ok(CreateTableStmt {
             table,
             columns,
             table_type,
             timeseries_column,
             ttl,
+            episode,
             if_not_exists,
         })
+    }
+
+    /// GAP duration: '5s' / '100ms' / '2min' / '1h' string literal, or a bare
+    /// NUMBER (microseconds).
+    fn parse_gap_duration(&mut self) -> Result<i64> {
+        let value: i64;
+        let unit: String;
+        match self.current().token_type.clone() {
+            TokenType::String(s) => {
+                self.advance();
+                // Split numeric prefix + unit suffix.
+                let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+                unit = s[digits.len()..].to_ascii_lowercase();
+                value = digits
+                    .parse()
+                    .map_err(|_| self.error("GAP duration must start with digits, e.g. '5s'"))?;
+            }
+            TokenType::PureInteger(i) => {
+                self.advance();
+                return Ok(i); // bare number = microseconds
+            }
+            _ => return Err(self.error("Expected GAP duration ('5s' / '100ms' / microseconds)")),
+        }
+        let micros = match unit.as_str() {
+            "us" | "µs" => value,
+            "ms" => value * 1_000,
+            "s" | "" => value * 1_000_000,
+            "m" | "min" => value * 60_000_000,
+            "h" => value * 3_600_000_000,
+            "d" => value * 86_400_000_000,
+            _ => return Err(self.error("GAP unit: us/ms/s/min/h/d")),
+        };
+        Ok(micros)
     }
 
     /// Parse TTL duration: NUMBER followed by s/m/h/d suffix
@@ -1383,10 +1450,10 @@ impl Parser {
         Ok(columns)
     }
 
-    /// RRF((sub1), (sub2)[, k = n][, rrk = n][, wN = f]) — args are
-    /// parenthesized subqueries plus optional named parameters. Subqueries
-    /// need NO alias (unlike bare derived tables).
-    fn parse_rrf_table_fn(&mut self) -> Result<TableRef> {
+    /// Table-function args: (SELECT …) subqueries | bare identifier (table
+    /// name) | name = literal. Subqueries need NO alias (unlike bare derived
+    /// tables).
+    fn parse_table_fn(&mut self, fname: &str) -> Result<TableRef> {
         self.expect(TokenType::LParen)?;
         let mut args: Vec<crate::sql::ast::TableFnArg> = Vec::new();
         loop {
@@ -1396,7 +1463,7 @@ impl Parser {
             if matches!(self.current().token_type, TokenType::LParen) {
                 self.advance();
                 if !matches!(self.current().token_type, TokenType::Select) {
-                    return Err(self.error("Expected SELECT in RRF subquery argument"));
+                    return Err(self.error("Expected SELECT in table-function subquery argument"));
                 }
                 let sub = self.parse_select()?;
                 self.expect(TokenType::RParen)?;
@@ -1408,24 +1475,42 @@ impl Parser {
                     },
                 )));
             } else if let TokenType::Identifier(name) = &self.current().token_type {
-                // named arg: k = 10 / rrk = 60 / w1 = 0.5
-                let key = name.to_ascii_lowercase();
-                self.advance();
-                self.expect(TokenType::Eq)?;
-                let val = match self.current().token_type.clone() {
-                    TokenType::Number(n) => {
-                        self.advance();
-                        Value::Float(n)
-                    }
-                    TokenType::PureInteger(i) => {
-                        self.advance();
-                        Value::Integer(i)
-                    }
-                    _ => return Err(self.error("Expected numeric value in RRF named argument")),
-                };
-                args.push(crate::sql::ast::TableFnArg::Named(key, val));
+                // Bare identifier BEFORE `=` = table name; otherwise a named
+                // parameter `k = 10` / `w1 = 0.5`.
+                let is_named = matches!(self.peek_token_type(), TokenType::Eq);
+                if is_named {
+                    let key = name.to_ascii_lowercase();
+                    self.advance();
+                    self.expect(TokenType::Eq)?;
+                    let val = match self.current().token_type.clone() {
+                        TokenType::Number(n) => {
+                            self.advance();
+                            Value::Float(n)
+                        }
+                        TokenType::PureInteger(i) => {
+                            self.advance();
+                            Value::Integer(i)
+                        }
+                        TokenType::String(sv) => {
+                            self.advance();
+                            Value::text(sv)
+                        }
+                        _ => {
+                            return Err(
+                                self.error("Expected numeric or string literal in named argument")
+                            )
+                        }
+                    };
+                    args.push(crate::sql::ast::TableFnArg::Named(key, val));
+                } else {
+                    let t = name.clone();
+                    self.advance();
+                    args.push(crate::sql::ast::TableFnArg::Table(t));
+                }
             } else {
-                return Err(self.error("Expected (SELECT …) or name = value in RRF args"));
+                return Err(self.error(
+                    "Expected (SELECT …), table name, or name = value in table-function args",
+                ));
             }
             if !self.match_token(TokenType::Comma) {
                 break;
@@ -1433,7 +1518,7 @@ impl Parser {
         }
         self.expect(TokenType::RParen)?;
         Ok(TableRef::TableFn {
-            name: "rrf".to_string(),
+            name: fname.to_lowercase(),
             args,
         })
     }

@@ -68,6 +68,16 @@ impl std::fmt::Display for TTLDuration {
     }
 }
 
+/// Episode segmentation config (v0.14): rows sharing `key_col` form episodes
+/// split whenever consecutive `ts_col` values gap more than `gap_micros`.
+/// Episodes are derived data — recomputable from the base table at any time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeConfig {
+    pub key_col: String,
+    pub ts_col: String,
+    pub gap_micros: i64,
+}
+
 /// Column data type
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnType {
@@ -216,6 +226,11 @@ pub struct TableSchema {
     /// 🚀 Phase 4: AUTO_INCREMENT 起始值 (默认为 1)
     #[serde(default)]
     pub auto_increment_start: Option<i64>,
+    /// 🔖 Episode segmentation config (`CREATE EPISODE TABLE … EPISODE BY
+    /// (key, ts) GAP d`). Episodes are DERIVED data — segmentation is a pure
+    /// function of (key, ts, gap), so no physical registry is persisted.
+    #[serde(default)]
+    pub episode_config: Option<EpisodeConfig>,
     /// Column name -> position mapping
     #[serde(skip)]
     column_map: HashMap<String, usize>,
@@ -272,6 +287,7 @@ impl TableSchema {
             table_type: TableType::Standard,
             timeseries_column: None,
             ttl: None,
+            episode_config: None,
         }
     }
 
