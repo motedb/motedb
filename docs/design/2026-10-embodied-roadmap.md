@@ -1,6 +1,8 @@
 # 技术方案:具身数据工作流 — v0.13「入场」与 v0.14「品类定义」
 
-> 状态:**Phase 1 完成**(W1a 文档对齐 ✅、W1b BLOB ✅ 含词法平方级修复、
+> 状态:**W5 spike 决议已出** → 见 docs/design/2026-10-traj-spike.md:
+> SAX 倒排 NO-GO(recall 0.762<0.90),PAA+DTW 两段 GO(recall 1.000,
+> p99 26ms,开销 ~1%)—— §5-§6 产品化方案已按决议修订。Phase 1 完成(W1a 文档对齐 ✅、W1b BLOB ✅ 含词法平方级修复、
 > W2-3 MCAP 核心/CLI/Python 钩子/重放幂等 ✅、W4 RRF+bm25+snippet ✅ 含
 > 非 Table FROM 执行器修复)。顺延项:MCAP 断点续导清单表、BLOB 标量函数
 > 求值/ORDER BY 输出缺口。下一阶段:W5 轨迹索引 spike(go/no-go)。
