@@ -2185,10 +2185,29 @@ impl MoteDB {
         use dashmap::mapref::entry::Entry;
         let store = match self.col_segment_stores.entry(table_name.to_string()) {
             Entry::Vacant(v) => {
+                // 🔖 Install the dataset-GC filter on fresh stores: pinned
+                // segment ids (COMMIT DATASET) survive compaction GC.
+                let refs = self.dataset_refs.clone();
+                let tname = table_name.to_string();
+                store.set_gc_filter(std::sync::Arc::new(move |id: u64| {
+                    refs.get(&tname).is_some_and(|set| set.contains(&id))
+                }));
                 v.insert(store.clone());
                 store
             }
-            Entry::Occupied(o) => o.get().clone(),
+            Entry::Occupied(o) => {
+                let st = o.get().clone();
+                // 🔖 Stores constructed on the open path never saw the
+                // dataset-filter install — backfill it here (idempotent).
+                if !st.gc_filter_installed() {
+                    let refs = self.dataset_refs.clone();
+                    let tname = table_name.to_string();
+                    st.set_gc_filter(std::sync::Arc::new(move |id: u64| {
+                        refs.get(&tname).is_some_and(|set| set.contains(&id))
+                    }));
+                }
+                st
+            }
         };
         // Budget choke point: every statement that touches a col-segment table
         // funnels through here, so trim here covers query paths that never call

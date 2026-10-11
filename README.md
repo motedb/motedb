@@ -194,6 +194,20 @@ Episodes are **derived data** — segmentation is a pure function of
 `(key, ts, gap)`, so there is no registry to persist or invalidate and
 reopen consistency is free.
 
+### Dataset snapshots (v0.14 work-in-progress)
+
+```sql
+COMMIT DATASET 'fixpos-v3' NOTE 'after gripper fix';
+-- … table keeps evolving (compaction GC will not touch pinned segments) …
+EXPORT DATASET 'fixpos-v3' TO '/data/fixpos-v3.mote';  -- materialized copy
+DROP DATASET 'fixpos-v3';                              -- release the pin
+```
+
+A snapshot is just the pinned segment list (segments are immutable files)
+— near-free to take, persisted in `_dataset_commits`, and compaction
+physically defers deletion of pinned files until the pin is dropped.
+EXPORT materializes the pinned state into a fresh standalone database.
+
 ### Robotics data on-ramp (new in v0.13)
 
 ```bash

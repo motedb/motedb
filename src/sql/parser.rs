@@ -181,6 +181,39 @@ impl Parser {
             TokenType::Release => self.parse_release()?,
             TokenType::Show => self.parse_show()?,
             TokenType::Describe | TokenType::Desc => self.parse_describe()?,
+            TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("EXPORT") => {
+                // 🔖 EXPORT DATASET 'name' TO 'path'
+                self.advance();
+                if !matches!(&self.current().token_type, TokenType::Identifier(ref d) if d.eq_ignore_ascii_case("DATASET"))
+                {
+                    return Err(self.error("Expected DATASET after EXPORT"));
+                }
+                self.advance();
+                let name = match self.current().token_type.clone() {
+                    TokenType::String(n) => {
+                        self.advance();
+                        n
+                    }
+                    TokenType::Identifier(n) => {
+                        self.advance();
+                        n
+                    }
+                    _ => return Err(self.error("Expected dataset name after EXPORT DATASET")),
+                };
+                if !matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("TO"))
+                {
+                    return Err(self.error("Expected TO after EXPORT DATASET name"));
+                }
+                self.advance();
+                let path = match self.current().token_type.clone() {
+                    TokenType::String(p) => {
+                        self.advance();
+                        p
+                    }
+                    _ => return Err(self.error("Expected destination path string after TO")),
+                };
+                Statement::ExportDataset { name, path }
+            }
             _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, DESCRIBE, BEGIN, COMMIT, or ROLLBACK")),
         };
 
@@ -1795,6 +1828,38 @@ impl Parser {
                 }
                 Ok(Statement::DropIndex(DropIndexStmt { index_name }))
             }
+            TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("DATASET") => {
+                // 🔖 DROP DATASET 'name' [IF EXISTS]
+                self.advance();
+                let if_exists = matches!(
+                    &self.current().token_type,
+                    TokenType::Identifier(ref x) if x.eq_ignore_ascii_case("IF")
+                );
+                if if_exists {
+                    self.advance();
+                    match &self.current().token_type {
+                        TokenType::Identifier(ref x) if x.eq_ignore_ascii_case("EXISTS") => {
+                            self.advance();
+                        }
+                        TokenType::Exists => {
+                            self.advance();
+                        }
+                        _ => return Err(self.error("Expected EXISTS after IF")),
+                    }
+                }
+                let name = match self.current().token_type.clone() {
+                    TokenType::String(n) => {
+                        self.advance();
+                        n
+                    }
+                    TokenType::Identifier(n) => {
+                        self.advance();
+                        n
+                    }
+                    _ => return Err(self.error("Expected dataset name after DROP DATASET")),
+                };
+                Ok(Statement::DropDataset { name, if_exists })
+            }
             _ => Err(self.error("Expected TABLE or INDEX after DROP")),
         }
     }
@@ -1810,9 +1875,39 @@ impl Parser {
         Ok(Statement::BeginTransaction)
     }
 
-    /// Parse COMMIT TRANSACTION
+    /// Parse COMMIT TRANSACTION — or COMMIT DATASET 'name' [NOTE '…'].
     fn parse_commit(&mut self) -> Result<Statement> {
         self.expect(TokenType::Commit)?;
+        if let TokenType::Identifier(id) = &self.current().token_type {
+            if id.eq_ignore_ascii_case("DATASET") {
+                self.advance();
+                let name = match self.current().token_type.clone() {
+                    TokenType::String(s) => {
+                        self.advance();
+                        s
+                    }
+                    TokenType::Identifier(n) => {
+                        self.advance();
+                        n
+                    }
+                    _ => return Err(self.error("Expected dataset name after COMMIT DATASET")),
+                };
+                let mut note = String::new();
+                if let TokenType::Identifier(w) = &self.current().token_type {
+                    if w.eq_ignore_ascii_case("NOTE") {
+                        self.advance();
+                        match self.current().token_type.clone() {
+                            TokenType::String(n) => {
+                                self.advance();
+                                note = n;
+                            }
+                            _ => return Err(self.error("Expected string after NOTE")),
+                        }
+                    }
+                }
+                return Ok(Statement::CommitDataset { name, note });
+            }
+        }
         Ok(Statement::CommitTransaction)
     }
 

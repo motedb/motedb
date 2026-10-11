@@ -2,6 +2,24 @@
 
 ## [0.14.0] — unreleased (W6 in flight)
 
+- **🔑 数据集快照(W7, v0.14)**:
+  - `COMMIT DATASET 'name' [NOTE '…']` — 钉住全部用户表的当前段集
+    (段 = 不可变文件,快照即段 id 清单,近乎免费);清单持久化在
+    `_dataset_commits` 表(dataset/table/seg_id/note/committed_at)
+  - **GC 引用保护**: ColSegmentStore 增加 gc_filter(三个构造点统一安装:
+    get_or_create Vacant/Occupied 补装/open 直接构造点)—— sync_manifest
+    对被钉住的段**延迟物理删除**(留在 pending_gc 反复复查);reopen 时
+    非 active 段的清理同样改为延迟(修复:原先直接删除会吃掉被钉段,
+    kill 测试实抓)
+  - `EXPORT DATASET 'name' TO 'path'` — 把快照物化为独立新库(清单段:
+    内存句柄或按 `{id:010}.sst` 直开 Segment::open;逐活行写入新库,
+    同 schema 含 EPISODE BY;索引在目标库按需重建);导出末尾 checkpoint
+    保证即时持久化与一致首读
+  - `DROP DATASET [IF EXISTS] 'name'` — 释放钉(原生 delete_rows_batch,
+    引用集全量重建)
+  - 测试: test_datasets.rs(2) — 快照隔离(commit 前后变更不串)、
+    reopen+VACUUM 后导出仍完整(GC 保护实抓:open 路径绕过 filter 安装)、
+    DROP/IF EXISTS/未知数据集错误
 - **🔑 Episode 数据模型(W6, v0.14 第一块)**:
   - `CREATE EPISODE TABLE … EPISODE BY (key_col, ts_col) GAP '5s'|'100ms'|
     microseconds` — 列存在性校验, 配置持久化在 TableSchema(serde 兼容旧库)

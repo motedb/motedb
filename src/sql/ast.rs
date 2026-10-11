@@ -51,6 +51,22 @@ pub enum Statement {
     DescribeTable(String), // table name
     BeginTransaction,
     CommitTransaction,
+    /// 🔖 COMMIT DATASET 'name' [NOTE '…'] — pin current segments as a
+    /// named snapshot.
+    CommitDataset {
+        name: String,
+        note: String,
+    },
+    /// 🔖 DROP DATASET 'name' — release a snapshot pin.
+    DropDataset {
+        name: String,
+        if_exists: bool,
+    },
+    /// 🔖 EXPORT DATASET 'name' TO 'path' — materialize into a fresh DB.
+    ExportDataset {
+        name: String,
+        path: String,
+    },
     RollbackTransaction,
     /// SAVEPOINT name
     Savepoint(String),

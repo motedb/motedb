@@ -94,6 +94,11 @@ pub struct MoteDB {
 
     /// 🚀 Text indexes (FTS with single-file B-Tree) - 使用 DashMap 提升并发性能
     pub(crate) text_indexes: Arc<DashMap<String, Arc<RwLock<TextFTSIndex>>>>,
+    /// 🔖 Dataset snapshot references (v0.14): table → segment ids pinned by
+    /// any `COMMIT DATASET`. Loaded from the `_dataset_commits` table on
+    /// open; consulted by the per-store GC filter so compaction never
+    /// deletes a snapshot-referenced segment file.
+    pub(crate) dataset_refs: Arc<DashMap<String, std::collections::HashSet<u64>>>,
 
     /// 🚀 Column value indexes (for WHERE optimization) - 使用 DashMap 提升并发性能
     pub(crate) column_indexes: Arc<DashMap<String, Arc<ColumnValueIndex>>>,
@@ -561,6 +566,7 @@ impl MoteDB {
             vector_indexes: Arc::new(DashMap::new()),
             ioctree_indexes: Arc::new(DashMap::new()),
             text_indexes: Arc::new(DashMap::new()),
+            dataset_refs: Arc::new(DashMap::new()),
             column_indexes: Arc::new(DashMap::new()),
             columnar_store,
             columnar_sstables,
@@ -837,6 +843,7 @@ impl MoteDB {
             vector_indexes: self.vector_indexes.clone(),
             ioctree_indexes: self.ioctree_indexes.clone(),
             text_indexes: self.text_indexes.clone(),
+            dataset_refs: self.dataset_refs.clone(),
             column_indexes: self.column_indexes.clone(),
             columnar_store: self.columnar_store.clone(),
             columnar_sstables: self.columnar_sstables.clone(),
@@ -1460,6 +1467,7 @@ impl MoteDB {
             vector_indexes: Arc::new(Self::hashmap_to_dashmap(vector_indexes)),
             ioctree_indexes: Arc::new(Self::hashmap_to_dashmap(ioctree_indexes)),
             text_indexes: Arc::new(Self::hashmap_to_dashmap(text_indexes)),
+            dataset_refs: Arc::new(DashMap::new()),
             column_indexes: Arc::new(Self::hashmap_to_dashmap(column_indexes)),
             columnar_store,
             columnar_sstables: Arc::new(DashMap::new()),
@@ -1541,6 +1549,16 @@ impl MoteDB {
                                                 crate::storage::col_segment::DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES,
                                             ),
                                     );
+                                    // 🔖 Dataset-GC filter on the open path:
+                                    // this construction bypasses
+                                    // get_or_create_col_segment_store, and
+                                    // without the filter a later sync would
+                                    // delete COMMIT DATASET-pinned segments.
+                                    let refs = db.dataset_refs.clone();
+                                    let tname = table_name.clone();
+                                    store.set_gc_filter(std::sync::Arc::new(move |id: u64| {
+                                        refs.get(&tname).is_some_and(|set| set.contains(&id))
+                                    }));
                                     db.col_segment_stores.insert(table_name, store);
                                 }
                             }
@@ -1972,6 +1990,10 @@ impl MoteDB {
         // 🔑 TTL enforcement: parsed-but-never-enforced retention — purge
         // expired rows on open.
         db.enforce_ttls();
+
+        // 🔖 Dataset snapshots: reload the GC reference set from the
+        // manifest table (no-op when no dataset was ever committed).
+        db.load_dataset_refs();
 
         // 🚀 P1: Async Index Build Pipeline (same as create_with_config)
         let (index_build_tx, index_builder_thread) =

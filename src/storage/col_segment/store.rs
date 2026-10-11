@@ -423,6 +423,11 @@ pub struct ColSegmentStore {
     /// deleted" must never leave the manifest referencing a deleted file).
     /// Deleted at sync points (`sync_manifest`), bounded by inline sync.
     pending_gc: Mutex<Vec<u64>>,
+    /// 🔖 Dataset-commit GC filter (v0.14): when Some, sync_manifest must
+    /// NOT physically delete segment ids for which the filter returns true
+    /// (a dataset snapshot references the file). Held-back ids stay in
+    /// pending_gc and are re-checked at every sync point.
+    gc_filter: parking_lot::RwLock<Option<std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>>>,
     /// Whether cross-segment duplicate keys are possible (UPDATE/DELETE of an
     /// already-segmented key). Precise replacement for the old conservative
     /// `seg_count >= 2` heuristic — under tiered compaction the steady state
@@ -513,6 +518,7 @@ impl ColSegmentStore {
             ),
             overlap_possible: std::sync::atomic::AtomicBool::new(false),
             pending_gc: Mutex::new(Vec::new()),
+            gc_filter: parking_lot::RwLock::new(None),
         });
         // 🔥 Auto-recover segments from disk if the MANIFEST has active entries.
         // This handles the restart case: get_or_create_col_segment_store is called
@@ -4478,8 +4484,12 @@ impl ColSegmentStore {
                             // compaction or already GC'd — their records were durable).
         for &id in &state.ever_seen {
             if !state.active_segments.contains(&id) {
-                let path = self.dir.join(format!("{:010}.sst", id));
-                let _ = std::fs::remove_file(&path);
+                // 🔖 Defer to the GC-filter path instead of deleting here:
+                // at construction time the dataset filter isn't installed
+                // yet, and a pinned segment (COMMIT DATASET) retired by an
+                // earlier compaction must survive the reopen. sync_manifest
+                // re-checks the filter at every sync point.
+                self.pending_gc.lock().push(id);
             }
         }
 
@@ -4800,16 +4810,41 @@ impl ColSegmentStore {
         Ok(())
     }
 
+    /// Segment directory (for dataset export to open pinned-but-merged
+    /// segment files directly).
+    pub fn dir_path(&self) -> std::path::PathBuf {
+        self.dir.clone()
+    }
+
+    /// Whether a dataset-GC filter has been installed (idempotent install).
+    pub fn gc_filter_installed(&self) -> bool {
+        self.gc_filter.read().is_some()
+    }
+
+    /// 🔖 Install the dataset-GC filter (see the field doc).
+    pub fn set_gc_filter(&self, f: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>) {
+        *self.gc_filter.write() = Some(f);
+    }
+
     /// Durability point: fsync the manifest, then physically delete retired
     /// segment files. Called from CHECKPOINT/flush/close and inline when
     /// pending file deletions pile up.
+    /// 🔖 Dataset-protected ids are held back (re-queued) instead of deleted.
     pub fn sync_manifest(&self) -> Result<()> {
         {
             let mut m = self.manifest.lock();
             m.sync()?;
         }
         let to_delete: Vec<u64> = std::mem::take(&mut *self.pending_gc.lock());
-        for oid in &to_delete {
+        let filter = self.gc_filter.read().clone();
+        let (deletable, held): (Vec<u64>, Vec<u64>) = match &filter {
+            Some(f) => to_delete.into_iter().partition(|id| !f(*id)),
+            None => (to_delete, Vec::new()),
+        };
+        if !held.is_empty() {
+            self.pending_gc.lock().extend(held);
+        }
+        for oid in &deletable {
             let p = self.dir.join(format!("{:010}.sst", oid));
             let _ = std::fs::remove_file(p);
         }

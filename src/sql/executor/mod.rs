@@ -2124,6 +2124,31 @@ impl QueryExecutor {
             Statement::Explain(inner) => self.execute_explain(&inner),
             Statement::Update(u) => self.execute_update(u),
             Statement::Delete(d) => self.execute_delete(d),
+            Statement::CommitDataset { name, note } => {
+                let (tables, segs) = self.db.commit_dataset(&name, &note)?;
+                Ok(QueryResult::Definition {
+                    message: format!(
+                        "dataset '{name}' committed: {tables} tables, {segs} segments"
+                    ),
+                })
+            }
+            Statement::DropDataset { name, if_exists } => {
+                let existed = self.db.drop_dataset(&name)?;
+                if !existed && !if_exists {
+                    return Err(StorageError::InvalidData(format!(
+                        "dataset '{name}' not found"
+                    )));
+                }
+                Ok(QueryResult::Definition {
+                    message: format!("dataset '{name}' dropped"),
+                })
+            }
+            Statement::ExportDataset { name, path } => {
+                let (tables, rows) = self.db.export_dataset(&name, std::path::Path::new(&path))?;
+                Ok(QueryResult::Definition {
+                    message: format!("dataset '{name}' exported: {tables} tables, {rows} rows"),
+                })
+            }
             Statement::CreateTable(c) => self.execute_create_table(c),
             Statement::CreateIndex(c) => self.execute_create_index(c),
             Statement::DropTable(d) => self.execute_drop_table(d),
@@ -2587,6 +2612,38 @@ impl QueryExecutor {
                 let result = self.execute_delete(owned)?;
                 StreamingQueryResult::Modification {
                     affected_rows: result.affected_rows(),
+                }
+            }
+            Statement::CommitDataset { name, note } => {
+                let (tables, segs) = self.db.commit_dataset(name, note)?;
+                StreamingQueryResult::SelectReady {
+                    columns: vec!["tables".into(), "segments".into()],
+                    rows: vec![vec![
+                        Value::Integer(tables as i64),
+                        Value::Integer(segs as i64),
+                    ]],
+                }
+            }
+            Statement::DropDataset { name, if_exists } => {
+                let existed = self.db.drop_dataset(name)?;
+                if !existed && !if_exists {
+                    return Err(StorageError::InvalidData(format!(
+                        "dataset '{}' not found",
+                        name
+                    )));
+                }
+                StreamingQueryResult::Definition {
+                    message: format!("dataset '{}' dropped", name),
+                }
+            }
+            Statement::ExportDataset { name, path } => {
+                let (tables, rows) = self.db.export_dataset(name, std::path::Path::new(path))?;
+                StreamingQueryResult::SelectReady {
+                    columns: vec!["tables".into(), "rows".into()],
+                    rows: vec![vec![
+                        Value::Integer(tables as i64),
+                        Value::Integer(rows as i64),
+                    ]],
                 }
             }
             Statement::CreateTable(c) => {

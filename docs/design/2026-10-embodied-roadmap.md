@@ -1,6 +1,8 @@
 # 技术方案:具身数据工作流 — v0.13「入场」与 v0.14「品类定义」
 
-> 状态:**W6 Episode 模型已实现**(DDL + EPISODES(t) 表函数 + traj_sim
+> 状态:**W7 数据集快照已实现**(COMMIT/DROP/EXPORT + GC 引用保护,
+> 3 构造点统一 gc_filter;CHECKOUT 只读视图顺延 — EXPORT 物化覆盖训练
+> 数据管线场景)。W6 Episode 模型已实现(DDL + EPISODES(t) 表函数 + traj_sim
 > DTW 排序, 3 项集成测试含暴力 DTW 对拍)。W5 spike 决议: → 见 docs/design/2026-10-traj-spike.md:
 > SAX 倒排 NO-GO(recall 0.762<0.90),PAA+DTW 两段 GO(recall 1.000,
 > p99 26ms,开销 ~1%)—— §5-§6 产品化方案已按决议修订。Phase 1 完成(W1a 文档对齐 ✅、W1b BLOB ✅ 含词法平方级修复、
