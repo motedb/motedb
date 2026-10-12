@@ -1,0 +1,4 @@
+target/
+*.node
+*.dylib
+node_modules/
