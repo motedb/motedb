@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.14.0] — unreleased (W6 in flight)
+## [0.14.0] — 2026-10-12
 
 - **🔑 ASOF JOIN(W8, v0.14)**: 机器人帧↔状态对齐原语
   - `t1 ASOF JOIN t2 ON key = key AND right_ts <= left_ts`(也接受
