@@ -8,9 +8,6 @@ name: Node SDK publish (npm)
 on:
   push:
     tags: ["v*"]
-    paths:
-      - "bindings/node/**"
-      - ".github/workflows/node-publish.yml"
   pull_request:
     paths:
       - "bindings/node/**"

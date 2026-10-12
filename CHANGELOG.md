@@ -15,6 +15,15 @@
   string · bool · nil · []float64↔VECTOR · []byte↔BLOB(JSON 边界对称
   {"$blob": base64}, 出入一致) · time.Time↔TIMESTAMP。go test 5 项:
   CRUD/类型往返/向量 KNN/重开耐久/EPISODES/ASOF/backup 快照
+- **npm 预构建流水线(.github/workflows/node-publish.yml)**:
+  五平台矩阵(macOS arm64/x64 · Linux x64/arm64-gnu · Windows x64)
+  napi build --platform → artifact 上传; PR staging = 每平台
+  npm publish --dry-run 结构校验(pre-publish 含真实发布, PR 严禁);
+  tag 触发 = napi pre-publish 逐包发布 + 根包。
+  本地验证: napi 布局 optionalDependencies 装载 ALL OK(修 index.js
+  suffix 丢连字符)、五平台 dry-run 全过、根包 files 白名单修正
+  (*.node 曾把 8.8MB 开发副本打进根包 tarball)。
+  ⚠️ npm 发布需配置 NPM_TOKEN secret
 - C ABI 扩展(src/ffi.rs): motedb_db_open/db_exec(JSON 参数化, 统一
   execute+query 出 {"columns","rows","affectedRows"})/
   db_checkpoint/db_backup/db_free_string/motedb_last_error; 句柄切

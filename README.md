@@ -276,7 +276,7 @@ Every push runs through three CI workflows:
 |---|---|---|
 | Rust | `motedb` (crates.io) | stable |
 | Python | `motedb-python` (PyPI) | stable |
-| Node.js | `motedb` (npm, bindings/node, napi-rs v3) | preview |
+| Node.js | `motedb` (npm, bindings/node, napi-rs v3) | preview (linux-gnu builds; musl not yet) |
 | Go | `bindings/go` (cgo) | preview |
 
 ## Installation
