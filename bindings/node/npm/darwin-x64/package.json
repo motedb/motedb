@@ -1,0 +1,23 @@
+{
+  "name": "motedb-darwin-x64",
+  "version": "0.15.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "motedb.darwin-x64.node",
+  "files": [
+    "motedb.darwin-x64.node"
+  ],
+  "description": "MoteDB native binding (do not install directly)",
+  "license": "MIT",
+  "engines": {
+    "node": ">= 18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/motedb/motedb.git"
+  },
+  "os": [
+    "darwin"
+  ]
+}

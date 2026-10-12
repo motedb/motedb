@@ -12,6 +12,15 @@ function loadNative() {
   const plat = `${process.platform}-${process.arch}`;
   const local = path.join(__dirname, `motedb.${plat}.node`);
   if (existsSync(local)) return require(local);
+  // napi optionalDependencies layout: motedb-<platform>-<arch>[-gnu]
+  // packages installed alongside this one.
+  const libc = process.platform === 'linux' ? '-gnu' : '';
+  const suffix = `${process.platform}-${process.arch}${libc}`;
+  try {
+    return require(`motedb-${suffix}`);
+  } catch {
+    // fall through to dev layouts
+  }
   const candidates = readdirSync(__dirname).filter(
     (f) => f.endsWith('.node') || f.endsWith('.dylib')
   );

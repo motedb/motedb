@@ -1,0 +1,23 @@
+{
+  "name": "motedb-win32-x64-msvc",
+  "version": "0.15.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "motedb.win32-x64-msvc.node",
+  "files": [
+    "motedb.win32-x64-msvc.node"
+  ],
+  "description": "MoteDB native binding (do not install directly)",
+  "license": "MIT",
+  "engines": {
+    "node": ">= 18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/motedb/motedb.git"
+  },
+  "os": [
+    "win32"
+  ]
+}

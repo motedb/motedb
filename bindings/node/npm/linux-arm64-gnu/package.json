@@ -1,0 +1,26 @@
+{
+  "name": "motedb-linux-arm64-gnu",
+  "version": "0.15.0",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "motedb.linux-arm64-gnu.node",
+  "files": [
+    "motedb.linux-arm64-gnu.node"
+  ],
+  "description": "MoteDB native binding (do not install directly)",
+  "license": "MIT",
+  "engines": {
+    "node": ">= 18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/motedb/motedb.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}
