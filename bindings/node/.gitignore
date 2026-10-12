@@ -2,3 +2,4 @@ target/
 *.node
 *.dylib
 node_modules/
+false
