@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.15.0] — unreleased (SDK cycle)
+
+- **🔑 Node.js SDK(bindings/node, napi-rs v3)**: Database 类 —
+  create-or-open / execute(mutations, ?-params) / query(行对象) /
+  checkpoint / backupTo / close / doctor。值映射: number↔Integer/Float ·
+  number[]↔VECTOR · Buffer 参数↔BLOB · BLOB 结果=base64 ·
+  TIMESTAMP↔µs。napi 3.14 适配: build.rs 注入 -undefined
+  dynamic_lookup(macOS) · Null::from_napi_value 不校验类型 → null 探针
+  必须放链尾(smoke 实抓全变 NULL)。JS 冒烟 debug+release 全过
+- **🔑 Go SDK(bindings/go, cgo)**: Database — Open/Close/Exec/Query/
+  Checkpoint/BackupTo, 经扩展的 C ABI(motedb_db_open/db_exec JSON
+  参数化/last_error/checkpoint/backup)。值映射: int/int64/float64 ·
+  string · bool · nil · []float64↔VECTOR · []byte↔BLOB(JSON 边界对称
+  {"$blob": base64}, 出入一致) · time.Time↔TIMESTAMP。go test 5 项:
+  CRUD/类型往返/向量 KNN/重开耐久/EPISODES/ASOF/backup 快照
+- C ABI 扩展(src/ffi.rs): motedb_db_open/db_exec(JSON 参数化, 统一
+  execute+query 出 {"columns","rows","affectedRows"})/
+  db_checkpoint/db_backup/db_free_string/motedb_last_error; 句柄切
+  高层 api::Database
+
 ## [0.14.0] — 2026-10-12
 
 - **🔑 ASOF JOIN(W8, v0.14)**: 机器人帧↔状态对齐原语

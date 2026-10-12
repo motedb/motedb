@@ -270,6 +270,15 @@ Every push runs through three CI workflows:
 | **Perf Gate** | Query-shape latency *ratios* vs a full-scan baseline — machine-independent budgets that catch complexity-class regressions (e.g. an O(N²) path that slipped through once) |
 | **Fuzz** (daily) | 5 min × 2 targets (`fuzz_sql_parser`, `fuzz_wal_recover`) under AddressSanitizer — found and fixed a parser stack-overflow on day one |
 
+### Multi-language SDKs
+
+| Language | Package | Status |
+|---|---|---|
+| Rust | `motedb` (crates.io) | stable |
+| Python | `motedb-python` (PyPI) | stable |
+| Node.js | `motedb` (npm, bindings/node, napi-rs v3) | preview |
+| Go | `bindings/go` (cgo) | preview |
+
 ## Installation
 
 ```bash
