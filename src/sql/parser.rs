@@ -912,7 +912,8 @@ impl Parser {
             // Alias is REQUIRED for subqueries in FROM
             let alias = if self.match_token(TokenType::As) {
                 self.parse_identifier()?
-            } else if matches!(self.current().token_type, TokenType::Identifier(_)) {
+            } else if matches!(self.current().token_type, TokenType::Identifier(ref w) if !w.eq_ignore_ascii_case("ASOF"))
+            {
                 // Allow implicit alias (without AS keyword)
                 self.parse_identifier()?
             } else {
@@ -945,9 +946,12 @@ impl Parser {
         let name = self.parse_identifier()?;
 
         // Check for optional AS alias
+        // 🔖 ASOF is never an implicit alias: `fr ASOF JOIN jt` must parse
+        // as a join, not as fr{alias:"ASOF"} + Inner join (silently 0 rows).
         let alias = if self.match_token(TokenType::As) {
             Some(self.parse_identifier()?)
-        } else if matches!(self.current().token_type, TokenType::Identifier(_)) {
+        } else if matches!(self.current().token_type, TokenType::Identifier(ref w) if !w.eq_ignore_ascii_case("ASOF"))
+        {
             // Allow implicit alias (without AS keyword)
             Some(self.parse_identifier()?)
         } else {
@@ -959,6 +963,10 @@ impl Parser {
 
     /// Check if current token is a JOIN keyword
     fn is_join_keyword(&self) -> bool {
+        if matches!(self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("ASOF"))
+        {
+            return true;
+        }
         matches!(
             self.current().token_type,
             TokenType::Join
@@ -979,9 +987,23 @@ impl Parser {
             }
             TokenType::Left => {
                 self.advance();
-                self.match_token(TokenType::Outer); // OUTER is optional
+                // 🔖 LEFT ASOF JOIN — left-outer as-of semantics.
+                if matches!(&self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("ASOF"))
+                {
+                    self.advance();
+                    self.expect(TokenType::Join)?;
+                    JoinType::LeftAsOf
+                } else {
+                    self.match_token(TokenType::Outer); // OUTER is optional
+                    self.expect(TokenType::Join)?;
+                    JoinType::Left
+                }
+            }
+            TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("ASOF") => {
+                // 🔖 ASOF JOIN — latest-match per key.
+                self.advance();
                 self.expect(TokenType::Join)?;
-                JoinType::Left
+                JoinType::AsOf
             }
             TokenType::Right => {
                 self.advance();

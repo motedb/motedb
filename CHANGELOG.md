@@ -2,6 +2,18 @@
 
 ## [0.14.0] — unreleased (W6 in flight)
 
+- **🔑 ASOF JOIN(W8, v0.14)**: 机器人帧↔状态对齐原语
+  - `t1 ASOF JOIN t2 ON key = key AND right_ts <= left_ts`(也接受
+    `left_ts >= right_ts` 等价形)— 每左行取同键下 ts 不超过它的最新右行
+  - `LEFT ASOF JOIN` 保留无匹配左行(右侧 NULL);可选键等值(缺省=全局桶)
+  - 实现: 右表按 (key → ts 升序) 建桶, 左行二分 partition_point, O(N·logM)
+  - 基建修复: **隐式别名吞 ASOF**(`fr ASOF JOIN jt` 曾解析为
+    fr{alias:"ASOF"} + Inner JOIN → 静默 0 行); normalize 操作数交换时
+    镜像不等号; 前向形式(left_ts <= right_ts)v1 明确报错
+  - 测试: test_asof_join.rs(4) — 对齐/左保留/反向形式与错误/30×40 抖动
+    时间戳 vs 测试内暴力参照逐行对拍
+- **Perf Gate 新形状**: +blob_scan(0.30x)/rrf_fusion(0.04x)/
+  traj_sim_topk(1.79x) 三个 v0.14 查询形状的比率预算(基线=全表扫描)
 - **🔑 数据集快照(W7, v0.14)**:
   - `COMMIT DATASET 'name' [NOTE '…']` — 钉住全部用户表的当前段集
     (段 = 不可变文件,快照即段 id 清单,近乎免费);清单持久化在

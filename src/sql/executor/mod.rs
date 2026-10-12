@@ -13758,6 +13758,22 @@ impl QueryExecutor {
                         &left_schema,
                         &right_schema,
                     )?,
+                    JoinType::AsOf => self.asof_join(
+                        &left_rows,
+                        &right_rows,
+                        on_condition,
+                        false,
+                        &left_alias,
+                        &right_alias,
+                    )?,
+                    JoinType::LeftAsOf => self.asof_join(
+                        &left_rows,
+                        &right_rows,
+                        on_condition,
+                        true,
+                        &left_alias,
+                        &right_alias,
+                    )?,
                 };
 
                 Ok((joined_rows, Arc::new(combined_schema)))

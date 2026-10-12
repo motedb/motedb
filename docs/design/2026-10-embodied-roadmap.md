@@ -1,6 +1,7 @@
 # 技术方案:具身数据工作流 — v0.13「入场」与 v0.14「品类定义」
 
-> 状态:**W7 数据集快照已实现**(COMMIT/DROP/EXPORT + GC 引用保护,
+> 状态:**W8 收口完成**(ASOF JOIN 对齐原语 + Perf Gate 三新形状 +
+> v0.14 发布)→ Phase 2 全部落地。W7 数据集快照已实现(COMMIT/DROP/EXPORT + GC 引用保护,
 > 3 构造点统一 gc_filter;CHECKOUT 只读视图顺延 — EXPORT 物化覆盖训练
 > 数据管线场景)。W6 Episode 模型已实现(DDL + EPISODES(t) 表函数 + traj_sim
 > DTW 排序, 3 项集成测试含暴力 DTW 对拍)。W5 spike 决议: → 见 docs/design/2026-10-traj-spike.md:

@@ -1887,6 +1887,290 @@ impl QueryExecutor {
         Ok(Some(out))
     }
 
+    /// 🔖 ASOF JOIN (v0.14): for each left row, the latest right row whose
+    /// ts column is ≤ (or <, per ON direction) the left ts — per equality
+    /// key. ON must be exactly `key = key AND right_ts <= left_ts` (one
+    /// equality + one cross-side ts inequality; AND-chained). Residual
+    /// predicates are unsupported v1 (clear error).
+    /// `keep_unmatched_left` = LEFT ASOF: unmatched left rows are emitted
+    /// with NULL right-side columns.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn asof_join(
+        &self,
+        left_rows: &[(u64, SqlRow)],
+        right_rows: &[(u64, SqlRow)],
+        on_condition: &Expr,
+        keep_unmatched_left: bool,
+        left_alias: &str,
+        right_alias: &str,
+    ) -> Result<Vec<(u64, SqlRow)>> {
+        Self::asof_join_impl(
+            self,
+            left_rows,
+            right_rows,
+            on_condition,
+            keep_unmatched_left,
+            left_alias,
+            right_alias,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn asof_join_impl(
+        &self,
+        left_rows: &[(u64, SqlRow)],
+        right_rows: &[(u64, SqlRow)],
+        on_condition: &Expr,
+        keep_unmatched_left: bool,
+        left_alias: &str,
+        right_alias: &str,
+    ) -> Result<Vec<(u64, SqlRow)>> {
+        use crate::sql::ast::BinaryOperator;
+        use std::collections::HashMap;
+
+        // ── Decompose ON ──
+        let mut leaves: Vec<Expr> = Vec::new();
+        fn flatten_and(e: &Expr, out: &mut Vec<Expr>) {
+            if let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } = e
+            {
+                flatten_and(left, out);
+                flatten_and(right, out);
+            } else {
+                out.push(e.clone());
+            }
+        }
+        flatten_and(on_condition, &mut leaves);
+
+        let mut equi: Option<(String, String)> = None;
+        let mut ineq: Option<(BinaryOperator, String, String)> = None;
+        for leaf in &leaves {
+            if let Expr::BinaryOp { left, op, right } = leaf {
+                let (Expr::Column(lc), Expr::Column(rc)) = (left.as_ref(), right.as_ref()) else {
+                    return Err(StorageError::InvalidData(
+                        "ASOF JOIN ON supports only column-to-column equality and one ts                          inequality"
+                            .into(),
+                    ));
+                };
+                match op {
+                    BinaryOperator::Eq if equi.is_none() => {
+                        equi = Some((lc.clone(), rc.clone()));
+                        continue;
+                    }
+                    BinaryOperator::Le
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Ge
+                    | BinaryOperator::Gt
+                        if ineq.is_none() =>
+                    {
+                        ineq = Some((op.clone(), lc.clone(), rc.clone()));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            return Err(StorageError::InvalidData(
+                "ASOF JOIN ON supports exactly one key equality and one ts inequality".into(),
+            ));
+        }
+        let Some((op, x, y)) = ineq else {
+            return Err(StorageError::InvalidData(
+                "ASOF JOIN requires ON <right_ts> <= <left_ts>".into(),
+            ));
+        };
+        // No-equality form: a single global bucket (whole-table as-of).
+        let (k_l, k_r): (Option<String>, Option<String>) = match equi {
+            Some((l, r)) => (Some(l), Some(r)),
+            None => (None, None),
+        };
+
+        // Normalize both pairs to (left-side key, right-side key) by sampling
+        // row keys (same discipline as normalize_join_columns).
+        let (k_l, k_r) = match (&k_l, &k_r) {
+            (Some(l), Some(r)) => {
+                let (a, b) = Self::normalize_join_columns(left_rows, right_rows, l, r);
+                (Some(a), Some(b))
+            }
+            _ => (None, None),
+        };
+        let (x_norm, y_norm) = Self::normalize_join_columns(left_rows, right_rows, &x, &y);
+        // After normalization: x_norm lives in LEFT rows, y_norm in RIGHT rows.
+        // Required shape: right_ts <= left_ts  (or <  for strict).
+        //   normalized op was Le/Ge over (x, y) syntactic — re-derive: the
+        // normalized pair (x_norm, y_norm) corresponds to (left, right)
+        // regardless of the original syntactic order ONLY if normalize
+        // swapped consistently with the op. Simpler: figure out which
+        // normalized column is the ts on each side by membership, then accept
+        // when (op ∈ {Le, Lt} and x_norm is RIGHT ts) or (op ∈ {Ge, Gt} and
+        // x_norm is LEFT ts).
+        // Side resolution: prefer the table-alias qualifier (`j.ts` vs
+        // `f.ts` — same bare name on both sides is common for ts columns);
+        // fall back to row-key membership when a column is unqualified.
+        // membership fallback (no Self inside the nested fn)
+        fn row_has_col(row: &SqlRow, col: &str) -> bool {
+            if row.contains_key(col) {
+                return true;
+            }
+            let suffix = format!(".{col}");
+            row.keys()
+                .any(|k| !k.starts_with("__") && k.ends_with(&suffix))
+        }
+        let side = |col: &str| -> Option<bool> {
+            let qual = col.split('.').next()?;
+            if !left_alias.is_empty() && qual.eq_ignore_ascii_case(left_alias) {
+                return Some(true);
+            }
+            if !right_alias.is_empty() && qual.eq_ignore_ascii_case(right_alias) {
+                return Some(false);
+            }
+            left_rows.first().map(|(_, r)| row_has_col(r, col))
+        };
+        // 🔑 normalize_join_columns swaps the OPERANDS to (left, right)
+        // orientation but does NOT mirror the operator (Eq is symmetric —
+        // Le/Ge are not). Detect the swap via the original side of x and
+        // flip the operator so the constraint stays equivalent:
+        //   j.ts <= f.ts  →  f.ts >= j.ts.
+        let x_orig_side = side(&x); // syntactic x (Some(left)/Some(right))
+        let swapped = x_orig_side.is_some_and(|orig| {
+            let now = if x_norm == x { orig } else { !orig };
+            now != orig
+        });
+        let eff_op = match (&op, swapped) {
+            (BinaryOperator::Le, true) => BinaryOperator::Ge,
+            (BinaryOperator::Lt, true) => BinaryOperator::Gt,
+            (BinaryOperator::Ge, true) => BinaryOperator::Le,
+            (BinaryOperator::Gt, true) => BinaryOperator::Lt,
+            (o, _) => o.clone(),
+        };
+        // Post-normalize, x_norm is the LEFT-side column, y_norm the RIGHT.
+        // Only the canonical backward direction is supported (for each left
+        // row, the latest right row at-or-before its ts). The forward form
+        // (left_ts <= right_ts) is a different primitive — rejected v1.
+        if !matches!(eff_op, BinaryOperator::Ge | BinaryOperator::Gt) {
+            return Err(StorageError::InvalidData(
+                "ASOF JOIN ts inequality must be right_ts <= left_ts".into(),
+            ));
+        }
+        let (ts_left_col, ts_right_col, strict) =
+            (x_norm, y_norm, matches!(eff_op, BinaryOperator::Gt));
+
+        // ── ts extraction (micros) ──
+        fn ts_micros(v: Option<&Value>) -> Result<i64> {
+            match v {
+                Some(Value::Timestamp(t)) => Ok(t.as_micros()),
+                Some(Value::Integer(i)) => Ok(*i),
+                Some(Value::Null) | None => Err(StorageError::InvalidData(
+                    "ASOF JOIN ts columns must be non-NULL (filter NULLs before joining)".into(),
+                )),
+                _ => Err(StorageError::InvalidData(
+                    "ASOF JOIN ts columns must be TIMESTAMP or INTEGER".into(),
+                )),
+            }
+        }
+
+        // ── Build right index: key → (ts, row) sorted by ts ──
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        enum K {
+            I(i64),
+            T(String),
+            B(bool),
+            F(u64),
+        }
+        fn key_of(v: &Value) -> Option<K> {
+            match v {
+                Value::Integer(i) => Some(K::I(*i)),
+                Value::Text(t) => Some(K::T(t.as_str().to_string())),
+                Value::Bool(b) => Some(K::B(*b)),
+                Value::Float(f) => Some(K::F((*f + 0.0).to_bits())),
+                _ => None,
+            }
+        }
+        let mut right_index: HashMap<Option<K>, Vec<(i64, usize)>> = HashMap::new();
+        for (ri, (_, row)) in right_rows.iter().enumerate() {
+            let k: K = match &k_r {
+                Some(kr) => match row.get(kr.as_str()) {
+                    Some(kv) if !matches!(kv, Value::Null) => match key_of(kv) {
+                        Some(k) => k,
+                        None => continue,
+                    },
+                    _ => continue, // NULL keys never match
+                },
+                None => K::I(i64::MIN), // global bucket
+            };
+            let Some(tv) = row.get(&ts_right_col) else {
+                continue;
+            };
+            let Ok(ts) = ts_micros(Some(tv)) else {
+                continue;
+            };
+            right_index.entry(Some(k)).or_default().push((ts, ri));
+        }
+        for v in right_index.values_mut() {
+            v.sort_by_key(|(t, _)| *t);
+        }
+
+        // ── Probe ──
+        let null_right_row: SqlRow = right_rows
+            .first()
+            .map(|(_, r)| r.iter().map(|(k, _)| (k.clone(), Value::Null)).collect())
+            .unwrap_or_default();
+        let mut result: Vec<(u64, SqlRow)> = Vec::with_capacity(left_rows.len());
+        let mut next_id = 0u64;
+        for (_lrid, lrow) in left_rows {
+            let ts_l_val = lrow.get(ts_left_col.as_str());
+            let matched = match (ts_l_val, k_l.as_ref()) {
+                (Some(tv), k_l) => {
+                    let k: Option<K> = match k_l {
+                        Some(kl) => match lrow.get(kl.as_str()) {
+                            Some(kv) if !matches!(kv, Value::Null) => key_of(kv),
+                            _ => None,
+                        },
+                        None => Some(K::I(i64::MIN)), // global bucket
+                    };
+                    let ts_l = ts_micros(Some(tv))?;
+                    k.as_ref()
+                        .and_then(|k| right_index.get(&Some(k.clone())))
+                        .and_then(|list| {
+                            // last entry with ts ≤ (< if strict) ts_l
+                            let pos = if strict {
+                                list.partition_point(|(t, _)| *t < ts_l)
+                            } else {
+                                list.partition_point(|(t, _)| *t <= ts_l)
+                            };
+                            pos.checked_sub(1).map(|p| &list[p])
+                        })
+                }
+                _ => None,
+            };
+            match matched {
+                Some((_rts, ri)) => {
+                    let rrow = &right_rows[*ri].1;
+                    result.push((next_id, self.combine_rows(lrow, rrow)));
+                    next_id += 1;
+                }
+                None if keep_unmatched_left => {
+                    result.push((next_id, self.combine_rows(lrow, &null_right_row)));
+                    next_id += 1;
+                }
+                None => {}
+            }
+        }
+        Ok(result)
+    }
+
+    /// Key-membership helper for ASOF column resolution.
+    fn row_has_col_impl(row: &SqlRow, col: &str) -> bool {
+        if row.contains_key(col) {
+            return true;
+        }
+        let suffix = format!(".{col}");
+        row.keys()
+            .any(|k| !k.starts_with("__") && k.ends_with(&suffix))
+    }
+
     pub(super) fn inner_join(
         &self,
         left_rows: &[(u64, SqlRow)],

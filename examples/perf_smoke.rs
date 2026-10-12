@@ -58,6 +58,55 @@ fn main() {
     }
     println!("setup: {} rows", n);
 
+    // v0.14 shapes: BLOB scan, RRF fusion, traj_sim (episode DTW). A second
+    // table carries the multimodal payloads; sizes kept modest so the gate
+    // stays fast while still catching complexity-class regressions.
+    db.execute("CREATE TABLE payloads (id INT PRIMARY KEY, body TEXT, data BLOB)")
+        .unwrap();
+    for i in 0..20_000i64 {
+        db.execute(&format!(
+            "INSERT INTO payloads VALUES ({}, 'doc {} about grasp {}', X'{}')",
+            i,
+            i,
+            i % 50,
+            "ab".repeat(16)
+        ))
+        .unwrap();
+    }
+    db.execute("CREATE TEXT INDEX payloads_body ON payloads(body)")
+        .unwrap();
+    db.execute(
+        "CREATE EPISODE TABLE teleop (session TEXT, ts TIMESTAMP, joint VECTOR(2)) EPISODE BY (session, ts) GAP 1000000",
+    )
+    .unwrap();
+    for s in 0..2i64 {
+        for e in 0..200i64 {
+            let base = 1_700_000_000_000_000i64 + s * 1_000_000_000_000 + e * 2_000_000_000;
+            for k in 0..64i64 {
+                let x = ((e + k) as f64) * 0.05;
+                db.execute(&format!(
+                    "INSERT INTO teleop VALUES ('s{}', {}, [{}, 0.5])",
+                    s,
+                    base + k * 100_000,
+                    x
+                ))
+                .unwrap();
+            }
+        }
+    }
+    let demo: String = (0..64)
+        .map(|i| format!("{}", i as f64 * 0.05))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let blob_hex = "ab".repeat(16);
+    let blob_scan_sql = format!("SELECT COUNT(*) FROM payloads WHERE data = X'{blob_hex}'");
+    let rrf_sql = "SELECT id FROM RRF((SELECT id FROM payloads WHERE MATCH(body, 'grasp') ORDER BY bm25(body) LIMIT 50), (SELECT id FROM payloads ORDER BY id LIMIT 50), k = 10)";
+    let traj_sql = format!(
+        "SELECT session, t0 FROM EPISODES(teleop) ORDER BY traj_sim(traj_joint, [{}]) LIMIT 10",
+        demo
+    );
+    println!("setup: {} rows (+20k payloads, 400 episodes)", n);
+
     let queries: &[(&str, &str, f64)] = &[
         ("full_scan (baseline)", "SELECT * FROM sales LIMIT 200000", f64::INFINITY),
         ("text_eq_filter", "SELECT id FROM sales WHERE region = 'US' LIMIT 100000", 8.0),
@@ -65,6 +114,9 @@ fn main() {
         ("count_sum_filter", "SELECT COUNT(*), SUM(amount) FROM sales WHERE region = 'US'", 6.0),
         ("order_topk", "SELECT id, amount FROM sales WHERE region = 'US' ORDER BY amount DESC LIMIT 10", 8.0),
         ("in_subquery", "SELECT id FROM sales WHERE customer IN (SELECT customer FROM sales WHERE region = 'US') LIMIT 100000", 14.0),
+        ("blob_scan", blob_scan_sql.as_str(), 10.0),
+        ("rrf_fusion", rrf_sql, 20.0),
+        ("traj_sim_topk", traj_sql.as_str(), 30.0),
     ];
 
     let mut baseline = Duration::ZERO;

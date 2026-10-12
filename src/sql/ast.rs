@@ -165,6 +165,12 @@ pub enum JoinType {
     Left,
     Right,
     Full,
+    /// 🔖 ASOF JOIN — for each left row, the latest right row whose ts is
+    /// ≤ the left ts (per equality key). ON must be `key = key AND
+    /// right_ts <= left_ts`.
+    AsOf,
+    /// 🔖 LEFT ASOF JOIN — unmatched left rows are kept with NULL right side.
+    LeftAsOf,
 }
 
 #[derive(Debug, Clone)]

@@ -173,6 +173,15 @@ One-SQL BM25 ⊕ vector fusion (Reciprocal Rank Fusion, `k`/`rrk`/`w1..w4`
 tunable). `snippet(body, 'grasp failure', 80)` renders FTS5-style excerpts
 with `<b>` highlights.
 
+### Frame↔state alignment: ASOF JOIN (v0.14 work-in-progress)
+
+```sql
+-- For each frame, the latest joint-state at-or-before its timestamp (per session):
+SELECT f.fname, j.q FROM frames f
+ASOF JOIN joints j ON f.session = j.session AND j.ts <= f.ts;
+-- LEFT ASOF JOIN keeps frames with no prior state (NULL right side).
+```
+
 ### Episode model + trajectory search (v0.14 work-in-progress)
 
 ```sql
