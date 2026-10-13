@@ -75,9 +75,9 @@ fn probe_total_docs_vs_live_rows() {
         verify_matches(&db, "pre-close");
     } // clean Drop → flush + marker
 
-    let marker = db_path.join("fts_indexes.fresh");
+    let marker = db_path.join(".clean_close"); // P1 rename: was fts_indexes.fresh
     println!("clean-close marker exists: {}", marker.exists());
-    assert!(marker.exists(), "clean Drop must stamp fts_indexes.fresh");
+    assert!(marker.exists(), "clean Drop must stamp .clean_close");
 
     // open #1: clean reopen — marker gates the stale check, NO rebuild.
     {
@@ -87,7 +87,7 @@ fn probe_total_docs_vs_live_rows() {
         // the end of this scope re-stamps it.
         assert!(
             !marker.exists(),
-            "open must consume fts_indexes.fresh (crash-mid-open safety)"
+            "open must consume .clean_close (crash-mid-open safety)"
         );
         verify_matches(&db, "clean-reopen");
     }

@@ -82,14 +82,18 @@ pub struct ColumnarStore {
 
 impl ColumnarStore {
     /// Create a new columnar store.
+    ///
+    /// 🔑 P1 lazy-file layout: the `columnar/` directory is NOT created here —
+    /// only TimeSeries tables use this engine, and `SegmentManager::open`
+    /// creates `columnar/<table_id>/` (with parents) on the first table
+    /// registration. Pure Standard-table databases stay free of the
+    /// empty legacy directory.
     pub fn create(
         base_dir: &Path,
         config: ColumnarConfig,
         next_row_id: Arc<AtomicU64>,
         table_registry: Arc<TableRegistry>,
     ) -> Result<Self> {
-        std::fs::create_dir_all(base_dir).map_err(StorageError::Io)?;
-
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
             buffers: DashMap::new(),

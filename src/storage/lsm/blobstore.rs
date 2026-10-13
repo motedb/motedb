@@ -33,9 +33,11 @@ const BLOB_COMPRESS_THRESHOLD: usize = 256;
 
 /// Internal mutable state for BlobStore, protected by a single Mutex
 struct BlobState {
-    /// Current active blob file
-    current_file: BlobFile,
-    /// Current file ID
+    /// Current active blob file. 🔑 P1 lazy-file layout: `None` until the
+    /// first `put()` — databases that never route large values through the
+    /// legacy LSM blob path hold no `blobs/` directory or blob file at all.
+    current_file: Option<BlobFile>,
+    /// Current file ID (the next id to materialize; existing files are lower)
     current_file_id: u32,
 }
 
@@ -59,25 +61,25 @@ struct BlobFile {
 }
 
 impl BlobStore {
-    /// Create new blob store
+    /// Create new blob store.
+    ///
+    /// 🔑 P1 lazy-file layout: neither the `blobs/` directory nor the first
+    /// blob file is created here — both materialize on the first `put()`.
+    /// Recovery/id scans already tolerate a missing directory.
     pub fn new<P: AsRef<Path>>(dir: P, max_file_size: usize) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
 
         // Crash recovery: validate and truncate the last blob file to the
         // last valid entry. This handles partial writes from crashes.
         Self::recover_last_blob_file(&dir)?;
 
-        // Find next file ID
+        // Next file ID (max existing + 1; 1 when nothing exists yet)
         let file_id = Self::find_next_file_id(&dir)?;
-
-        // Create first blob file
-        let blob_file = BlobFile::create(&dir, file_id)?;
 
         Ok(Self {
             dir,
             state: Mutex::new(BlobState {
-                current_file: blob_file,
+                current_file: None,
                 current_file_id: file_id,
             }),
             max_file_size,
@@ -92,7 +94,20 @@ impl BlobStore {
             .state
             .lock()
             .map_err(|_| StorageError::Lock("BlobStore state lock poisoned".into()))?;
-        state.current_file.flush()
+        if let Some(f) = state.current_file.as_mut() {
+            f.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Materialize the active blob file on first write. Caller holds the lock.
+    fn ensure_file_locked(&self, state: &mut BlobState) -> Result<()> {
+        if state.current_file.is_none() {
+            std::fs::create_dir_all(&self.dir)?;
+            let f = BlobFile::create(&self.dir, state.current_file_id)?;
+            state.current_file = Some(f);
+        }
+        Ok(())
     }
 
     /// Write large value to blob file
@@ -102,12 +117,22 @@ impl BlobStore {
             .lock()
             .map_err(|_| StorageError::Lock("BlobStore state lock poisoned".into()))?;
 
+        self.ensure_file_locked(&mut state)?;
+
         // Check if need to rotate file
-        if state.current_file.offset + data.len() as u64 + 12 > self.max_file_size as u64 {
+        let need_rotate = state
+            .current_file
+            .as_ref()
+            .is_some_and(|f| f.offset + data.len() as u64 + 12 > self.max_file_size as u64);
+        if need_rotate {
             self.rotate_file_locked(&mut state)?;
         }
 
-        state.current_file.write_blob(data)
+        state
+            .current_file
+            .as_mut()
+            .expect("materialized above")
+            .write_blob(data)
     }
 
     /// Read blob data by reference (supports V1 and V2 formats)
@@ -223,14 +248,17 @@ impl BlobStore {
 
     /// Rotate to a new blob file. Caller must hold the state lock.
     fn rotate_file_locked(&self, state: &mut BlobState) -> Result<()> {
-        // Flush current file
-        state.current_file.flush()?;
+        // Flush current file (if any)
+        if let Some(f) = state.current_file.as_mut() {
+            f.flush()?;
+        }
 
         // Allocate new file ID
         let new_id = state.current_file_id + 1;
+        std::fs::create_dir_all(&self.dir)?;
         let new_file = BlobFile::create(&self.dir, new_id)?;
 
-        state.current_file = new_file;
+        state.current_file = Some(new_file);
         state.current_file_id = new_id;
 
         Ok(())

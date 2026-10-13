@@ -655,8 +655,11 @@ struct PartitionWAL {
     /// WAL file path
     path: PathBuf,
 
-    /// Buffered WAL file (BufWriter amortizes syscalls for Periodic/GroupCommit modes)
-    file: BufWriter<File>,
+    /// Buffered WAL file (BufWriter amortizes syscalls for Periodic/GroupCommit
+    /// modes). 🔑 P1 lazy-file layout: `None` until the first append — a fresh
+    /// or read-mostly database holds zero partition files on disk. Materialized
+    /// by [`Self::ensure_file`]; dropped (and the file unlinked) by checkpoint.
+    file: Option<BufWriter<File>>,
 
     /// Current LSN
     next_lsn: LogSequenceNumber,
@@ -676,22 +679,33 @@ struct PartitionWAL {
 }
 
 impl PartitionWAL {
-    /// Create a new partition WAL with config
+    /// Create a new partition WAL with config.
+    ///
+    /// 🔑 P1 lazy-file layout: does NOT touch disk — the partition file is
+    /// materialized on the first append (see [`Self::ensure_file`]). Recovery
+    /// treats a missing file exactly like a zero-length one (no records).
     fn create_with_config(path: PathBuf, config: WALConfig) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
-
         Ok(Self {
             path,
-            file: BufWriter::new(file),
+            file: None,
             next_lsn: 0,
             last_checkpoint: 0,
             config,
             defer_periodic_flush: false,
         })
+    }
+
+    /// Materialize the on-disk WAL file on first write.
+    fn ensure_file(&mut self) -> Result<&mut BufWriter<File>> {
+        if self.file.is_none() {
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&self.path)?;
+            self.file = Some(BufWriter::new(f));
+        }
+        Ok(self.file.as_mut().expect("just materialized"))
     }
 
     /// Open existing partition WAL with config
@@ -798,7 +812,7 @@ impl PartitionWAL {
 
         Ok(Self {
             path,
-            file: BufWriter::new(file),
+            file: Some(BufWriter::new(file)),
             next_lsn,
             last_checkpoint,
             config,
@@ -806,11 +820,14 @@ impl PartitionWAL {
         })
     }
 
-    /// Flush BufWriter to OS buffer + fsync (for durability)
+    /// Flush BufWriter to OS buffer + fsync (for durability).
+    /// No-op when the partition file was never materialized (nothing buffered).
     fn sync_flush(&mut self) -> Result<()> {
-        self.file.flush()?;
-        // fsync: flush both data and metadata (file size) for durability on all platforms
-        self.file.get_ref().sync_all()?;
+        if let Some(f) = self.file.as_mut() {
+            f.flush()?;
+            // fsync: flush both data and metadata (file size) for durability on all platforms
+            f.get_ref().sync_all()?;
+        }
         Ok(())
     }
 
@@ -828,7 +845,7 @@ impl PartitionWAL {
             }
             DurabilityLevel::GroupCommit { .. } => {
                 // Flush BufWriter to OS buffers; group commit thread handles fsync
-                self.file.flush()?;
+                self.ensure_file()?.flush()?;
             }
             DurabilityLevel::Periodic { .. } => {
                 // 🔑 Process-crash safety (SQLite synchronous=NORMAL / MySQL
@@ -843,7 +860,7 @@ impl PartitionWAL {
                 // deferred to ONE flush at batch end (end_deferred_batch) —
                 // the per-record write() syscall was ~1µs × rows.
                 if !self.defer_periodic_flush {
-                    self.file.flush()?;
+                    self.ensure_file()?.flush()?;
                 }
             }
             DurabilityLevel::NoSync => {}
@@ -903,14 +920,14 @@ impl PartitionWAL {
         let checksum = Checksum::compute(ChecksumType::CRC32C, &write_buf[record_start..]);
         write_buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
 
-        self.file.write_all(&write_buf)?;
+        self.ensure_file()?.write_all(&write_buf)?;
 
         match self.config.durability_level {
             DurabilityLevel::Synchronous => self.sync_flush()?,
             // Process-crash safety: committed bytes reach the OS page cache
             // now; fsync stays on the periodic thread (SQLite
             // synchronous=NORMAL semantics).
-            DurabilityLevel::Periodic { .. } => self.file.flush()?,
+            DurabilityLevel::Periodic { .. } => self.ensure_file()?.flush()?,
             _ => {}
         }
 
@@ -960,14 +977,14 @@ impl PartitionWAL {
         let checksum = Checksum::compute(ChecksumType::CRC32C, &write_buf[record_start..]);
         write_buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
 
-        self.file.write_all(&write_buf)?;
+        self.ensure_file()?.write_all(&write_buf)?;
 
         match self.config.durability_level {
             DurabilityLevel::Synchronous => self.sync_flush()?,
             // Process-crash safety: committed bytes reach the OS page cache
             // now; fsync stays on the periodic thread (SQLite
             // synchronous=NORMAL semantics).
-            DurabilityLevel::Periodic { .. } => self.file.flush()?,
+            DurabilityLevel::Periodic { .. } => self.ensure_file()?.flush()?,
             _ => {}
         }
 
@@ -1037,7 +1054,7 @@ impl PartitionWAL {
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(&payload);
 
-        self.file.write_all(&buf)?;
+        self.ensure_file()?.write_all(&buf)?;
 
         Ok(())
     }
@@ -1087,7 +1104,7 @@ impl PartitionWAL {
         }
 
         // 2. Single write operation (append 模式自动追加)
-        self.file.write_all(&buffer)?;
+        self.ensure_file()?.write_all(&buffer)?;
 
         // 3. Fsync based on durability level
         match self.config.durability_level {
@@ -1097,7 +1114,7 @@ impl PartitionWAL {
             DurabilityLevel::Periodic { .. } => {
                 // Same process-crash contract as append(): records reach the
                 // OS page cache now; fsync stays on the periodic thread.
-                self.file.flush()?;
+                self.ensure_file()?.flush()?;
             }
             DurabilityLevel::NoSync => {}
         }
@@ -1107,14 +1124,17 @@ impl PartitionWAL {
 
     /// Create a checkpoint
     ///
-    /// Uses atomic write-new-rename pattern for crash safety:
-    /// 1. Write checkpoint record and sync
-    /// 2. Create a new empty WAL file at a temp path
-    /// 3. Sync the temp file
-    /// 4. Atomically rename temp → original path
-    /// 5. Reopen the new file
+    /// Crash safety (sync-then-unlink pattern):
+    /// 1. Write checkpoint record and sync — the record is now durable
+    /// 2. Drop the buffered handle, then unlink the file
     ///
-    /// If crash occurs at any point, the original WAL is intact.
+    /// 🔑 P1 lazy-file layout: the file is REMOVED instead of truncated to a
+    /// zero-length shell. At recovery a missing partition file and an empty
+    /// one are equivalent (no records — everything is already in segments),
+    /// so this keeps the steady-state directory free of empty `.wal` files.
+    /// A crash before the unlink leaves the full history intact — the same
+    /// window the old truncate-rename had. The file is re-materialized on
+    /// the next append.
     fn checkpoint(&mut self) -> Result<()> {
         if self.next_lsn == 0 {
             return Ok(());
@@ -1124,32 +1144,18 @@ impl PartitionWAL {
         self.append(WALRecord::Checkpoint { lsn })?;
         self.last_checkpoint = lsn;
 
-        // Ensure checkpoint record is durable BEFORE truncating.
-        self.file.flush()?;
-        self.file.get_ref().sync_all()?;
+        // Ensure checkpoint record is durable BEFORE removing the file.
+        self.sync_flush()?;
 
-        // Atomic truncation: write-new-rename pattern
-        // Create a fresh empty WAL file at a temp path
-        let tmp_path = self.path.with_extension("wal.tmp");
-        {
-            let tmp_file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            tmp_file.sync_all()?;
+        // Drop the handle first (Windows can't unlink an open file), then
+        // remove. Missing file at the next open = fresh empty partition.
+        self.file = None;
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
-
-        // Atomic rename: temp → original (on same filesystem, this is atomic)
-        std::fs::rename(&tmp_path, &self.path)?;
         crate::fsync_dir(&self.path);
-
-        // Reopen the new empty file
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        self.file = BufWriter::new(file);
 
         // Reset counters
         self.next_lsn = 0;
@@ -1169,7 +1175,13 @@ impl PartitionWAL {
 
     fn recover(&mut self) -> Result<Vec<WALRecord>> {
         let mut records = Vec::new();
-        let mut file = File::open(&self.path)?;
+        // P1 lazy-file layout: a partition that was never written (or whose
+        // file was removed by checkpoint) has no records.
+        let mut file = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(records),
+            Err(e) => return Err(e.into()),
+        };
         file.seek(SeekFrom::Start(0))?;
 
         let mut skipped_corrupted = 0;
@@ -1417,6 +1429,9 @@ impl WALManager {
         config: WALConfig,
     ) -> Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
+        // The `wal/` directory itself is created eagerly — it doubles as the
+        // valid-database marker in resolve_open_path. The partition FILES
+        // inside it are lazy (see PartitionWAL::create_with_config).
         std::fs::create_dir_all(&base_path)?;
 
         let partitions = DashMap::new();
@@ -1462,9 +1477,12 @@ impl WALManager {
         for partition_id in 0..num_partitions {
             let wal_path = base_path.join(format!("partition_{}.wal", partition_id));
             if wal_path.exists() {
+                // Existing file must be opened for recovery scan.
                 let wal = PartitionWAL::open_with_config(wal_path, config.clone())?;
                 partitions.insert(partition_id, parking_lot::Mutex::new(wal));
             } else {
+                // Missing file stays missing (P1 lazy layout): the partition
+                // is a fresh empty one; the file materializes on first append.
                 let wal = PartitionWAL::create_with_config(wal_path, config.clone())?;
                 partitions.insert(partition_id, parking_lot::Mutex::new(wal));
             }
@@ -2179,7 +2197,9 @@ impl WALManager {
                 wal.config.durability_level,
                 DurabilityLevel::Periodic { .. }
             ) {
-                let _ = wal.file.flush();
+                if let Some(f) = wal.file.as_mut() {
+                    let _ = f.flush();
+                }
             }
         }
     }
@@ -2299,7 +2319,9 @@ impl WALManager {
             let partition_id = *entry.key();
             let mut wal = entry.value().lock();
             // Flush BufWriter so all written data is visible to the file read
-            let _ = wal.file.flush();
+            if let Some(f) = wal.file.as_mut() {
+                let _ = f.flush();
+            }
             let records = wal.recover()?;
             result.insert(partition_id, records);
         }

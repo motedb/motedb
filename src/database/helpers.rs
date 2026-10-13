@@ -199,7 +199,8 @@ impl MoteDB {
             None => return Ok(()),
         };
 
-        let mut ts_index = self.timestamp_index.write();
+        let ts_idx = self.timestamp_index.ensure()?;
+        let mut ts_index = ts_idx.write();
         let mut count = 0;
 
         for (row_id, row) in rows {

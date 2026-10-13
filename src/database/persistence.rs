@@ -701,7 +701,12 @@ impl MoteDB {
             return Ok(());
         }
 
-        self.timestamp_index.write().flush()?;
+        // P1 lazy: flush only an already-materialized timestamp index —
+        // flushing an uninitialized one would create the file on
+        // TIMESTAMP-free databases at close/checkpoint.
+        if let Some(ts_idx) = self.timestamp_index.get_if_init() {
+            ts_idx.write().flush()?;
+        }
         self.flush_vector_indexes()?;
         self.flush_text_indexes()?;
         self.flush_ioctree_indexes()?;
@@ -741,7 +746,12 @@ impl MoteDB {
                 ));
             }
         }
-        self.timestamp_index.write().flush()?;
+        // P1 lazy: flush only an already-materialized timestamp index —
+        // flushing an uninitialized one would create the file on
+        // TIMESTAMP-free databases at close/checkpoint.
+        if let Some(ts_idx) = self.timestamp_index.get_if_init() {
+            ts_idx.write().flush()?;
+        }
         self.flush_vector_indexes()?;
         self.flush_text_indexes()?;
         self.flush_ioctree_indexes()?;

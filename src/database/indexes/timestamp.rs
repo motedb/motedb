@@ -8,6 +8,64 @@ use crate::Result;
 
 use crate::database::core::MoteDB;
 
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+
+/// 🔑 P1 lazy-file layout wrapper around the timestamp B-tree index
+/// (`indexes/timestamp.idx`).
+///
+/// The on-disk file materializes on the first WRITE-path use (row indexing,
+/// recovery insert, rebuild). Read-only paths (range query, stats, flush,
+/// checkpoint rebuild) treat an uninitialized index as empty — uninitialized
+/// ⟺ no TIMESTAMP-first row was ever inserted in any run, so they have
+/// nothing to read. Databases without TIMESTAMP columns never create the
+/// file or the `indexes/` directory.
+#[derive(Clone)]
+pub(crate) struct LazyTsIndex {
+    path: PathBuf,
+    inner: Arc<OnceLock<Arc<parking_lot::RwLock<crate::index::btree::BTree>>>>,
+}
+
+impl LazyTsIndex {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            inner: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Get or create the index handle. First call materializes the on-disk
+    /// file (`BTree::with_config` creates parent directories).
+    pub(crate) fn ensure(&self) -> Result<Arc<parking_lot::RwLock<crate::index::btree::BTree>>> {
+        if let Some(idx) = self.inner.get() {
+            return Ok(Arc::clone(idx));
+        }
+        let idx = Arc::new(parking_lot::RwLock::new(
+            crate::index::btree::BTree::with_config(
+                self.path.clone(),
+                crate::index::btree::BTreeConfig {
+                    unique_keys: false, // Allow duplicate timestamps
+                    allow_updates: true,
+                    ..Default::default()
+                },
+            )?,
+        ));
+        // Lost a concurrent init race: discard ours and hand out the winner.
+        let _ = self.inner.set(idx);
+        Ok(Arc::clone(
+            self.inner.get().expect("initialized above or by winner"),
+        ))
+    }
+
+    /// Access without initializing: `None` when the index was never
+    /// materialized in this process run (and, invariantly, holds no data).
+    pub(crate) fn get_if_init(
+        &self,
+    ) -> Option<Arc<parking_lot::RwLock<crate::index::btree::BTree>>> {
+        self.inner.get().cloned()
+    }
+}
+
 /// Query performance profile
 #[derive(Debug, Clone)]
 pub struct QueryProfile {
@@ -42,8 +100,36 @@ impl MoteDB {
         use std::time::Instant;
         let start = Instant::now();
 
-        // Get max indexed timestamp to avoid reprocessing
-        let max_indexed_ts = self.timestamp_index.read().max_key()?.unwrap_or(0);
+        // P1 lazy fast path: when NO registered table has a TIMESTAMP column,
+        // there is nothing to index ever — skip the scan without touching the
+        // lazy index file (a TIMESTAMP-free database must not materialize
+        // indexes/ at checkpoint).
+        //
+        // NOTE: the "index initialized" check is NOT sufficient here — tables
+        // whose timestamp column is not FIRST are indexed only by this scan
+        // (index_row_timestamp handles ts-first rows only), so an
+        // uninitialized index can still have indexable rows in segments.
+        let any_ts_table = self.table_registry.list_tables()?.iter().any(|t| {
+            self.table_registry
+                .get_table(t)
+                .map(|s| {
+                    s.columns
+                        .iter()
+                        .any(|c| matches!(c.col_type, crate::types::ColumnType::Timestamp))
+                })
+                .unwrap_or(false)
+        });
+        if !any_ts_table {
+            return Ok(());
+        }
+
+        // Get max indexed timestamp to avoid reprocessing (0 when the lazy
+        // index was never materialized — full scan indexes everything).
+        let ts_handle = self.timestamp_index.get_if_init();
+        let max_indexed_ts = match &ts_handle {
+            Some(idx) => idx.read().max_key()?.unwrap_or(0),
+            None => 0,
+        };
 
         // Use LSM range scan for each known table (O(SSTable_count), not O(N))
         let mut entries_to_index = Vec::new();
@@ -125,10 +211,11 @@ impl MoteDB {
             }
         }
 
-        // Batch insert into index
+        // Batch insert into index (materializes the lazy file on first entries)
         let count = entries_to_index.len();
         if count > 0 {
-            let mut ts_index = self.timestamp_index.write();
+            let ts_idx = self.timestamp_index.ensure()?;
+            let mut ts_index = ts_idx.write();
             for (timestamp, row_id) in entries_to_index {
                 ts_index.insert(timestamp, row_id)?;
             }
@@ -185,16 +272,20 @@ impl MoteDB {
     ) -> Result<(Vec<RowId>, QueryProfile)> {
         let total_start = std::time::Instant::now();
 
-        // 1. Query from persisted index (flushed data)
+        // 1. Query from persisted index (flushed data). P1 lazy: an
+        // uninitialized index holds no rows — query without materializing.
         let index_start = std::time::Instant::now();
         let start_u64 = start as u64;
         let end_u64 = end as u64;
-        let index_results = if let Some(lim) = limit {
-            self.timestamp_index
-                .read()
-                .range_with_limit(&start_u64, &end_u64, lim)?
-        } else {
-            self.timestamp_index.read().range(&start_u64, &end_u64)?
+        let index_results: Vec<(u64, RowId)> = match self.timestamp_index.get_if_init() {
+            None => Vec::new(),
+            Some(idx) => {
+                if let Some(lim) = limit {
+                    idx.read().range_with_limit(&start_u64, &end_u64, lim)?
+                } else {
+                    idx.read().range(&start_u64, &end_u64)?
+                }
+            }
         };
         let mut result_ids: Vec<RowId> = index_results
             .into_iter()
@@ -323,6 +414,9 @@ impl MoteDB {
 
     /// Get timestamp index statistics
     pub fn timestamp_index_stats(&self) -> crate::index::btree::BTreeStats {
-        self.timestamp_index.read().stats()
+        match self.timestamp_index.get_if_init() {
+            Some(idx) => idx.read().stats(),
+            None => crate::index::btree::BTreeStats::default(),
+        }
     }
 }

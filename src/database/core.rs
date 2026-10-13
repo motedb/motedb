@@ -10,7 +10,6 @@
 use crate::cache::RowCache;
 use crate::catalog::TableRegistry;
 use crate::config::DBConfig;
-use crate::index::btree::{BTree, BTreeConfig};
 use crate::index::column_value::ColumnValueIndex;
 use crate::index::ioctree::IOctreeIndex;
 use crate::index::text_fts::TextFTSIndex;
@@ -42,8 +41,10 @@ pub struct MoteDB {
     /// LSM-Tree storage engine (main data storage)
     pub(crate) lsm_engine: Arc<LSMEngine>,
 
-    /// Timestamp index (using BTree for persistent storage)
-    pub(crate) timestamp_index: Arc<RwLock<BTree>>,
+    /// Timestamp index (using BTree for persistent storage).
+    /// 🔑 P1 lazy-file layout: the file materializes on first write-path use —
+    /// databases without TIMESTAMP columns never create `indexes/`.
+    pub(crate) timestamp_index: crate::database::indexes::timestamp::LazyTsIndex,
 
     /// Next row ID (lock-free atomic counter)
     pub(crate) next_row_id: Arc<AtomicU64>,
@@ -437,18 +438,12 @@ impl MoteDB {
             wal_config,
         )?);
 
-        // Create timestamp index with BTree storage (放在 indexes/ 目录)
-        std::fs::create_dir_all(&indexes_dir)?;
-        let timestamp_storage = indexes_dir.join("timestamp.idx");
-        let btree_config = BTreeConfig {
-            unique_keys: false, // Allow duplicate timestamps
-            allow_updates: true,
-            ..Default::default()
-        };
-        let timestamp_index = Arc::new(RwLock::new(BTree::with_config(
-            timestamp_storage,
-            btree_config,
-        )?));
+        // 🔑 P1 lazy-file layout: the timestamp index (and the `indexes/`
+        // directory) materialize on first write-path use — see LazyTsIndex.
+        // User secondary indexes / FTS create `indexes/` on their own DDL.
+        let timestamp_index = crate::database::indexes::timestamp::LazyTsIndex::new(
+            indexes_dir.join("timestamp.idx"),
+        );
 
         // Create LSM-Tree storage engine
         std::fs::create_dir_all(&lsm_dir)?;
@@ -903,8 +898,13 @@ impl MoteDB {
         // suspect (crash / kill -9) ⇒ the stale-count check in the rebuild
         // loop below runs and rebuilds on mismatch. Captured BEFORE removal
         // (a crash mid-open must never leave a stale marker behind).
-        let clean_close = db_path.join("fts_indexes.fresh").exists();
-        let _ = std::fs::remove_file(db_path.join("fts_indexes.fresh"));
+        // P1 file-layout: renamed `fts_indexes.fresh` → `.clean_close`
+        // (dot-prefixed, hidden); the legacy name is still honored once.
+        let clean_close_marker = db_path.join(".clean_close");
+        let legacy_marker = db_path.join("fts_indexes.fresh");
+        let clean_close = clean_close_marker.exists() || legacy_marker.exists();
+        let _ = std::fs::remove_file(&clean_close_marker);
+        let _ = std::fs::remove_file(&legacy_marker);
 
         // 🎯 统一目录结构：从 {name}.mote/ 目录读取
         let wal_path = db_path.join("wal");
@@ -938,18 +938,18 @@ impl MoteDB {
         // TimeSeries data is replayed separately into the columnar store below.
         let recovered_records = wal.recover()?;
 
-        // Open timestamp index with BTree storage (从 indexes/ 目录)
+        // 🔑 P1 lazy-file layout: open the persisted timestamp index ONLY if
+        // the file exists (missing ⟺ no TIMESTAMP-first row was ever indexed
+        // in any run). Never materialize it merely to count an empty tree.
         std::fs::create_dir_all(&indexes_dir)?;
         let timestamp_storage = indexes_dir.join("timestamp.idx");
-        let btree_config = BTreeConfig {
-            unique_keys: false,
-            allow_updates: true,
-            ..Default::default()
+        let timestamp_index =
+            crate::database::indexes::timestamp::LazyTsIndex::new(timestamp_storage.clone());
+        let persisted_count = if timestamp_storage.exists() {
+            timestamp_index.ensure()?.read().len()
+        } else {
+            0
         };
-        let mut timestamp_idx = BTree::with_config(timestamp_storage, btree_config)?;
-
-        // Get total entries from timestamp index (already persisted data)
-        let persisted_count = timestamp_idx.len();
 
         let mut max_row_id = if persisted_count > 0 {
             // Estimate max_row_id from persisted count
@@ -1008,7 +1008,9 @@ impl MoteDB {
                         max_row_id = max_row_id.max(*row_id);
                         if *txn_id == 0 || committed_txns.contains(txn_id) {
                             if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
-                                if let Err(e) = timestamp_idx.insert(ts.as_micros_u64(), *row_id) {
+                                let ts_idx = timestamp_index.ensure()?;
+                                let mut guard = ts_idx.write();
+                                if let Err(e) = guard.insert(ts.as_micros_u64(), *row_id) {
                                     warn_log!(
                                         "[Recovery] Timestamp index insert failed for row {}: {}",
                                         row_id,
@@ -1039,9 +1041,9 @@ impl MoteDB {
                                 crate::storage::row_format::decode(raw_data, &col_types)
                             {
                                 if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
-                                    if let Err(e) =
-                                        timestamp_idx.insert(ts.as_micros_u64(), *row_id)
-                                    {
+                                    let ts_idx = timestamp_index.ensure()?;
+                                    let mut guard = ts_idx.write();
+                                    if let Err(e) = guard.insert(ts.as_micros_u64(), *row_id) {
                                         warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
                                     }
                                 }
@@ -1052,8 +1054,6 @@ impl MoteDB {
                 }
             }
         }
-
-        let timestamp_index = Arc::new(RwLock::new(timestamp_idx));
 
         // Initialize write_lsn early for WAL recovery replay.
         // Must exceed any pre-existing timestamp AND the persisted LSN from
@@ -1901,7 +1901,7 @@ impl MoteDB {
                     // Rebuild on ANY count mismatch. NULL texts are legitimately
                     // unindexed, so mismatched-but-clean tables (NULL-bearing)
                     // also rebuild here — that is crash-path-only work: a clean
-                    // Drop stamps `fts_indexes.fresh`, and open skips this
+                    // Drop stamps `.clean_close`, and open skips this
                     // check entirely when the marker was present (marker is
                     // consumed at open start, above). Replayed/corrupt triggers
                     // stay live regardless of the marker — they carry their own
@@ -3183,12 +3183,12 @@ impl MoteDB {
     /// 🔒 v0.12.9 clean-close marker: flush the FTS indexes (bounded — never
     /// hang the caller on a wedged index write lock; skipping the marker
     /// just means the next open pays the crash-verify path) and durably
-    /// stamp `fts_indexes.fresh`. CALLER MUST HOLD THE EXCLUSIVE LOCK — see
-    /// `holds_exclusive_lock`.
+    /// stamp `.clean_close` (v0.16 rename of `fts_indexes.fresh`).
+    /// CALLER MUST HOLD THE EXCLUSIVE LOCK — see `holds_exclusive_lock`.
     pub(crate) fn stamp_fts_freshness_marker(&self, who: &str) {
         if !self.try_flush_text_indexes_bounded(std::time::Duration::from_secs(2)) {
             warn_log!(
-                "{who} ⚠️ FTS flush not confirmed — skipping fts_indexes.fresh stamp \
+                "{who} ⚠️ FTS flush not confirmed — skipping .clean_close stamp \
                  (next open pays crash-verify)"
             );
             return;
@@ -3199,8 +3199,8 @@ impl MoteDB {
         // STRICTLY AFTER the flushed index data so a power loss can never
         // leave the marker claiming freshness for postings that didn't
         // survive.
-        let marker = self.path.join("fts_indexes.fresh");
-        let tmp = self.path.join(".fts_indexes.fresh.tmp");
+        let marker = self.path.join(".clean_close");
+        let tmp = self.path.join(".clean_close.tmp");
         let stamped = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut f = std::fs::File::create(&tmp)?;
@@ -3215,7 +3215,7 @@ impl MoteDB {
         match stamped {
             Ok(()) => debug_log!("{who} ✅ FTS flushed, freshness marker stamped"),
             Err(e) => warn_log!(
-                "{who} ⚠️ fts_indexes.fresh stamp failed ({e:?}) — next open pays crash-verify"
+                "{who} ⚠️ .clean_close stamp failed ({e:?}) — next open pays crash-verify"
             ),
         }
     }

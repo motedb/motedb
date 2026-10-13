@@ -2115,10 +2115,11 @@ impl MoteDB {
     /// fetched), exactly like recovery-built entries.
     pub(crate) fn index_row_timestamp(&self, row: &Row, row_id: RowId) {
         if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
-            let _ = self
-                .timestamp_index
-                .write()
-                .insert(ts.as_micros_u64(), row_id);
+            // Write path: materializes the index file on first TIMESTAMP row.
+            let ts_idx = self.timestamp_index.ensure();
+            if let Ok(idx) = ts_idx {
+                let _ = idx.write().insert(ts.as_micros_u64(), row_id);
+            }
         }
     }
 
