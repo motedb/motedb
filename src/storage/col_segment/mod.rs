@@ -14,7 +14,7 @@ mod merge;
 mod segment;
 mod store;
 
-pub use manifest::{Manifest, ManifestState};
+pub use manifest::{migrate_to_global, Manifest, ManifestState, SharedManifest, LOCAL_TABLE_ID};
 pub use merge::MergeCursor;
 pub use segment::Segment;
 pub use store::{

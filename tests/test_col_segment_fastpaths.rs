@@ -13,7 +13,7 @@ use tempfile::TempDir;
 fn make_store(col_types: Vec<ColumnType>) -> (TempDir, std::sync::Arc<ColSegmentStore>) {
     let dir = TempDir::new().unwrap();
     // Use a fixed sub-name so create can be called once.
-    let store = ColSegmentStore::create(dir.path(), "t", col_types).unwrap();
+    let store = ColSegmentStore::create(dir.path(), "t", col_types, None).unwrap();
     (dir, store)
 }
 

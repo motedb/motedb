@@ -12,7 +12,7 @@ fn col_types() -> Vec<ColumnType> {
 #[test]
 fn s1_single_segment_get() {
     let dir = TempDir::new().unwrap();
-    let store = ColSegmentStore::create(dir.path(), "t", col_types()).unwrap();
+    let store = ColSegmentStore::create(dir.path(), "t", col_types(), None).unwrap();
     store
         .append_rows(&[
             (1, 100, vec![Value::Integer(10), Value::Text("a".into())]),
@@ -36,7 +36,7 @@ fn s1_single_segment_get() {
 #[test]
 fn s2_multiple_flushes_create_multiple_segments() {
     let dir = TempDir::new().unwrap();
-    let store = ColSegmentStore::create(dir.path(), "t", col_types()).unwrap();
+    let store = ColSegmentStore::create(dir.path(), "t", col_types(), None).unwrap();
 
     store
         .append_rows(&[
@@ -61,7 +61,7 @@ fn s2_multiple_flushes_create_multiple_segments() {
 #[test]
 fn s3_merge_all_distinct_keys_across_segments() {
     let dir = TempDir::new().unwrap();
-    let store = ColSegmentStore::create(dir.path(), "t", col_types()).unwrap();
+    let store = ColSegmentStore::create(dir.path(), "t", col_types(), None).unwrap();
     store
         .append_rows(&[
             (1, 100, vec![Value::Integer(10), Value::Text("a".into())]),
@@ -84,7 +84,7 @@ fn s3_merge_all_distinct_keys_across_segments() {
 #[test]
 fn s3_merge_newest_version_wins() {
     let dir = TempDir::new().unwrap();
-    let store = ColSegmentStore::create(dir.path(), "t", col_types()).unwrap();
+    let store = ColSegmentStore::create(dir.path(), "t", col_types(), None).unwrap();
     // seg1: key=1 val=10 ts=100
     store
         .append_rows(&[(1, 100, vec![Value::Integer(10), Value::Text("old".into())])])
@@ -108,25 +108,23 @@ fn s4_manifest_records_and_recovers() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("MANIFEST");
     {
-        let mut m = Manifest::create(&path).unwrap();
-        m.add_segment(1).unwrap();
-        m.add_segment(2).unwrap();
-        m.record_compaction(3, &[1, 2]).unwrap();
+        // v2 manifest: records carry the table id (LOCAL_TABLE_ID here).
+        let mut m = Manifest::open_or_create_local(dir.path()).unwrap();
+        let tid = motedb::storage::col_segment::LOCAL_TABLE_ID;
+        m.add_segment(tid, 1).unwrap();
+        m.add_segment(tid, 2).unwrap();
+        m.record_compaction(tid, 3, &[1, 2]).unwrap();
+        m.sync().unwrap();
     }
     // Reopen and replay.
-    let m = Manifest::open(&path).unwrap();
+    let m = Manifest::open_or_create_local(path.parent().unwrap()).unwrap();
     let state: ManifestState = m.replay();
-    assert!(state.active_segments.contains(&3), "new segment 3 active");
+    let ts = state.table(motedb::storage::col_segment::LOCAL_TABLE_ID);
+    assert!(ts.active_segments.contains(&3), "new segment 3 active");
+    assert!(!ts.active_segments.contains(&1), "old segment 1 superseded");
+    assert!(!ts.active_segments.contains(&2), "old segment 2 superseded");
     assert!(
-        !state.active_segments.contains(&1),
-        "old segment 1 superseded"
-    );
-    assert!(
-        !state.active_segments.contains(&2),
-        "old segment 2 superseded"
-    );
-    assert!(
-        state.obsolete_files.contains(&1) && state.obsolete_files.contains(&2),
+        ts.obsolete_files.contains(&1) && ts.obsolete_files.contains(&2),
         "old files pending GC"
     );
 }
@@ -134,7 +132,7 @@ fn s4_manifest_records_and_recovers() {
 #[test]
 fn s5_compaction_merges_to_one_segment() {
     let dir = TempDir::new().unwrap();
-    let store = ColSegmentStore::create(dir.path(), "t", col_types()).unwrap();
+    let store = ColSegmentStore::create(dir.path(), "t", col_types(), None).unwrap();
     for start in [0u64, 2, 4] {
         store
             .append_rows(&[
@@ -169,7 +167,7 @@ fn s5_compaction_merges_to_one_segment() {
 #[test]
 fn s5_compaction_dedups_same_key() {
     let dir = TempDir::new().unwrap();
-    let store = ColSegmentStore::create(dir.path(), "t", col_types()).unwrap();
+    let store = ColSegmentStore::create(dir.path(), "t", col_types(), None).unwrap();
     // 3 segments all with key=1, increasing ts
     for ts in [100u64, 200, 300] {
         store

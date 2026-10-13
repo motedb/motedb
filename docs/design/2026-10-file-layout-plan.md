@@ -2,7 +2,7 @@
 
 - 日期: 2026-10-13
 - 前置: [2026-10-file-layout.md](./2026-10-file-layout.md)(评定)及单文件格式分析
-- 状态: **P1 已实施并验收**(惰性创建 + 死文件清理;tests/test_file_layout.rs 5/5,全量回归无 FAILED,clippy --all-targets 0 警告);P2~P4 待开工
+- 状态: **P1+P2 已实施并验收**(P1 惰性创建;P2 全局单一 MANIFEST + 旧布局迁移。tests/test_file_layout.rs 5/5、tests/test_global_manifest.rs 6/6,含迁移/中断迁移/DROP/孤儿领养/fd 实测 50 表进程 fd<40;clippy --all-targets 0 警告);P3~P4 待开工
 - 定位依据: 运行时=收敛目录格式,运输/分发=单文件快照(EXPORT),部署=只读容器(远期)
 
 ## 0. 总览

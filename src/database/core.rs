@@ -129,6 +129,12 @@ pub struct MoteDB {
     pub(crate) col_segment_stores:
         Arc<DashMap<String, Arc<crate::storage::col_segment::ColSegmentStore>>>,
 
+    /// 🔑 P2 global layout: the single `columnar_ms/MANIFEST` shared by every
+    /// ColSegmentStore (one manifest file + one fd per database, not per
+    /// table). Constructed at create/open (folding any legacy per-table
+    /// manifests in) and handed to every store.
+    pub(crate) col_manifest: crate::storage::col_segment::SharedManifest,
+
     /// 🚀 In-memory PK lookup: table_name → (PK_value_key → RowId)
     /// Bypasses disk-based column index for O(1) PK → row_id resolution.
     /// Only populated for non-AUTO_INCREMENT primary keys.
@@ -484,6 +490,13 @@ impl MoteDB {
 
         // Create columnar store for TimeSeries tables (shares next_row_id and table_registry)
         let columnar_dir = db_path.join("columnar");
+        // 🔑 P2 global layout: one shared columnar_ms manifest for the whole
+        // database (a fresh create has no legacy per-table manifests — the
+        // migrate call degenerates to open_or_create).
+        let col_manifest = crate::storage::col_segment::migrate_to_global(
+            &db_path,
+            &std::collections::HashMap::new(),
+        )?;
         let columnar_store = Arc::new(crate::storage::ColumnarStore::create(
             &columnar_dir,
             config.columnar_config.clone(),
@@ -567,6 +580,7 @@ impl MoteDB {
             columnar_sstables,
             columnar_write_bufs: Arc::new(DashMap::new()),
             col_segment_stores: Arc::new(DashMap::new()),
+            col_manifest,
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
@@ -844,6 +858,7 @@ impl MoteDB {
             columnar_sstables: self.columnar_sstables.clone(),
             columnar_write_bufs: self.columnar_write_bufs.clone(),
             col_segment_stores: self.col_segment_stores.clone(),
+            col_manifest: self.col_manifest.clone(),
             pk_lookup: self.pk_lookup.clone(),
             table_row_count: self.table_row_count.clone(),
             table_registry: self.table_registry.clone(),
@@ -1356,6 +1371,14 @@ impl MoteDB {
             }
         }
 
+        // 🔑 P2 global layout: fold legacy per-table manifests into the single
+        // global columnar_ms/MANIFEST (no-op when already migrated).
+        let name_to_id: std::collections::HashMap<String, u32> = table_registry
+            .list_tables()?
+            .into_iter()
+            .filter_map(|n| table_registry.get_table_id(&n).ok().map(|id| (n, id)))
+            .collect();
+        let col_manifest = crate::storage::col_segment::migrate_to_global(&db_path, &name_to_id)?;
         let columnar_store = Arc::new(crate::storage::ColumnarStore::create(
             &columnar_dir,
             config.columnar_config.clone(),
@@ -1473,6 +1496,7 @@ impl MoteDB {
             columnar_sstables: Arc::new(DashMap::new()),
             columnar_write_bufs: Arc::new(DashMap::new()),
             col_segment_stores: Arc::new(DashMap::new()),
+            col_manifest,
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
@@ -1521,11 +1545,16 @@ impl MoteDB {
                                     continue;
                                 }
                                 let col_types = schema.col_types().to_vec();
+                                let table_id = db
+                                    .table_registry
+                                    .get_table_id(&table_name)
+                                    .unwrap_or(crate::storage::col_segment::LOCAL_TABLE_ID);
                                 if let Ok(store) =
                                     crate::storage::col_segment::ColSegmentStore::create(
                                         &db.path,
                                         &table_name,
                                         col_types,
+                                        Some((db.col_manifest.clone(), table_id)),
                                     )
                                 {
                                     store.recover_from_disk();

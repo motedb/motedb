@@ -392,7 +392,13 @@ pub struct ColSegmentStore {
     /// (the v0.5.0 large_batch_durability race — 5000 of 10000 rows lost).
     flush_merge_lock: parking_lot::Mutex<()>,
     next_segment_id: AtomicU64,
-    manifest: Mutex<Manifest>,
+    /// 🔑 P2 global layout: the SHARED database-wide manifest (one file, one
+    /// fd for all tables). Records are tagged with `table_id`. In local
+    /// (unit-test) mode all stores in the test share one local manifest with
+    /// `LOCAL_TABLE_ID`.
+    manifest: super::manifest::SharedManifest,
+    /// This table's registry id (or LOCAL_TABLE_ID in local mode).
+    table_id: u32,
     /// Column types for this table. Lock-free atomic swap so ALTER TABLE
     /// ADD COLUMN can extend it without invalidating the store or risking
     /// deadlock with the write_buf / flush_merge_lock holders below.
@@ -480,19 +486,26 @@ const POINT_QUERY_EVICT_INTERVAL: u64 = 4096;
 impl ColSegmentStore {
     /// Create a new store for a table at `base_dir/columnar_ms/<table_name>/`.
     /// (`columnar_ms` to avoid clashing with the time-series `columnar/` dir.)
+    /// `shared`: `Some((manifest, table_id))` — production global mode (one
+    /// manifest file for the whole database, records tagged with the
+    /// registry table id). `None` — local mode (unit tests): a per-table
+    /// manifest inside the table directory, records use LOCAL_TABLE_ID.
     pub fn create(
         base_dir: &Path,
         table_name: &str,
         col_types: Vec<ColumnType>,
+        shared: Option<(super::manifest::SharedManifest, u32)>,
     ) -> Result<Arc<Self>> {
         let dir = base_dir.join("columnar_ms").join(table_name);
         std::fs::create_dir_all(&dir)?;
-        let manifest_path = dir.join("MANIFEST");
-        let manifest_exists = manifest_path.exists();
-        let manifest = if manifest_exists {
-            Manifest::open(&manifest_path)?
-        } else {
-            Manifest::create(&manifest_path)?
+        let (manifest, table_id) = match shared {
+            Some((m, tid)) => (m, tid),
+            None => (
+                std::sync::Arc::new(parking_lot::Mutex::new(Manifest::open_or_create_local(
+                    &dir,
+                )?)),
+                super::manifest::LOCAL_TABLE_ID,
+            ),
         };
         let buf_path = dir.join(".writebuf.tmp");
         let write_buf = ColumnarSSTableBuilder::new(&buf_path, col_types.clone());
@@ -503,7 +516,8 @@ impl ColSegmentStore {
             write_buf: Mutex::new(write_buf),
             flush_merge_lock: parking_lot::Mutex::new(()),
             next_segment_id: AtomicU64::new(1),
-            manifest: Mutex::new(manifest),
+            manifest,
+            table_id,
             col_types: ArcSwap::from_pointee(col_types),
             groupby_cache: RwLock::new(std::collections::HashMap::new()),
             in_hash_cache: RwLock::new(std::collections::HashMap::new()),
@@ -520,12 +534,11 @@ impl ColSegmentStore {
             pending_gc: Mutex::new(Vec::new()),
             gc_filter: parking_lot::RwLock::new(None),
         });
-        // 🔥 Auto-recover segments from disk if the MANIFEST has active entries.
-        // This handles the restart case: get_or_create_col_segment_store is called
-        // on a table that has data on disk from a previous session.
-        if manifest_exists {
-            store.recover_from_disk();
-        }
+        // 🔥 Auto-recover segments from the manifest + directory scan.
+        // No-op for brand-new tables (empty state, empty dir). Handles the
+        // restart case: get_or_create_col_segment_store is called on a table
+        // that has data on disk from a previous session.
+        store.recover_from_disk();
         Ok(store)
     }
 
@@ -728,7 +741,7 @@ impl ColSegmentStore {
         old_buf.finish()?;
         let seg = Arc::new(Segment::open(&path, id)?);
         // Record in manifest (fsync'd) BEFORE exposing in memory.
-        self.manifest.lock().add_segment(id)?;
+        self.manifest.lock().add_segment(self.table_id, id)?;
         {
             let mut list = self.segs().as_ref().clone();
             list.push(seg);
@@ -778,8 +791,18 @@ impl ColSegmentStore {
         }
         // Delete the manifest file so a reopen finds no manifest → creates a
         // fresh one with no segments.
-        let manifest_path = self.dir.join("MANIFEST");
-        let _ = std::fs::remove_file(&manifest_path);
+        if self.table_id == super::manifest::LOCAL_TABLE_ID {
+            // Local (test) mode: the manifest file belongs to this table alone.
+            let manifest_path = self.dir.join("MANIFEST");
+            let _ = std::fs::remove_file(&manifest_path);
+        } else {
+            // Global mode: record the drop so a leftover file from a failed
+            // delete is never adopted as an orphan at reopen. Append-only
+            // (no fsync — the registry DROP already committed; a lost record
+            // at worst leaves a deletable directory, never resurrected data
+            // because the table is gone from the catalog).
+            let _ = self.manifest.lock().record_drop_table(self.table_id);
+        }
         Ok(())
     }
 
@@ -4415,16 +4438,22 @@ impl ColSegmentStore {
     /// active segment ids, opens each .sst file, and loads them into memory.
     /// Ensures no data loss on crash (ACID durability).
     pub fn recover_from_disk(&self) {
-        // Read MANIFEST to get active segment ids.
-        let manifest_path = self.dir.join("MANIFEST");
-        if !manifest_path.exists() {
+        // Replay the (shared) manifest and take THIS table's slice.
+        let state = self.manifest.lock().replay();
+        if state.dropped.contains(&self.table_id) {
+            // DropTable recorded: any files here are stale deletions, not
+            // orphans — wipe them and start clean.
+            if let Ok(entries) = std::fs::read_dir(&self.dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name.to_str().is_some_and(|n| n.ends_with(".sst")) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
             return;
         }
-        let manifest = match crate::storage::col_segment::manifest::Manifest::open(&manifest_path) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        let state = manifest.replay();
+        let state = state.table(self.table_id);
 
         // Find the highest segment id to continue numbering.
         let mut max_id = 0u64;
@@ -4774,7 +4803,9 @@ impl ColSegmentStore {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         // Record compaction in manifest FIRST (crash safety), then swap memory.
-        self.manifest.lock().record_compaction(id, &old_ids)?;
+        self.manifest
+            .lock()
+            .record_compaction(self.table_id, id, &old_ids)?;
         {
             let old_set: std::collections::HashSet<u64> = old_ids.iter().copied().collect();
             let mut new_list: Vec<Arc<Segment>> = self
@@ -4798,7 +4829,7 @@ impl ColSegmentStore {
         // manifest record is durable could leave a power-loss recovery with
         // active ids whose files are gone. Inline sync bounds disk usage when
         // checkpoints are far apart.
-        self.manifest.lock().record_gc(&old_ids)?;
+        self.manifest.lock().record_gc(self.table_id, &old_ids)?;
         {
             let mut gc = self.pending_gc.lock();
             gc.extend(old_ids.iter().copied());
@@ -4866,7 +4897,7 @@ mod budget_tests {
             crate::types::ColumnType::Integer,
             crate::types::ColumnType::Timestamp,
         ];
-        let store = ColSegmentStore::create(dir.path(), "t", col_types).unwrap();
+        let store = ColSegmentStore::create(dir.path(), "t", col_types, None).unwrap();
         // Tiny budget so the test triggers without MBs of data (bypasses the
         // 1MB floor in set_col_cache_budget, which only guards config misuse).
         store
@@ -4934,7 +4965,7 @@ mod tiered_tests {
             crate::types::ColumnType::Integer,
             crate::types::ColumnType::Text,
         ];
-        ColSegmentStore::create(dir.path(), "t", col_types).unwrap()
+        ColSegmentStore::create(dir.path(), "t", col_types, None).unwrap()
     }
 
     fn rows(start: u64, n: u64, ts: u64) -> Vec<(u64, u64, Vec<crate::types::Value>)> {
@@ -5075,7 +5106,7 @@ mod manifest_durability_tests {
             crate::types::ColumnType::Integer,
             crate::types::ColumnType::Text,
         ];
-        ColSegmentStore::create(dir.path(), "t", col_types).unwrap()
+        ColSegmentStore::create(dir.path(), "t", col_types, None).unwrap()
     }
 
     fn rows(start: u64, n: u64, ts: u64) -> Vec<(u64, u64, Vec<crate::types::Value>)> {
@@ -5193,7 +5224,7 @@ mod projected_tests {
             crate::types::ColumnType::Text,
             crate::types::ColumnType::Float,
         ];
-        let store = ColSegmentStore::create(dir.path(), "t", col_types).unwrap();
+        let store = ColSegmentStore::create(dir.path(), "t", col_types, None).unwrap();
         let rows: Vec<(u64, u64, Vec<Value>)> = (0..20u64)
             .map(|i| {
                 (
@@ -5254,7 +5285,7 @@ mod merge_stream_tests {
             crate::types::ColumnType::Text,
             crate::types::ColumnType::Float,
         ];
-        let store = ColSegmentStore::create(dir.path(), "t", col_types.clone()).unwrap();
+        let store = ColSegmentStore::create(dir.path(), "t", col_types.clone(), None).unwrap();
         let k = |r: u64| (3u64 << 32) | r;
 
         // Segment 1: rows 1..=5. Row 3 text NULL, row 4 bool false.
@@ -5443,7 +5474,7 @@ mod merge_stream_tests {
             crate::types::ColumnType::Integer,
             crate::types::ColumnType::Tensor(3),
         ];
-        let store = ColSegmentStore::create(dir.path(), "t", col_types.clone()).unwrap();
+        let store = ColSegmentStore::create(dir.path(), "t", col_types.clone(), None).unwrap();
         let k = |r: u64| (5u64 << 32) | r;
         let v = |a: f32, b: f32, c: f32| Value::Vector(crate::types::ArcVec::new(vec![a, b, c]));
 

@@ -96,8 +96,13 @@ fn p1_no_ts_no_index_minimal_fixed_files() {
         files
     );
     assert!(
-        files.iter().any(|f| f == "columnar_ms/t/MANIFEST"),
-        "per-table MANIFEST must exist (P2 will globalize it): {:?}",
+        files.iter().any(|f| f == "columnar_ms/MANIFEST"),
+        "single global MANIFEST (P2): {:?}",
+        files
+    );
+    assert!(
+        !files.iter().any(|f| f == "columnar_ms/t/MANIFEST"),
+        "per-table manifests are gone (P2): {:?}",
         files
     );
 }

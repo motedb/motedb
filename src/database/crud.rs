@@ -2162,10 +2162,16 @@ impl MoteDB {
         // Create OUTSIDE any map lock (directory + file I/O). Holding the
         // shard write lock across I/O stalled every other thread touching
         // this map — the signature of the intermittent suite-wide deadlock.
+        // 🔑 P2: pass the shared global manifest + this table's registry id.
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
+            .unwrap_or(crate::storage::col_segment::LOCAL_TABLE_ID);
         let store = crate::storage::col_segment::ColSegmentStore::create(
             &self.path,
             table_name,
             col_types.to_vec(),
+            Some((self.col_manifest.clone(), table_id)),
         )?;
         // 🚀 compact_storage: 从 DBConfig 继承到 store
         store.set_compact_storage(self.compact_storage);
