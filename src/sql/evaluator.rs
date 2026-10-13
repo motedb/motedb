@@ -2951,6 +2951,97 @@ pub(crate) fn round_f64_half_away(v: f64, decimals: i32) -> f64 {
     }
 }
 
+/// Head window used by snippet() when no term matches.
+fn head_window(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width).collect();
+    out.push('…');
+    out
+}
+
+/// O(n·m·dim) DTW with rolling rows (n = m = 64, dim ≤ ~16 in practice).
+pub(crate) fn traj_sim_values(a: Value, b: Value) -> Result<Value> {
+    let (Value::Vector(av), Value::Vector(bv)) = (&a, &b) else {
+        if matches!(a, Value::Null) || matches!(b, Value::Null) {
+            return Ok(Value::Null);
+        }
+        return Err(MoteDBError::TypeError(
+            "traj_sim() requires vector arguments (use the EPISODES traj_ columns)".to_string(),
+        ));
+    };
+    if av.is_empty() || av.len() % crate::sql::executor::TRAJ_SAMPLES != 0 {
+        return Err(MoteDBError::InvalidArgument(
+            "trajectory must be a flattened 64-sample vector (EPISODES traj_ column)".to_string(),
+        ));
+    }
+    let dim = av.len() / crate::sql::executor::TRAJ_SAMPLES;
+    if bv.is_empty() || bv.len() % dim != 0 {
+        return Err(MoteDBError::InvalidArgument(format!(
+            "demo trajectory length {} is not a multiple of the trajectory dim {}",
+            bv.len(),
+            dim
+        )));
+    }
+    // Resample the demo to 64 samples (its own sample count = len/dim).
+    let p_samples = bv.len() / dim;
+    let p64 = if p_samples == crate::sql::executor::TRAJ_SAMPLES {
+        bv.to_vec()
+    } else {
+        resample_flat(
+            bv.as_slice(),
+            p_samples,
+            crate::sql::executor::TRAJ_SAMPLES,
+            dim,
+        )
+    };
+    Ok(Value::Float(
+        dtw_multi(av.as_slice(), &p64, crate::sql::executor::TRAJ_SAMPLES, dim) as f64,
+    ))
+}
+
+/// Resample a flattened samples×dim series to `to` samples (per-dim linear
+/// interpolation over the sample index).
+fn resample_flat(v: &[f32], from: usize, to: usize, dim: usize) -> Vec<f32> {
+    let denom = (to as f32 - 1.0).max(1.0);
+    let mut out = Vec::with_capacity(to * dim);
+    for j in 0..to {
+        let pos = j as f32 * (from as f32 - 1.0) / denom;
+        let i0 = (pos as usize).min(from - 1);
+        let i1 = (i0 + 1).min(from - 1);
+        let f = pos - i0 as f32;
+        for d in 0..dim {
+            let a = v[i0 * dim + d];
+            let b = v[i1 * dim + d];
+            out.push(a + (b - a) * f);
+        }
+    }
+    out
+}
+
+/// O(n·m·dim) DTW with rolling rows (n = m = 64, dim ≤ ~16 in practice).
+fn dtw_multi(a: &[f32], b: &[f32], samples: usize, dim: usize) -> f32 {
+    let m = samples;
+    let mut prev = vec![f32::INFINITY; m + 1];
+    let mut cur = vec![f32::INFINITY; m + 1];
+    prev[0] = 0.0;
+    for i in 0..samples {
+        cur[0] = f32::INFINITY;
+        for j in 0..m {
+            let mut d = 0f32;
+            for k in 0..dim {
+                let diff = a[i * dim + k] - b[j * dim + k];
+                d += diff * diff;
+            }
+            let d = d.sqrt();
+            cur[j + 1] = d + prev[j].min(prev[j + 1]).min(cur[j]);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3512,98 +3603,4 @@ mod tests {
         let result = eval(&expr, &r).unwrap();
         assert_eq!(result, Value::Integer(0), "i64::MIN % -1 should be 0");
     }
-}
-
-/// Head window used by snippet() when no term matches.
-fn head_window(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(width).collect();
-    out.push('…');
-    out
-}
-
-/// traj_sim core shared by the evaluator and the executor's positional /
-/// simple dispatch tables. Both inputs are flattened trajectories
-/// (samples × dim); the row trajectory must be the EPISODES 64-sample
-/// resample; the demo is resampled to 64 to match.
-pub(crate) fn traj_sim_values(a: Value, b: Value) -> Result<Value> {
-    let (Value::Vector(av), Value::Vector(bv)) = (&a, &b) else {
-        if matches!(a, Value::Null) || matches!(b, Value::Null) {
-            return Ok(Value::Null);
-        }
-        return Err(MoteDBError::TypeError(
-            "traj_sim() requires vector arguments (use the EPISODES traj_ columns)".to_string(),
-        ));
-    };
-    if av.is_empty() || av.len() % crate::sql::executor::TRAJ_SAMPLES != 0 {
-        return Err(MoteDBError::InvalidArgument(
-            "trajectory must be a flattened 64-sample vector (EPISODES traj_ column)".to_string(),
-        ));
-    }
-    let dim = av.len() / crate::sql::executor::TRAJ_SAMPLES;
-    if bv.is_empty() || bv.len() % dim != 0 {
-        return Err(MoteDBError::InvalidArgument(format!(
-            "demo trajectory length {} is not a multiple of the trajectory dim {}",
-            bv.len(),
-            dim
-        )));
-    }
-    // Resample the demo to 64 samples (its own sample count = len/dim).
-    let p_samples = bv.len() / dim;
-    let p64 = if p_samples == crate::sql::executor::TRAJ_SAMPLES {
-        bv.to_vec()
-    } else {
-        resample_flat(
-            bv.as_slice(),
-            p_samples,
-            crate::sql::executor::TRAJ_SAMPLES,
-            dim,
-        )
-    };
-    Ok(Value::Float(
-        dtw_multi(av.as_slice(), &p64, crate::sql::executor::TRAJ_SAMPLES, dim) as f64,
-    ))
-}
-
-/// Resample a flattened samples×dim series to `to` samples (per-dim linear
-/// interpolation over the sample index).
-fn resample_flat(v: &[f32], from: usize, to: usize, dim: usize) -> Vec<f32> {
-    let denom = (to as f32 - 1.0).max(1.0);
-    let mut out = Vec::with_capacity(to * dim);
-    for j in 0..to {
-        let pos = j as f32 * (from as f32 - 1.0) / denom;
-        let i0 = (pos as usize).min(from - 1);
-        let i1 = (i0 + 1).min(from - 1);
-        let f = pos - i0 as f32;
-        for d in 0..dim {
-            let a = v[i0 * dim + d];
-            let b = v[i1 * dim + d];
-            out.push(a + (b - a) * f);
-        }
-    }
-    out
-}
-
-/// O(n·m·dim) DTW with rolling rows (n = m = 64, dim ≤ ~16 in practice).
-fn dtw_multi(a: &[f32], b: &[f32], samples: usize, dim: usize) -> f32 {
-    let m = samples;
-    let mut prev = vec![f32::INFINITY; m + 1];
-    let mut cur = vec![f32::INFINITY; m + 1];
-    prev[0] = 0.0;
-    for i in 0..samples {
-        cur[0] = f32::INFINITY;
-        for j in 0..m {
-            let mut d = 0f32;
-            for k in 0..dim {
-                let diff = a[i * dim + k] - b[j * dim + k];
-                d += diff * diff;
-            }
-            let d = d.sqrt();
-            cur[j + 1] = d + prev[j].min(prev[j + 1]).min(cur[j]);
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[m]
 }

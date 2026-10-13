@@ -13597,13 +13597,11 @@ impl QueryExecutor {
                             query: Box::new(st),
                             alias: name.clone(),
                         };
-                        return self.execute_from_with_limit(&sub, limit, push);
+                        self.execute_from_with_limit(&sub, limit, push)
                     }
-                    None => {
-                        return Err(StorageError::InvalidData(
-                            "table-function result exceeds the 10k inline limit".into(),
-                        ));
-                    }
+                    None => Err(StorageError::InvalidData(
+                        "table-function result exceeds the 10k inline limit".into(),
+                    )),
                 }
             }
             TableRef::Subquery { query, alias } => {
@@ -25256,6 +25254,52 @@ fn outc_rows(outcome: &crate::sql::vector_exec::VecScanAggOutcome) -> Vec<Vec<Va
     vec![outcome.values.clone()]
 }
 
+fn val_as_usize(v: &Value) -> Result<usize> {
+    match v {
+        Value::Integer(i) if *i >= 0 => Ok(*i as usize),
+        Value::Float(f) if *f >= 0.0 && f.fract() == 0.0 => Ok(*f as usize),
+        _ => Err(StorageError::InvalidData(
+            "RRF numeric parameters must be non-negative integers".into(),
+        )),
+    }
+}
+
+/// traj_sim resample length (samples per episode trajectory).
+pub(crate) const TRAJ_SAMPLES: usize = 64;
+
+/// Uniformly resample a time-stamped multi-dim trajectory to `n` samples
+/// (linear interpolation per dimension). `pts` must be ts-ascending.
+fn resample_trajectory(pts: &[(i64, &Vec<f32>)], dim: usize, n: usize) -> Vec<f32> {
+    let t0 = pts[0].0;
+    let t1 = pts[pts.len() - 1].0;
+    let span = (t1 - t0).max(1);
+    let denom = (n as i64 - 1).max(1);
+    let mut out = Vec::with_capacity(n * dim);
+    for j in 0..n {
+        let tt = t0 + span * j as i64 / denom;
+        let idx = pts.partition_point(|(t, _)| *t < tt);
+        let (ia, ib, frac) = if idx == 0 {
+            (0usize, 0usize, 0f32)
+        } else if idx >= pts.len() {
+            (pts.len() - 1, pts.len() - 1, 0f32)
+        } else {
+            let a = &pts[idx - 1];
+            let b = &pts[idx];
+            let f = if b.0 == a.0 {
+                0f32
+            } else {
+                ((tt - a.0) as f64 / (b.0 - a.0) as f64) as f32
+            };
+            (idx - 1, idx, f)
+        };
+        let (a, b) = (&pts[ia].1, &pts[ib].1);
+        for d in 0..dim {
+            out.push(a[d] + (b[d] - a[d]) * frac);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -25881,50 +25925,4 @@ mod tests {
         );
         assert!(checked >= 1000, "row-level checks too small: {checked}");
     }
-}
-
-fn val_as_usize(v: &Value) -> Result<usize> {
-    match v {
-        Value::Integer(i) if *i >= 0 => Ok(*i as usize),
-        Value::Float(f) if *f >= 0.0 && f.fract() == 0.0 => Ok(*f as usize),
-        _ => Err(StorageError::InvalidData(
-            "RRF numeric parameters must be non-negative integers".into(),
-        )),
-    }
-}
-
-/// traj_sim resample length (samples per episode trajectory).
-pub(crate) const TRAJ_SAMPLES: usize = 64;
-
-/// Uniformly resample a time-stamped multi-dim trajectory to `n` samples
-/// (linear interpolation per dimension). `pts` must be ts-ascending.
-fn resample_trajectory(pts: &[(i64, &Vec<f32>)], dim: usize, n: usize) -> Vec<f32> {
-    let t0 = pts[0].0;
-    let t1 = pts[pts.len() - 1].0;
-    let span = (t1 - t0).max(1);
-    let denom = (n as i64 - 1).max(1);
-    let mut out = Vec::with_capacity(n * dim);
-    for j in 0..n {
-        let tt = t0 + span * j as i64 / denom;
-        let idx = pts.partition_point(|(t, _)| *t < tt);
-        let (ia, ib, frac) = if idx == 0 {
-            (0usize, 0usize, 0f32)
-        } else if idx >= pts.len() {
-            (pts.len() - 1, pts.len() - 1, 0f32)
-        } else {
-            let a = &pts[idx - 1];
-            let b = &pts[idx];
-            let f = if b.0 == a.0 {
-                0f32
-            } else {
-                ((tt - a.0) as f64 / (b.0 - a.0) as f64) as f32
-            };
-            (idx - 1, idx, f)
-        };
-        let (a, b) = (&pts[ia].1, &pts[ib].1);
-        for d in 0..dim {
-            out.push(a[d] + (b[d] - a[d]) * frac);
-        }
-    }
-    out
 }

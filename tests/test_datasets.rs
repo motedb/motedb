@@ -151,12 +151,12 @@ fn dataset_refs_survive_reopen_and_gc() {
     let ds = rows(&db, "SELECT COUNT(*) AS n FROM _dataset_commits");
     assert_eq!(ds[0][0], Value::Integer(0));
     db.execute("COMMIT DATASET 'snap2'").unwrap();
-    assert_eq!(
+    assert_ne!(
         one(
             &db,
             "SELECT COUNT(*) FROM _dataset_commits WHERE dataset = 'snap2'"
-        ) != Value::Integer(0),
-        true
+        ),
+        Value::Integer(0)
     );
     // IF EXISTS on a missing name is a no-op.
     db.execute("DROP DATASET IF EXISTS 'nope'").unwrap();

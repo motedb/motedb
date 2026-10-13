@@ -2115,7 +2115,7 @@ impl QueryExecutor {
         // ── Probe ──
         let null_right_row: SqlRow = right_rows
             .first()
-            .map(|(_, r)| r.iter().map(|(k, _)| (k.clone(), Value::Null)).collect())
+            .map(|(_, r)| r.keys().map(|k| (k.clone(), Value::Null)).collect())
             .unwrap_or_default();
         let mut result: Vec<(u64, SqlRow)> = Vec::with_capacity(left_rows.len());
         let mut next_id = 0u64;
@@ -2159,16 +2159,6 @@ impl QueryExecutor {
             }
         }
         Ok(result)
-    }
-
-    /// Key-membership helper for ASOF column resolution.
-    fn row_has_col_impl(row: &SqlRow, col: &str) -> bool {
-        if row.contains_key(col) {
-            return true;
-        }
-        let suffix = format!(".{col}");
-        row.keys()
-            .any(|k| !k.starts_with("__") && k.ends_with(&suffix))
     }
 
     pub(super) fn inner_join(

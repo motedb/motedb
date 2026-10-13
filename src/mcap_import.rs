@@ -122,7 +122,7 @@ fn value_column_type(v: &Value) -> &'static str {
         Value::Timestamp(_) => "TIMESTAMP",
         Value::Text(_) => "TEXT",
         Value::Blob(_) => "BLOB",
-        Value::Vector(v) => return Box::leak(format!("VECTOR({})", v.len()).into_boxed_str()),
+        Value::Vector(v) => Box::leak(format!("VECTOR({})", v.len()).into_boxed_str()),
         _ => "TEXT",
     }
 }

@@ -3337,6 +3337,23 @@ impl Parser {
     }
 }
 
+/// Decode a hex string (X'0aff00' body) into bytes. Accepts an even number
+/// of hex digits; empty is a valid zero-length blob.
+fn decode_hex_literal(s: &str) -> std::result::Result<Vec<u8>, String> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        return Err("odd number of hex digits".into());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    for i in (0..b.len()).step_by(2) {
+        let hi = (b[i] as char).to_digit(16).ok_or("non-hex digit")?;
+        let lo = (b[i + 1] as char).to_digit(16).ok_or("non-hex digit")?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3429,21 +3446,4 @@ mod tests {
             _ => panic!("Expected CREATE TABLE statement"),
         }
     }
-}
-
-/// Decode a hex string (X'0aff00' body) into bytes. Accepts an even number
-/// of hex digits; empty is a valid zero-length blob.
-fn decode_hex_literal(s: &str) -> std::result::Result<Vec<u8>, String> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
-        return Err("odd number of hex digits".into());
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let b = s.as_bytes();
-    for i in (0..b.len()).step_by(2) {
-        let hi = (b[i] as char).to_digit(16).ok_or("non-hex digit")?;
-        let lo = (b[i + 1] as char).to_digit(16).ok_or("non-hex digit")?;
-        out.push((hi * 16 + lo) as u8);
-    }
-    Ok(out)
 }

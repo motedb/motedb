@@ -358,7 +358,7 @@ impl Segment {
                 }
                 Some(ColumnVector {
                     data: ColData::Utf8(buf),
-                    valid: valid,
+                    valid,
                 })
             }
             ColumnType::Blob => {
@@ -381,7 +381,7 @@ impl Segment {
                 }
                 Some(ColumnVector {
                     data: ColData::Values(vals),
-                    valid: valid,
+                    valid,
                 })
             }
             ColumnType::Tensor(_) | ColumnType::Spatial => {

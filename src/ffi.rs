@@ -149,6 +149,10 @@ pub struct DbHandle {
 
 /// Last error message (empty string when none). The returned pointer stays
 /// valid until the next fallible call on any thread.
+///
+/// # Safety
+/// - The returned pointer must be released with `motedb_db_free_string`
+///   (or ignored); it must not outlive the next fallible FFI call.
 #[no_mangle]
 pub unsafe extern "C" fn motedb_last_error() -> *const c_char {
     let msg = take_err();
@@ -283,7 +287,7 @@ fn json_to_value(v: &serde_json::Value) -> Result<MValue2, String> {
 }
 
 fn value_to_json(v: &MValue2) -> serde_json::Value {
-    use crate::types::{ArcString, Value as V2};
+    use crate::types::Value as V2;
     match v {
         V2::Null => serde_json::Value::Null,
         V2::Integer(i) => serde_json::Value::Number((*i).into()),

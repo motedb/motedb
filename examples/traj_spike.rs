@@ -62,10 +62,9 @@ fn dtw(a: &[f32], b: &[f32], abandon: Option<f32>) -> Option<f32> {
     let mut prev = vec![f32::INFINITY; m + 1];
     let mut cur = vec![f32::INFINITY; m + 1];
     prev[0] = 0.0;
-    for i in 0..a.len() {
+    for &ai in a {
         cur[0] = f32::INFINITY;
         let mut row_min = f32::INFINITY;
-        let ai = a[i];
         for j in 0..m {
             let d = (ai - b[j]).abs();
             let v = d + prev[j].min(prev[j + 1]).min(cur[j]);
@@ -175,13 +174,13 @@ fn main() {
     // ── Corpus ──
     let mut corpus: Vec<Vec<f32>> = Vec::with_capacity(N_CORPUS);
     let mut is_structured = vec![false; N_CORPUS];
-    for i in 0..N_CORPUS {
+    for (i, slot) in is_structured.iter_mut().enumerate() {
         if i < N_WALK {
             corpus.push(random_walk(&mut rng));
         } else {
-            let g = (i % 10) as usize;
+            let g = i % 10;
             corpus.push(family_shape(g, &mut rng));
-            is_structured[i] = true;
+            *slot = true;
         }
     }
 
@@ -205,8 +204,7 @@ fn main() {
 
     // ── Queries ──
     let mut queries: Vec<(Vec<f32>, bool)> = Vec::with_capacity(N_QUERIES);
-    for i in 0..N_QUERIES / 2 {
-        let g = i % 10;
+    for g in 0..N_QUERIES / 2 {
         let mut q = family_shape(g, &mut rng);
         // fresh noise so the query isn't byte-identical to a member
         for x in q.iter_mut().step_by(7) {

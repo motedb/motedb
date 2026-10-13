@@ -1600,7 +1600,7 @@ impl QueryExecutor {
                                                 ));
                                             }
                                         } else if let Ok(t) = segs[0].sst.read_text(pc) {
-                                            col_segs.push(text_or_blob_seg(&seg0_tags, pc, t));
+                                            col_segs.push(text_or_blob_seg(seg0_tags, pc, t));
                                         }
                                     }
                                     return Ok(StreamingQueryResult::SelectColumnar {
@@ -1756,7 +1756,7 @@ impl QueryExecutor {
                                                     ));
                                                 }
                                             } else if let Ok(t) = segs[0].sst.read_text(pc) {
-                                                col_segs.push(text_or_blob_seg(&seg0_tags, pc, t));
+                                                col_segs.push(text_or_blob_seg(seg0_tags, pc, t));
                                             }
                                         }
                                         return Ok(StreamingQueryResult::SelectColumnar {

@@ -41,7 +41,7 @@ impl MoteDB {
             let (_rid, row) = item;
             // schema: (dataset TEXT, table_name TEXT, seg_id INTEGER, …)
             let (Some(Value::Text(_d)), Some(Value::Text(t)), Some(Value::Integer(id))) = (
-                row.get(0).cloned(),
+                row.first().cloned(),
                 row.get(1).cloned(),
                 row.get(2).cloned(),
             ) else {
@@ -207,7 +207,7 @@ impl MoteDB {
         for item in iter.flatten() {
             let (_rid, row) = item;
             let (Some(Value::Text(d)), Some(Value::Text(t)), Some(Value::Integer(id))) = (
-                row.get(0).cloned(),
+                row.first().cloned(),
                 row.get(1).cloned(),
                 row.get(2).cloned(),
             ) else {
@@ -322,7 +322,7 @@ impl MoteDB {
         for item in iter.flatten() {
             let (_rid, row) = item;
             let (Some(Value::Text(d)), Some(Value::Text(t))) =
-                (row.get(0).cloned(), row.get(1).cloned())
+                (row.first().cloned(), row.get(1).cloned())
             else {
                 continue;
             };
@@ -346,6 +346,6 @@ impl MoteDB {
 
     /// Episode config re-export for tests/introspection.
     pub fn episode_config_of(&self, table: &str) -> Option<EpisodeConfig> {
-        (*self.get_table_schema(table).ok()?).episode_config.clone()
+        self.get_table_schema(table).ok()?.episode_config.clone()
     }
 }
