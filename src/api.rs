@@ -380,6 +380,25 @@ impl Database {
         self.inner.backup_to(dest.as_ref())
     }
 
+    /// 🔑 P4: pack the whole database into a single MOTESNAP file.
+    /// The transport form — copy/rsync/checksum one file.
+    pub fn export_snapshot<P: AsRef<std::path::Path>>(
+        &self,
+        dest: P,
+        compressed: bool,
+    ) -> Result<crate::database::snapshot::SnapshotStats> {
+        self.inner.export_snapshot_to(dest.as_ref(), compressed)
+    }
+
+    /// 🔑 P4: unpack a MOTESNAP into a fresh directory, then open it.
+    pub fn open_snapshot<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
+        src: P,
+        dest_dir: Q,
+    ) -> Result<Self> {
+        crate::database::core::MoteDB::import_snapshot(src.as_ref(), dest_dir.as_ref())?;
+        Self::open(dest_dir)
+    }
+
     /// Full checkpoint with index rebuild (slower but thorough).
     /// Used internally on shutdown to ensure index completeness.
     pub fn checkpoint_full(&self) -> Result<()> {

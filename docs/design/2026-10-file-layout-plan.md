@@ -2,7 +2,7 @@
 
 - 日期: 2026-10-13
 - 前置: [2026-10-file-layout.md](./2026-10-file-layout.md)(评定)及单文件格式分析
-- 状态: **P1+P2+P3 已实施并验收**(P1 惰性创建;P2 全局单一 MANIFEST;P3 meta.bin 四合一 + catalog 损坏 fail-fast。库固定文件 11→4:.lock/meta.bin/columnar_ms/MANIFEST/(.clean_close 已并入 flags)。tests/test_file_layout 5/5、test_global_manifest 8/8、corruption 4/4,全量回归零 FAILED,clippy --all-targets 0 警告);P4 (EXPORT/IMPORT 快照) 待开工
+- 状态: **P1~P4 全部实施并验收**(P1 惰性创建;P2 全局单一 MANIFEST;P3 meta.bin 四合一;P4 EXPORT/IMPORT 单文件快照。库固定文件 11→4;`EXPORT DB TO 'snap.mote' [COMPRESSED]` + API/FFI/Python/Node/Go 全接线。tests/test_file_layout 5/5、test_global_manifest 8/8、test_snapshot 5/5、corruption 4/4,全量回归零 FAILED,clippy --all-targets 0 警告)
 - 定位依据: 运行时=收敛目录格式,运输/分发=单文件快照(EXPORT),部署=只读容器(远期)
 
 ## 0. 总览

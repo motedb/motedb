@@ -220,6 +220,133 @@ impl MoteDB {
         result
     }
 
+    /// 🔑 P4 transport form: pack the whole database into ONE snapshot file
+    /// (`MOTESNAP` container — see `database::snapshot`).
+    ///
+    /// Quiesce discipline is identical to [`Self::backup_to`] (CAS the
+    /// reentrancy flag, checkpoint_mutex, ALL autocommit stripes + global
+    /// write_lock, flush buffers + indexes, truncate WAL), then pack instead
+    /// of copying. Retry-on-NotFound rides out a flush that was already
+    /// in flight when the stripes were taken.
+    pub fn export_snapshot_to(
+        &self,
+        dest: &std::path::Path,
+        compressed: bool,
+    ) -> Result<crate::database::snapshot::SnapshotStats> {
+        ensure_open!(self);
+
+        if dest.exists() {
+            return Err(StorageError::InvalidData(format!(
+                "snapshot destination already exists: {}",
+                dest.display()
+            )));
+        }
+        // Destination inside the database directory would be packed by a
+        // later export (and pollutes the dir we are packing right now).
+        let src_canon = std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let dest_canon = {
+            match dest.parent() {
+                Some(p) => std::fs::canonicalize(p)
+                    .map(|cp| cp.join(dest.file_name().unwrap_or_default()))
+                    .unwrap_or_else(|_| dest.to_path_buf()),
+                None => dest.to_path_buf(),
+            }
+        };
+        if dest_canon.starts_with(&src_canon) {
+            return Err(StorageError::InvalidData(format!(
+                "snapshot destination must be outside the database directory: {} is inside {}",
+                dest.display(),
+                self.path.display()
+            )));
+        }
+
+        // 🔁 CAS the reentrancy flag (same retry window as backup_to).
+        let mut acquired = false;
+        for attempt in 0..6 {
+            if self
+                .is_flushing
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                acquired = true;
+                break;
+            }
+            if attempt < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+        if !acquired {
+            return Err(StorageError::InvalidData(
+                "a flush/checkpoint is in progress — retry export".into(),
+            ));
+        }
+        let _ckpt_guard = self
+            .checkpoint_mutex
+            .lock()
+            .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
+
+        // Big-lock equivalence over every writer (see backup_to's BUG #35 note).
+        let mut _stripe_guards: Vec<parking_lot::MutexGuard<'_, ()>> =
+            self.autocommit_locks.iter().map(|s| s.lock()).collect();
+        let _write_guard = self.write_lock.lock();
+
+        let flush_result = self.flush_impl().and_then(|()| {
+            self.flush_all_indexes_for_backup()?;
+            self.wal.checkpoint_all()
+        });
+
+        let result = match flush_result {
+            Ok(()) => {
+                let mut out = Ok(crate::database::snapshot::SnapshotStats {
+                    entries: 0,
+                    logical_bytes: 0,
+                    stored_bytes: 0,
+                });
+                for attempt in 0..10 {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        let _ = std::fs::remove_file(dest);
+                    }
+                    match crate::database::snapshot::pack_directory(&self.path, dest, compressed) {
+                        Ok(stats) => {
+                            out = Ok(stats);
+                            break;
+                        }
+                        Err(e) => {
+                            let retryable = matches!(
+                                &e,
+                                StorageError::Io(io_e)
+                                    if io_e.kind() == std::io::ErrorKind::NotFound
+                            );
+                            out = Err(e);
+                            if !retryable {
+                                break;
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            Err(e) => Err(e),
+        };
+
+        drop(_write_guard);
+        drop(_ckpt_guard);
+        self.is_flushing.store(false, Ordering::Release);
+        result
+    }
+
+    /// 🔑 P4: unpack a snapshot into a fresh directory. The caller opens it
+    /// with the regular `Database::open` (which runs the crash-verify path —
+    /// the archive's meta.bin carries clean_close=0, i.e. exactly the right
+    /// paranoia for a copy).
+    pub fn import_snapshot(
+        src: &std::path::Path,
+        dest_dir: &std::path::Path,
+    ) -> Result<crate::database::snapshot::SnapshotStats> {
+        crate::database::snapshot::unpack_snapshot(src, dest_dir)
+    }
+
     /// Recursive directory copy with per-file fsync and a final directory
     /// fsync, so the completed copy survives power loss immediately (no
     /// reliance on dirty page cache). Skips the process lock file.

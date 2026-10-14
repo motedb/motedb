@@ -18,6 +18,10 @@ export declare class Database {
   checkpoint(): void;
   /** Online snapshot into a new directory (must be outside the DB dir). */
   backupTo(dest: string): void;
+  /** Pack the whole database into a single MOTESNAP file. */
+  exportSnapshot(dest: string, compressed?: boolean): number;
+  /** Static: unpack a MOTESNAP into a fresh directory and open it. */
+  static openSnapshot(src: string, destDir: string): Database;
   /** Close the database (flush + clean-close marker). */
   close(): void;
   /** Self-check report: [{name, status, detail}]. */

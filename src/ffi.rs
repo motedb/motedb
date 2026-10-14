@@ -466,3 +466,68 @@ pub unsafe extern "C" fn motedb_db_free_string(s: *mut c_char) {
         drop(unsafe { CString::from_raw(s) });
     }
 }
+
+/// 🔑 P4: pack the database into a single MOTESNAP snapshot file.
+/// Returns the packed entry count (>= 0) on success; -1 on failure (see
+/// motedb_last_error).
+///
+/// # Safety
+/// `handle` must come from motedb_db_open and stay open for the call;
+/// `dest` must be a valid NUL-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn motedb_db_export(
+    handle: *mut DbHandle,
+    dest: *const c_char,
+    compressed: i32,
+) -> i32 {
+    if handle.is_null() || dest.is_null() {
+        set_err("handle or dest is NULL".into());
+        return -1;
+    }
+    let h = unsafe { &*handle };
+    let dest = unsafe { CStr::from_ptr(dest) };
+    let Ok(dest) = dest.to_str() else {
+        set_err("dest is not UTF-8".into());
+        return -1;
+    };
+    match h
+        .db
+        .export_snapshot(std::path::Path::new(dest), compressed != 0)
+    {
+        Ok(stats) => stats.entries as i32,
+        Err(e) => {
+            set_err(format!("{e}"));
+            -1
+        }
+    }
+}
+
+/// 🔑 P4: unpack a MOTESNAP snapshot into a fresh directory (then open it
+/// with motedb_db_open). Returns the unpacked entry count (>= 0) on
+/// success; -1 on failure.
+///
+/// # Safety
+/// `src` and `dest` must be valid NUL-terminated UTF-8 C strings.
+#[no_mangle]
+pub unsafe extern "C" fn motedb_db_import(src: *const c_char, dest: *const c_char) -> i32 {
+    if src.is_null() || dest.is_null() {
+        set_err("src or dest is NULL".into());
+        return -1;
+    }
+    let src = unsafe { CStr::from_ptr(src) };
+    let dest = unsafe { CStr::from_ptr(dest) };
+    let (Ok(src), Ok(dest)) = (src.to_str(), dest.to_str()) else {
+        set_err("src or dest is not UTF-8".into());
+        return -1;
+    };
+    match crate::database::core::MoteDB::import_snapshot(
+        std::path::Path::new(src),
+        std::path::Path::new(dest),
+    ) {
+        Ok(stats) => stats.entries as i32,
+        Err(e) => {
+            set_err(format!("{e}"));
+            -1
+        }
+    }
+}

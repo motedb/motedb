@@ -67,6 +67,11 @@ pub enum Statement {
         name: String,
         path: String,
     },
+    /// 🔖 EXPORT DB TO 'path' [COMPRESSED] — single-file MOTESNAP snapshot.
+    ExportDb {
+        path: String,
+        compressed: bool,
+    },
     RollbackTransaction,
     /// SAVEPOINT name
     Savepoint(String),

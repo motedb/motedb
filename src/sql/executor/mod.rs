@@ -2149,6 +2149,20 @@ impl QueryExecutor {
                     message: format!("dataset '{name}' exported: {tables} tables, {rows} rows"),
                 })
             }
+            Statement::ExportDb { path, compressed } => {
+                let stats = self
+                    .db
+                    .export_snapshot_to(std::path::Path::new(&path), compressed)?;
+                Ok(QueryResult::Definition {
+                    message: format!(
+                        "database exported to '{}': {} files, {} bytes{}",
+                        path,
+                        stats.entries,
+                        stats.stored_bytes,
+                        if compressed { " (compressed)" } else { "" }
+                    ),
+                })
+            }
             Statement::CreateTable(c) => self.execute_create_table(c),
             Statement::CreateIndex(c) => self.execute_create_index(c),
             Statement::DropTable(d) => self.execute_drop_table(d),
@@ -2634,6 +2648,20 @@ impl QueryExecutor {
                 }
                 StreamingQueryResult::Definition {
                     message: format!("dataset '{}' dropped", name),
+                }
+            }
+            Statement::ExportDb { path, compressed } => {
+                let stats = self
+                    .db
+                    .export_snapshot_to(std::path::Path::new(path), *compressed)?;
+                StreamingQueryResult::Definition {
+                    message: format!(
+                        "database exported to '{}': {} files, {} bytes{}",
+                        path,
+                        stats.entries,
+                        stats.stored_bytes,
+                        if *compressed { " (compressed)" } else { "" }
+                    ),
                 }
             }
             Statement::ExportDataset { name, path } => {

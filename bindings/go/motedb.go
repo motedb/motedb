@@ -91,6 +91,36 @@ func (db *Database) BackupTo(dest string) error {
 	return nil
 }
 
+// ExportSnapshot packs the whole database into a single MOTESNAP file
+// (P4 transport form — one file to copy/rsync/checksum). compressed
+// selects per-file zstd framing.
+func (db *Database) ExportSnapshot(dest string, compressed bool) (int32, error) {
+	cd := C.CString(dest)
+	defer C.free(unsafe.Pointer(cd))
+	ci := C.int(0)
+	if compressed {
+		ci = 1
+	}
+	n := C.motedb_db_export(db.handle, cd, ci)
+	if n < 0 {
+		return 0, fmt.Errorf("motedb: export: %s", lastError())
+	}
+	return int32(n), nil
+}
+
+// ImportSnapshot unpacks a MOTESNAP file into a fresh directory.
+// Open the directory afterwards with Open(destDir).
+func ImportSnapshot(src, destDir string) error {
+	cs := C.CString(src)
+	defer C.free(unsafe.Pointer(cs))
+	cd := C.CString(destDir)
+	defer C.free(unsafe.Pointer(cd))
+	if C.motedb_db_import(cs, cd) < 0 {
+		return fmt.Errorf("motedb: import: %s", lastError())
+	}
+	return nil
+}
+
 // blobParam marks a []byte parameter as a BLOB over the JSON boundary.
 type blobParam struct {
 	Blob string `json:"$blob"`

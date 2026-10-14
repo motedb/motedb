@@ -36,6 +36,7 @@ pub mod mem_buffer;
 pub mod meta_store;
 pub mod persistence;
 pub mod pk_cache;
+pub mod snapshot;
 pub mod table;
 pub mod timeseries;
 pub mod transaction;

@@ -930,6 +930,22 @@ impl PyDatabase {
         py.allow_threads(|| self.db.backup_to(dest)).map_err(py_err)
     }
 
+    /// 🔑 P4: pack the whole database into a single MOTESNAP file (the
+    /// transport form — copy/rsync/checksum ONE file). Returns
+    /// {"files": n, "bytes": n}. `compressed` selects per-file zstd.
+    #[pyo3(signature = (dest, compressed=false))]
+    fn export_to(&self, py: Python<'_>, dest: &str, compressed: bool) -> PyResult<PyObject> {
+        let stats = py
+            .allow_threads(|| self.db.export_snapshot(dest, compressed))
+            .map_err(py_err)?;
+        Python::with_gil(|py| -> PyResult<PyObject> {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("files", stats.entries)?;
+            dict.set_item("bytes", stats.stored_bytes)?;
+            Ok(dict.into())
+        })
+    }
+
     /// Operational self-check: list of {"name", "status", "detail"} dicts
     /// plus a "verdict" ("PASS" | "WARN" | "FAIL").
     fn doctor(&self) -> PyResult<PyObject> {
@@ -1112,6 +1128,16 @@ impl PyDatabase {
     }
 }
 
+/// 🔑 P4: unpack a MOTESNAP snapshot into a fresh directory. Open it
+/// afterwards with `motedb.Database(dest_dir)`.
+#[pyfunction]
+fn import_snapshot(src: &str, dest_dir: &str) -> PyResult<()> {
+    // The core MoteDB static (unpack only) — open with Database(dest_dir).
+    motedb_core::MoteDB::import_snapshot(std::path::Path::new(src), std::path::Path::new(dest_dir))
+        .map(|_| ())
+        .map_err(py_err)
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `Database` is the primary entry point — expose it under that name;
@@ -1119,5 +1145,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDatabase>()?;
     m.add("Database", m.getattr("PyDatabase")?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        import_snapshot,
+        m
+    )?)?;
     Ok(())
 }

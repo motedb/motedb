@@ -182,37 +182,66 @@ impl Parser {
             TokenType::Show => self.parse_show()?,
             TokenType::Describe | TokenType::Desc => self.parse_describe()?,
             TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("EXPORT") => {
-                // 🔖 EXPORT DATASET 'name' TO 'path'
+                // 🔖 EXPORT DATASET 'name' TO 'path' | EXPORT DB TO 'path' [COMPRESSED]
                 self.advance();
-                if !matches!(&self.current().token_type, TokenType::Identifier(ref d) if d.eq_ignore_ascii_case("DATASET"))
+                if matches!(&self.current().token_type, TokenType::Identifier(ref d) if d.eq_ignore_ascii_case("DB")) {
+                    self.advance();
+                    if !matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("TO"))
+                    {
+                        return Err(self.error("Expected TO after EXPORT DB"));
+                    }
+                    self.advance();
+                    let path = match self.current().token_type.clone() {
+                        TokenType::String(p) => {
+                            self.advance();
+                            p
+                        }
+                        _ => {
+                            return Err(
+                                self.error("Expected destination path string after EXPORT DB TO")
+                            )
+                        }
+                    };
+                    let compressed = if matches!(&self.current().token_type, TokenType::Identifier(ref c) if c.eq_ignore_ascii_case("COMPRESSED"))
+                    {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    Statement::ExportDb { path, compressed }
+                } else if matches!(&self.current().token_type, TokenType::Identifier(ref d) if d.eq_ignore_ascii_case("DATASET"))
                 {
-                    return Err(self.error("Expected DATASET after EXPORT"));
+                    self.advance();
+                    let name = match self.current().token_type.clone() {
+                        TokenType::String(n) => {
+                            self.advance();
+                            n
+                        }
+                        TokenType::Identifier(n) => {
+                            self.advance();
+                            n
+                        }
+                        _ => {
+                            return Err(self.error("Expected dataset name after EXPORT DATASET"))
+                        }
+                    };
+                    if !matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("TO"))
+                    {
+                        return Err(self.error("Expected TO after EXPORT DATASET name"));
+                    }
+                    self.advance();
+                    let path = match self.current().token_type.clone() {
+                        TokenType::String(p) => {
+                            self.advance();
+                            p
+                        }
+                        _ => return Err(self.error("Expected destination path string after TO")),
+                    };
+                    Statement::ExportDataset { name, path }
+                } else {
+                    return Err(self.error("Expected DATASET or DB after EXPORT"));
                 }
-                self.advance();
-                let name = match self.current().token_type.clone() {
-                    TokenType::String(n) => {
-                        self.advance();
-                        n
-                    }
-                    TokenType::Identifier(n) => {
-                        self.advance();
-                        n
-                    }
-                    _ => return Err(self.error("Expected dataset name after EXPORT DATASET")),
-                };
-                if !matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("TO"))
-                {
-                    return Err(self.error("Expected TO after EXPORT DATASET name"));
-                }
-                self.advance();
-                let path = match self.current().token_type.clone() {
-                    TokenType::String(p) => {
-                        self.advance();
-                        p
-                    }
-                    _ => return Err(self.error("Expected destination path string after TO")),
-                };
-                Statement::ExportDataset { name, path }
             }
             _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, DESCRIBE, BEGIN, COMMIT, or ROLLBACK")),
         };

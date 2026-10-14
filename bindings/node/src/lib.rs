@@ -231,6 +231,24 @@ impl Database {
         self.inner.backup_to(&dest).map_err(st_err)
     }
 
+    /// 🔑 P4: pack the whole database into a single MOTESNAP file.
+    /// Returns the number of packed files.
+    #[napi]
+    pub fn export_snapshot(&self, dest: String, compressed: Option<bool>) -> Result<i32> {
+        self.inner
+            .export_snapshot(&dest, compressed.unwrap_or(false))
+            .map(|s| s.entries as i32)
+            .map_err(st_err)
+    }
+
+    /// 🔑 P4: unpack a MOTESNAP into a fresh directory and open it.
+    #[napi]
+    pub fn open_snapshot(src: String, dest_dir: String) -> Result<Self> {
+        let inner =
+            motedb_core::Database::open_snapshot(&src, &dest_dir).map_err(st_err)?;
+        Ok(Self { inner })
+    }
+
     /// Close the database (flush + clean-close marker).
     #[napi]
     pub fn close(&self) -> Result<()> {

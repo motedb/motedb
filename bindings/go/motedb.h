@@ -21,3 +21,7 @@ void motedb_db_free_string(char *s);
 }
 #endif
 #endif
+
+/* P4: single-file MOTESNAP snapshot transport. */
+int motedb_db_export(DbHandle *handle, const char *dest, int compressed);
+int motedb_db_import(const char *src, const char *dest);
