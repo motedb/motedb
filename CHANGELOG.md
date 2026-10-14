@@ -1,6 +1,37 @@
 # Changelog
 
-## [0.15.0] — unreleased (SDK cycle)
+## [0.15.0] — unreleased (SDK cycle + 存储文件布局收敛)
+
+### 存储文件布局收敛 (docs/design/2026-10-file-layout{,-plan}.md, P1~P4)
+
+- **P1 惰性文件创建 + 死文件清理**: WAL 分区文件首写物化、CHECKPOINT
+  由截断改为删除(缺失=空语义); 纯 Standard 库不再创建空 `columnar/`;
+  LSM blob 首写物化; `indexes/timestamp.idx` 惰性化(LazyTsIndex, 无
+  TIMESTAMP 列的库不建 `indexes/`); `fts_indexes.fresh` → `.clean_close`
+  (旧名一次性兼容)。空库固定文件 11→4, 零写入库常驻 fd 6→1
+- **P2 全局单一 MANIFEST**: v2 记录携带 table_id + DropTable;
+  全库一个 `columnar_ms/MANIFEST` — 每表 -1 文件 -1 常驻 fd, fd 不再随
+  表数线性增长(50 表实测进程 fd<40, 原为 56+)。v0.14 旧布局打开即
+  自动迁移(先写后删 + 重入幂等); manifest 尾损坏孤儿领养语义不变
+- **P3 meta.bin 四合一**: catalog/index 元数据/LSN/干净关闭旗标并入
+  单个分节容器(每节 CRC32 + header flags), 任一节更新整文件原子重写;
+  旧三文件字节透明采纳后清理。🔒 catalog 节损坏/魔数不识别 → fail-fast
+  硬错误(对齐旧 corrupt catalog 行为, 杜绝空注册表覆盖备份)
+- **P4 EXPORT/IMPORT 单文件快照 (MOTESNAP)**: `EXPORT DB TO 'snap.mote'
+  [COMPRESSED]` — 数据库的"运输形态": 顺序流式条目 + 每文件 CRC32 +
+  逐文件 zstd, 1MiB 缓冲内存有界; 静默纪律复用 backup_to 全套
+  (CAS+checkpoint_mutex+全写条纹+WAL 截断)。导入: 路径穿越防护 +
+  逐条校验 + 截断检测, 产物即 P3 布局。Rust API/FFI/Python/Node/Go
+  全接线(`export_snapshot`/`open_snapshot`/`export_to`/
+  `import_snapshot`/`ExportSnapshot`/`ImportSnapshot`)
+- **总账**: 库固定文件 11→4(.lock/meta.bin/MANIFEST/数据段); 文件
+  3+表数+索引数; fd 恒定个位数; 断电语义未动(temp+rename/孤儿领养/
+  per-segment mmap); 每阶段旧格式读兼容。测试: test_file_layout 5/5 ·
+  test_global_manifest 8/8 · test_snapshot 5/5 · corruption 4/4 ·
+  全量回归零 FAILED · 同机 A/B(file_layout_bench) 吞吐零回退
+- 遗留可选: TimeSeries 引擎统一(方案 E)与只读容器模式, 按路线图另排
+
+### SDK cycle
 
 - **🔑 Node.js SDK(bindings/node, napi-rs v3)**: Database 类 —
   create-or-open / execute(mutations, ?-params) / query(行对象) /

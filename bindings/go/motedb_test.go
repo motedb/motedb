@@ -194,3 +194,51 @@ func TestBackupSnapshot(t *testing.T) {
 	}
 	_ = os.Stdout
 }
+
+func TestExportImportSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "src.mote"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE t (id INT PRIMARY KEY, v TEXT, emb VECTOR(3))"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		if _, err := db.Exec("INSERT INTO t VALUES (?, ?, ?)", i, fmt.Sprintf("v%d", i),
+			[]float64{float64(i), 1, 2}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap := filepath.Join(dir, "fleet.mote")
+	n, err := db.ExportSnapshot(snap, true)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if n <= 0 {
+		t.Fatalf("export packed %d files, want > 0", n)
+	}
+	st, err := os.Stat(snap)
+	if err != nil || st.IsDir() {
+		t.Fatalf("snapshot must be a single file: %v %v", st, err)
+	}
+
+	dest := filepath.Join(dir, "dest.mote")
+	if err := ImportSnapshot(snap, dest); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	imported, err := Open(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer imported.Close()
+	qr, err := imported.Query("SELECT COUNT(*) AS n FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qr[0]["n"] != float64(40) {
+		t.Fatalf("imported rows = %v, want 40", qr[0]["n"])
+	}
+}
