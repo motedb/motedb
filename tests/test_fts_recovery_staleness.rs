@@ -75,28 +75,35 @@ fn probe_total_docs_vs_live_rows() {
         verify_matches(&db, "pre-close");
     } // clean Drop → flush + marker
 
-    let marker = db_path.join(".clean_close"); // P1 rename: was fts_indexes.fresh
-    println!("clean-close marker exists: {}", marker.exists());
-    assert!(marker.exists(), "clean Drop must stamp .clean_close");
+    // P3: the flag lives in meta.bin's header (the P1-era marker file is gone).
+    let ms = motedb::database::meta_store::MetaStore::open_or_migrate(&db_path).unwrap();
+    println!("clean-close flag: {}", ms.clean_close());
+    assert!(
+        ms.clean_close(),
+        "clean Drop must stamp the clean-close flag in meta.bin"
+    );
 
-    // open #1: clean reopen — marker gates the stale check, NO rebuild.
+    // open #1: clean reopen — flag gates the stale check, NO rebuild.
     {
         let db = Database::open(&db_path).unwrap();
         // Consumed at open START (a crash mid-open must never leave a stale
-        // marker claiming freshness for a LATER open); the closing Drop at
-        // the end of this scope re-stamps it.
+        // flag claiming freshness for a LATER open). Re-read from disk: the
+        // Database::open above instantiated its own MetaStore and durably
+        // cleared the flag; our outer handle is a stale snapshot.
+        let fresh = motedb::database::meta_store::MetaStore::open_or_migrate(&db_path).unwrap();
         assert!(
-            !marker.exists(),
-            "open must consume .clean_close (crash-mid-open safety)"
+            !fresh.clean_close(),
+            "open must consume the clean-close flag (crash-mid-open safety)"
         );
         verify_matches(&db, "clean-reopen");
     }
 
-    // Simulate crash evidence: marker absent, data current. The stale check
+    // Simulate crash evidence: flag absent, data current. The stale check
     // must run; NULL discrepancy (80 vs 85) forces a rebuild whose [czdbg]
     // line reports the exact rebuilt doc count (the multi-version answer:
     // 80 ⇒ no duplicate live keys across segments; >80 ⇒ build double-counts).
-    std::fs::remove_file(&marker).unwrap();
+    // P3: clear the flag inside meta.bin (was: delete the marker file).
+    ms.set_clean_close(false).unwrap();
     {
         let db = Database::open(&db_path).unwrap();
         verify_matches(&db, "no-marker-reopen");

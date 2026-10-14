@@ -33,6 +33,7 @@ pub mod helpers;
 pub mod index_metadata;
 pub mod indexes;
 pub mod mem_buffer;
+pub mod meta_store;
 pub mod persistence;
 pub mod pk_cache;
 pub mod table;

@@ -40,13 +40,35 @@ pub struct TableRegistry {
     /// Table ID cache: avoids acquiring metadata lock for every composite key construction.
     /// Invalidated on CREATE TABLE / DROP TABLE. Uses parking_lot for lock-free reads.
     table_id_cache: parking_lot::RwLock<HashMap<String, u32>>,
-    /// Persistence file path
+    /// Persistence file path (legacy standalone mode — used when no
+    /// MetaStore is provided, e.g. low-level unit tests)
     persist_path: PathBuf,
+    /// 🔑 P3 unified metadata: when set, persist()/load go through the shared
+    /// `meta.bin` container instead of the standalone `catalog.bin`.
+    meta: Option<std::sync::Arc<crate::database::meta_store::MetaStore>>,
 }
 
 impl TableRegistry {
-    /// Create a new table registry
+    /// Create a new table registry (legacy standalone-file mode; prefer
+    /// [`Self::new_with_meta`] inside the database).
     pub fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
+        Self::build(data_dir, None)
+    }
+
+    /// Create a table registry backed by the unified `meta.bin` container.
+    /// The catalog section payload format is IDENTICAL to the legacy
+    /// `catalog.bin` bytes, so migration is byte-transparent.
+    pub fn new_with_meta<P: AsRef<Path>>(
+        data_dir: P,
+        meta: std::sync::Arc<crate::database::meta_store::MetaStore>,
+    ) -> Result<Self> {
+        Self::build(data_dir, Some(meta))
+    }
+
+    fn build<P: AsRef<Path>>(
+        data_dir: P,
+        meta_store: Option<std::sync::Arc<crate::database::meta_store::MetaStore>>,
+    ) -> Result<Self> {
         let persist_path = data_dir.as_ref().join("catalog.bin");
 
         // Create directory if it doesn't exist
@@ -54,9 +76,15 @@ impl TableRegistry {
             fs::create_dir_all(parent).map_err(StorageError::Io)?;
         }
 
-        // Try to load existing metadata
-        let metadata = if persist_path.exists() {
-            let data = fs::read(&persist_path).map_err(StorageError::Io)?;
+        // Try to load existing metadata (unified container first)
+        let existing: Option<Vec<u8>> = match &meta_store {
+            Some(m) => m.load_section(crate::database::meta_store::MetaSection::Catalog),
+            None => persist_path
+                .exists()
+                .then(|| fs::read(&persist_path).ok())
+                .flatten(),
+        };
+        let metadata = if let Some(data) = existing {
             let mut meta: RegistryMetadata = bincode::deserialize(&data)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
@@ -89,6 +117,7 @@ impl TableRegistry {
             schema_cache: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             table_id_cache: parking_lot::RwLock::new(HashMap::new()),
             persist_path,
+            meta: meta_store,
         })
     }
 
@@ -522,7 +551,9 @@ impl TableRegistry {
         self.persist()
     }
 
-    /// Persist metadata to disk (atomic: write to temp, fsync, rename)
+    /// Persist metadata to disk (atomic: write to temp, fsync, rename).
+    /// 🔑 P3: through the unified `meta.bin` container when wired; standalone
+    /// `catalog.bin` otherwise (low-level tests only).
     fn persist(&self) -> Result<()> {
         let meta = self
             .metadata
@@ -531,16 +562,21 @@ impl TableRegistry {
 
         let data =
             bincode::serialize(&*meta).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        drop(meta);
 
-        let tmp_path = self.persist_path.with_extension("bin.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp_path).map_err(StorageError::Io)?;
-            std::io::Write::write_all(&mut f, &data).map_err(StorageError::Io)?;
-            f.sync_data().map_err(StorageError::Io)?;
+        match &self.meta {
+            Some(m) => m.update_section(crate::database::meta_store::MetaSection::Catalog, data),
+            None => {
+                let tmp_path = self.persist_path.with_extension("bin.tmp");
+                {
+                    let mut f = std::fs::File::create(&tmp_path).map_err(StorageError::Io)?;
+                    std::io::Write::write_all(&mut f, &data).map_err(StorageError::Io)?;
+                    f.sync_data().map_err(StorageError::Io)?;
+                }
+                std::fs::rename(&tmp_path, &self.persist_path).map_err(StorageError::Io)?;
+                Ok(())
+            }
         }
-        std::fs::rename(&tmp_path, &self.persist_path).map_err(StorageError::Io)?;
-
-        Ok(())
     }
 }
 

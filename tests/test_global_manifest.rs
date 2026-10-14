@@ -331,3 +331,90 @@ fn p2_runtime_fd_flat_across_tables() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn p3_meta_bin_unifies_catalog_lsn_and_clean_close() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("d.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE mt (id INTEGER PRIMARY KEY AUTO_INCREMENT, v TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            db.execute(&format!("INSERT INTO mt (v) VALUES ('x{i}')"))
+                .unwrap();
+        }
+        db.execute("CHECKPOINT").unwrap();
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM mt"), 50);
+        db.close().unwrap();
+    }
+    // meta.bin 存在; 旧三文件不复存在
+    assert!(path.join("meta.bin").exists());
+    assert!(!path.join("catalog.bin").exists());
+    assert!(!path.join("index_metadata.bin").exists());
+    assert!(!path.join("lsn_counter").exists());
+
+    // 重开: catalog(AUTO_INCREMENT 续号)、lsn、数据全保留
+    let db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM mt"), 50);
+    let r = db.execute("INSERT INTO mt (v) VALUES ('after')").unwrap();
+    let _ = r;
+    let n = count(&db, "SELECT COUNT(*) FROM mt");
+    assert_eq!(n, 51);
+    // AUTO_INCREMENT 必须续号 (id=51) 而不是从 1 重新分配
+    let r = db
+        .execute("SELECT id FROM mt WHERE v = 'after'")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let (_, data) = r.select_rows().unwrap();
+    assert_eq!(
+        data[0][0],
+        motedb::types::Value::Integer(51),
+        "AUTO_INCREMENT survives reopen via meta.bin"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn p3_migration_from_pre_p3_layout() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("d.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE legacy (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for i in 0..30 {
+            db.execute(&format!("INSERT INTO legacy VALUES ({i}, 'l{i}')"))
+                .unwrap();
+        }
+        db.execute("CHECKPOINT").unwrap();
+        db.close().unwrap();
+    }
+    // 伪造 pre-P3 布局: 从 meta.bin 拆出 catalog 节回 catalog.bin, 删 meta.bin
+    let meta_path = path.join("meta.bin");
+    let data = std::fs::read(&meta_path).unwrap();
+    assert!(data.len() > 10);
+    // 找到 catalog 节 (kind=1): header 10B 后第一节
+    let sec_len = u32::from_le_bytes(data[11..15].try_into().unwrap()) as usize;
+    let crc_off = 15usize;
+    let payload = &data[19..19 + sec_len];
+    assert_eq!(data[10], 1, "first section is catalog");
+    let expect_crc = u32::from_le_bytes(data[crc_off..crc_off + 4].try_into().unwrap());
+    assert_eq!(crc32fast::hash(payload), expect_crc);
+    std::fs::write(path.join("catalog.bin"), payload).unwrap();
+    std::fs::write(path.join("lsn_counter"), 0u64.to_le_bytes()).unwrap();
+    std::fs::remove_file(&meta_path).unwrap();
+
+    // 重开: 迁移回 meta.bin, 表完好
+    let db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM legacy"), 30);
+    assert!(meta_path.exists(), "meta.bin recreated by migration");
+    assert!(!path.join("catalog.bin").exists(), "legacy file consumed");
+    db.close().unwrap();
+
+    // 再次重开幂等
+    let db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM legacy"), 30);
+    db.close().unwrap();
+}

@@ -616,9 +616,13 @@ impl MoteDB {
             //   the segment files are written. The WAL exists only for crash
             //   recovery of unflushed write_buf data.
             self.wal.checkpoint_all()?;
-            // Persist write_lsn so restarts survive clock regression
+            // Persist write_lsn so restarts survive clock regression.
+            // 🔑 P3: through the unified meta.bin container.
             let current_lsn = self.write_lsn.load(std::sync::atomic::Ordering::SeqCst);
-            crate::database::core::MoteDB::persist_lsn_counter(&self.path, current_lsn);
+            self.meta_store.update_section(
+                crate::database::meta_store::MetaSection::Lsn,
+                current_lsn.to_le_bytes().to_vec(),
+            )?;
             true
         } else {
             false

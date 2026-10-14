@@ -86,29 +86,59 @@ pub struct IndexRegistry {
     lookup_cache:
         parking_lot::RwLock<Option<std::collections::HashMap<(String, String, u8), String>>>,
 
-    /// Persistence path
+    /// Persistence path (legacy standalone mode)
     metadata_path: std::path::PathBuf,
+
+    /// 🔑 P3 unified metadata: when set, load/save go through the shared
+    /// `meta.bin` container instead of the standalone `index_metadata.bin`.
+    meta: Option<std::sync::Arc<crate::database::meta_store::MetaStore>>,
 }
 
 impl IndexRegistry {
-    /// Create a new index registry
+    /// Create a new index registry (legacy standalone-file mode; prefer
+    /// [`Self::new_with_meta`] inside the database).
     pub fn new(db_path: &Path) -> Self {
+        Self::build(db_path, None)
+    }
+
+    /// Create an index registry backed by the unified `meta.bin` container.
+    /// The section payload format is IDENTICAL to the legacy
+    /// `index_metadata.bin` bytes, so migration is byte-transparent.
+    pub fn new_with_meta(
+        db_path: &Path,
+        meta: std::sync::Arc<crate::database::meta_store::MetaStore>,
+    ) -> Self {
+        Self::build(db_path, Some(meta))
+    }
+
+    fn build(
+        db_path: &Path,
+        meta: Option<std::sync::Arc<crate::database::meta_store::MetaStore>>,
+    ) -> Self {
         let metadata_path = db_path.join("index_metadata.bin");
 
         Self {
             indexes: Arc::new(DashMap::new()),
             lookup_cache: parking_lot::RwLock::new(None),
             metadata_path,
+            meta,
         }
     }
 
     /// Load metadata from disk
     pub fn load(&self) -> Result<()> {
-        if !self.metadata_path.exists() {
-            return Ok(());
-        }
-
-        let data = std::fs::read(&self.metadata_path).map_err(StorageError::Io)?;
+        let data = match &self.meta {
+            Some(m) => match m.load_section(crate::database::meta_store::MetaSection::IndexMeta) {
+                Some(d) => d,
+                None => return Ok(()),
+            },
+            None => {
+                if !self.metadata_path.exists() {
+                    return Ok(());
+                }
+                std::fs::read(&self.metadata_path).map_err(StorageError::Io)?
+            }
+        };
 
         let metadata_list: Vec<IndexMetadata> =
             bincode::deserialize(&data).map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -132,16 +162,20 @@ impl IndexRegistry {
         let data = bincode::serialize(&metadata_list)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        // Write to temp file first, then rename for atomicity
-        let tmp_path = self.metadata_path.with_extension("bin.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp_path).map_err(StorageError::Io)?;
-            std::io::Write::write_all(&mut f, &data).map_err(StorageError::Io)?;
-            f.sync_all().map_err(StorageError::Io)?;
+        match &self.meta {
+            Some(m) => m.update_section(crate::database::meta_store::MetaSection::IndexMeta, data),
+            None => {
+                // Write to temp file first, then rename for atomicity
+                let tmp_path = self.metadata_path.with_extension("bin.tmp");
+                {
+                    let mut f = std::fs::File::create(&tmp_path).map_err(StorageError::Io)?;
+                    std::io::Write::write_all(&mut f, &data).map_err(StorageError::Io)?;
+                    f.sync_all().map_err(StorageError::Io)?;
+                }
+                std::fs::rename(&tmp_path, &self.metadata_path).map_err(StorageError::Io)?;
+                Ok(())
+            }
         }
-        std::fs::rename(&tmp_path, &self.metadata_path).map_err(StorageError::Io)?;
-
-        Ok(())
     }
 
     /// Register a new index.

@@ -79,12 +79,25 @@ fn p1_no_ts_no_index_minimal_fixed_files() {
     );
     assert!(
         !files.iter().any(|f| f.contains("fresh")),
-        "clean-close marker must be dot-prefixed .clean_close: {:?}",
+        "no legacy freshness markers: {:?}",
+        files
+    );
+    // P3: clean-close flag lives in meta.bin; catalog/lsn merged in too.
+    assert!(
+        !files.iter().any(|f| f == ".clean_close"),
+        "marker file replaced by meta.bin flag (P3): {:?}",
         files
     );
     assert!(
-        files.iter().any(|f| f == ".clean_close"),
-        ".clean_close marker must be stamped on clean close: {:?}",
+        !files
+            .iter()
+            .any(|f| f == "catalog.bin" || f == "lsn_counter"),
+        "catalog/lsn merged into meta.bin (P3): {:?}",
+        files
+    );
+    assert!(
+        files.iter().any(|f| f == "meta.bin"),
+        "unified metadata container must exist: {:?}",
         files
     );
     // 数据本体必须存在

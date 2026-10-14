@@ -74,13 +74,21 @@ fn test_corrupt_catalog_clear_error() {
             .unwrap();
         let _ = db.close();
     }
-    std::fs::write(p.join("catalog.bin"), b"NOT BINCODE").unwrap();
+    // P3: the catalog lives in meta.bin's first section — corrupt ITS payload.
+    // Sections are emitted kind-ordered, so catalog (kind 1) is first; flip
+    // the LAST byte of its payload (later sections like lsn tolerate loss).
+    let meta_path = p.join("meta.bin");
+    let mut data = std::fs::read(&meta_path).unwrap();
+    let sec_len = u32::from_le_bytes(data[11..15].try_into().unwrap()) as usize;
+    let cat_last = 10 + 9 + sec_len - 1; // header(10) + section header(9) + payload
+    data[cat_last] ^= 0xFF;
+    std::fs::write(&meta_path, &data).unwrap();
     let err = Database::open(&p)
         .err()
         .expect("corrupt catalog must error");
     assert!(
-        err.to_string().to_lowercase().contains("serial"),
-        "clear serialization error, got: {err}"
+        err.to_string().to_lowercase().contains("catalog"),
+        "clear catalog corruption error, got: {err}"
     );
 }
 

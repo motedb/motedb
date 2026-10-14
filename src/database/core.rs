@@ -23,7 +23,6 @@ use crate::{MoteDBError, Result, StorageError};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::{Arc, Mutex};
@@ -128,6 +127,10 @@ pub struct MoteDB {
     /// multi-way merge. Coexists with the legacy fields during migration.
     pub(crate) col_segment_stores:
         Arc<DashMap<String, Arc<crate::storage::col_segment::ColSegmentStore>>>,
+
+    /// 🔑 P3 unified metadata container (`meta.bin`): catalog + index
+    /// metadata + LSN + clean-close flag in one sectioned file.
+    pub(crate) meta_store: std::sync::Arc<crate::database::meta_store::MetaStore>,
 
     /// 🔑 P2 global layout: the single `columnar_ms/MANIFEST` shared by every
     /// ColSegmentStore (one manifest file + one fd per database, not per
@@ -461,13 +464,23 @@ impl MoteDB {
         let version_store = Arc::new(VersionStore::new());
         let txn_coordinator = Arc::new(TransactionCoordinator::new(version_store.clone()));
 
+        // 🔑 P3 unified metadata: one meta.bin for catalog + index metadata +
+        // LSN + clean-close flag. (A fresh create has no legacy files; the
+        // migrate call degenerates to creating the empty container.)
+        let meta_store = Arc::new(crate::database::meta_store::MetaStore::open_or_migrate(
+            &db_path,
+        )?);
+
         // Create table registry (catalog)
-        let table_registry = Arc::new(TableRegistry::new(&db_path)?);
+        let table_registry = Arc::new(TableRegistry::new_with_meta(&db_path, meta_store.clone())?);
 
         // 🆕 Create index metadata registry
-        let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(
-            &db_path,
-        ));
+        let index_registry = Arc::new(
+            crate::database::index_metadata::IndexRegistry::new_with_meta(
+                &db_path,
+                meta_store.clone(),
+            ),
+        );
 
         // 🚀 P1: Create row cache (default 10000 rows ≈ 10MB)
         let row_cache = Arc::new(RowCache::new(config.row_cache_size.unwrap_or(10000)));
@@ -486,7 +499,10 @@ impl MoteDB {
         let write_lsn = Arc::new(AtomicU64::new(init_lsn));
 
         // Persist initial LSN so restart after clock change doesn't regress
-        Self::persist_lsn_counter(&db_path, init_lsn);
+        meta_store.update_section(
+            crate::database::meta_store::MetaSection::Lsn,
+            init_lsn.to_le_bytes().to_vec(),
+        )?;
 
         // Create columnar store for TimeSeries tables (shares next_row_id and table_registry)
         let columnar_dir = db_path.join("columnar");
@@ -581,6 +597,7 @@ impl MoteDB {
             columnar_write_bufs: Arc::new(DashMap::new()),
             col_segment_stores: Arc::new(DashMap::new()),
             col_manifest,
+            meta_store: meta_store.clone(),
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
@@ -859,6 +876,7 @@ impl MoteDB {
             columnar_write_bufs: self.columnar_write_bufs.clone(),
             col_segment_stores: self.col_segment_stores.clone(),
             col_manifest: self.col_manifest.clone(),
+            meta_store: self.meta_store.clone(),
             pk_lookup: self.pk_lookup.clone(),
             table_row_count: self.table_row_count.clone(),
             table_registry: self.table_registry.clone(),
@@ -913,11 +931,18 @@ impl MoteDB {
         // suspect (crash / kill -9) ⇒ the stale-count check in the rebuild
         // loop below runs and rebuilds on mismatch. Captured BEFORE removal
         // (a crash mid-open must never leave a stale marker behind).
-        // P1 file-layout: renamed `fts_indexes.fresh` → `.clean_close`
-        // (dot-prefixed, hidden); the legacy name is still honored once.
+        // P3 file-layout: the flag lives in meta.bin's header; the P1-era
+        // marker FILES (`.clean_close`, legacy `fts_indexes.fresh`) are
+        // still honored once for databases last closed by an older build.
+        let meta_store = Arc::new(crate::database::meta_store::MetaStore::open_or_migrate(
+            &db_path,
+        )?);
         let clean_close_marker = db_path.join(".clean_close");
         let legacy_marker = db_path.join("fts_indexes.fresh");
-        let clean_close = clean_close_marker.exists() || legacy_marker.exists();
+        let clean_close =
+            meta_store.clean_close() || clean_close_marker.exists() || legacy_marker.exists();
+        // Consume durably — a crash mid-open must not re-observe `clean`.
+        meta_store.set_clean_close(false)?;
         let _ = std::fs::remove_file(&clean_close_marker);
         let _ = std::fs::remove_file(&legacy_marker);
 
@@ -982,7 +1007,7 @@ impl MoteDB {
 
         // Load table registry BEFORE WAL replay so we can resolve table_name → table_id
         // for correct composite key construction.
-        let table_registry = Arc::new(TableRegistry::new(&db_path)?);
+        let table_registry = Arc::new(TableRegistry::new_with_meta(&db_path, meta_store.clone())?);
         table_registry.ensure_default_table_id()?;
 
         // Replay WAL records into LSM Engine using stable table_id
@@ -1077,7 +1102,12 @@ impl MoteDB {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(1);
-        let persisted_lsn = Self::load_lsn_counter(&db_path);
+        let persisted_lsn = crate::database::meta_store::payload_as_u64(
+            meta_store.load_section(crate::database::meta_store::MetaSection::Lsn),
+        );
+        // Migration fallback: a pre-P3 database persists its LSN in the
+        // legacy `lsn_counter` file (consumed by MetaStore::open_or_migrate —
+        // the section is already populated there).
         let init_lsn = current_micros
             .max(max_row_id + 1)
             .max(persisted_lsn)
@@ -1270,9 +1300,12 @@ impl MoteDB {
         let txn_coordinator = Arc::new(TransactionCoordinator::new(version_store.clone()));
 
         // 🆕 Load index metadata registry first (needed for metric info)
-        let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(
-            &db_path,
-        ));
+        let index_registry = Arc::new(
+            crate::database::index_metadata::IndexRegistry::new_with_meta(
+                &db_path,
+                meta_store.clone(),
+            ),
+        );
         // 🔑 Tables that got WAL-replayed rows (committed inserts/updates/
         // deletes). Decides whether on-disk indexes are stale (crash
         // recovery ⇒ rebuild) or current (clean close flushed them ⇒ load
@@ -1497,6 +1530,7 @@ impl MoteDB {
             columnar_write_bufs: Arc::new(DashMap::new()),
             col_segment_stores: Arc::new(DashMap::new()),
             col_manifest,
+            meta_store: meta_store.clone(),
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
@@ -3059,49 +3093,6 @@ impl MoteDB {
         }
         let _ = timeout;
     }
-
-    /// Persist the current write_lsn to a counter file.
-    /// Survives clock regression across restarts.
-    pub(crate) fn persist_lsn_counter(db_path: &Path, lsn: u64) {
-        let path = db_path.join("lsn_counter");
-        match std::fs::File::create(&path) {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(&lsn.to_le_bytes()) {
-                    warn_log!(
-                        "[persist_lsn_counter] write failed {}: {}",
-                        path.display(),
-                        e
-                    );
-                    return;
-                }
-                if let Err(e) = file.sync_all() {
-                    warn_log!(
-                        "[persist_lsn_counter] fsync failed {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
-            Err(e) => {
-                warn_log!(
-                    "[persist_lsn_counter] create failed {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
-    }
-
-    /// Load the persisted LSN counter. Returns 0 if the file doesn't exist.
-    fn load_lsn_counter(db_path: &Path) -> u64 {
-        let path = db_path.join("lsn_counter");
-        match std::fs::read(&path) {
-            Ok(data) if data.len() >= 8 => {
-                u64::from_le_bytes(data[..8].try_into().unwrap_or([0u8; 8]))
-            }
-            _ => 0,
-        }
-    }
 }
 
 /// Automatic cleanup when database is dropped
@@ -3222,30 +3213,17 @@ impl MoteDB {
             );
             return;
         }
-        // Durable stamp (fs::write alone is page-cache only): fsync the
-        // file, rename, then fsync the dir (unix-only — Windows opens on
-        // directories return Access Denied, v0.12.6). This orders the marker
-        // STRICTLY AFTER the flushed index data so a power loss can never
-        // leave the marker claiming freshness for postings that didn't
-        // survive.
-        let marker = self.path.join(".clean_close");
-        let tmp = self.path.join(".clean_close.tmp");
-        let stamped = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(b"v1")?;
-            f.sync_all()?;
-            drop(f);
-            std::fs::rename(&tmp, &marker)?;
-            #[cfg(unix)]
-            std::fs::File::open(&self.path)?.sync_all()?;
-            Ok(())
-        })();
+        // 🔑 P3: the flag lives in meta.bin's header. update_section rewrites
+        // the whole container atomically (temp + fsync + rename + dir fsync),
+        // ordering the flag STRICTLY AFTER the flushed index data so a power
+        // loss can never leave it claiming freshness for postings that
+        // didn't survive.
+        let stamped = self.meta_store.set_clean_close(true);
         match stamped {
             Ok(()) => debug_log!("{who} ✅ FTS flushed, freshness marker stamped"),
-            Err(e) => warn_log!(
-                "{who} ⚠️ .clean_close stamp failed ({e:?}) — next open pays crash-verify"
-            ),
+            Err(e) => {
+                warn_log!("{who} ⚠️ clean-close stamp failed ({e:?}) — next open pays crash-verify")
+            }
         }
     }
 }
