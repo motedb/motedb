@@ -507,6 +507,10 @@ impl ColSegmentStore {
                 super::manifest::LOCAL_TABLE_ID,
             ),
         };
+        // 🔑 F1b: let manifest compaction stat this table's segment files —
+        // retired ids whose files are gone can be forgotten (bounded log).
+        manifest.lock().register_table_dir(table_id, dir.clone());
+
         let buf_path = dir.join(".writebuf.tmp");
         let write_buf = ColumnarSSTableBuilder::new(&buf_path, col_types.clone());
         let store = Arc::new(Self {
@@ -4438,9 +4442,14 @@ impl ColSegmentStore {
     /// active segment ids, opens each .sst file, and loads them into memory.
     /// Ensures no data loss on crash (ACID durability).
     pub fn recover_from_disk(&self) {
-        // Replay the (shared) manifest and take THIS table's slice.
-        let state = self.manifest.lock().replay();
-        if state.dropped.contains(&self.table_id) {
+        // 🔑 F1: take this table's slice from the manifest's IN-MEMORY
+        // incrementally-maintained state — the file is parsed once per
+        // database open, not once per store.
+        let (dropped, state) = {
+            let m = self.manifest.lock();
+            (m.is_dropped(self.table_id), m.table_snapshot(self.table_id))
+        };
+        if dropped {
             // DropTable recorded: any files here are stale deletions, not
             // orphans — wipe them and start clean.
             if let Ok(entries) = std::fs::read_dir(&self.dir) {
@@ -4453,7 +4462,6 @@ impl ColSegmentStore {
             }
             return;
         }
-        let state = state.table(self.table_id);
 
         // Find the highest segment id to continue numbering.
         let mut max_id = 0u64;
@@ -4467,6 +4475,10 @@ impl ColSegmentStore {
         // (id never mentioned by any record) is a complete, durable segment —
         // adopt it. A file whose id WAS mentioned but is no longer active was
         // superseded/GC'd — delete it.
+        // F1: set-membership for the per-file scan (Vec contains was linear
+        // in lifetime history; ever_seen can hold thousands of ids between
+        // manifest compactions).
+        let known: std::collections::HashSet<u64> = state.ever_seen.iter().copied().collect();
         let mut orphans: Vec<u64> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
@@ -4474,8 +4486,7 @@ impl ColSegmentStore {
                     if name.ends_with(".sst") {
                         if let Ok(id) = name.trim_end_matches(".sst").parse::<u64>() {
                             max_id = max_id.max(id);
-                            if state.active_segments.contains(&id) || state.ever_seen.contains(&id)
-                            {
+                            if known.contains(&id) {
                                 continue;
                             }
                             orphans.push(id);

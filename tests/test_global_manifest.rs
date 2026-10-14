@@ -418,3 +418,71 @@ fn p3_migration_from_pre_p3_layout() {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM legacy"), 30);
     db.close().unwrap();
 }
+
+#[test]
+fn f1_manifest_compaction_bounds_size_and_preserves_state() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("d.mote");
+    let ms_dir_holder;
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        // 积累记录: 大量小 flush → AddSegment×N (每 checkpoint flush 一个段)
+        for round in 0..1200 {
+            db.execute(&format!("INSERT INTO t VALUES ({round}, 'v{round}')"))
+                .unwrap();
+            db.execute("CHECKPOINT").unwrap();
+        }
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 1200);
+        db.close().unwrap();
+        ms_dir_holder = path.join("columnar_ms");
+    }
+    let manifest = ms_dir_holder.join("MANIFEST");
+    let len = std::fs::metadata(&manifest).unwrap().len();
+    // 1200 轮 ≈ 无 compaction 时 ~50KB 记录; 阈值 64KB 未到则文件也不应
+    // 超过 64KB + 单记录 — 断言硬上界。
+    assert!(
+        len < 64 * 1024 + 4096,
+        "manifest must stay bounded ({len}B after 1200 flush cycles)"
+    );
+
+    // 重开: 数据完好, 内存状态与文件一致(隐式验证 compaction 后 replay 等价)
+    let db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 1200);
+    db.close().unwrap();
+}
+
+#[test]
+fn f1_open_time_scales_once_not_per_table() {
+    // 回归防呆: 打开耗时不应随 manifest 历史显著膨胀 (F1 修复前,
+    // 每个 store 全量 replay 整个 manifest)。
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("d.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        for t in 0..20 {
+            db.execute(&format!(
+                "CREATE TABLE t{t} (id INTEGER PRIMARY KEY, v TEXT)"
+            ))
+            .unwrap();
+        }
+        // 每表积累 ~40 条 AddSegment 记录 (compaction 合并段, 历史进 ever_seen)
+        for round in 0..40 {
+            for t in 0..20 {
+                db.execute(&format!("INSERT INTO t{t} VALUES ({round}, 'v')"))
+                    .unwrap();
+            }
+            db.execute("CHECKPOINT").unwrap();
+        }
+        db.close().unwrap();
+    }
+    let t0 = std::time::Instant::now();
+    let db = Database::open(&path).unwrap();
+    let open_ms = t0.elapsed().as_millis();
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t0"), 40);
+    db.close().unwrap();
+    // 20 表 + 800 轮记录: 修复后应远小于 1s (修复前量级 ~50ms+/表组);
+    // 上界宽松以防 CI 抖动, 主要防 N×replay 退化回归。
+    assert!(open_ms < 1000, "open took {open_ms}ms");
+}

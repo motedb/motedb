@@ -56,6 +56,13 @@ impl TableManifestState {
     fn note_gc(&mut self, gced: &[u64]) {
         self.obsolete_files.retain(|x| !gced.contains(x));
     }
+    /// Compaction-written history marker: ids are known (ever_seen) but not
+    /// active — a leftover file for one of them must be RETRIED for deletion,
+    /// never adopted as an orphan.
+    fn note_retired(&mut self, ids: &[u64]) {
+        self.ever_seen.extend(ids.iter().copied());
+        self.obsolete_files.extend(ids.iter().copied());
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +97,12 @@ enum Record {
     DropTable {
         tid: u32,
     },
+    /// ids that are known-history (ever_seen) but not active — emitted only
+    /// by manifest compaction to preserve "never adopt these files" semantics.
+    Retired {
+        tid: u32,
+        ids: Vec<u64>,
+    },
 }
 
 impl Record {
@@ -99,6 +112,7 @@ impl Record {
             Record::Compaction { .. } => 2,
             Record::GcCompleted { .. } => 3,
             Record::DropTable { .. } => 4,
+            Record::Retired { .. } => 5,
         }
     }
     fn encode(&self) -> Vec<u8> {
@@ -130,6 +144,13 @@ impl Record {
             }
             Record::DropTable { tid } => {
                 v.extend_from_slice(&tid.to_le_bytes());
+            }
+            Record::Retired { tid, ids } => {
+                v.extend_from_slice(&tid.to_le_bytes());
+                v.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+                for id in ids {
+                    v.extend_from_slice(&id.to_le_bytes());
+                }
             }
         }
         v
@@ -188,13 +209,39 @@ fn decode_v2(data: &[u8], pos: &mut usize, t: u8) -> Option<Record> {
             let tid = take_u32(data, pos)?;
             Some(Record::DropTable { tid })
         }
+        5 => {
+            let tid = take_u32(data, pos)?;
+            let ids = take_ids(data, pos)?;
+            Some(Record::Retired { tid, ids })
+        }
         _ => None,
     }
 }
 
+/// Compact the manifest when its file exceeds max(64 KiB, 4 × live-state
+/// bytes). The floor keeps tiny databases from rewriting on every record;
+/// the factor bounds steady-state size to a small multiple of the minimum
+/// encoding (one AddSegment per active segment + DropTable history).
+const MANIFEST_MIN_COMPACTION_BYTES: u64 = 64 * 1024;
+const MANIFEST_COMPACTION_FACTOR: u64 = 4;
+
 pub struct Manifest {
     path: PathBuf,
     writer: BufWriter<File>,
+    /// 🔑 F1: incrementally-maintained decoded state. Built once at open
+    /// (single file parse); every append folds its record in. Store creation
+    /// reads its table slice from memory instead of re-parsing the file —
+    /// opening an N-table database parses the manifest ONCE, not N times.
+    state: ManifestState,
+    /// Current file length in bytes (header + records); drives compaction.
+    file_bytes: u64,
+    /// 🔑 F1b: per-table segment directories (registered by ColSegmentStore
+    /// at creation). Compaction stats retired ids' files here: an id whose
+    /// file is GONE can be forgotten entirely — segment ids are strictly
+    /// monotonic per table, so the name can never be reused; the record's
+    /// only job was "don't adopt / retry-delete this file". Tables without a
+    /// registered dir keep their full history (conservative).
+    table_dirs: HashMap<u32, PathBuf>,
 }
 
 impl Manifest {
@@ -235,6 +282,9 @@ impl Manifest {
         Ok(Self {
             path: path.to_path_buf(),
             writer: BufWriter::new(file),
+            state: ManifestState::default(),
+            file_bytes: 10, // magic + version + count placeholder
+            table_dirs: HashMap::new(),
         })
     }
 
@@ -242,14 +292,20 @@ impl Manifest {
     /// writes after the existing records (NOT at offset 0, which would
     /// overwrite the MAGIC header — the v0.5.0 WAL-recovery-gap bug).
     fn open(path: &Path) -> Result<Self> {
+        // Parse ONCE here — every later read (store creation, compaction)
+        // works from the in-memory state.
+        let state = Self::parse_file(path);
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         // Position the write cursor at end-of-file so append() extends the log
         // instead of clobbering the header.
         use std::io::Seek;
-        let _ = file.seek(std::io::SeekFrom::End(0));
+        let file_bytes = file.seek(std::io::SeekFrom::End(0))?;
         Ok(Self {
             path: path.to_path_buf(),
             writer: BufWriter::new(file),
+            state,
+            file_bytes,
+            table_dirs: HashMap::new(),
         })
     }
 
@@ -264,7 +320,123 @@ impl Manifest {
         let bytes = rec.encode();
         self.writer.write_all(&bytes)?;
         self.writer.flush()?;
+        apply_record(&mut self.state, &rec);
+        self.file_bytes += bytes.len() as u64;
+        self.maybe_compact()?;
         Ok(())
+    }
+
+    /// In-memory table slice for `recover_from_disk` (no file I/O).
+    pub fn table_snapshot(&self, tid: u32) -> TableManifestState {
+        self.state.table(tid)
+    }
+
+    /// Register a table's segment directory (called by ColSegmentStore at
+    /// creation) so compaction can prune retired history whose files are
+    /// already gone.
+    pub fn register_table_dir(&mut self, tid: u32, dir: PathBuf) {
+        self.table_dirs.insert(tid, dir);
+    }
+
+    /// Whether a DropTable record covers `tid` (no file I/O).
+    pub fn is_dropped(&self, tid: u32) -> bool {
+        self.state.dropped.contains(&tid)
+    }
+
+    /// Rewrite the manifest as its minimal encoding when the append log has
+    /// grown far beyond the live state. Crash-safe: minimal file is written
+    /// to a sibling temp, fsync'd, renamed — a crash mid-compaction leaves
+    /// the old log authoritative. Preserves the recovery contract:
+    /// - active segments → AddSegment records;
+    /// - ever_seen-but-inactive ids → Retired records (leftover files must
+    ///   be retried for deletion, NEVER adopted as orphans);
+    /// - DropTable history → DropTable records (5 B each).
+    fn maybe_compact(&mut self) -> Result<()> {
+        let live = self.live_bytes_estimate();
+        let threshold = MANIFEST_COMPACTION_FACTOR * live;
+        let threshold = threshold.max(MANIFEST_MIN_COMPACTION_BYTES);
+        if self.file_bytes <= threshold {
+            return Ok(());
+        }
+        let tmp_path = self.path.with_file_name(".MANIFEST.cmp.tmp");
+        let mut minimal = Manifest::create(&tmp_path)?;
+        for (tid, ts) in &self.state.tables {
+            for id in &ts.active_segments {
+                minimal.append(Record::AddSegment { tid: *tid, id: *id })?;
+            }
+            // ever_seen is an append-only multiset (an id can arrive via
+            // AddSegment AND Compaction) — dedupe, then prune by file
+            // existence: ids whose segment file is already deleted are
+            // FORGOTTEN (monotonic ids never reuse the name), ids whose file
+            // lingers (crash between GcCompleted and delete) are kept so
+            // recovery retries deletion instead of adopting the file.
+            let active: std::collections::HashSet<u64> =
+                ts.active_segments.iter().copied().collect();
+            let retired: Vec<u64> = {
+                let mut seen: std::collections::HashSet<u64> =
+                    ts.ever_seen.iter().copied().collect();
+                seen.retain(|id| !active.contains(id));
+                let mut v: Vec<u64> = match self.table_dirs.get(tid) {
+                    Some(dir) => seen
+                        .into_iter()
+                        .filter(|id| dir.join(format!("{id:010}.sst")).exists())
+                        .collect(),
+                    None => seen.into_iter().collect(),
+                };
+                v.sort_unstable();
+                v
+            };
+            if !retired.is_empty() {
+                minimal.append(Record::Retired {
+                    tid: *tid,
+                    ids: retired,
+                })?;
+            }
+        }
+        for tid in &self.state.dropped {
+            minimal.append(Record::DropTable { tid: *tid })?;
+        }
+        minimal.sync()?;
+        drop(minimal);
+        std::fs::rename(&tmp_path, &self.path)?;
+        crate::fsync_dir(&self.path);
+        // Reopen the (now minimal) file for appending, and rebuild the
+        // in-memory state FROM it so memory and file agree exactly (the
+        // minimal encoding folds GC'd history into Retired — semantically
+        // equivalent, but we keep one source of truth).
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        use std::io::Seek;
+        let file_bytes = file.seek(std::io::SeekFrom::End(0))?;
+        self.writer = BufWriter::new(file);
+        self.file_bytes = file_bytes;
+        self.state = Self::parse_file(&self.path);
+        Ok(())
+    }
+
+    /// Minimal-encoding size estimate for the live state (UNIQUE ids —
+    /// ever_seen is an append-only multiset and would over-count 2-3×).
+    fn live_bytes_estimate(&self) -> u64 {
+        let mut total = 10u64; // header
+        for (tid, ts) in &self.state.tables {
+            let active: std::collections::HashSet<u64> =
+                ts.active_segments.iter().copied().collect();
+            let seen: std::collections::HashSet<u64> = ts.ever_seen.iter().copied().collect();
+            total += (active.len() as u64) * (1 + 4 + 8);
+            let retired = match self.table_dirs.get(tid) {
+                Some(dir) => seen
+                    .iter()
+                    .filter(|id| {
+                        !active.contains(*id) && dir.join(format!("{:010}.sst", id)).exists()
+                    })
+                    .count(),
+                None => seen.len().saturating_sub(active.len()),
+            };
+            if retired > 0 {
+                total += 1 + 4 + 4 + (retired as u64) * 8;
+            }
+        }
+        total += (self.state.dropped.len() as u64) * (1 + 4);
+        total
     }
 
     /// fsync the manifest (durability point). Callers then may physically
@@ -306,8 +478,13 @@ impl Manifest {
     /// all records land under [`LOCAL_TABLE_ID`] — the migration path then
     /// re-tags them with real registry ids.
     pub fn replay(&self) -> ManifestState {
+        Self::parse_file(&self.path)
+    }
+
+    /// One-shot file parse (v1 legacy shapes or v2).
+    fn parse_file(path: &Path) -> ManifestState {
         let mut data = Vec::new();
-        if let Ok(mut f) = File::open(&self.path) {
+        if let Ok(mut f) = File::open(path) {
             let _ = f.read_to_end(&mut data);
         }
         if data.len() < 10 || &data[..4] != MAGIC {
@@ -349,31 +526,40 @@ impl Manifest {
             let Some(rec) = decode_v2(&data, &mut pos, t) else {
                 break;
             };
-            match rec {
-                Record::AddSegment { tid, id } => {
-                    state.tables.entry(tid).or_default().note_add(id);
-                }
-                Record::Compaction {
-                    tid,
-                    new_id,
-                    old_ids,
-                } => {
-                    state
-                        .tables
-                        .entry(tid)
-                        .or_default()
-                        .note_compaction(new_id, &old_ids);
-                }
-                Record::GcCompleted { tid, ids } => {
-                    state.tables.entry(tid).or_default().note_gc(&ids);
-                }
-                Record::DropTable { tid } => {
-                    state.tables.remove(&tid);
-                    state.dropped.insert(tid);
-                }
-            }
+            apply_record(&mut state, &rec);
         }
         state
+    }
+}
+
+/// Fold one v2 record into a state — shared by replay (file parse) and
+/// `Manifest::append` (incremental in-memory maintenance).
+fn apply_record(state: &mut ManifestState, rec: &Record) {
+    match rec {
+        Record::AddSegment { tid, id } => {
+            state.tables.entry(*tid).or_default().note_add(*id);
+        }
+        Record::Compaction {
+            tid,
+            new_id,
+            old_ids,
+        } => {
+            state
+                .tables
+                .entry(*tid)
+                .or_default()
+                .note_compaction(*new_id, old_ids);
+        }
+        Record::GcCompleted { tid, ids } => {
+            state.tables.entry(*tid).or_default().note_gc(ids);
+        }
+        Record::DropTable { tid } => {
+            state.tables.remove(tid);
+            state.dropped.insert(*tid);
+        }
+        Record::Retired { tid, ids } => {
+            state.tables.entry(*tid).or_default().note_retired(ids);
+        }
     }
 }
 
@@ -544,4 +730,47 @@ fn write_global_from_state(base_dir: &Path, state: &ManifestState) -> Result<()>
     std::fs::rename(&tmp_path, &final_path)?;
     crate::fsync_dir(&final_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod f1_tests {
+    use super::*;
+
+    #[test]
+    fn f1_compaction_triggers_and_binds_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manifest::open_or_create_local(dir.path()).unwrap();
+        // Register a (file-less) table dir: every retired id's file is absent
+        // → compaction must FORGET them, not carry them as Retired records.
+        m.register_table_dir(7, dir.path().join("7"));
+        // Steady-state churn: each cycle retires the previous segment
+        // (flush → compaction → gc), active stays 1, history accumulates —
+        // the shape a long-running ingest database produces.
+        m.add_segment(7, 1).unwrap();
+        let mut old = 1u64;
+        for new in 2..=6000u64 {
+            m.add_segment(7, new).unwrap();
+            m.record_compaction(7, new, &[old]).unwrap();
+            m.record_gc(7, &[old]).unwrap();
+            old = new;
+        }
+        let len = std::fs::metadata(dir.path().join("MANIFEST"))
+            .unwrap()
+            .len();
+        eprintln!("manifest after 6000 churn cycles: {len}B");
+        assert!(
+            len < 70 * 1024,
+            "manifest {len}B must stay bounded (≈ constant under churn)"
+        );
+        // Active state survived the compaction swap; pruned (file-less)
+        // history is intentionally forgotten.
+        let ts = m.table_snapshot(7);
+        assert!(ts.active_segments.contains(&6000), "active id kept");
+        assert!(!ts.ever_seen.contains(&100), "file-less retired id pruned");
+        // A fresh parse of the compacted file agrees.
+        let m2 = Manifest::open_or_create_local(dir.path()).unwrap();
+        let ts2 = m2.table_snapshot(7);
+        assert!(ts2.active_segments.contains(&6000));
+        assert!(!ts2.ever_seen.contains(&100));
+    }
 }

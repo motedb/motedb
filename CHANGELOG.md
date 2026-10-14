@@ -29,6 +29,13 @@
   per-segment mmap); 每阶段旧格式读兼容。测试: test_file_layout 5/5 ·
   test_global_manifest 8/8 · test_snapshot 5/5 · corruption 4/4 ·
   全量回归零 FAILED · 同机 A/B(file_layout_bench) 吞吐零回退
+- **F1 性能修复(布局收敛审查发现)**: 全局 MANIFEST 增量内存状态 — 打开
+  时解析一次(原每 store 全量重解析, N 表 = N 次); manifest compaction —
+  文件超过 max(64KB, 4×活跃态)时最简重写(AddSegment×active + Retired×
+  文件仍在的退役 id + DropTable), 退役 id 按段文件存在性裁剪(段 id 单调
+  不复用, 文件已删者彻底遗忘) → churn 下有界常量。实测 50 表×60 轮:
+  manifest 210KB→17KB, 打开 77ms→17.6ms(4.4×); 修复 ever_seen 多重集
+  计数膨胀 2-3× 导致阈值永不触发的 bug。恢复扫描 Vec→HashSet
 - 遗留可选: TimeSeries 引擎统一(方案 E)与只读容器模式, 按路线图另排
 
 ### SDK cycle
