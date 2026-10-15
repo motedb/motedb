@@ -11,18 +11,37 @@ fn main() {
     let dir = std::env::temp_dir().join(format!("mote_ck_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("d.mote");
+    let ts_mode: bool = std::env::args().nth(2).as_deref() == Some("ts");
     let db = Database::create_with_config(&path, DBConfig::default()).unwrap();
     for t in 0..n_tables {
-        db.execute(&format!(
-            "CREATE TABLE t{t} (id INTEGER PRIMARY KEY, v TEXT)"
-        ))
-        .unwrap();
+        if ts_mode {
+            db.execute(&format!(
+                "CREATE TABLE t{t} (ts TIMESTAMP, sid INT, v FLOAT) TIMESERIES(ts)"
+            ))
+            .unwrap();
+        } else {
+            db.execute(&format!(
+                "CREATE TABLE t{t} (id INTEGER PRIMARY KEY, v TEXT)"
+            ))
+            .unwrap();
+        }
     }
+    let insert_t0 = |db: &Database, i: usize| {
+        if ts_mode {
+            db.execute(&format!(
+                "INSERT INTO t0 VALUES ({}, 1, 1.0)",
+                1_700_000_000_000_000_i64 + i as i64
+            ))
+            .unwrap();
+        } else {
+            db.execute(&format!("INSERT INTO t0 VALUES ({i}, 'x')"))
+                .unwrap();
+        }
+    };
 
     // 预热
     for i in 0..5 {
-        db.execute(&format!("INSERT INTO t0 VALUES ({i}, 'x')"))
-            .unwrap();
+        insert_t0(&db, i);
         db.checkpoint().unwrap();
     }
     // 空转 checkpoint (无脏数据 — 早退路径)
@@ -37,8 +56,7 @@ fn main() {
     // 每次脏 1 行 (t0)
     let mut t_dirty = Vec::new();
     for i in 100..130 {
-        db.execute(&format!("INSERT INTO t0 VALUES ({i}, 'x')"))
-            .unwrap();
+        insert_t0(&db, i);
         let t = Instant::now();
         db.checkpoint().unwrap();
         t_dirty.push(t.elapsed().as_secs_f64() * 1000.0);

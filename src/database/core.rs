@@ -1419,7 +1419,9 @@ impl MoteDB {
             table_registry.clone(),
         )?);
 
-        // Register existing TimeSeries tables with columnar store
+        // 🔑 方案 E: legacy ColumnarStore is retained read-only for one
+        // purpose — migrating pre-v0.15 TimeSeries .mcdb data into the
+        // unified ColSegmentStore (below, after stores are created).
         for table_name in table_registry.list_tables()? {
             if let Ok(schema) = table_registry.get_table(&table_name) {
                 if schema.table_type == crate::types::TableType::TimeSeries {
@@ -1438,69 +1440,6 @@ impl MoteDB {
 
         // Set WAL on columnar store for crash recovery
         columnar_store.set_wal(wal.clone());
-
-        // Replay WAL records for TimeSeries tables into columnar store
-        // (These records were already replayed into LSM above, but TimeSeries data
-        //  belongs in the columnar store for proper querying)
-        {
-            let mut columnar_replay_count = 0u64;
-            for records in recovered_records.values() {
-                for record in records {
-                    let (table_name, row_id, txn_id, row_data) = match record {
-                        WALRecord::Insert {
-                            table_name,
-                            row_id,
-                            data,
-                            txn_id,
-                            ..
-                        } => (table_name.clone(), *row_id, *txn_id, data.clone()),
-                        WALRecord::InsertRaw {
-                            table_name,
-                            row_id,
-                            raw_data,
-                            txn_id,
-                            ..
-                        } => {
-                            // 🔑 Schema-aware decode (decode_any misreads types
-                            // and broke the TimeSeries replay width assert).
-                            let col_types = table_registry
-                                .get_table(table_name)
-                                .map(|s| s.col_types().to_vec())
-                                .unwrap_or_default();
-                            let row = match crate::storage::row_format::decode(raw_data, &col_types)
-                            {
-                                Ok(r) => r,
-                                Err(_) => continue,
-                            };
-                            (table_name.clone(), *row_id, *txn_id, row)
-                        }
-                        _ => continue,
-                    };
-                    if txn_id != 0 && !committed_txns.contains(&txn_id) {
-                        continue;
-                    }
-                    if let Ok(schema) = table_registry.get_table(&table_name) {
-                        if schema.table_type == crate::types::TableType::TimeSeries {
-                            if let Err(e) = columnar_store.replay_row(&table_name, row_id, row_data)
-                            {
-                                debug_log!(
-                                    "[database] ⚠️ Failed to replay columnar row for '{}': {:?}",
-                                    table_name,
-                                    e
-                                );
-                            }
-                            columnar_replay_count += 1;
-                        }
-                    }
-                }
-            }
-            if columnar_replay_count > 0 {
-                debug_log!(
-                    "[database] Replayed {} columnar rows from WAL",
-                    columnar_replay_count
-                );
-            }
-        }
 
         let mut db = Self {
             path: db_path,
@@ -1570,14 +1509,6 @@ impl MoteDB {
                             let table_name = entry.file_name().to_string_lossy().to_string();
                             if let Ok(schema) = db.table_registry.get_table(&table_name) {
                                 // 🔑 TimeSeries tables are served by the
-                                // ColumnarStore — a columnar_ms/ dir for them
-                                // is a query-side artifact holding no data.
-                                // Loading it created an EMPTY ColSegmentStore
-                                // that shadowed the real data in every
-                                // has_col_segment_store-guarded fast path.
-                                if schema.table_type == crate::types::TableType::TimeSeries {
-                                    continue;
-                                }
                                 let col_types = schema.col_types().to_vec();
                                 let table_id = db
                                     .table_registry
@@ -1777,12 +1708,7 @@ impl MoteDB {
                     if txn_id != 0 && !committed_txns.contains(&txn_id) {
                         continue;
                     }
-                    // TimeSeries rows were replayed into columnar_store above.
-                    if let Ok(schema) = db.table_registry.get_table(&table_name) {
-                        if schema.table_type != crate::types::TableType::TimeSeries {
-                            by_table.entry(table_name).or_default().push((key, op));
-                        }
-                    }
+                    by_table.entry(table_name).or_default().push((key, op));
                 }
             }
             let mut replayed = 0u64;
@@ -1830,31 +1756,87 @@ impl MoteDB {
             }
         }
 
-        // 🔑 TimeSeries row-count recovery: COUNT(*) answers from the atomic
-        // table_row_count counter (fast_row_count), which is NOT persisted.
-        // After crash recovery the counter was absent → SELECT COUNT(*)
-        // returned 0 even though the WAL replay had restored all rows into
-        // the ColumnarStore. Seed the counter from the recovered data.
+        // 🔑 方案 E: migrate pre-v0.15 TimeSeries .mcdb data into the unified
+        // ColSegmentStore. The legacy ColumnarStore is opened read-only for
+        // this one pass; a table with rows on disk AND an empty unified view
+        // (no segments, empty buffer) gets its rows appended + flushed.
+        // Idempotent: after migration the unified view is non-empty.
         {
             let _ = db.columnar_store.flush_all();
             for table_name in db.table_registry.list_tables()? {
-                if let Ok(schema) = db.table_registry.get_table(&table_name) {
-                    if schema.table_type == crate::types::TableType::TimeSeries {
-                        let n = db
-                            .columnar_store
-                            .query_time_range(&table_name, i64::MIN, i64::MAX, &[])
-                            .map(|v| v.len() as u64)
-                            .unwrap_or(0);
-                        if n > 0 {
-                            let counter = db
-                                .table_row_count
-                                .entry(table_name.clone())
-                                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
-                            let cur = counter.load(std::sync::atomic::Ordering::Relaxed);
-                            if cur < n {
-                                counter.store(n, std::sync::atomic::Ordering::Relaxed);
-                            }
+                let Ok(schema) = db.table_registry.get_table(&table_name) else {
+                    continue;
+                };
+                if schema.table_type != crate::types::TableType::TimeSeries {
+                    continue;
+                }
+                let Ok(n_legacy) =
+                    db.columnar_store
+                        .query_time_range(&table_name, i64::MIN, i64::MAX, &[])
+                else {
+                    continue;
+                };
+                if n_legacy.is_empty() {
+                    continue;
+                }
+                let Ok(store) = db.get_or_create_col_segment_store(&table_name, schema.col_types())
+                else {
+                    continue;
+                };
+                let unified_rows = store.segment_count() > 0 || store.buffered_rows() > 0;
+                if unified_rows {
+                    // Already migrated (or live data present) — only seed count.
+                } else {
+                    let positions: Vec<usize> = schema.columns.iter().map(|c| c.position).collect();
+                    let tid = db.table_registry.get_table_id(&table_name).unwrap_or(0) as u64;
+                    let mut migrated = 0u64;
+                    for (row_id, sql_row) in &n_legacy {
+                        let row: crate::types::Row = positions
+                            .iter()
+                            .map(|&pos| {
+                                let name = &schema.columns[pos].name;
+                                sql_row
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or(crate::types::Value::Null)
+                            })
+                            .collect();
+                        let key = (tid << 32) | (*row_id & 0xFFFFFFFF);
+                        let ts = db
+                            .write_lsn
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if store.append_row_ref(key, ts, &row).is_ok() {
+                            migrated += 1;
                         }
+                    }
+                    let _ = store.flush_buffer();
+                    // 🔑 Legacy row_ids now live in the unified key space —
+                    // advance next_row_id past them or the NEXT insert
+                    // reuses an id and (newest-wins) silently REPLACES a
+                    // migrated row.
+                    let max_rid = n_legacy
+                        .iter()
+                        .map(|(rid, _)| *rid & 0xFFFFFFFF)
+                        .max()
+                        .unwrap_or(0);
+                    db.next_row_id
+                        .fetch_max(max_rid + 1, std::sync::atomic::Ordering::SeqCst);
+                    debug_log!(
+                        "[migration] TimeSeries '{}': {} legacy .mcdb rows → ColSegmentStore",
+                        table_name,
+                        migrated
+                    );
+                }
+                // Seed the row counter from the now-authoritative source.
+                let n = n_legacy.len() as u64;
+                if n > 0 {
+                    let counter = db
+                        .table_row_count
+                        .entry(table_name.clone())
+                        .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+                    let cur = counter.load(std::sync::atomic::Ordering::Relaxed);
+                    if cur < n {
+                        counter.store(n, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }

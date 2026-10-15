@@ -2126,10 +2126,14 @@ impl ColSegmentStore {
             let ptext_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols
                 .iter()
                 .map(|&pc| {
+                    // 🔖 BLOB rides the text layout — load it here too, else the
+                    // emit arm below gets None and decodes the column as NULL
+                    // (the v0.13 LENGTH(blob)-under-int-WHERE gap).
                     if pc < seg.sst.column_tags.len()
                         && matches!(
                             seg.sst.column_tags[pc],
                             crate::storage::lsm::columnar::ColumnTypeTag::Text
+                                | crate::storage::lsm::columnar::ColumnTypeTag::Blob
                         )
                     {
                         seg.sst.read_text(pc).ok()
@@ -2242,6 +2246,11 @@ impl ColSegmentStore {
             }
         }
         result
+    }
+
+    /// Rows sitting in the write buffer (not yet flushed to a segment).
+    pub fn buffered_rows(&self) -> u64 {
+        self.buffered_count.load(Ordering::Relaxed)
     }
 
     pub fn segment_count(&self) -> usize {
@@ -5523,6 +5532,51 @@ mod merge_stream_tests {
                 assert_eq!(&vec.0[..], &[9.0f32, 8.0, 7.0][..]);
             }
             other => panic!("vector lost in merge: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod blob_gap_tests {
+    use super::*;
+
+    /// Isolate scan_i64_filtered_limit's blob decode: WHERE int filter with a
+    /// blob column in the projection.
+    #[test]
+    fn scan_i64_filtered_limit_decodes_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let col_types = vec![
+            crate::types::ColumnType::Integer,
+            crate::types::ColumnType::Text,
+            crate::types::ColumnType::Blob,
+        ];
+        let store = ColSegmentStore::create(dir.path(), "t", col_types.clone(), None).unwrap();
+        use crate::types::{ArcBytes, Value};
+        for id in 1u64..=2 {
+            store
+                .append_row_ref(
+                    id,
+                    1700000000 + id,
+                    &[
+                        Value::Integer(id as i64),
+                        Value::Text("hello".into()),
+                        Value::Blob(ArcBytes::new(vec![0x0a, 0x0b, 0x0c, 0x0d])),
+                    ],
+                )
+                .unwrap();
+        }
+        store.flush_buffer().unwrap();
+
+        let rows = store.scan_i64_filtered_limit(0, &[0, 1, 2], &|v| v == Some(1), 10);
+        assert_eq!(rows.len(), 1, "one row matches id=1");
+        let (_, row) = &rows[0];
+        assert!(
+            matches!(row[2], Value::Blob(_)),
+            "blob decoded, got {:?}",
+            row[2]
+        );
+        if let Value::Blob(b) = &row[2] {
+            assert_eq!(b.as_slice(), &[0x0a, 0x0b, 0x0c, 0x0d]);
         }
     }
 }

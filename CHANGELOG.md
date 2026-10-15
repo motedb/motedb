@@ -46,13 +46,29 @@
   每表边际成本 ~0.3ms→~0)。剩余固定成本: legacy 双写缓冲 ~5ms(方案 E
   范畴)、WAL 截断 3.3ms 与 meta LSN 重写 4.1ms(均为真耐久性开销)。
   新增 examples/probe_ckpt.rs
-- **BLOB 缺口根因定位 + 部分修复**: v0.13 已知缺口收窄 — WHERE
-  <int 列> <op> <字面量> 路由的 scan_i64_filtered_limit 投影臂缺
-  ColumnType::Blob 分支 → 整列 NULL;已补(裸投影/混合列表现在正确)。
-  仍开放(更窄): LENGTH(blob) 于 int-WHERE 下经写缓冲合并+计算列求值
-  路径仍 NULL — 工作面: 任意 WHERE 下裸投影、text/blob-WHERE 或无
-  WHERE 下的标量函数、ORDER BY。回归测试 test_blob_type 5/5
-- 遗留可选: TimeSeries 引擎统一(方案 E)与只读容器模式, 按路线图另排
+- **BLOB 缺口完全修复 (v0.13 已知缺口关闭)**: WHERE <int 列> <op> <
+  字面量> 路由的 scan_i64_filtered_limit 两处缺陷 — ① 文本段装载门只
+  匹配 ColumnTypeTag::Text(Blob 列不装载) ② 输出臂缺 ColumnType::Blob
+  — 修复后 int 过滤查询下 blob 列(裸投影/LENGTH/混合列/ORDER BY/重开)
+  全部正确。隔离单测 + SQL 级回归 test_blob_type 5/5
+- **🔑 方案 E: TimeSeries 引擎统一 (v0.15 最大结构清理)**: TIMESERIES(ts)
+  表改由统一的 ColSegmentStore 服务 — 与标准表同一条写/读/恢复路径,
+  旧 ColumnarStore 引擎退出运行时 (仅保留只读迁移用途)。写路径:
+  get_or_create 放开 + INSERT 统一准备路径 + API 快解析去 TS 绕行;
+  读路径: 移除 executor 10 处 TS 专属路由/优化臂 (latest_by/order_limit/
+  simple_aggregate/columnar_select/窗口源等, 死代码 ~600 行删除),
+  LATEST BY/ORDER BY/聚合走通用路径; 恢复: WAL 回放并入标准 by_table
+  重放; 迁移: 打开时 .mcdb → 段存储一次性拷贝(幂等) + next_row_id
+  推进(修复迁移后新插入覆盖同号迁移行 — 探针实测发现); TTL/DELETE
+  时间窗重写为段存储 tombstone 版 (gc_timeseries)。顺带修复两个被旧
+  路径掩盖的存量 bug: ① TableRowStreamingInner Columnar 解码缺
+  TIMESTAMP 臂(物化路径读 ts 变 Integer) ② BTree superblock 内联页偏移
+  表超 4096 保留区 — 任何 10 万行 ts-first 表 close 即炸("SuperBlock
+  too large"), v3 64KB 保留 + >2M 键降级重建阀。实测: TS 与标准表
+  checkpoint 同价 (18.2ms vs 18.3ms, legacy flush 退出); 迁移探针全绿
+  (3000 行 .mcdb → 段存储 → 新插入/LATEST BY/重开无重复无丢失);
+  TS 语义 13+18、columnar/crash/backup 全绿
+- 遗留可选: 只读容器模式, 按路线图另排
 
 ### SDK cycle
 

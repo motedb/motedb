@@ -187,14 +187,11 @@ fn blob_core_three_column_shape() {
 
 #[test]
 fn blob_under_int_where_and_remaining_gap() {
-    // Root-caused (v0.15): WHERE <int col> <op> <literal> routes through
-    // scan_i64_filtered_limit, whose project arm lacked a ColumnType::Blob
-    // case → bare blob projection under an int WHERE returned NULL. FIXED.
-    //
-    // Still open (narrower than the v0.13 note): LENGTH(blob) under an int
-    // WHERE goes through the write-buffer merge + computed-select eval path,
-    // which decodes the blob arg as NULL. Working surface: bare projection
-    // under any WHERE, LENGTH under text/blob-WHERE or no WHERE, ORDER BY.
+    // Root-caused & FIXED (v0.15): WHERE <int col> <op> <literal> routes
+    // through scan_i64_filtered_limit, which (a) didn't load Blob columns
+    // into its text-segment set (ColumnTypeTag::Text-only gate) and (b) had
+    // no ColumnType::Blob emit arm — blob columns decoded as NULL under any
+    // int-filtered query (bare or inside functions).
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("g.mote");
     {
@@ -206,7 +203,7 @@ fn blob_under_int_where_and_remaining_gap() {
         db.execute("INSERT INTO t VALUES (2, 'world', X'0102')")
             .unwrap();
 
-        // FIXED: bare blob under int WHERE (buffered and persisted).
+        // Buffered path: bare + function over blob under int WHERE.
         let r = db
             .execute("SELECT b FROM t WHERE id = 1")
             .unwrap()
@@ -217,26 +214,44 @@ fn blob_under_int_where_and_remaining_gap() {
             matches!(rows[0][0], Value::Blob(_)),
             "bare blob under int-eq WHERE"
         );
+        let r = db
+            .execute("SELECT LENGTH(b) FROM t WHERE id = 1")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let (_, rows) = r.select_rows().unwrap();
+        assert_eq!(rows[0][0], Value::Integer(4), "LENGTH under int-eq WHERE");
+        let r = db
+            .execute("SELECT LENGTH(b) FROM t WHERE id > 0")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let (_, rows) = r.select_rows().unwrap();
+        assert_eq!(
+            rows[0][0],
+            Value::Integer(4),
+            "LENGTH under int-range WHERE"
+        );
+        let r = db
+            .execute("SELECT b, LENGTH(b) FROM t WHERE id = 1")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let (_, rows) = r.select_rows().unwrap();
+        assert!(matches!(rows[0][0], Value::Blob(_)), "mixed bare+computed");
+        assert_eq!(rows[0][1], Value::Integer(4), "computed alongside bare");
+
+        // Persisted path.
         db.checkpoint().unwrap();
         let r = db
-            .execute("SELECT b FROM t WHERE id = 2")
+            .execute("SELECT LENGTH(b) FROM t WHERE id = 1")
             .unwrap()
             .materialize()
             .unwrap();
         let (_, rows) = r.select_rows().unwrap();
-        assert!(
-            matches!(rows[0][0], Value::Blob(_)),
-            "bare blob under int WHERE post-checkpoint"
-        );
+        assert_eq!(rows[0][0], Value::Integer(4), "post-checkpoint");
 
-        // Working function surfaces (regression guard).
-        let r = db
-            .execute("SELECT LENGTH(b) FROM t WHERE s = 'hello'")
-            .unwrap()
-            .materialize()
-            .unwrap();
-        let (_, rows) = r.select_rows().unwrap();
-        assert_eq!(rows[0][0], Value::Integer(4), "LENGTH under text WHERE");
+        // Working surfaces stay working.
         let r = db
             .execute("SELECT COUNT(*) FROM t WHERE LENGTH(b) = 4")
             .unwrap()
@@ -244,20 +259,30 @@ fn blob_under_int_where_and_remaining_gap() {
             .unwrap();
         let (_, rows) = r.select_rows().unwrap();
         assert_eq!(rows[0][0], Value::Integer(1), "LENGTH in WHERE");
+        let r = db
+            .execute("SELECT id FROM t ORDER BY b ASC")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let (_, rows) = r.select_rows().unwrap();
+        assert_eq!(
+            rows[0][0],
+            Value::Integer(2),
+            "ORDER BY blob (2-byte first)"
+        );
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
     let r = db
-        .execute("SELECT b FROM t WHERE id > 0")
+        .execute("SELECT LENGTH(b) FROM t WHERE id = 2")
         .unwrap()
         .materialize()
         .unwrap();
     let (_, rows) = r.select_rows().unwrap();
     assert_eq!(
-        rows.len(),
-        2,
-        "bare blobs under int-range WHERE after reopen"
+        rows[0][0],
+        Value::Integer(2),
+        "reopen int WHERE + LENGTH(blob)"
     );
-    assert!(matches!(rows[0][0], Value::Blob(_)));
     db.close().unwrap();
 }

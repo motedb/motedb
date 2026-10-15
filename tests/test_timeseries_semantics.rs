@@ -365,3 +365,47 @@ fn ts_order_limit_multiple_buffered_rows() {
         ]
     );
 }
+
+#[test]
+fn ts_reopen_assigns_fresh_row_ids() {
+    // 方案 E regression: after reopen, a new INSERT must not reuse an
+    // existing row_id (newest-wins would silently REPLACE the old row —
+    // found by the migration probe: count went 3001 → 3000 on reopen).
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE m (ts TIMESTAMP, sid INT, v FLOAT) TIMESERIES(ts)")
+            .unwrap();
+        for i in 0..500i64 {
+            db.execute(&format!(
+                "INSERT INTO m VALUES ({}, {}, 1.0)",
+                1_700_000_000_000_000 + i * 1_000_000,
+                i % 3
+            ))
+            .unwrap();
+        }
+        db.execute("CHECKPOINT").unwrap();
+        db.close().unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    db.execute("INSERT INTO m VALUES (1700009999000000, 9, 99.0)")
+        .unwrap();
+    let n = scalar(&db, "SELECT COUNT(*) FROM m");
+    assert_eq!(n, Value::Integer(501), "insert after reopen");
+    db.execute("CHECKPOINT").unwrap();
+    db.close().unwrap();
+    let db = Database::open(&path).unwrap();
+    let n2 = scalar(&db, "SELECT COUNT(*) FROM m");
+    assert_eq!(
+        n2,
+        Value::Integer(501),
+        "no row replaced after reopen+insert+reopen"
+    );
+    let v = scalar(&db, "SELECT v FROM m WHERE ts = 1700009999000000");
+    assert!(
+        matches!(v, Value::Float(f) if (f - 99.0).abs() < 1e-9),
+        "new row intact"
+    );
+    db.close().unwrap();
+}

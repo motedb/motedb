@@ -511,6 +511,13 @@ fn ts_delete_purges_buffered_and_straddling_rows() {
         (cutoff + 20_000_000, 5),
     ];
     assert_eq!(buckets.len(), 3, "bucket count");
+    // 🔑 方案 E: generic GROUP BY emits hash order — the old TS pushdown
+    // happened to return time-sorted buckets. Compare by content.
+    let mut buckets = buckets;
+    buckets.sort_by_key(|row| match &row[0] {
+        Value::Timestamp(t) => t.as_micros(),
+        _ => 0,
+    });
     for (row, (b, cnt)) in buckets.iter().zip(expect) {
         assert!(
             matches!(&row[0], Value::Timestamp(t) if t.as_micros() == b),

@@ -46,7 +46,7 @@ const INVALID_PAGE_ID: u64 = u64::MAX;
 const BTREE_MAGIC: u32 = 0x42545245;
 
 /// Current B+Tree format version
-const BTREE_VERSION: u32 = 2;
+const BTREE_VERSION: u32 = 3;
 
 /// Type alias for the insert result: (old_value, optional split_info)
 type InsertResult = Result<(Option<u64>, Option<(u64, u64)>)>;
@@ -493,6 +493,15 @@ impl BTree {
                 return Self::with_config(storage_path, config);
             }
 
+            // Degrade valve companion: a v3 superblock whose offset table
+            // was dropped at flush time (see write_superblock) reinitializes
+            // here; the index rebuilds from source data.
+            if superblock.page_offsets.len() <= 1 && superblock.next_page_id > 1 {
+                drop(file);
+                let _ = std::fs::remove_file(&storage_path);
+                return Self::with_config(storage_path, config);
+            }
+
             // Extract values before moving superblock
             let root_id = superblock.root_page_id;
             let next_id = superblock.next_page_id;
@@ -528,8 +537,12 @@ impl BTree {
         })
     }
 
-    /// Superblock allocation size (first 4KB of file reserved for superblock)
-    const SUPERBLOCK_SIZE: usize = 4096;
+    /// Superblock allocation size. v3: 64KB — the inline page-offset table
+    /// (~8 B/page, one leaf holds 255 keys) overflowed the old 4KB at ~570
+    /// pages (~100K keys), failing every flush/close with "SuperBlock too
+    /// large" (any 100K-row ts-first table). 64KB covers ~8K pages ≈ 2M keys;
+    /// beyond that the degrade-on-overflow path below kicks in.
+    const SUPERBLOCK_SIZE: usize = 64 * 1024;
 
     /// Read SuperBlock from file start
     fn read_superblock(file: &mut File) -> Result<SuperBlock> {
@@ -550,13 +563,20 @@ impl BTree {
         let data = bincode::serialize(superblock)
             .map_err(|e| StorageError::Index(format!("Failed to serialize SuperBlock: {}", e)))?;
 
-        if data.len() > Self::SUPERBLOCK_SIZE {
-            return Err(StorageError::Index(format!(
-                "SuperBlock too large: {} bytes exceeds {} reservation",
-                data.len(),
-                Self::SUPERBLOCK_SIZE
-            )));
-        }
+        let data = if data.len() > Self::SUPERBLOCK_SIZE {
+            // 🔒 Degrade valve (>2M keys): indexes are DERIVED data — drop
+            // the inline offset table rather than failing the flush. The
+            // next open finds v3 with an inconsistent (1-entry) offset table
+            // against next_page_id>1 and reinitializes; the index then
+            // rebuilds from source (recovery doctrine).
+            let mut sb = superblock.clone();
+            sb.page_offsets = vec![0];
+            bincode::serialize(&sb).map_err(|e| {
+                StorageError::Index(format!("Failed to serialize SuperBlock: {}", e))
+            })?
+        } else {
+            data
+        };
 
         let mut buf = vec![0u8; Self::SUPERBLOCK_SIZE];
         buf[..data.len()].copy_from_slice(&data);

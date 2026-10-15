@@ -1784,41 +1784,6 @@ impl MoteDB {
         let schema = self.table_registry.get_table(table_name)?;
         let col_types = schema.col_types();
 
-        // 🔑 TimeSeries tables: the authoritative store is the ColumnarStore
-        // (WAL recovery replays into its buffers). The legacy col-segment /
-        // columnar_sstables path below can hold an EMPTY view of a TS table
-        // and shadow it — after a crash, every SELECT/COUNT returned 0 rows
-        // even though recovery had replayed the data. Read the full range
-        // from the ColumnarStore instead.
-        if schema.table_type == crate::types::TableType::TimeSeries {
-            // WAL-recovered rows sit in the ColumnarStore's in-memory write
-            // buffers until flushed — make them visible before querying.
-            let _ = self.columnar_store.flush_all();
-            let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            let fetched =
-                self.columnar_store
-                    .query_time_range(table_name, i64::MIN, i64::MAX, &col_names)?;
-            let positions: Vec<usize> = schema.columns.iter().map(|c| c.position).collect();
-            let rows: Vec<(RowId, Row)> = fetched
-                .into_iter()
-                .map(|(rid, sql_row)| {
-                    let row: Row = positions
-                        .iter()
-                        .map(|&pos| {
-                            // SqlRow is keyed by column name; map back to
-                            // schema order positions.
-                            let name = &schema.columns[pos].name;
-                            sql_row.get(name).cloned().unwrap_or(Value::Null)
-                        })
-                        .collect();
-                    (rid, row)
-                })
-                .collect();
-            return Ok(TableRowStreamingIterator {
-                inner: TableRowStreamingInner::Materialized { rows, idx: 0 },
-            });
-        }
-
         // Columnar-backed scan: if the table's data lives in a columnar SSTable
         // (rather than the LSM), decode column arrays and synthesize rows.
         // Falling back to the LSM scan here would yield empty/stale results.
@@ -2069,42 +2034,54 @@ impl MoteDB {
     /// TimeSeries retention purge: delete rows with ts < cutoff from the
     /// ColumnarStore (flush buffers first so unflushed rows are covered),
     /// keep the COUNT(*) atomic counter in sync.
+    /// 🔑 方案 E: TimeSeries retention purge, segment-store edition.
+    /// Scans the ts column, tombstones rows with ts < cutoff (DELETE-style
+    /// newest-wins), flushes, and adjusts the row counter. The legacy
+    /// ColumnarStore.gc_expired (whole-segment drop) is gone with the engine.
     pub fn gc_timeseries(&self, table_name: &str, cutoff_ts: i64) -> Result<usize> {
         ensure_open!(self);
-        let _ = self.columnar_store.flush_all();
-        let segments = self.columnar_store.segment_count(table_name);
-        let _segments_dropped = self.columnar_store.gc_expired(table_name, cutoff_ts)?;
-        // 🔑 Perf: gc_expired drops WHOLE segments; when the count didn't
-        // change nothing was purged — skip the full-range recount (this runs
-        // on EVERY checkpoint via TTL enforcement; two full scans per TS
-        // table per checkpoint were pure waste in the common no-op case).
-        if self.columnar_store.segment_count(table_name) == segments {
+        let schema = self.table_registry.get_table(table_name)?;
+        let Some(ts_col) = schema.timeseries_column.as_ref() else {
+            return Ok(0);
+        };
+        let Some(ts_pos) = schema.get_column_position(ts_col) else {
+            return Ok(0);
+        };
+        let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
+        let _ = store.flush_buffer();
+
+        // Collect keys of expired rows (empty projection — keys only).
+        let expired: Vec<u64> = store
+            .scan_projected_filtered(Some(ts_pos), &[], &|v| match v {
+                Some(Value::Timestamp(t)) => t.as_micros() < cutoff_ts,
+                Some(Value::Integer(i)) => *i < cutoff_ts,
+                _ => false,
+            })
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        if expired.is_empty() {
             return Ok(0);
         }
-        let after = self
-            .columnar_store
-            .query_time_range(table_name, i64::MIN, i64::MAX, &[])
-            .map(|v| v.len() as u64)
-            .unwrap_or(0);
-        // Read the pre-purge count BEFORE overwriting the counter.
-        let before_rows = self
-            .table_row_count
-            .get(table_name)
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(after);
+        let n = expired.len();
+        for key in expired {
+            let ts = self
+                .write_lsn
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            store.append_tombstone(key, ts)?;
+        }
+        let _ = store.flush_buffer();
         if let Some(counter) = self.table_row_count.get(table_name) {
-            counter.store(after, std::sync::atomic::Ordering::Relaxed);
+            counter.fetch_sub(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
         debug_log!(
-            "[gc_timeseries] '{}': purged segments (cutoff {}), rows {} → {}",
+            "[gc_timeseries] '{}': tombstoned {} rows (cutoff {})",
             table_name,
-            cutoff_ts,
-            before_rows,
-            after
+            n,
+            cutoff_ts
         );
-        Ok(before_rows.saturating_sub(after) as usize)
+        Ok(n)
     }
-
     /// Maintain the in-memory timestamp index after a row lands (runtime
     /// insert paths). Mirrors the WAL-recovery fill: when a row's FIRST
     /// value is a Timestamp, index ts → row_id. Without this,
@@ -2143,22 +2120,9 @@ impl MoteDB {
         if let Some(store) = self.get_col_segment_store(table_name) {
             return Ok(store);
         }
-        // 🔑 TimeSeries tables live in the ColumnarStore, not a
-        // ColSegmentStore. Query-side paths used to create an EMPTY
-        // ColSegmentStore for them, which then shadowed the authoritative
-        // data in every has_col_segment_store-guarded fast path (after a
-        // crash, plain SELECT / ORDER BY / DISTINCT returned 0 rows).
-        // Refuse creation; callers' `if let Ok(store)` guards fall through
-        // to the generic scan, which routes TimeSeries to the ColumnarStore.
-        if let Ok(schema) = self.table_registry.get_table(table_name) {
-            if schema.table_type == crate::types::TableType::TimeSeries {
-                return Err(StorageError::InvalidData(format!(
-                    "TimeSeries table '{}' is served by the ColumnarStore, \
-                     not a ColSegmentStore",
-                    table_name
-                )));
-            }
-        }
+        // 🔑 方案 E (v0.15): TimeSeries tables are served by the unified
+        // ColSegmentStore like every other table — same write/read/recovery
+        // path. Legacy .mcdb data is migrated at open (core.rs).
         // Create OUTSIDE any map lock (directory + file I/O). Holding the
         // shard write lock across I/O stalled every other thread touching
         // this map — the signature of the intermittent suite-wide deadlock.
@@ -4247,9 +4211,6 @@ enum TableRowStreamingInner {
         decode_ctx: Option<crate::storage::row_format::SchemaDecodeContext>,
         use_raw: bool,
     },
-    /// Pre-fetched rows (TimeSeries tables read from the authoritative
-    /// ColumnarStore, which has no streaming iterator API).
-    Materialized { rows: Vec<(RowId, Row)>, idx: usize },
     /// Columnar SSTable backed scan. For tables whose data lives in the
     /// columnar SSTable (not the LSM), we decode column arrays into rows.
     /// `col_types` drives the decode: Integer→get_i64, Float→get_f64,
@@ -4275,14 +4236,7 @@ impl Iterator for TableRowStreamingIterator {
                 decode_ctx,
                 use_raw,
             } => lsm_next(lsm_iter, decode_ctx, *use_raw),
-            TableRowStreamingInner::Materialized { rows, idx } => {
-                if *idx >= rows.len() {
-                    return None;
-                }
-                let item = Ok(rows[*idx].clone());
-                *idx += 1;
-                Some(item)
-            }
+
             TableRowStreamingInner::Columnar {
                 row_map,
                 segments,
@@ -4310,6 +4264,17 @@ impl Iterator for TableRowStreamingIterator {
                                 }
                                 Some(crate::types::ColumnType::Boolean) => {
                                     f.get_bool(idx).map(crate::types::Value::Bool)
+                                }
+                                // 🔑 TIMESTAMP decodes as Timestamp (micros) —
+                                // the missing arm surfaced as Integer ts values
+                                // on every materialized-path read after the
+                                // TimeSeries engine unification.
+                                Some(crate::types::ColumnType::Timestamp) => {
+                                    f.get_i64(idx).map(|m| {
+                                        crate::types::Value::Timestamp(
+                                            crate::types::Timestamp::from_micros(m),
+                                        )
+                                    })
                                 }
                                 _ => f.get_i64(idx).map(crate::types::Value::Integer),
                             }
