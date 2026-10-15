@@ -43,6 +43,11 @@ pub struct TableRegistry {
     /// Persistence file path (legacy standalone mode — used when no
     /// MetaStore is provided, e.g. low-level unit tests)
     persist_path: PathBuf,
+    /// 🔑 F2: set when auto-increment counters (or anything else persisted
+    /// ONLY at checkpoint cadence) changed since the last durable persist.
+    /// Checkpoints skip the catalog rewrite when clean — a full meta.bin
+    /// rewrite per checkpoint for UNCHANGED counters was ~5ms of pure fsync.
+    counters_dirty: std::sync::atomic::AtomicBool,
     /// 🔑 P3 unified metadata: when set, persist()/load go through the shared
     /// `meta.bin` container instead of the standalone `catalog.bin`.
     meta: Option<std::sync::Arc<crate::database::meta_store::MetaStore>>,
@@ -117,6 +122,7 @@ impl TableRegistry {
             schema_cache: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             table_id_cache: parking_lot::RwLock::new(HashMap::new()),
             persist_path,
+            counters_dirty: std::sync::atomic::AtomicBool::new(false),
             meta: meta_store,
         })
     }
@@ -540,6 +546,11 @@ impl TableRegistry {
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
         meta.auto_increment_counters
             .insert(table_name.to_string(), value);
+        // 🔑 hold the write lock while marking — snapshot takes the same
+        // lock, so a bump can never interleave between payload-read and
+        // flag-clear on the checkpoint side.
+        self.counters_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         drop(meta);
         // Note: don't persist on every update — too expensive.
         // Caller (checkpoint) will persist periodically.
@@ -564,7 +575,7 @@ impl TableRegistry {
             bincode::serialize(&*meta).map_err(|e| StorageError::Serialization(e.to_string()))?;
         drop(meta);
 
-        match &self.meta {
+        let r = match &self.meta {
             Some(m) => m.update_section(crate::database::meta_store::MetaSection::Catalog, data),
             None => {
                 let tmp_path = self.persist_path.with_extension("bin.tmp");
@@ -576,7 +587,37 @@ impl TableRegistry {
                 std::fs::rename(&tmp_path, &self.persist_path).map_err(StorageError::Io)?;
                 Ok(())
             }
+        };
+        if r.is_ok() {
+            self.counters_dirty
+                .store(false, std::sync::atomic::Ordering::Release);
         }
+        r
+    }
+
+    /// 🔑 F2: snapshot of the catalog payload WHEN (and only when) counters
+    /// changed since the last durable persist. The flag clears atomically
+    /// with the snapshot under the metadata read — a concurrent bump after
+    /// the snapshot re-marks dirty and the next checkpoint persists it.
+    pub fn catalog_payload_if_dirty(&self) -> Option<Result<Vec<u8>>> {
+        if !self
+            .counters_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        // Write lock: pairs with the writer's mark-under-lock so the
+        // snapshot+clear can't lose a concurrent bump.
+        let meta = match self.metadata.write() {
+            Ok(m) => m,
+            Err(e) => return Some(Err(StorageError::InvalidData(e.to_string()))),
+        };
+        let data =
+            bincode::serialize(&*meta).map_err(|e| StorageError::Serialization(e.to_string()));
+        self.counters_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
+        drop(meta);
+        Some(data)
     }
 }
 

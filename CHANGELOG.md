@@ -36,6 +36,22 @@
   不复用, 文件已删者彻底遗忘) → churn 下有界常量。实测 50 表×60 轮:
   manifest 210KB→17KB, 打开 77ms→17.6ms(4.4×); 修复 ever_seen 多重集
   计数膨胀 2-3× 导致阈值永不触发的 bug。恢复扫描 Vec→HashSet
+- **F2 checkpoint 成本优化(纯省略型, 零持久化语义变化)**: 分解发现脏
+  checkpoint ~28ms 中三项是"写没变的数据" — ① AUTO_INCREMENT 计数器
+  未变也全量重写 catalog 节 → registry 脏标记(写方持锁置位/快照持锁
+  清除, 无丢更新窗口), 干净则零 fsync; ② LSN 节与 catalog 节两次整文件
+  重写 → update_sections 合并为单次原子重写; ③ manifest 无新记录也
+  fsync → append/sync 脏标记, 空转跳过。noop checkpoint 0.05ms 不变;
+  实测脏 checkpoint: 1 表 28→24.5ms, 50 表 42→24.6ms (表数平坦化,
+  每表边际成本 ~0.3ms→~0)。剩余固定成本: legacy 双写缓冲 ~5ms(方案 E
+  范畴)、WAL 截断 3.3ms 与 meta LSN 重写 4.1ms(均为真耐久性开销)。
+  新增 examples/probe_ckpt.rs
+- **BLOB 缺口根因定位 + 部分修复**: v0.13 已知缺口收窄 — WHERE
+  <int 列> <op> <字面量> 路由的 scan_i64_filtered_limit 投影臂缺
+  ColumnType::Blob 分支 → 整列 NULL;已补(裸投影/混合列表现在正确)。
+  仍开放(更窄): LENGTH(blob) 于 int-WHERE 下经写缓冲合并+计算列求值
+  路径仍 NULL — 工作面: 任意 WHERE 下裸投影、text/blob-WHERE 或无
+  WHERE 下的标量函数、ORDER BY。回归测试 test_blob_type 5/5
 - 遗留可选: TimeSeries 引擎统一(方案 E)与只读容器模式, 按路线图另排
 
 ### SDK cycle

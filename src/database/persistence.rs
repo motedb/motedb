@@ -744,12 +744,24 @@ impl MoteDB {
             //   recovery of unflushed write_buf data.
             self.wal.checkpoint_all()?;
             // Persist write_lsn so restarts survive clock regression.
-            // 🔑 P3: through the unified meta.bin container.
+            // 🔑 F2: fold the DIRTY catalog payload into the same rewrite —
+            // two separate whole-file rewrites cost 2×2 fsyncs.
             let current_lsn = self.write_lsn.load(std::sync::atomic::Ordering::SeqCst);
-            self.meta_store.update_section(
+            let mut sections = vec![(
                 crate::database::meta_store::MetaSection::Lsn,
                 current_lsn.to_le_bytes().to_vec(),
-            )?;
+            )];
+            match self.table_registry.catalog_payload_if_dirty() {
+                Some(Ok(payload)) => {
+                    sections.push((crate::database::meta_store::MetaSection::Catalog, payload))
+                }
+                Some(Err(e)) => warn_log!(
+                    "[checkpoint] catalog payload snapshot failed: {} — counters persist deferred",
+                    e
+                ),
+                None => {}
+            }
+            self.meta_store.update_sections(sections)?;
             true
         } else {
             false
@@ -809,8 +821,20 @@ impl MoteDB {
             store.release_query_memory();
         }
 
-        if let Err(e) = self.table_registry.persist_auto_increment_counters() {
-            warn_log!("[Flush] Auto-increment persistence failed: {}", e);
+        // 🔑 F2: persist the catalog ONLY when counters changed since the
+        // last durable write (covers checkpoint_done=false and bumps that
+        // arrived while the checkpoint ran). Clean → zero fsyncs.
+        match self.table_registry.catalog_payload_if_dirty() {
+            Some(Ok(payload)) => {
+                if let Err(e) = self
+                    .meta_store
+                    .update_section(crate::database::meta_store::MetaSection::Catalog, payload)
+                {
+                    warn_log!("[Flush] Auto-increment persistence failed: {}", e);
+                }
+            }
+            Some(Err(e)) => warn_log!("[Flush] catalog payload snapshot failed: {}", e),
+            None => {}
         }
 
         Ok(())

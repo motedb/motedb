@@ -2214,6 +2214,14 @@ impl ColSegmentStore {
                                 (_, Some(Some(t)), ColumnType::Text) => {
                                     t.get_str(i).map(|s| Value::Text(s.into()))
                                 }
+                                // 🔖 BLOB rides the text layout — verbatim bytes.
+                                // Missing here → every WHERE int_col <op> N query
+                                // projected/evaluated blob columns as NULL (the
+                                // v0.13 known gap: LENGTH(blob) under an int
+                                // WHERE returned NULL).
+                                (_, Some(Some(t)), ColumnType::Blob) => t
+                                    .get_bytes(i)
+                                    .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec()))),
                                 // Vector / Spatial were decoded as text → NULL:
                                 // `WHERE id > 0` never returned an embedding.
                                 (_, _, ColumnType::Tensor(_)) | (_, _, ColumnType::Spatial) => {

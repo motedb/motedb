@@ -154,9 +154,21 @@ impl MetaStore {
 
     /// Update one section's payload and durably rewrite the file.
     pub fn update_section(&self, section: MetaSection, payload: Vec<u8>) -> Result<()> {
+        self.update_sections(vec![(section, payload)])
+    }
+
+    /// 🔑 F2: update SEVERAL sections with ONE durable whole-file rewrite —
+    /// a checkpoint that persists LSN + catalog paid two full rewrites
+    /// (2×2 fsyncs) for what is one atomic write.
+    pub fn update_sections(&self, sections: Vec<(MetaSection, Vec<u8>)>) -> Result<()> {
+        if sections.is_empty() {
+            return Ok(());
+        }
         {
             let mut inner = self.inner.lock();
-            inner.sections.insert(section as u8, payload);
+            for (section, payload) in sections {
+                inner.sections.insert(section as u8, payload);
+            }
         }
         self.flush()
     }

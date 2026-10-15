@@ -235,6 +235,11 @@ pub struct Manifest {
     state: ManifestState,
     /// Current file length in bytes (header + records); drives compaction.
     file_bytes: u64,
+    /// 🔑 F2: records appended since the last durable `sync()`. `sync()` on
+    /// a clean manifest skips the fsync entirely — a checkpoint that flushed
+    /// nothing (or whose records were already synced) paid one fsync per
+    /// table for nothing.
+    dirty: bool,
     /// 🔑 F1b: per-table segment directories (registered by ColSegmentStore
     /// at creation). Compaction stats retired ids' files here: an id whose
     /// file is GONE can be forgotten entirely — segment ids are strictly
@@ -285,6 +290,7 @@ impl Manifest {
             state: ManifestState::default(),
             file_bytes: 10, // magic + version + count placeholder
             table_dirs: HashMap::new(),
+            dirty: false,
         })
     }
 
@@ -306,6 +312,7 @@ impl Manifest {
             state,
             file_bytes,
             table_dirs: HashMap::new(),
+            dirty: false,
         })
     }
 
@@ -322,6 +329,7 @@ impl Manifest {
         self.writer.flush()?;
         apply_record(&mut self.state, &rec);
         self.file_bytes += bytes.len() as u64;
+        self.dirty = true;
         self.maybe_compact()?;
         Ok(())
     }
@@ -409,6 +417,7 @@ impl Manifest {
         let file_bytes = file.seek(std::io::SeekFrom::End(0))?;
         self.writer = BufWriter::new(file);
         self.file_bytes = file_bytes;
+        self.dirty = false; // minimal.sync() above made it durable
         self.state = Self::parse_file(&self.path);
         Ok(())
     }
@@ -440,10 +449,15 @@ impl Manifest {
     }
 
     /// fsync the manifest (durability point). Callers then may physically
-    /// delete retired segment files.
+    /// delete retired segment files. 🔑 F2: no-op when nothing was appended
+    /// since the last sync — there is nothing to make durable.
     pub fn sync(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
+        self.dirty = false;
         Ok(())
     }
 
