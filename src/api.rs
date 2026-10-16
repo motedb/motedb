@@ -16,7 +16,7 @@ use crate::sql::StreamingQueryResult;
 use crate::types::{Row, RowId, SqlRow, Value};
 use crate::StorageError;
 use crate::{DBConfig, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Outcome of fast-PK value → row_id resolution (shared by the single-
@@ -256,6 +256,80 @@ impl Database {
     /// };
     /// let db = Database::create_with_config("data.mote", config)?;
     /// ```
+    /// 🔑 容器模式: open a MOTESNAP container directly — read-only.
+    ///
+    /// The container is extracted ONCE into a per-container cache under the
+    /// system temp dir (stamped with size+mtime; a changed container
+    /// re-extracts). All write paths are refused; no lock is taken, so any
+    /// number of readers can share one container. The source file itself is
+    /// never modified.
+    pub fn open_readonly<P: AsRef<Path>>(container: P) -> Result<Self> {
+        let container = container.as_ref();
+        if !crate::database::snapshot::is_motesnap_container(container) {
+            return Err(crate::MoteDBError::InvalidArgument(format!(
+                "not a MOTESNAP container: {}",
+                container.display()
+            )));
+        }
+        let cache = Self::container_cache_dir(container);
+        Self::ensure_container_extracted(container, &cache)?;
+        let config = DBConfig {
+            read_only: true,
+            ..Default::default()
+        };
+        let (inner, reg_key) = open_engine_shared(cache, |p| MoteDB::open_with_config(p, config))?;
+        let query_executor = crate::sql::QueryExecutor::new(inner.clone());
+        Ok(Self {
+            inner,
+            stmt_cache: Arc::new(dashmap::DashMap::new()),
+            stmt_cache_cap: 256,
+            query_executor,
+            reg_key: Some(reg_key),
+        })
+    }
+
+    /// Stable per-container extraction cache dir (FNV-1a of the absolute path).
+    fn container_cache_dir(container: &Path) -> PathBuf {
+        let abs = std::fs::canonicalize(container).unwrap_or_else(|_| container.to_path_buf());
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in abs.to_string_lossy().as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        // `.mote` suffix keeps resolve_open_path's verbatim branch active —
+        // the extraction lacks wal/ (excluded from containers), which would
+        // otherwise fail the lsm|wal probe and rewrite to a sibling path.
+        std::env::temp_dir()
+            .join("motedb-ro")
+            .join(format!("{h:016x}.mote"))
+    }
+
+    /// Idempotent extraction: reuse the cache when the stamp matches the
+    /// container's size+mtime; otherwise wipe and re-extract.
+    fn ensure_container_extracted(container: &Path, cache: &Path) -> Result<()> {
+        let meta = std::fs::metadata(container)?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let stamp = format!("{}:{}\n", meta.len(), modified);
+        let marker = cache.join(".container-stamp");
+        if cache.join("meta.bin").is_file() {
+            if let Ok(existing) = std::fs::read_to_string(&marker) {
+                if existing == stamp {
+                    return Ok(());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(cache);
+        MoteDB::import_snapshot(container, cache)?;
+        std::fs::create_dir_all(cache)?;
+        std::fs::write(&marker, &stamp)?;
+        Ok(())
+    }
+
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         let db_path = MoteDB::resolve_create_path_public(path.as_ref());
         let (inner, reg_key) =
@@ -277,6 +351,12 @@ impl Database {
     /// let db = Database::open("data.mote")?;
     /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        // 🔑 容器模式 auto-route: opening a MOTESNAP container FILE opens it
+        // read-only (extracted to a per-container cache). The deployment
+        // form: `Database::open("map.mote")` on firmware-bundled snapshots.
+        if crate::database::snapshot::is_motesnap_container(path.as_ref()) {
+            return Self::open_readonly(path);
+        }
         // 🔑 Shared handle: in-process reopens of the same directory attach
         // to the SAME engine (flock is per-file-description — a second
         // plain open used to fail with "already open by another process").
@@ -548,7 +628,13 @@ impl Database {
         // graphs, text postings and column-index buffers stayed in memory;
         // the flag was one-shot from open() and never cleared here).
         self.inner.mark_index_pipeline_stopped();
-        let result = self.inner.checkpoint();
+        // 🔑 容器模式: nothing can be dirty — skip the checkpoint (and the
+        // freshness stamp below, which would write into the scratch cache).
+        let result = if self.inner.read_only {
+            Ok(())
+        } else {
+            self.inner.checkpoint()
+        };
         self.inner
             .is_closed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -681,6 +767,35 @@ impl Database {
             ));
         }
 
+        // 🔑 容器模式: reject writes BEFORE any fast path — the hand-rolled
+        // INSERT/UPDATE/DELETE parsers below bypass the executor's gate.
+        if self.inner.read_only {
+            let head: String = sql
+                .trim_start()
+                .chars()
+                .take(12)
+                .collect::<String>()
+                .to_ascii_uppercase();
+            let writing = head.starts_with("INSERT")
+                || head.starts_with("UPDATE")
+                || head.starts_with("DELETE")
+                || head.starts_with("CREATE")
+                || head.starts_with("DROP")
+                || head.starts_with("BEGIN")
+                || head.starts_with("COMMIT")
+                || head.starts_with("ROLLB")
+                || head.starts_with("VACUU")
+                || head.starts_with("CHECKPOINT")
+                || head.starts_with("EXPORT ")
+                || head.starts_with("CALL ");
+            if writing {
+                return Err(crate::MoteDBError::InvalidArgument(
+                    "database is opened read-only (MOTESNAP container) — writes are disabled"
+                        .into(),
+                ));
+            }
+        }
+
         // In transaction mode, skip fast INSERT paths so rows go through
         // insert_row_with_txn (buffered in write_set until COMMIT).
         let in_txn = self.query_executor.is_in_transaction();
@@ -800,6 +915,11 @@ impl Database {
     /// 🔥 列式批量插入 (numpy 数组直通): 跳过 SQL 解析与逐行 Python 对象,
     /// 一次 WAL 批 + 单次锁获取。绑定层把 numpy 缓冲区组装成行后走这里。
     pub fn insert_rows(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
+        if self.inner.read_only {
+            return Err(crate::MoteDBError::InvalidArgument(
+                "database is opened read-only (MOTESNAP container) — writes are disabled".into(),
+            ));
+        }
         let ids = self.inner.batch_insert_rows_to_table(table, rows)?;
         Ok(ids.len() as u64)
     }

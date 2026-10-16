@@ -50,6 +50,20 @@ pub struct SnapshotStats {
 }
 
 /// Files/directories that never belong in a snapshot (live-state artifacts).
+/// True when `path` is an existing FILE carrying the MOTESNAP magic —
+/// used by `Database::open` to auto-route container opens to read-only mode.
+pub fn is_motesnap_container(path: &Path) -> bool {
+    use std::io::Read;
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    matches!(f.read_exact(&mut magic), Ok(())) && &magic == SNAP_MAGIC
+}
+
 fn excluded(rel: &str) -> bool {
     if rel == ".lock" || rel == ".clean_close" || rel == "fts_indexes.fresh" {
         return true;

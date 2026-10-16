@@ -2077,7 +2077,39 @@ impl QueryExecutor {
         self.evaluator.clear_params();
     }
 
+    /// 🔑 容器模式: statements that mutate persisted state. Refused with a
+    /// clear error before any execution when the database was opened
+    /// read-only (MOTESNAP container).
+    fn statement_requires_write(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::CreateTable(_)
+                | Statement::CreateIndex(_)
+                | Statement::DropTable(_)
+                | Statement::DropIndex(_)
+                | Statement::AlterTable(_)
+                | Statement::CommitDataset { .. }
+                | Statement::DropDataset { .. }
+                | Statement::ExportDataset { .. }
+                | Statement::ExportDb { .. }
+                | Statement::BeginTransaction
+                | Statement::CommitTransaction
+                | Statement::RollbackTransaction
+                | Statement::Savepoint(_)
+                | Statement::RollbackToSavepoint(_)
+                | Statement::ReleaseSavepoint(_)
+        )
+    }
+
     pub fn execute(&self, stmt: Statement) -> Result<QueryResult> {
+        if self.db.read_only && Self::statement_requires_write(&stmt) {
+            return Err(crate::MoteDBError::InvalidArgument(
+                "database is opened read-only (MOTESNAP container) — writes are disabled".into(),
+            ));
+        }
         match stmt {
             Statement::Select {
                 stmt: s,
@@ -2866,6 +2898,11 @@ impl QueryExecutor {
     }
 
     pub fn execute_streaming(&self, stmt: Statement) -> Result<StreamingQueryResult> {
+        if self.db.read_only && Self::statement_requires_write(&stmt) {
+            return Err(crate::MoteDBError::InvalidArgument(
+                "database is opened read-only (MOTESNAP container) — writes are disabled".into(),
+            ));
+        }
         self.execute_streaming_ref(&stmt)
     }
 

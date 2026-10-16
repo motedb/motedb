@@ -68,7 +68,17 @@
   checkpoint 同价 (18.2ms vs 18.3ms, legacy flush 退出); 迁移探针全绿
   (3000 行 .mcdb → 段存储 → 新插入/LATEST BY/重开无重复无丢失);
   TS 语义 13+18、columnar/crash/backup 全绿
-- 遗留可选: 只读容器模式, 按路线图另排
+- **🔑 容器模式 (只读快照直开)**: `Database::open_readonly('snap.mote')`
+  及 `open()` 自动路由(命中 MOTESNAP 魔数的文件) — 部署形态落地: 固件
+  预置库一个文件分发, 打开即查。实现: 容器幂等解包到系统临时目录的
+  per-container 缓存(FNV 路径哈希 + size/mtime 新鲜度戳, 容器变更自动
+  重解包); 引擎级只读门 — 全部写语句拒绝(SQL 快路径+executor 双入口+
+  insert_rows 直写 API), checkpoint/vacuum/backup/export 禁用, 不取
+  flock(多读者共存), 后台写线程不启动, 关闭免盖章; trusted-clean 跳过
+  崩溃校验(容器导出时已静默+checkpoint)。源容器文件字节级不变(验收
+  断言)。回归 test_snapshot 6/6(查询正确性含 BLOB/TS/FTS、八类写拒绝、
+  字节不变、自动路由、双句柄共存、非容器报错)
+- 遗留可选: —
 
 ### SDK cycle
 

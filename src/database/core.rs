@@ -132,6 +132,11 @@ pub struct MoteDB {
     /// metadata + LSN + clean-close flag in one sectioned file.
     pub(crate) meta_store: std::sync::Arc<crate::database::meta_store::MetaStore>,
 
+    /// 🔑 容器模式: read-only open — every write path is refused, and the
+    /// lock / WAL-append / background write threads / close-time stamping
+    /// are skipped entirely (the container was checkpointed at export).
+    pub(crate) read_only: bool,
+
     /// 🔑 P2 global layout: the single `columnar_ms/MANIFEST` shared by every
     /// ColSegmentStore (one manifest file + one fd per database, not per
     /// table). Constructed at create/open (folding any legacy per-table
@@ -598,6 +603,7 @@ impl MoteDB {
             col_segment_stores: Arc::new(DashMap::new()),
             col_manifest,
             meta_store: meta_store.clone(),
+            read_only: config.read_only,
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
@@ -877,6 +883,7 @@ impl MoteDB {
             col_segment_stores: self.col_segment_stores.clone(),
             col_manifest: self.col_manifest.clone(),
             meta_store: self.meta_store.clone(),
+            read_only: self.read_only,
             pk_lookup: self.pk_lookup.clone(),
             table_row_count: self.table_row_count.clone(),
             table_registry: self.table_registry.clone(),
@@ -923,8 +930,14 @@ impl MoteDB {
         let path = path.as_ref();
         let db_path = Self::resolve_open_path(path);
 
-        // 🔒 Acquire exclusive file lock to prevent concurrent opens
-        let lock_file = Self::acquire_lock(&db_path)?;
+        // 🔒 Acquire exclusive file lock to prevent concurrent opens.
+        // 🔑 容器模式: NO lock — read-only opens must coexist (many readers
+        // share one extraction cache) and nothing is mutated.
+        let lock_file = if config.read_only {
+            None
+        } else {
+            Some(Self::acquire_lock(&db_path)?)
+        };
 
         // 🔒 Crash-evidence gate (v0.12.9): a clean Drop flushes the FTS
         // indexes and stamps this marker. Its absence ⇒ index durability is
@@ -939,10 +952,18 @@ impl MoteDB {
         )?);
         let clean_close_marker = db_path.join(".clean_close");
         let legacy_marker = db_path.join("fts_indexes.fresh");
-        let clean_close =
-            meta_store.clean_close() || clean_close_marker.exists() || legacy_marker.exists();
+        // 🔑 容器模式 trusted-clean: the container was quiesced + checkpointed
+        // at export — skip the crash-verify path (which would rebuild/flush
+        // indexes, i.e. WRITE into the extraction cache).
+        let clean_close = config.read_only
+            || meta_store.clean_close()
+            || clean_close_marker.exists()
+            || legacy_marker.exists();
         // Consume durably — a crash mid-open must not re-observe `clean`.
-        meta_store.set_clean_close(false)?;
+        // 🔑 容器模式: skip — RO never writes, the extraction cache is scratch.
+        if !config.read_only {
+            meta_store.set_clean_close(false)?;
+        }
         let _ = std::fs::remove_file(&clean_close_marker);
         let _ = std::fs::remove_file(&legacy_marker);
 
@@ -1470,6 +1491,7 @@ impl MoteDB {
             col_segment_stores: Arc::new(DashMap::new()),
             col_manifest,
             meta_store: meta_store.clone(),
+            read_only: config.read_only,
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
@@ -1494,7 +1516,7 @@ impl MoteDB {
             index_build_tx: None,
             index_builder_thread: None,
             auto_flush_thread: None,
-            _lock_file: std::sync::Mutex::new(Some(lock_file)),
+            _lock_file: std::sync::Mutex::new(lock_file),
             _is_clone: false,
         };
 
@@ -2063,15 +2085,24 @@ impl MoteDB {
         }
 
         // 🚀 Start auto-checkpoint thread (only if config provided, matching create behavior)
-        let auto_checkpoint_thread = config
-            .auto_checkpoint
-            .map(|cfg| Self::start_auto_checkpoint_thread(db.clone_for_callback(), cfg));
+        // 🔑 容器模式: no writer threads — nothing can become dirty.
+        let auto_checkpoint_thread = if config.read_only {
+            None
+        } else {
+            config
+                .auto_checkpoint
+                .map(|cfg| Self::start_auto_checkpoint_thread(db.clone_for_callback(), cfg))
+        };
 
         db.auto_checkpoint_thread = auto_checkpoint_thread;
 
         // Start auto-flush background thread
-        let auto_flush = Self::start_auto_flush_thread(db.clone_for_callback())?;
-        db.auto_flush_thread = Some(auto_flush);
+        let auto_flush = if config.read_only {
+            None
+        } else {
+            Some(Self::start_auto_flush_thread(db.clone_for_callback())?)
+        };
+        db.auto_flush_thread = auto_flush;
 
         // 🚀 Phase 5: Recover AUTO_INCREMENT counters (B3: Crash Recovery)
         // For each table with AUTO_INCREMENT, find max ID from LSM and initialize counter

@@ -75,6 +75,13 @@ impl MoteDB {
     /// `Database::open(dest)`. `dest` must not already exist.
     pub fn backup_to(&self, dest: &std::path::Path) -> Result<()> {
         ensure_open!(self);
+        if self.read_only {
+            return Err(StorageError::InvalidData(
+                "database is opened read-only — backup (which flushes) is disabled; \
+                 re-export from the source or copy the container"
+                    .into(),
+            ));
+        }
 
         // Normalize exactly like open_with_config does so
         // `Database::open(dest)` restores the snapshot from the same path
@@ -234,6 +241,13 @@ impl MoteDB {
         compressed: bool,
     ) -> Result<crate::database::snapshot::SnapshotStats> {
         ensure_open!(self);
+        if self.read_only {
+            return Err(StorageError::InvalidData(
+                "database is opened read-only — re-export is disabled; copy the \
+                 source container instead"
+                    .into(),
+            ));
+        }
 
         if dest.exists() {
             return Err(StorageError::InvalidData(format!(
@@ -462,6 +476,11 @@ impl MoteDB {
 
     pub fn checkpoint(&self) -> Result<()> {
         ensure_open!(self);
+        if self.read_only {
+            return Err(StorageError::InvalidData(
+                "database is opened read-only — checkpoint is disabled".into(),
+            ));
+        }
         let _guard = self
             .checkpoint_mutex
             .lock()
@@ -474,6 +493,9 @@ impl MoteDB {
     /// Full checkpoint with index rebuild (used on shutdown/drop)
     pub fn checkpoint_full(&self) -> Result<()> {
         ensure_open!(self);
+        if self.read_only {
+            return Ok(()); // nothing can be dirty
+        }
         let _guard = self
             .checkpoint_mutex
             .lock()
@@ -487,6 +509,11 @@ impl MoteDB {
     /// then flushes and waits for all column indexes.
     pub fn vacuum(&self) -> Result<()> {
         ensure_open!(self);
+        if self.read_only {
+            return Err(StorageError::InvalidData(
+                "database is opened read-only — VACUUM is disabled".into(),
+            ));
+        }
         let _guard = self
             .checkpoint_mutex
             .lock()

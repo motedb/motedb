@@ -355,6 +355,12 @@ impl IndexUpdateStrategy {
 /// 数据库配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DBConfig {
+    /// 🔑 容器模式: 只读打开。配合 Database::open_readonly / open() 命中
+    /// MOTESNAP 容器 — 写语句被拒, 锁/WAL 追加/后台写线程/关闭盖章全部
+    /// 跳过(容器在导出时已 checkpoint, 数据按构造即一致)。
+    #[serde(default)]
+    pub read_only: bool,
+
     /// WAL 配置
     pub wal_config: WALConfig,
 
@@ -514,6 +520,7 @@ impl AutoCheckpointConfig {
 impl Default for DBConfig {
     fn default() -> Self {
         Self {
+            read_only: false,
             wal_config: WALConfig::default(),
             num_partitions: 4,
             lsm_config: LSMConfig::default(),

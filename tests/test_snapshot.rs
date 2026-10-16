@@ -264,3 +264,89 @@ fn p4_export_rejects_dest_inside_db_and_existing() {
     // Import onto an existing directory must fail.
     assert!(MoteDB::import_snapshot(&snap, &src).is_err());
 }
+
+#[test]
+fn container_readonly_mode_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src.mote");
+    build_source_db(&src);
+    let snap = dir.path().join("fleet.mote");
+    {
+        let db = Database::open(&src).unwrap();
+        let _ = db
+            .execute(&format!("EXPORT DB TO '{}'", snap.display()))
+            .unwrap();
+        db.close().unwrap();
+    }
+    let hash_before = {
+        let mut h = crc32fast::Hasher::new();
+        h.update(&std::fs::read(&snap).unwrap());
+        h.finalize()
+    };
+
+    // 显式只读打开
+    let ro = Database::open_readonly(&snap).unwrap();
+    assert_eq!(count(&ro, "SELECT COUNT(*) FROM sensors"), 500);
+    assert_eq!(count(&ro, "SELECT COUNT(*) FROM files"), 100);
+    let blob = ro
+        .execute("SELECT LENGTH(payload) FROM files WHERE id = 7")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let (_, rows) = blob.select_rows().unwrap();
+    assert_eq!(rows[0][0], motedb::types::Value::Integer(16));
+    // TS 表 (方案 E 统一后) 也在容器内可查
+    let fts = count(
+        &ro,
+        "SELECT COUNT(*) FROM docs WHERE MATCH(body, 'calibration')",
+    );
+    assert_eq!(fts, 80);
+
+    // 写全部拒绝
+    for sql in [
+        "INSERT INTO sensors VALUES (999, 'x', 1.0, 1, [1,2,3,4], 'n')",
+        "UPDATE files SET name = 'x' WHERE id = 1",
+        "DELETE FROM docs WHERE id = 1",
+        "CREATE TABLE rogue (id INTEGER PRIMARY KEY)",
+        "DROP TABLE sensors",
+        "CHECKPOINT",
+        "VACUUM",
+        "BEGIN",
+    ] {
+        let err = ro.execute(sql).err().expect(sql);
+        assert!(
+            err.to_string().to_lowercase().contains("read-only"),
+            "{sql} -> {err}"
+        );
+    }
+    assert!(ro.insert_rows("sensors", vec![vec![]]).is_err());
+    ro.close().unwrap();
+
+    // 容器源文件字节不变
+    let hash_after = {
+        let mut h = crc32fast::Hasher::new();
+        h.update(&std::fs::read(&snap).unwrap());
+        h.finalize()
+    };
+    assert_eq!(hash_before, hash_after, "container file must be untouched");
+
+    // open() 自动路由 (文件路径直接命中容器)
+    let ro2 = Database::open(&snap).unwrap();
+    assert_eq!(count(&ro2, "SELECT COUNT(*) FROM sensors"), 500);
+    assert!(ro2.execute("INSERT INTO docs VALUES (1, 'x')").is_err());
+    ro2.close().unwrap();
+
+    // 并存: 两个只读句柄同时打开同一容器
+    let a = Database::open_readonly(&snap).unwrap();
+    let b = Database::open_readonly(&snap).unwrap();
+    assert_eq!(count(&a, "SELECT COUNT(*) FROM files"), 100);
+    assert_eq!(count(&b, "SELECT COUNT(*) FROM docs"), 80);
+    a.close().unwrap();
+    b.close().unwrap();
+
+    // 非容器文件报清晰错误
+    let not_container = dir.path().join("plain.txt");
+    std::fs::write(&not_container, b"garbage").unwrap();
+    let err = Database::open_readonly(&not_container).err().unwrap();
+    assert!(err.to_string().contains("not a MOTESNAP container"));
+}
