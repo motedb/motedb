@@ -519,6 +519,13 @@ impl PyDatabase {
         durability: Option<&str>,
         periodic_ms: Option<u64>,
     ) -> PyResult<Self> {
+        // 🔑 容器模式 auto-route: a MOTESNAP container file opens read-only
+        // (mirrors the Rust Database::open behavior this binding's
+        // create-or-open heuristic would otherwise bypass).
+        if motedb_core::database::snapshot::is_motesnap_container(std::path::Path::new(path)) {
+            let db = Database::open_readonly(path).map_err(py_err)?;
+            return Ok(Self { db });
+        }
         let config = config_for_preset(preset, durability, periodic_ms, path)?;
         let db = if create {
             if std::path::Path::new(path).exists() {

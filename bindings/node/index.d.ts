@@ -22,6 +22,12 @@ export declare class Database {
   exportSnapshot(dest: string, compressed?: boolean): number;
   /** Static: unpack a MOTESNAP into a fresh directory and open it. */
   static openSnapshot(src: string, destDir: string): Database;
+  /**
+   * Static: open a MOTESNAP container read-only (extracted to a per-container
+   * cache; all writes rejected). The plain constructor auto-routes container
+   * files to this mode.
+   */
+  static openReadonly(container: string): Database;
   /** Close the database (flush + clean-close marker). */
   close(): void;
   /** Self-check report: [{name, status, detail}]. */

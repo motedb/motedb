@@ -242,3 +242,49 @@ func TestExportImportSnapshot(t *testing.T) {
 		t.Fatalf("imported rows = %v, want 40", qr[0]["n"])
 	}
 }
+
+func TestTimeSeriesUnifiedAndContainerReadonly(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "ts.mote"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE m (ts TIMESTAMP, sid INT, v FLOAT) TIMESERIES(ts)"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, err := db.Exec(
+			"INSERT INTO m VALUES (?, ?, ?)",
+			1700000000000000+int64(i)*1000000, i%3, float64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	qr, err := db.Query("SELECT COUNT(*) AS n FROM m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qr[0]["n"] != float64(50) {
+		t.Fatalf("count=%v", qr[0]["n"])
+	}
+
+	snap := filepath.Join(dir, "c.mote")
+	if _, err := db.Exec(fmt.Sprintf("EXPORT DB TO '%s'", snap)); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := Open(snap) // 自动路由只读 (FFI → api::open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	qr, err = ro.Query("SELECT COUNT(*) AS n FROM m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qr[0]["n"] != float64(50) {
+		t.Fatalf("ro count=%v", qr[0]["n"])
+	}
+	if _, err := ro.Exec("INSERT INTO m VALUES (1, 1, 1.0)"); err == nil {
+		t.Fatal("read-only write must be rejected")
+	}
+}

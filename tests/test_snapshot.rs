@@ -350,3 +350,94 @@ fn container_readonly_mode_end_to_end() {
     let err = Database::open_readonly(&not_container).err().unwrap();
     assert!(err.to_string().contains("not a MOTESNAP container"));
 }
+
+#[test]
+fn container_readonly_gates_prepared_and_direct_paths() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src.mote");
+    build_source_db(&src);
+    let snap = dir.path().join("c.mote");
+    {
+        let db = Database::open(&src).unwrap();
+        let _ = db
+            .execute(&format!("EXPORT DB TO '{}'", snap.display()))
+            .unwrap();
+        db.close().unwrap();
+    }
+    let ro = Database::open_readonly(&snap).unwrap();
+
+    // prepared-statement entry (execute_prepared / execute_prepared_many)
+    let err = ro
+        .execute_prepared(
+            "INSERT INTO docs VALUES (?, ?)",
+            vec![
+                motedb::types::Value::Integer(1),
+                motedb::types::Value::Text("x".into()),
+            ],
+        )
+        .err()
+        .expect("prepared INSERT must be rejected");
+    assert!(err.to_string().contains("read-only"), "{err}");
+    let err = ro
+        .execute_prepared_many(
+            "INSERT INTO docs VALUES (?, ?)",
+            vec![vec![
+                motedb::types::Value::Integer(2),
+                motedb::types::Value::Text("y".into()),
+            ]],
+        )
+        .expect_err("prepared-many INSERT must be rejected");
+    assert!(err.to_string().contains("read-only"), "{err}");
+    // direct API
+    assert!(ro.insert_rows("docs", vec![vec![]]).is_err());
+    assert!(ro.checkpoint().is_err());
+    ro.close().unwrap();
+
+    // create + read_only 组合拒绝
+    let bad = motedb::DBConfig {
+        read_only: true,
+        ..Default::default()
+    };
+    let err = Database::create_with_config(dir.path().join("bad.mote"), bad)
+        .err()
+        .expect("create+read_only must be rejected");
+    assert!(err.to_string().contains("open_readonly"), "{err}");
+}
+
+#[test]
+fn btree_small_file_reopens_after_v3_reservation() {
+    // 审计回归: read_superblock 曾对 <64KB 文件 read_exact EOF — v2 升级
+    // 路径与零页 v3 文件全炸。空表建索引 = 最小文件形态。
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("t.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+            .unwrap();
+        // 空表上建列索引: btree 文件只有 superblock。
+        db.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        db.close().unwrap();
+    }
+    // 重开: 小文件 read_superblock 必须 EOF-容忍。
+    let db = Database::open(&path).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 42)").unwrap();
+    let r = db
+        .execute("SELECT COUNT(*) FROM t WHERE v = 42")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let (_, rows) = r.select_rows().unwrap();
+    assert_eq!(rows[0][0], motedb::types::Value::Integer(1));
+    db.execute("CHECKPOINT").unwrap();
+    db.close().unwrap();
+    // 再重开: 写入页后 (≥64KB) 同样正常。
+    let db = Database::open(&path).unwrap();
+    let r = db
+        .execute("SELECT COUNT(*) FROM t WHERE v = 42")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let (_, rows) = r.select_rows().unwrap();
+    assert_eq!(rows[0][0], motedb::types::Value::Integer(1));
+    db.close().unwrap();
+}

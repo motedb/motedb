@@ -422,6 +422,13 @@ impl MoteDB {
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         crate::configure_allocator_decay();
         config.validate()?;
+        if config.read_only {
+            return Err(StorageError::InvalidData(
+                "read_only cannot be combined with create() — use \
+                 Database::open_readonly (container mode)"
+                    .into(),
+            ));
+        }
         let path = path.as_ref();
         let db_path = Self::resolve_create_path(path);
 

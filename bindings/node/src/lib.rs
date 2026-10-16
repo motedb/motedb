@@ -163,6 +163,13 @@ impl Database {
         Ok(Self { inner })
     }
 
+    /// 🔑 容器模式: open a MOTESNAP container read-only.
+    #[napi]
+    pub fn open_readonly(container: String) -> Result<Self> {
+        let inner = motedb_core::Database::open_readonly(&container).map_err(py_err)?;
+        Ok(Self { inner })
+    }
+
     /// Run a mutation/DDL statement (with optional `?` params). Returns
     /// { affectedRows }.
     #[napi]

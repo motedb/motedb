@@ -2571,6 +2571,13 @@ impl QueryExecutor {
     }
 
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
+        // 🔑 容器模式: prepared-statement entry (execute_prepared*) — same
+        // write gate as execute()/execute_streaming().
+        if self.db.read_only && Self::statement_requires_write(stmt) {
+            return Err(crate::MoteDBError::InvalidArgument(
+                "database is opened read-only (MOTESNAP container) — writes are disabled".into(),
+            ));
+        }
         let max_rows = self.db.max_result_rows;
         SPATIAL_KNN_MEMO.with(|m| m.borrow_mut().clear());
         TEXT_MATCH_MEMO.with(|m| m.borrow_mut().clear());

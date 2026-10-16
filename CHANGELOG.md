@@ -78,6 +78,14 @@
   崩溃校验(容器导出时已静默+checkpoint)。源容器文件字节级不变(验收
   断言)。回归 test_snapshot 6/6(查询正确性含 BLOB/TS/FTS、八类写拒绝、
   字节不变、自动路由、双句柄共存、非容器报错)
+- **发布前审计修复 ×4**: ① BTree read_superblock 对 <64KB 文件 read_exact
+  EOF — v2 升级路径与零页 v3 文件(空表建索引)重开即炸; 改 EOF-容忍读+
+  零填充 ② execute_prepared/many 走 execute_streaming_ref — 绕过容器
+  只读门, 补门 ③ Python/Node 构造器 create-or-open 启发式绕过 open()
+  容器自动路由 — Python 补魔数检测, Node/Go 经 api::open 已覆盖(FFI
+  直连) ④ create+read_only 组合显式拒绝。bindings 全面复验(方案 E 后
+  首次): Python e2e×3 + TS/容器冒烟、Node 冒烟×2、Go 测试×7 全过;
+  e2e time_bucket 断言适配通用 GROUP BY 哈希序
 - 遗留可选: —
 
 ### SDK cycle

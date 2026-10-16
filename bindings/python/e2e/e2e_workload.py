@@ -117,6 +117,8 @@ def suite_multimodal(root):
         b0 = base // 60_000_000 * 60_000_000  # true 60s bucket boundary
         _, r = db.query(f"SELECT TIME_BUCKET('60s', ts) AS b, COUNT(*) FROM ts "
                         f"WHERE ts >= {base} AND ts < {base + 120_000_000} GROUP BY b")
+        # 方案 E: generic GROUP BY emits hash order — compare sorted by bucket.
+        r = sorted(r, key=lambda row: row[0])
         check("time_bucket group-by buckets", len(r) == 3 and r[0][0] == b0 and r[0][1] == 40,
               f"buckets={len(r)} first={r[0] if r else None}")
         _, r = db.query(f"SELECT COUNT(*) FROM ts WHERE TIME_BUCKET('60s', ts) = {b0}")

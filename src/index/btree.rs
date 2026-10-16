@@ -19,7 +19,7 @@ use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -548,8 +548,27 @@ impl BTree {
     fn read_superblock(file: &mut File) -> Result<SuperBlock> {
         file.seek(SeekFrom::Start(0))?;
 
+        // 🔑 EOF-tolerant read: files smaller than the (v3, 64KB) reservation
+        // are legal — v2 files written with the old 4KB reservation, and v3
+        // files whose superblock was written before any page flushed (empty
+        // index). Read what exists, zero-pad the rest; bincode stops at the
+        // struct's fields so trailing zeros are inert.
         let mut buf = vec![0u8; Self::SUPERBLOCK_SIZE];
-        file.read_exact(&mut buf)?;
+        let mut filled = 0usize;
+        loop {
+            use std::io::Read;
+            match file.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    filled += n;
+                    if filled == buf.len() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         bincode::deserialize(&buf).map_err(|e| {
             StorageError::Corruption(format!("Failed to deserialize SuperBlock: {}", e))
