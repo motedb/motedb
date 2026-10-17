@@ -34,7 +34,10 @@ jobs:
         include:
           - os: macos-latest # arm64
             target: aarch64-apple-darwin
-          - os: macos-13 # x64
+          # x64-macOS via CROSS-COMPILE on the arm64 runner — macos-13
+          # (Intel) runners are retiring and queue for an hour+; rust
+          # cross-compiles x86_64-apple-darwin natively from arm64.
+          - os: macos-latest # arm64 → cross x64
             target: x86_64-apple-darwin
           - os: ubuntu-latest # x64 gnu
             target: x86_64-unknown-linux-gnu
