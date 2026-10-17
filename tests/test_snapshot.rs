@@ -441,3 +441,83 @@ fn btree_small_file_reopens_after_v3_reservation() {
     assert_eq!(rows[0][0], motedb::types::Value::Integer(1));
     db.close().unwrap();
 }
+
+#[test]
+fn btree_v2_index_files_survive_upgrade() {
+    // 审计轮2回归: v3 保留区变更后, version != 3 曾把存量 v2 索引静默重置为
+    // 空(干净库无 WAL 重放 → 重建被跳过 → 索引驱动查询悄悄丢行)。现在 v2
+    // 保持可读。模拟: 把新写索引文件的版本字节改成 2 再重开。
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("t.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+            .unwrap();
+        for i in 0..200 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i % 17))
+                .unwrap();
+        }
+        db.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        db.execute("CHECKPOINT").unwrap();
+        db.close().unwrap();
+    }
+    // Patch every column index file's version field (u32 LE at offset 4) to 2.
+    let idx_dir = path.join("indexes");
+    let mut patched = 0;
+    for e in std::fs::read_dir(&idx_dir).unwrap().flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("idx")
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .starts_with("column_")
+        {
+            let mut data = std::fs::read(&p).unwrap();
+            data[4..8].copy_from_slice(&2u32.to_le_bytes());
+            std::fs::write(&p, &data).unwrap();
+            patched += 1;
+        }
+    }
+    assert!(patched >= 1, "expected at least one column index");
+
+    let db = Database::open(&path).unwrap();
+    let r = db
+        .execute("SELECT COUNT(*) FROM t WHERE v = 5")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let (_, rows) = r.select_rows().unwrap();
+    assert_eq!(
+        rows[0][0],
+        motedb::types::Value::Integer(12),
+        "v2 index serves queries after upgrade"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn container_extraction_concurrent_opens() {
+    // 审计轮2回归: 两进程同时首开同一容器, 解包竞争的落败方曾直接报错。
+    // 线程级模拟: 并发 open_readonly, 双方都必须成功。
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src.mote");
+    build_source_db(&src);
+    let snap = dir.path().join("c.mote");
+    {
+        let db = Database::open(&src).unwrap();
+        let _ = db
+            .execute(&format!("EXPORT DB TO '{}'", snap.display()))
+            .unwrap();
+        db.close().unwrap();
+    }
+    let s1 = snap.clone();
+    let s2 = snap.clone();
+    let h1 = std::thread::spawn(move || Database::open_readonly(&s1));
+    let h2 = std::thread::spawn(move || Database::open_readonly(&s2));
+    let a = h1.join().expect("t1 panicked").expect("t1 open failed");
+    let b = h2.join().expect("t2 panicked").expect("t2 open failed");
+    assert_eq!(count(&a, "SELECT COUNT(*) FROM sensors"), 500);
+    assert_eq!(count(&b, "SELECT COUNT(*) FROM sensors"), 500);
+    a.close().unwrap();
+    b.close().unwrap();
+}

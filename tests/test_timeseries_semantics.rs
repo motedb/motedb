@@ -409,3 +409,39 @@ fn ts_reopen_assigns_fresh_row_ids() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn ts_wal_crash_recovery_unified() {
+    // 方案 E 回归: TS 表写入后不 checkpoint 直接丢弃句柄(模拟 kill),
+    // 重开必须从 WAL 恢复全部行 — 统一引擎的回放路径。
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE m (ts TIMESTAMP, sid INT, v FLOAT) TIMESERIES(ts)")
+            .unwrap();
+        for i in 0..300i64 {
+            db.execute(&format!(
+                "INSERT INTO m VALUES ({}, {}, 1.0)",
+                1_700_000_000_000_000 + i * 1_000_000,
+                i % 3
+            ))
+            .unwrap();
+        }
+        // 不 checkpoint、不 close — 直接丢句柄模拟崩溃。
+        std::mem::forget(db);
+    }
+    let db = Database::open(&path).unwrap();
+    let n = scalar(&db, "SELECT COUNT(*) FROM m");
+    assert_eq!(
+        n,
+        Value::Integer(300),
+        "WAL crash recovery for TS (unified)"
+    );
+    let lb = scalar(
+        &db,
+        "SELECT COUNT(*) FROM (SELECT ts FROM m LATEST BY sid) AS t",
+    );
+    assert_eq!(lb, Value::Integer(3), "LATEST BY after crash recovery");
+    db.close().unwrap();
+}

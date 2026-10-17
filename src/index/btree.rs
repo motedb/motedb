@@ -485,12 +485,24 @@ impl BTree {
                 )));
             }
 
-            // Check version compatibility
-            if superblock.version != BTREE_VERSION {
-                // v1 files use fixed PAGE_SIZE layout — silently reinitialize
+            // Check version compatibility.
+            // 🔑 v2 files remain READABLE (the v3 change only grew the WRITE
+            // reservation; the serialized layout is identical) — reinitializing
+            // them would silently empty every column index on upgrade (the
+            // clean-close path replays no WAL and skips index rebuilds).
+            // v1 files use the fixed PAGE_SIZE layout — reinitialize.
+            // Newer-than-known versions are a hard error (forward compat).
+            if superblock.version == 1 {
                 drop(file);
                 let _ = std::fs::remove_file(&storage_path);
                 return Self::with_config(storage_path, config);
+            }
+            if superblock.version > BTREE_VERSION {
+                return Err(StorageError::Corruption(format!(
+                    "B+Tree file version {} is newer than this build supports ({}) — \
+                     upgrade motedb",
+                    superblock.version, BTREE_VERSION
+                )));
             }
 
             // Degrade valve companion: a v3 superblock whose offset table

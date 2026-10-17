@@ -305,7 +305,12 @@ impl Database {
     }
 
     /// Idempotent extraction: reuse the cache when the stamp matches the
-    /// container's size+mtime; otherwise wipe and re-extract.
+    /// container's size+mtime; otherwise re-extract.
+    ///
+    /// 🔑 Multi-PROCESS safe: extract into a PRIVATE temp dir, write the
+    /// stamp marker LAST, then atomically rename into place. Race losers
+    /// discard their temp and adopt the winner's cache (stamp-verified);
+    /// a stale cache is replaced (open mmaps survive unlink on POSIX).
     fn ensure_container_extracted(container: &Path, cache: &Path) -> Result<()> {
         let meta = std::fs::metadata(container)?;
         let modified = meta
@@ -316,20 +321,58 @@ impl Database {
             .unwrap_or(0);
         let stamp = format!("{}:{}\n", meta.len(), modified);
         let marker = cache.join(".container-stamp");
-        if cache.join("meta.bin").is_file() {
-            if let Ok(existing) = std::fs::read_to_string(&marker) {
-                if existing == stamp {
-                    return Ok(());
+        let stamp_matches = || {
+            std::fs::read_to_string(&marker)
+                .map(|existing| existing == stamp)
+                .unwrap_or(false)
+        };
+        if cache.join("meta.bin").is_file() && stamp_matches() {
+            return Ok(());
+        }
+
+        // Unique per EXTRACTION (pid alone collides for in-process
+        // concurrency): pid + a process-global monotonic counter.
+        static EXTRACT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = EXTRACT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = cache.with_file_name(format!(
+            ".{}.extracting-{}-{}",
+            cache
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("cache"),
+            std::process::id(),
+            seq
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        match MoteDB::import_snapshot(container, &tmp) {
+            Ok(_) => {
+                std::fs::write(tmp.join(".container-stamp"), &stamp)?;
+                match std::fs::rename(&tmp, cache) {
+                    Ok(()) => Ok(()),
+                    Err(_) => {
+                        // Cache exists: a racing winner landed (adopt it if the
+                        // stamp verifies) or a STALE cache needs replacing.
+                        if stamp_matches() {
+                            let _ = std::fs::remove_dir_all(&tmp);
+                            return Ok(());
+                        }
+                        let _ = std::fs::remove_dir_all(cache);
+                        match std::fs::rename(&tmp, cache) {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                let _ = std::fs::remove_dir_all(&tmp);
+                                Err(e.into())
+                            }
+                        }
+                    }
                 }
             }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                Err(e)
+            }
         }
-        let _ = std::fs::remove_dir_all(cache);
-        MoteDB::import_snapshot(container, cache)?;
-        std::fs::create_dir_all(cache)?;
-        std::fs::write(&marker, &stamp)?;
-        Ok(())
     }
-
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         let db_path = MoteDB::resolve_create_path_public(path.as_ref());
         let (inner, reg_key) =
