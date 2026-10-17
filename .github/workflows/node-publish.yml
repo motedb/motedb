@@ -69,10 +69,6 @@ jobs:
         run: |
           set -e
           ARGS=(--release --platform --target ${{ matrix.target }} --js false --dts false)
-          if [[ "${{ matrix.target }}" == x86_64-unknown-linux-gnu ]]; then
-            # musl-free runners: keep default gnu toolchain
-            ARGS+=(--cargo-flags="--features jemalloc")
-          fi
           npx napi build "${ARGS[@]}"
 
       - name: Smoke (JS loader)
@@ -80,8 +76,11 @@ jobs:
         working-directory: bindings/node
         shell: bash
         run: |
-          cat > /tmp/smoke.js <<'JS'
-          const Database = require('../bindings/node');
+          # 🔑 require resolves FILE-relative — write the smoke INTO the
+          # package dir and require './index.js' (the old /tmp/smoke.js +
+          # '../bindings/node' resolved to /bindings/node: MODULE_NOT_FOUND).
+          cat > smoke-ci.js <<'JS'
+          const Database = require('./index.js');
           const os = require('node:os'), path = require('node:path'), fs = require('node:fs');
           const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'motedb-ci-'));
           const db = new Database(path.join(dir, 't.mote'));
@@ -99,7 +98,7 @@ jobs:
           fs.rmSync(dir, { recursive: true, force: true });
           console.log('smoke OK');
           JS
-          node /tmp/smoke.js
+          node smoke-ci.js && rm -f smoke-ci.js
 
       - name: Upload binding artifact
         uses: actions/upload-artifact@v4
