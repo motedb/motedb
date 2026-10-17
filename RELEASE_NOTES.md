@@ -94,6 +94,10 @@ BLOB 在 int 过滤查询下的双缺陷(装载门只匹配 Text tag + 输出臂
 
 ## 已知限制
 
-- npm 发布流水线待 NPM_TOKEN 配置后重跑
+- Node SDK 发布在 **GitHub Packages**(`@motedb/motedb` 六包) — 包默认
+  私有, 需在包设置页改为 Public 后消费者方可匿名安装(.npmrc 指一行
+  scoped registry)。npmjs.com 注册受阻(区域限制), 未来可加镜像通道
+- crates.io 流水线待 CARGO_TOKEN secret; PyPI 轮子已全平台构建+冒烟,
+  待 pypi.org trusted-publisher 登记
 - timestamp 索引覆盖 ts 首列表;非首列 ts 的 query_timestamp_range
   走扫描(与 v0.14 相同)
