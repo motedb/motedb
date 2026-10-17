@@ -130,12 +130,32 @@ jobs:
       - name: Place binaries into npm dirs
         working-directory: bindings/node
         shell: bash
+        # 🔑 Deterministic placement (napi artifacts misbehaves with
+        # cross-compiled targets): match each downloaded .node against the
+        # platform package's "main" field, copy, then verify completeness.
         run: |
           set -e
           for d in artifacts/bindings-*; do
-            target="${d#artifacts/bindings-}"
-            npx napi artifacts "$d" --target "$target"
+            node_file=$(ls "$d"/*.node 2>/dev/null | head -1 || true)
+            [ -n "$node_file" ] || { echo "no .node in $d"; ls -la "$d"; exit 1; }
+            base=$(basename "$node_file")
+            placed=0
+            for pkg in npm/*/; do
+              main=$(jq -r .main "${pkg}package.json")
+              if [ "$main" = "$base" ]; then
+                cp "$node_file" "$pkg"
+                echo "placed $base -> $pkg"
+                placed=1
+              fi
+            done
+            [ "$placed" = 1 ] || { echo "no package wants $base"; exit 1; }
           done
+          missing=0
+          for pkg in npm/*/; do
+            main=$(jq -r .main "${pkg}package.json")
+            [ -f "$pkg/$main" ] || { echo "MISSING $pkg/$main"; missing=1; }
+          done
+          [ "$missing" = 0 ] || exit 1
           ls -R npm | head -40
       - name: Dry-run publish (structure validation only)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -175,9 +195,26 @@ jobs:
         run: |
           set -e
           for d in artifacts/bindings-*; do
-            target="${d#artifacts/bindings-}"
-            npx napi artifacts "$d" --target "$target"
+            node_file=$(ls "$d"/*.node 2>/dev/null | head -1 || true)
+            [ -n "$node_file" ] || { echo "no .node in $d"; ls -la "$d"; exit 1; }
+            base=$(basename "$node_file")
+            placed=0
+            for pkg in npm/*/; do
+              main=$(jq -r .main "${pkg}package.json")
+              if [ "$main" = "$base" ]; then
+                cp "$node_file" "$pkg"
+                echo "placed $base -> $pkg"
+                placed=1
+              fi
+            done
+            [ "$placed" = 1 ] || { echo "no package wants $base"; exit 1; }
           done
+          missing=0
+          for pkg in npm/*/; do
+            main=$(jq -r .main "${pkg}package.json")
+            [ -f "$pkg/$main" ] || { echo "MISSING $pkg/$main"; missing=1; }
+          done
+          [ "$missing" = 0 ] || exit 1
       - name: Publish platform packages + root
         # 🔑 napi pre-publish IS the publish command: it validates all
         # platform packages, then runs `npm publish` for each + the root.
