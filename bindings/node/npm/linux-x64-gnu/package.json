@@ -1,5 +1,5 @@
 {
-  "name": "motedb-linux-x64-gnu",
+  "name": "@motedb/motedb-linux-x64-gnu",
   "version": "0.15.0",
   "cpu": [
     "x64"
@@ -22,5 +22,8 @@
   ],
   "libc": [
     "glibc"
-  ]
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
 }

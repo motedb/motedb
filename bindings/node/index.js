@@ -17,7 +17,7 @@ function loadNative() {
   const libc = process.platform === 'linux' ? '-gnu' : '';
   const suffix = `${process.platform}-${process.arch}${libc}`;
   try {
-    return require(`motedb-${suffix}`);
+    return require(`@motedb/motedb-${suffix}`);
   } catch {
     // fall through to dev layouts
   }

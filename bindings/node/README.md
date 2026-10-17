@@ -1,10 +1,24 @@
-# motedb (Node.js)
+# @motedb/motedb (Node.js)
 
 AI-native embedded multimodal database — Node.js bindings (napi-rs v3).
 
+## 安装 Install
+
+发布在 GitHub Packages（npm registry），一次配置后正常 `npm i`：
+
+```bash
+# 项目里一次性配置（写入 .npmrc）
+npm config set @motedb:registry https://npm.pkg.github.com
+npm install @motedb/motedb
+```
+
+公共包**无需任何登录/token** 即可安装。
+
+## 快速开始 Quick start
+
 ```js
-const Database = require('motedb');
-// or: import { Database } from 'motedb';
+const Database = require('@motedb/motedb');
+// or: import { Database } from '@motedb/motedb';
 
 const db = new Database('/data/app.mote');
 db.execute('CREATE TABLE robots (id INT PRIMARY KEY, name TEXT, emb VECTOR(3), data BLOB)');
