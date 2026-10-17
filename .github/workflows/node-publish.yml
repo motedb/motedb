@@ -216,13 +216,20 @@ jobs:
           done
           [ "$missing" = 0 ] || exit 1
       - name: Publish platform packages + root
-        # 🔑 napi pre-publish IS the publish command: it validates all
-        # platform packages, then runs `npm publish` for each + the root.
-        # GitHub Packages: the built-in GITHUB_TOKEN suffices (packages:write
-        # above). A future npmjs.com mirror: add NPM_TOKEN + a second pass
-        # with registry-url: https://registry.npmjs.org (same scoped names,
-        # requires the @motedb scope to exist under the publishing account).
+        # 🔑 Plain `npm publish` per package — napi pre-publish embeds
+        # npmjs-registry assumptions that don't hold for GitHub Packages.
+        # Registry comes from each package.json's publishConfig; auth from
+        # setup-node's .npmrc + NODE_AUTH_TOKEN (the built-in GITHUB_TOKEN
+        # with packages:write). A future npmjs mirror: add NPM_TOKEN and a
+        # second pass with registry-url: registry.npmjs.org.
         working-directory: bindings/node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./node_modules/.bin/napi pre-publish -p npm
+        run: |
+          set -e
+          for d in npm/*/; do
+            echo "::group::publish ${d}"
+            (cd "$d" && npm publish --access public) || exit 1
+            echo "::endgroup::"
+          done
+          npm publish --access public
