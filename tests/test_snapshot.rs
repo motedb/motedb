@@ -521,3 +521,89 @@ fn container_extraction_concurrent_opens() {
     a.close().unwrap();
     b.close().unwrap();
 }
+
+#[test]
+fn empty_column_index_self_heals_on_open() {
+    // 审计轮3回归: BTree 降级阀(>2M 键)或任何静默空索引路径 — 曾在
+    // 干净关闭(无 WAL 重放)下永不重建。现在 total_row_ids==0 的列索引
+    // 在打开时从源数据重建。模拟: 手工清空索引内容(留空文件)后重开。
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("t.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+            .unwrap();
+        for i in 0..100 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i % 13))
+                .unwrap();
+        }
+        db.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        db.execute("CHECKPOINT").unwrap();
+        db.close().unwrap();
+    }
+    // 模拟降级阀后的重置: 把索引文件截断成 v3 超级块壳(零页)。
+    let idx = path.join("indexes").join("column_idx_v.idx");
+    let mut shell = Vec::new();
+    shell.extend_from_slice(b"BTRE"); // magic
+    shell.extend_from_slice(&3u32.to_le_bytes()); // version
+                                                  // bincode SuperBlock with next_page_id>1? 用零页文件: 只有 magic+version
+                                                  // 之外的字段... 直接写最小可反序列化体: magic, version, 其余全零。
+    shell.extend_from_slice(&[0u8; 64]);
+    std::fs::write(&idx, &shell).unwrap();
+
+    let db = Database::open(&path).unwrap();
+    let r = db
+        .execute("SELECT COUNT(*) FROM t WHERE v = 5")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let (_, rows) = r.select_rows().unwrap();
+    assert_eq!(
+        rows[0][0],
+        motedb::types::Value::Integer(8),
+        "empty index self-heals from source at open"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn container_cache_refreshes_when_file_changes() {
+    // 审计轮3: 陈旧替换链 — 容器文件被替换(同路径重新导出)后, 重开必须
+    // 检测 size/mtime 戳不匹配并重解包。
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src.mote");
+    build_source_db(&src);
+    let snap = dir.path().join("c.mote");
+    {
+        let db = Database::open(&src).unwrap();
+        let _ = db
+            .execute(&format!("EXPORT DB TO '{}'", snap.display()))
+            .unwrap();
+        db.close().unwrap();
+    }
+    let ro = Database::open_readonly(&snap).unwrap();
+    assert_eq!(count(&ro, "SELECT COUNT(*) FROM sensors"), 500);
+    ro.close().unwrap();
+
+    // 源库追加行后重新导出到同一路径。
+    {
+        let db = Database::open(&src).unwrap();
+        for i in 500..600 {
+            db.execute(&format!(
+                "INSERT INTO sensors VALUES ({i}, 'd{i}', '2024-01-16 10:00:00', 1.0, [1,2,3,4], 'n')"
+            ))
+            .unwrap();
+        }
+        db.execute("CHECKPOINT").unwrap();
+        std::fs::remove_file(&snap).unwrap();
+        let _ = db
+            .execute(&format!("EXPORT DB TO '{}'", snap.display()))
+            .unwrap();
+        db.close().unwrap();
+    }
+    // 重开: 戳不匹配 → 重解包 → 看到新数据。
+    let ro2 = Database::open_readonly(&snap).unwrap();
+    let n = count(&ro2, "SELECT COUNT(*) FROM sensors");
+    assert_eq!(n, 600, "stale extraction must refresh: got {n}");
+    ro2.close().unwrap();
+}

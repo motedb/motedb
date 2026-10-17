@@ -1627,6 +1627,31 @@ impl MoteDB {
         // Idempotent: after migration the unified view is non-empty.
         {
             let _ = db.columnar_store.flush_all();
+            // 🧹 Orphan legacy dirs: `columnar/<table_id>/` for tables that
+            // were DROPped in a pre-unification build stay forever (space
+            // leak — the migration loop only visits registry tables). Sweep
+            // ids the registry no longer knows.
+            let legacy_dir = db.path.join("columnar");
+            if legacy_dir.is_dir() {
+                let live_ids: std::collections::HashSet<u32> = db
+                    .table_registry
+                    .list_tables()?
+                    .iter()
+                    .filter_map(|n| db.table_registry.get_table_id(n).ok())
+                    .collect();
+                if let Ok(entries) = std::fs::read_dir(&legacy_dir) {
+                    for e in entries.flatten() {
+                        let name = e.file_name();
+                        let Some(name) = name.to_str() else { continue };
+                        let Ok(id) = name.parse::<u32>() else {
+                            continue;
+                        };
+                        if !live_ids.contains(&id) {
+                            let _ = std::fs::remove_dir_all(e.path());
+                        }
+                    }
+                }
+            }
             for table_name in db.table_registry.list_tables()? {
                 let Ok(schema) = db.table_registry.get_table(&table_name) else {
                     continue;
@@ -1940,7 +1965,13 @@ impl MoteDB {
                 if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
                     // Clean close flushed the index and the loader opened it
                     // as-is — repopulating would rewrite all N entries.
-                    if !replayed_tables.contains(&table) {
+                    // 🔑 EXCEPT an index that loaded EMPTY: the BTree degrade
+                    // valve (>2M keys, offsets dropped → open reinits) and any
+                    // future silent-empty path leave total_row_ids == 0 with a
+                    // non-empty table — rebuild from source (empty table →
+                    // populate is a cheap no-op, so this is self-healing).
+                    let loaded_empty = arc.stats().total_row_ids == 0;
+                    if !replayed_tables.contains(&table) && !loaded_empty {
                         continue;
                     }
                     if let Err(e) = db.populate_column_index(&arc, &table, &column) {
