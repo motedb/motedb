@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.15.0] — unreleased (SDK cycle + 存储文件布局收敛)
+## [0.15.0] — 2026-10-17
 
 ### 存储文件布局收敛 (docs/design/2026-10-file-layout{,-plan}.md, P1~P4)
 
