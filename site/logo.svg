@@ -1,3 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
-  <g fill="none" stroke="#1b3a5f" stroke-linecap="round" stroke-linejoin="round"><circle cx="60" cy="74" r="28" stroke="#1b3a5f" stroke-width="6"/><g stroke="#1b3a5f" stroke-width="4"><path d="M 48 66 v 12 a 12 4.6 0 0 0 24 0 v -12"/><ellipse cx="60" cy="66" rx="12" ry="4.6"/><path d="M 48 70.6 a 12 4.6 0 0 0 24 0"/><path d="M 48 75.2 a 12 4.6 0 0 0 24 0"/></g><path d="M 28 33 L 43.4 48.6 L 51.4 42.2 L 62.9 48.6 L 71.2 42.2" stroke="#1b3a5f" stroke-width="5"/><path d="M 77.9 44 L 99.8 28.3" stroke="#ee7623" stroke-width="5"/></g><polygon points="105,21 101,33 92,25" fill="#ee7623"/>
-</svg>
