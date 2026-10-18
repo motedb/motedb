@@ -589,8 +589,7 @@ impl TableRegistry {
             }
         };
         if r.is_ok() {
-            self.counters_dirty
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.clear_counters_dirty();
         }
         r
     }
@@ -614,10 +613,19 @@ impl TableRegistry {
         };
         let data =
             bincode::serialize(&*meta).map_err(|e| StorageError::Serialization(e.to_string()));
+        drop(meta);
+        // 🔑 NOT cleared here — the flag clears via clear_counters_dirty()
+        // ONLY after the caller durably persists the payload. Clearing
+        // before a possibly-failing write could drop the dirty mark on an
+        // IO error → AUTO_INCREMENT counters silently unpersisted → id
+        // reuse after crash.
+        Some(data)
+    }
+
+    /// Clear the dirty flag after a successful durable persist.
+    pub fn clear_counters_dirty(&self) {
         self.counters_dirty
             .store(false, std::sync::atomic::Ordering::Release);
-        drop(meta);
-        Some(data)
     }
 }
 

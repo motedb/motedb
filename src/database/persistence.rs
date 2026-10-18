@@ -789,6 +789,9 @@ impl MoteDB {
                 None => {}
             }
             self.meta_store.update_sections(sections)?;
+            // 🔑 Clear only AFTER the durable write succeeded — a failed
+            // write leaves the flag set so the next checkpoint retries.
+            self.table_registry.clear_counters_dirty();
             true
         } else {
             false
@@ -858,6 +861,9 @@ impl MoteDB {
                     .update_section(crate::database::meta_store::MetaSection::Catalog, payload)
                 {
                     warn_log!("[Flush] Auto-increment persistence failed: {}", e);
+                } else {
+                    // 🔑 Clear after success only — failure retries next ckpt.
+                    self.table_registry.clear_counters_dirty();
                 }
             }
             Some(Err(e)) => warn_log!("[Flush] catalog payload snapshot failed: {}", e),
