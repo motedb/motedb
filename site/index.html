@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MoteDB — 具身智能的多模态嵌入式数据库</title>
+<meta name="description" content="MoteDB 是面向具身智能的嵌入式多模态数据库引擎：一个 SQL 引擎原生承载向量、时序、文本与二进制。采集、运输、部署三种形态，嵌入式零运维。">
+<meta property="og:title" content="MoteDB — 具身智能的多模态嵌入式数据库">
+<meta property="og:description" content="一个引擎，原生承载向量、时序、文本与二进制。采集、运输、部署三种形态一种体验。">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a0e14'/%3E%3Cellipse cx='16' cy='9' rx='9' ry='4' fill='none' stroke='%2300d4aa' stroke-width='2'/%3E%3Cpath d='M7 9v7c0 2.2 4 4 9 4s9-1.8 9-4V9' fill='none' stroke='%234a9eff' stroke-width='2'/%3E%3Cpath d='M7 16v7c0 2.2 4 4 9 4s9-1.8 9-4v-7' fill='none' stroke='%234a9eff' stroke-width='2'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#0a0e14; --bg2:#0d131c; --card:#111823; --card2:#0f1520;
+    --line:#1c2634; --txt:#e6edf3; --dim:#8b98a9; --faint:#5b6878;
+    --teal:#00d4aa; --blue:#4a9eff; --grad:linear-gradient(90deg,#00d4aa,#4a9eff);
+    --code:#0b1018; --mono:'SF Mono','Cascadia Code',Consolas,'JetBrains Mono',monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',Roboto,sans-serif;line-height:1.65;-webkit-font-smoothing:antialiased}
+  ::selection{background:rgba(0,212,170,.25)}
+  a{color:var(--blue);text-decoration:none}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+
+  /* ── nav ── */
+  nav{position:sticky;top:0;z-index:50;background:rgba(10,14,20,.82);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+  .nav-in{max-width:1080px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;gap:28px}
+  .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:.3px;color:var(--txt)}
+  .logo svg{flex:none}
+  .logo em{font-style:normal;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .nav-links{margin-left:auto;display:flex;gap:22px;align-items:center;font-size:14px}
+  .nav-links a{color:var(--dim);transition:color .15s}
+  .nav-links a:hover{color:var(--txt)}
+  .nav-gh{display:flex;align-items:center;gap:6px;padding:6px 14px;border:1px solid var(--line);border-radius:8px;color:var(--txt)!important;font-weight:600}
+  .nav-gh:hover{border-color:var(--teal)}
+  @media(max-width:720px){.nav-links a:not(.nav-gh){display:none}}
+
+  /* ── hero ── */
+  .hero{position:relative;padding:96px 0 72px;overflow:hidden}
+  .hero::before{content:'';position:absolute;inset:-40%;background:
+    radial-gradient(600px 300px at 20% 10%,rgba(0,212,170,.10),transparent 60%),
+    radial-gradient(700px 340px at 85% 30%,rgba(74,158,255,.10),transparent 60%);
+    pointer-events:none}
+  .hero .wrap{position:relative}
+  .ver-badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12.5px;color:var(--teal);border:1px solid rgba(0,212,170,.35);background:rgba(0,212,170,.06);padding:5px 14px;border-radius:999px;margin-bottom:26px}
+  .ver-badge .dot{width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 8px var(--teal)}
+  h1{font-size:clamp(34px,6vw,58px);line-height:1.14;font-weight:800;letter-spacing:-.5px;max-width:760px}
+  h1 em{font-style:normal;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .hero p.sub{margin:24px 0 34px;font-size:clamp(15px,2.2vw,18px);color:var(--dim);max-width:640px}
+  .hero p.sub b{color:var(--txt);font-weight:600}
+  .installs{display:flex;flex-direction:column;gap:10px;max-width:560px}
+  .inst{display:flex;align-items:center;gap:0;background:var(--code);border:1px solid var(--line);border-radius:10px;overflow:hidden;font-family:var(--mono);font-size:13.5px}
+  .inst .tag{flex:none;width:74px;text-align:center;padding:11px 0;color:var(--faint);border-right:1px solid var(--line);font-size:11.5px;letter-spacing:1px}
+  .inst code{flex:1;padding:11px 16px;color:#c9d6e2}
+  .inst code .p{color:var(--teal)}
+  .inst button{flex:none;background:none;border:none;border-left:1px solid var(--line);color:var(--faint);padding:0 16px;cursor:pointer;font-size:13px;align-self:stretch}
+  .inst button:hover{color:var(--teal)}
+  .inst button.ok{color:var(--teal)}
+  .hero-ctas{display:flex;gap:14px;margin-top:30px;flex-wrap:wrap}
+  .btn{padding:11px 26px;border-radius:9px;font-size:15px;font-weight:600;transition:transform .12s,box-shadow .12s}
+  .btn:hover{transform:translateY(-1px)}
+  .btn.primary{background:var(--grad);color:#04121a;box-shadow:0 4px 20px rgba(0,212,170,.25)}
+  .btn.primary:hover{box-shadow:0 6px 28px rgba(0,212,170,.4)}
+  .btn.ghost{border:1px solid var(--line);color:var(--txt)}
+  .btn.ghost:hover{border-color:var(--blue)}
+  .soon{display:inline-block;font-size:10px;color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:1px 6px;margin-left:8px;vertical-align:1px}
+
+  /* ── strip ── */
+  .strip{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--bg2)}
+  .strip .wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;padding:26px 24px;text-align:center}
+  .strip b{display:block;font-size:22px;font-weight:800;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .strip span{font-size:12.5px;color:var(--faint)}
+
+  /* ── sections ── */
+  section{padding:84px 0}
+  .sec-tag{font-family:var(--mono);font-size:12px;letter-spacing:2px;color:var(--teal);text-transform:uppercase;margin-bottom:12px}
+  h2{font-size:clamp(26px,4vw,36px);font-weight:800;letter-spacing:-.4px;margin-bottom:16px}
+  .lead{color:var(--dim);max-width:640px;margin-bottom:44px;font-size:16px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px;transition:border-color .15s,transform .15s}
+  .card:hover{border-color:#2a3a4e;transform:translateY(-2px)}
+  .card .ic{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:16px;background:rgba(0,212,170,.08);border:1px solid rgba(0,212,170,.2)}
+  .card h3{font-size:17px;margin-bottom:8px;font-weight:700}
+  .card p{font-size:14px;color:var(--dim)}
+  .card code{font-family:var(--mono);font-size:12.5px;color:var(--teal);background:rgba(0,212,170,.07);padding:1px 6px;border-radius:5px}
+
+  /* lifecycle */
+  .life{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:14px;align-items:stretch}
+  @media(max-width:860px){.life{grid-template-columns:1fr}.life .arrow{transform:rotate(90deg);margin:0 auto}}
+  .life .stage{background:var(--card2);border:1px solid var(--line);border-radius:14px;padding:26px}
+  .life .stage .k{font-family:var(--mono);font-size:11px;letter-spacing:2px;color:var(--teal)}
+  .life .stage h3{font-size:19px;margin:8px 0 10px}
+  .life .stage p{font-size:13.5px;color:var(--dim)}
+  .life .stage .f{margin-top:14px;font-family:var(--mono);font-size:12px;color:var(--blue)}
+  .life .arrow{align-self:center;color:var(--faint);font-size:22px}
+
+  /* code demo */
+  .demo{display:grid;grid-template-columns:1fr 1fr;gap:36px;align-items:center}
+  @media(max-width:860px){.demo{grid-template-columns:1fr}}
+  .demo ul{list-style:none;color:var(--dim);font-size:14.5px}
+  .demo li{padding:9px 0 9px 26px;position:relative;border-bottom:1px dashed var(--line)}
+  .demo li::before{content:'▸';position:absolute;left:4px;color:var(--teal)}
+  .term{background:var(--code);border:1px solid var(--line);border-radius:14px;overflow:hidden;font-family:var(--mono);font-size:13px}
+  .term .bar{display:flex;gap:6px;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .term .bar i{width:11px;height:11px;border-radius:50%;background:#2a3a4e}
+  .term .bar i:first-child{background:#e5566d}.term .bar i:nth-child(2){background:#e5b456}.term .bar i:nth-child(3){background:#3fd68f}
+  .term pre{padding:18px;overflow-x:auto;line-height:1.75}
+  .term .c{color:var(--faint)}.term .k{color:#c792ea}.term .s{color:var(--teal)}.term .n{color:#e5b456}.term .f{color:var(--blue)}
+
+  /* sdks */
+  .sdk-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+  .sdk{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px}
+  .sdk .lang{font-family:var(--mono);font-size:12px;color:var(--blue);letter-spacing:1px}
+  .sdk h3{font-size:18px;margin:6px 0 14px}
+  .sdk .cmd{display:flex;align-items:center;gap:8px;background:var(--code);border:1px solid var(--line);border-radius:8px;padding:10px 14px;font-family:var(--mono);font-size:12.5px;color:#c9d6e2}
+  .sdk .cmd button{margin-left:auto;background:none;border:none;color:var(--faint);cursor:pointer}
+  .sdk .cmd button:hover{color:var(--teal)}
+  .sdk a.more{display:inline-block;margin-top:14px;font-size:13.5px}
+
+  /* cta band */
+  .cta-band{background:linear-gradient(135deg,rgba(0,212,170,.08),rgba(74,158,255,.08));border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .cta-band .wrap{text-align:center;padding:64px 24px}
+  .cta-band h2{margin-bottom:10px}
+  .cta-band p{color:var(--dim);margin-bottom:28px}
+
+  /* footer */
+  footer{padding:44px 0;font-size:13.5px;color:var(--faint)}
+  footer .wrap{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}
+  footer a{color:var(--dim)}
+  footer a:hover{color:var(--teal)}
+  .foot-links{display:flex;gap:20px}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-in">
+    <a class="logo" href="#">
+      <svg width="26" height="26" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#0d131c"/><ellipse cx="16" cy="9" rx="9" ry="4" fill="none" stroke="#00d4aa" stroke-width="2"/><path d="M7 9v7c0 2.2 4 4 9 4s9-1.8 9-4V9" fill="none" stroke="#4a9eff" stroke-width="2"/><path d="M7 16v7c0 2.2 4 4 9 4s9-1.8 9-4v-7" fill="none" stroke="#4a9eff" stroke-width="2"/></svg>
+      Mote<em>DB</em>
+    </a>
+    <div class="nav-links">
+      <a href="#features">特性</a>
+      <a href="#lifecycle">架构</a>
+      <a href="#quickstart">快速开始</a>
+      <a href="#sdks">SDK</a>
+      <a class="nav-gh" href="https://github.com/motedb/motedb" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="ver-badge"><span class="dot"></span>v0.15.0 · MIT 开源 · crates.io / PyPI / npm</span>
+    <h1>具身智能的<br><em>多模态嵌入式数据库</em></h1>
+    <p class="sub">一个 SQL 引擎，原生承载 <b>向量 · 时序 · 文本 · 二进制</b>。从机器人数据采集到舰队分发——嵌入式零运维，打开即用。</p>
+    <div class="installs">
+      <div class="inst"><span class="tag">RUST</span><code><span class="p">cargo</span> add motedb</code><button onclick="cp(this)">复制</button></div>
+      <div class="inst"><span class="tag">PYTHON</span><code><span class="p">pip</span> install motedb-python</code><button onclick="cp(this)">复制</button></div>
+      <div class="inst"><span class="tag">NODE</span><code><span class="p">npm</span> install motedb<span class="soon" style="margin-left:10px;color:#5b6878;font-family:inherit">发布配置中</span></code><button onclick="cp(this)">复制</button></div>
+    </div>
+    <div class="hero-ctas">
+      <a class="btn primary" href="#quickstart">5 分钟上手</a>
+      <a class="btn ghost" href="https://github.com/motedb/motedb" target="_blank" rel="noopener">查看源码</a>
+    </div>
+  </div>
+</header>
+
+<div class="strip">
+  <div class="wrap">
+    <div><b>1</b><span>引擎 · 三种形态</span></div>
+    <div><b>3</b><span>官方 SDK</span></div>
+    <div><b>5</b><span>平台预构建二进制</span></div>
+    <div><b>4</b><span>模态：向量/时序/文本/BLOB</span></div>
+    <div><b>3</b><span>轮独立发布审计</span></div>
+  </div>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-tag">// FEATURES</div>
+    <h2>为具身 AI 工作负载而生</h2>
+    <p class="lead">不是通用数据库的裁剪版——每个能力都对着机器人数据的真实形状设计。</p>
+    <div class="grid">
+      <div class="card">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#00d4aa" stroke-width="2"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7 7.5l3.5 8M17 7.5l-3.5 8M7.5 6h9"/></svg></div>
+        <h3>多模态原生</h3>
+        <p><code>VECTOR(n)</code> 向量列带索引 KNN、<code>BLOB</code> 字节等值、全文检索与 <code>TIME_BUCKET</code> 时序聚合——同一个 SQL 引擎，同一个事务视图。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#00d4aa" stroke-width="2"><path d="M12 2l8 4.5v9L12 20l-8-4.5v-9L12 2z"/><path d="M12 11L4 6.5M12 11l8-4.5M12 11v9"/></svg></div>
+        <h3>三种形态一种体验</h3>
+        <p>采集期是高性能目录，运输期是单文件快照（CRC 校验 + zstd），部署期是只读容器直开——<code>EXPORT DB</code> 一条 SQL 串联。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#00d4aa" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 12l5-5M22 2l-5 5"/></svg></div>
+        <h3>嵌入式零运维</h3>
+        <p>无服务、无端口、无独立进程。库文件即数据库，索引损坏自动从源数据重建，打开即用。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#00d4aa" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6M9 15l2 2 4-4"/></svg></div>
+        <h3>断电安全内核</h3>
+        <p>temp+fsync+rename 原子发布、WAL 组提交、孤儿段领养、崩溃注入与差分模糊测试持续验证——边缘设备的拔电是常态而非异常。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#00d4aa" stroke-width="2"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg></div>
+        <h3>五平台预构建</h3>
+        <p>macOS (arm64/x64)、Linux (x64/arm64)、Windows 的官方二进制直接安装——交叉编译与冒烟测试在 CI 里逐平台验证。</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#00d4aa" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg></div>
+        <h3>舰队友好</h3>
+        <p>快照增量重导出、只读容器多读者共存、字典序数据自愈——为"一台指挥、百台采集"的机器人舰队同步而设计。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="lifecycle" style="background:var(--bg2)">
+  <div class="wrap">
+    <div class="sec-tag">// ARCHITECTURE</div>
+    <h2>数据的三种形态，一条流水线</h2>
+    <p class="lead">具身智能的数据要经历采集、运输、部署。每个阶段对磁盘形态的要求不同——MoteDB 为每一段给最优解，用一条 SQL 串联。</p>
+    <div class="life">
+      <div class="stage">
+        <div class="k">01 · 采集</div>
+        <h3>高性能目录</h3>
+        <p>机器人本体持续写入。temp+rename 原子发布 + WAL 组提交，拔电安全；全局清单 + 惰性文件，固定开销恒定。</p>
+        <div class="f">open("robot.mote")</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <div class="k">02 · 运输</div>
+        <h3>单文件快照</h3>
+        <p><code style="color:var(--teal)">EXPORT DB TO 'fleet.mote'</code> — 一条 SQL 打包整库。逐文件 CRC 校验、可选 zstd、弱网续传友好。</p>
+        <div class="f">EXPORT DB TO 'snap.mote'</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="stage">
+        <div class="k">03 · 部署</div>
+        <h3>只读容器</h3>
+        <p>固件预置一个文件，<code style="color:var(--teal)">open()</code> 打开即查。全部写路径拒绝，多读者共存，地图与知识库随版本分发。</p>
+        <div class="f">open_readonly("snap.mote")</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <div class="sec-tag">// QUICKSTART</div>
+    <h2>5 分钟：从 MCAP 到可查询的时序库</h2>
+    <div class="demo">
+      <ul>
+        <li>建表即声明多模态：<code style="color:var(--teal)">TIMESERIES(ts)</code> 时序语义、<code style="color:var(--teal)">VECTOR(4)</code> 向量列</li>
+        <li>参数化写入，预编译语句缓存</li>
+        <li>向量 KNN 用熟悉的 <code style="color:var(--teal)">&lt;-&gt;</code> 算符，索引加速</li>
+        <li>重开自动恢复：WAL 回放 + 段迁移 + 索引自愈</li>
+      </ul>
+      <div class="term">
+        <div class="bar"><i></i><i></i><i></i></div>
+        <pre><span class="c"># pip install motedb-python</span>
+<span class="k">from</span> motedb <span class="k">import</span> Database
+
+db = Database(<span class="s">"robot.mote"</span>)
+db.execute(<span class="s">"CREATE TABLE poses (
+  ts TIMESTAMP, sid INT, emb VECTOR(4)
+) TIMESERIES(ts)"</span>)
+db.executemany(<span class="s">"INSERT INTO poses VALUES (?,?,?)"</span>,
+               poses)
+
+<span class="c"># 向量 KNN：最近的 5 个位姿</span>
+hits = db.query(<span class="s">"SELECT ts, sid FROM poses
+  ORDER BY emb &lt;-&gt; [0.1,0.2,0.3,0.4] LIMIT 5"</span>)
+
+<span class="c"># 运输：整库打成单文件快照</span>
+db.execute(<span class="s">"EXPORT DB TO 'fleet.mote'"</span>)</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="sdks" style="background:var(--bg2)">
+  <div class="wrap">
+    <div class="sec-tag">// SDK</div>
+    <h2>三个官方 SDK，同一套语义</h2>
+    <p class="lead">值映射开箱即用：向量 ↔ 数组、BLOB ↔ 字节、时间戳 ↔ 微秒。没有第三方的半成品绑定。</p>
+    <div class="sdk-grid">
+      <div class="sdk">
+        <div class="lang">RUST · crates.io</div>
+        <h3>motedb</h3>
+        <div class="cmd"><span>cargo add motedb</span><button onclick="cp(this)">复制</button></div>
+        <a class="more" href="https://github.com/motedb/motedb" target="_blank" rel="noopener">文档与示例 →</a>
+      </div>
+      <div class="sdk">
+        <div class="lang">PYTHON · PyPI</div>
+        <h3>motedb-python</h3>
+        <div class="cmd"><span>pip install motedb-python</span><button onclick="cp(this)">复制</button></div>
+        <a class="more" href="https://github.com/motedb/motedb" target="_blank" rel="noopener">文档与示例 →</a>
+      </div>
+      <div class="sdk">
+        <div class="lang">NODE.JS · npm<span class="soon">发布配置中</span></div>
+        <h3>motedb</h3>
+        <div class="cmd"><span>npm install motedb</span><button onclick="cp(this)">复制</button></div>
+        <a class="more" href="https://github.com/motedb/motedb" target="_blank" rel="noopener">文档与示例 →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="cta-band">
+  <div class="wrap">
+    <h2>MIT 开源 · 今天就能跑起来</h2>
+    <p>无服务、无端口、无依赖锁定 —— 一个库文件，就是你的多模态数据库。</p>
+    <div class="hero-ctas" style="justify-content:center">
+      <a class="btn primary" href="https://github.com/motedb/motedb" target="_blank" rel="noopener">GitHub 仓库</a>
+      <a class="btn ghost" href="#quickstart">快速开始</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>© 2026 MoteDB · MIT License</div>
+    <div class="foot-links">
+      <a href="https://github.com/motedb/motedb" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://crates.io/crates/motedb" target="_blank" rel="noopener">crates.io</a>
+      <a href="https://pypi.org/project/motedb-python/" target="_blank" rel="noopener">PyPI</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+function cp(btn){
+  const code=btn.parentElement.querySelector('code')||btn.parentElement.querySelector('span');
+  navigator.clipboard.writeText(code.innerText.trim()).then(()=>{
+    const old=btn.innerText; btn.innerText='✓'; btn.classList.add('ok');
+    setTimeout(()=>{btn.innerText=old;btn.classList.remove('ok')},1200);
+  });
+}
+</script>
+</body>
+</html>
