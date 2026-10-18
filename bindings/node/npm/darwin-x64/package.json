@@ -1,5 +1,5 @@
 {
-  "name": "@motedb/motedb-darwin-x64",
+  "name": "motedb-darwin-x64",
   "version": "0.15.0",
   "cpu": [
     "x64"
@@ -19,8 +19,5 @@
   },
   "os": [
     "darwin"
-  ],
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
-  }
+  ]
 }

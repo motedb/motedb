@@ -1,5 +1,5 @@
 {
-  "name": "@motedb/motedb",
+  "name": "motedb",
   "version": "0.15.0",
   "description": "AI-native embedded multimodal database — Node.js bindings.",
   "license": "MIT",
@@ -20,7 +20,7 @@
   "napi": {
     "binaryName": "motedb",
     "package": {
-      "name": "@motedb/motedb-{{platform}}{{arch}}{{libc}}"
+      "name": "motedb-{{platform}}{{arch}}{{libc}}"
     },
     "targets": [
       "x86_64-apple-darwin",
@@ -31,13 +31,10 @@
     ]
   },
   "optionalDependencies": {
-    "@motedb/motedb-darwin-x64": "0.15.0",
-    "@motedb/motedb-darwin-arm64": "0.15.0",
-    "@motedb/motedb-linux-x64-gnu": "0.15.0",
-    "@motedb/motedb-linux-arm64-gnu": "0.15.0",
-    "@motedb/motedb-win32-x64-msvc": "0.15.0"
-  },
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
+    "motedb-darwin-x64": "0.15.0",
+    "motedb-darwin-arm64": "0.15.0",
+    "motedb-linux-x64-gnu": "0.15.0",
+    "motedb-linux-arm64-gnu": "0.15.0",
+    "motedb-win32-x64-msvc": "0.15.0"
   }
 }

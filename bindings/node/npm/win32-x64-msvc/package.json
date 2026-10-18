@@ -1,5 +1,5 @@
 {
-  "name": "@motedb/motedb-win32-x64-msvc",
+  "name": "motedb-win32-x64-msvc",
   "version": "0.15.0",
   "cpu": [
     "x64"
@@ -19,8 +19,5 @@
   },
   "os": [
     "win32"
-  ],
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
-  }
+  ]
 }

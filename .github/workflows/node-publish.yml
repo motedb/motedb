@@ -179,7 +179,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://npm.pkg.github.com
+          registry-url: https://registry.npmjs.org
       - name: Install napi CLI
         working-directory: bindings/node
         run: npm install --no-save @napi-rs/cli@3.10.8
@@ -224,7 +224,7 @@ jobs:
         # second pass with registry-url: registry.npmjs.org.
         working-directory: bindings/node
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
           for d in npm/*/; do
