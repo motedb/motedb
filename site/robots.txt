@@ -1,3 +1,22 @@
 User-agent: *
 Allow: /
-Sitemap: https://motedb.github.io/motedb/sitemap.xml
+
+# AI crawlers explicitly welcome
+User-agent: GPTBot
+Allow: /
+User-agent: OAI-SearchBot
+Allow: /
+User-agent: ChatGPT-User
+Allow: /
+User-agent: ClaudeBot
+Allow: /
+User-agent: Claude-Web
+Allow: /
+User-agent: anthropic-ai
+Allow: /
+User-agent: PerplexityBot
+Allow: /
+User-agent: Bytespider
+Allow: /
+
+Sitemap: https://motedb.github.io/sitemap.xml

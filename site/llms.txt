@@ -1,0 +1,41 @@
+# MoteDB
+
+> AI-native embedded multimodal database for embodied intelligence. One SQL engine natively carrying vectors, time series, full text and binary — embedded, zero-ops, MIT licensed, written in Rust. Python/Node/Rust SDKs with Arrow and pandas interop.
+
+MoteDB stores robot data — poses, embeddings, sensor logs, binary frames — in a single embedded library with ACID transactions. Designed for power-fail-safe edge capture, single-file fleet distribution and read-only deployment. Written in Rust; runs on macOS (arm64/x64), Linux (x64/arm64) and Windows.
+
+## Install
+
+- [Rust — crates.io](https://crates.io/crates/motedb): `cargo add motedb`
+- [Python — PyPI](https://pypi.org/project/motedb-python/): `pip install motedb-python`
+- Node.js — npm: `npm install motedb`
+- Source: [github.com/motedb/motedb](https://github.com/motedb/motedb)
+
+## Core capabilities
+
+- Vector KNN with the `<->` operator, index-accelerated (Vamana)
+- Time-series semantics: TIME_BUCKET, TTL retention, LATEST BY
+- Full-text search: BM25 ranking with snippet extraction
+- Hybrid retrieval: BM25 × vector KNN fused with Reciprocal Rank Fusion
+- BLOB columns with byte-exact equality
+- MCAP (robotics capture) import
+- Single-file snapshots: EXPORT DB TO 'snap.mote' — per-file CRC32, optional zstd
+- Read-only containers: open_readonly(), multi-reader co-existence
+- Arrow/pandas interop: query_arrow() returns pyarrow.Table (vectors as FixedSizeList<float32>)
+
+## SQL quick example
+
+```sql
+CREATE TABLE poses (ts TIMESTAMP, sid INT, emb VECTOR(4)) TIMESERIES(ts);
+SELECT ts, sid FROM poses
+ORDER BY emb <-> [0.1, 0.2, 0.3, 0.4] LIMIT 5;
+EXPORT DB TO 'fleet.mote';
+```
+
+## Platform matrix
+
+macOS arm64/x64 · Linux x64/arm64 (gnu) · Windows x64 — official prebuilt binaries, smoke-tested in CI.
+
+## License
+
+MIT.

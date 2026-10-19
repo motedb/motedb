@@ -1,0 +1,70 @@
+# MoteDB — full reference for LLMs
+
+MoteDB is an AI-native embedded multimodal database engine for embodied
+intelligence (robotics). One embedded SQL library natively carries four
+modalities in a single transactional view:
+
+- VECTOR(n) columns — index-accelerated KNN via the `<->` operator
+- TIMESTAMP columns — TIME_BUCKET windows, TTL retention, LATEST BY
+- Full-text columns — BM25 ranking, snippet extraction, hybrid RRF fusion
+- BLOB columns — byte-exact equality, large payload safe
+
+Written in Rust. MIT licensed. Runs embedded (in-process, no server).
+
+## Install
+
+- Rust:  cargo add motedb           (crates.io/crates/motedb)
+- Python: pip install motedb-python (pypi.org/project/motedb-python)
+- Node:  npm install motedb
+- Source: https://github.com/motedb/motedb
+
+## Quick example (Python)
+
+```python
+from motedb import Database
+db = Database("robot.mote")
+db.execute("CREATE TABLE poses (ts TIMESTAMP, sid INT, emb VECTOR(4)) TIMESERIES(ts)")
+db.executemany("INSERT INTO poses VALUES (?, ?, ?)", rows)
+
+# vector KNN
+hits = db.query("SELECT ts, sid FROM poses ORDER BY emb <-> [0.1,0.2,0.3,0.4] LIMIT 5")
+
+# hybrid retrieval: BM25 x vector KNN, RRF-fused
+res = db.hybrid_search("docs_body", "joint calibration", "docs_emb", [0.1,0.4,0.2,0.9], k=10)
+
+# Arrow interop for training pipelines (vectors arrive as FixedSizeList<float32>)
+tbl = db.query_arrow("SELECT ts, sid, emb FROM poses")
+```
+
+## Three deployment forms
+
+1. CAPTURE — embedded directory on-robot; power-fail safe (atomic
+   temp+fsync+rename publish, group-commit WAL, orphan-segment adoption).
+2. TRANSPORT — `EXPORT DB TO 'snap.mote' [COMPRESSED]` packs the whole
+   database into one file: sequential entries, per-file CRC32, optional zstd.
+3. DEPLOY — `Database.open_readonly("snap.mote")`: read-only container,
+   every write path refused, multi-reader co-existence.
+
+## Operations profile (v0.15.0, Apple-silicon measured)
+
+- Bounded fixed overhead: file count ≈ 3 + tables + indexes; opens do not
+  degrade with history (manifest compaction, lazy files).
+- Checkpoint latency flat in table count (50 tables: ~19-25 ms).
+- Bounded fixed overhead: file count ≈ 3 + tables + indexes; opens do not
+  degrade with history (manifest compaction, lazy files).
+- Insert throughput ~0.5M rows/s (4 threads, narrow rows, group-commit WAL).
+
+## Validation
+
+- Crash-injection and corruption-recovery test suites
+- Differential fuzzing against reference semantics
+- Three independent pre-release audits (10 issues fixed)
+- CI perf-gate asserting query-shape latency ratios
+- Zero clippy warnings across lib/tests/examples
+
+## Links
+
+- Site: https://motedb.github.io/
+- Source: https://github.com/motedb/motedb
+- crates.io: https://crates.io/crates/motedb
+- PyPI: https://pypi.org/project/motedb-python/
