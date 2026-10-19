@@ -8,6 +8,7 @@ Columnar storage engine with ACID transactions, vector search, full-text search,
 [![crates.io](https://img.shields.io/crates/v/motedb.svg)](https://crates.io/crates/motedb)
 [![CI](https://github.com/motedb/motedb/actions/workflows/ci.yml/badge.svg)](https://github.com/motedb/motedb/actions/workflows/ci.yml)
 [![Perf Gate](https://github.com/motedb/motedb/actions/workflows/perf-gate.yml/badge.svg)](https://github.com/motedb/motedb/actions/workflows/perf-gate.yml)
+[![Website](https://img.shields.io/badge/website-motedb.github.io-ff8a2b.svg)](https://motedb.github.io/)
 
 > **Status: pre-1.0.** The Rust embedding API and storage engine are stable and
 > heavily tested; the SQL surface and multi-language FFI are still evolving.
