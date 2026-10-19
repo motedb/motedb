@@ -20,6 +20,7 @@
 <meta name="twitter:image" content="https://motedb.github.io/motedb/logo-lockup.png">
 <meta name="theme-color" content="#0a0f16">
 <link rel="icon" type="image/png" href="favicon.png">
+<link rel="preload" as="image" href="logo-mark-dark.png">
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
@@ -57,6 +58,7 @@
     background-size:44px 44px;
     mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 30%,transparent 100%);
     -webkit-mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 30%,transparent 100%)}
+  #pcv{position:absolute;inset:0;pointer-events:none}
   main,nav,footer{position:relative;z-index:1}
 
   nav{position:sticky;top:0;z-index:50;background:rgba(10,15,22,.78);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
@@ -72,9 +74,13 @@
   @media(max-width:760px){.nav-links a:not(.nav-gh):not(.lang){display:none}}
 
   .hero{position:relative;padding:92px 0 76px;overflow:hidden}
-  .hero .wrap{position:relative;display:grid;grid-template-columns:1.12fr .88fr;gap:44px;align-items:center}
+  .hero .wrap{position:relative;display:grid;grid-template-columns:1.12fr .88fr;gap:44px;align-items:center;z-index:2}
   @media(max-width:900px){.hero .wrap{grid-template-columns:1fr}}
   .ekg-bg{position:absolute;inset:0;pointer-events:none;opacity:.55;width:100%;height:100%}
+  .orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.55;pointer-events:none;animation:drift 20s ease-in-out infinite alternate}
+  .orb.o1{width:440px;height:440px;top:-140px;right:-100px;background:radial-gradient(circle,rgba(255,138,43,.15),transparent 65%)}
+  .orb.o2{width:380px;height:380px;bottom:-120px;left:-80px;background:radial-gradient(circle,rgba(74,158,255,.12),transparent 65%);animation-delay:-10s}
+  @keyframes drift{from{transform:translate(0,0) scale(1)}to{transform:translate(46px,34px) scale(1.09)}}
   .ver-badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12.5px;color:var(--orange2);border:1px solid rgba(255,138,43,.4);background:rgba(255,138,43,.07);padding:5px 14px;border-radius:999px;margin-bottom:26px;box-shadow:0 0 18px rgba(255,138,43,.12)}
   .ver-badge .dot{width:7px;height:7px;border-radius:50%;background:var(--orange);animation:pulse-dot 2s infinite}
   @keyframes pulse-dot{0%,100%{box-shadow:0 0 0 0 rgba(255,138,43,.5)}50%{box-shadow:0 0 0 6px rgba(255,138,43,0)}}
@@ -98,12 +104,14 @@
   .btn.primary:hover{box-shadow:0 6px 32px rgba(255,138,43,.5)}
   .btn.ghost{border:1px solid var(--line2);color:var(--txt)}
   .btn.ghost:hover{border-color:var(--orange)}
-  .hero-mark{display:flex;align-items:center;justify-content:center;position:relative}
+  .hero-mark{display:flex;align-items:center;justify-content:center;position:relative;will-change:transform;transition:transform .2s ease-out}
   .hero-mark::before{content:'';position:absolute;width:120%;aspect-ratio:1;border-radius:50%;
     background:radial-gradient(circle,rgba(255,138,43,.10) 0%,rgba(90,160,255,.06) 40%,transparent 70%);
     animation:breathe 6s ease-in-out infinite}
   @keyframes breathe{0%,100%{transform:scale(1);opacity:.8}50%{transform:scale(1.06);opacity:1}}
-  .hero-mark img{width:min(320px,68vw);position:relative;filter:drop-shadow(0 0 34px rgba(120,170,255,.18))}
+  .hero-mark img{width:min(320px,68vw);position:relative;filter:drop-shadow(0 0 34px rgba(120,170,255,.18));animation:float 7s ease-in-out infinite}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-13px)}}
+  #pcv{position:absolute;inset:0;pointer-events:none;z-index:1}
 
   .strip{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:rgba(12,18,32,.6)}
   .strip .wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;padding:28px 24px;text-align:center}
@@ -118,9 +126,10 @@
   .lead{color:var(--dim);max-width:680px;margin-bottom:44px;font-size:16px}
 
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px;position:relative;overflow:hidden;transition:border-color .18s,transform .18s,box-shadow .18s}
-  .card::before{content:'';position:absolute;inset:0;background:radial-gradient(400px 140px at var(--mx,50%) var(--my,0%),rgba(255,138,43,.07),transparent 60%);opacity:0;transition:opacity .2s;pointer-events:none}
-  .card:hover{border-color:#31465f;transform:translateY(-3px);box-shadow:0 12px 32px rgba(0,0,0,.35)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px;position:relative;overflow:hidden;
+    transition:border-color .18s,box-shadow .18s;transform-style:preserve-3d;will-change:transform}
+  .card::before{content:'';position:absolute;inset:0;background:radial-gradient(400px 140px at var(--mx,50%) var(--my,0%),rgba(255,138,43,.08),transparent 60%);opacity:0;transition:opacity .2s;pointer-events:none}
+  .card:hover{border-color:#31465f;box-shadow:0 12px 32px rgba(0,0,0,.35)}
   .card:hover::before{opacity:1}
   .card .ic{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:16px;background:rgba(255,138,43,.1);border:1px solid rgba(255,138,43,.3)}
   .card h3{font-size:17px;margin-bottom:8px;font-weight:700;color:var(--txt)}
@@ -144,12 +153,19 @@
   .demo li:last-child{border-bottom:none}
   .demo li::before{content:'▸';position:absolute;left:4px;color:var(--orange)}
   .demo li code{font-family:var(--mono);font-size:12.5px;color:#bcd3ea;background:rgba(90,160,255,.08);padding:1px 6px;border-radius:5px}
-  .term{background:#0a101a;border:1px solid var(--line2);border-radius:14px;overflow:hidden;font-family:var(--mono);font-size:13px;box-shadow:0 16px 40px rgba(0,0,0,.4)}
+  .term{position:relative;background:#0a101a;border:1px solid var(--line2);border-radius:14px;font-family:var(--mono);font-size:13px;box-shadow:0 16px 40px rgba(0,0,0,.4)}
+  .term::before{content:'';position:absolute;inset:-1px;border-radius:14px;padding:1px;pointer-events:none;
+    background:conic-gradient(from var(--beam,0deg),transparent 0 82%,rgba(255,138,43,.65) 92%,rgba(255,176,102,.9) 96%,transparent 100%);
+    -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+    -webkit-mask-composite:xor;mask-composite:exclude;
+    animation:beam 6s linear infinite}
+  @property --beam{syntax:'<angle>';initial-value:0deg;inherits:false}
+  @keyframes beam{to{--beam:360deg}}
   .term .bar{display:flex;gap:6px;padding:12px 14px;border-bottom:1px solid var(--line2);align-items:center}
   .term .bar i{width:11px;height:11px;border-radius:50%;background:#263449}
   .term .bar i:first-child{background:#e5566d}.term .bar i:nth-child(2){background:#e5b456}.term .bar i:nth-child(3){background:#3fd68f}
   .term .bar .t{margin-left:8px;color:var(--faint);font-size:11.5px}
-  .term pre{padding:18px;overflow-x:auto;line-height:1.75;color:#c9d6e2;min-height:330px}
+  .term pre{padding:18px;overflow-x:auto;line-height:1.75;color:#c9d6e2;min-height:330px;margin:0}
   .term .c{color:#5d7189}.term .k{color:#c792ea}.term .s{color:#8fd6a8}.term .f{color:#6fb3ff}
   .cursor{display:inline-block;width:8px;height:15px;background:var(--orange);vertical-align:-2px;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
@@ -174,14 +190,18 @@
   footer{padding:44px 0;font-size:13.5px;color:var(--faint)}
   footer .wrap{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;align-items:center}
   footer .brand{display:flex;align-items:center;gap:9px;font-weight:700;color:var(--txt);font-size:15px}
+  footer .brand img{filter:drop-shadow(0 0 10px rgba(120,170,255,.25))}
   footer a{color:var(--dim)}
   footer a:hover{color:var(--orange2)}
   .foot-links{display:flex;gap:20px}
 
   .reveal{opacity:0;transform:translateY(24px);transition:opacity .6s ease,transform .6s ease}
   .reveal.in{opacity:1;transform:none}
-  @media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}}
-
+  @media(prefers-reduced-motion:reduce){
+    .reveal{opacity:1;transform:none;transition:none}
+    .orb,.hero-mark img,.hero-mark::before,.ver-badge .dot{animation:none}
+    #pcv{display:none}
+  }
   @media(max-width:900px){.hero{padding-top:64px}}
 </style>
 </head>
@@ -210,15 +230,18 @@
 
 <main>
 <header class="hero">
+  <div class="orb o1" aria-hidden="true"></div>
+  <div class="orb o2" aria-hidden="true"></div>
+  <canvas id="pcv" aria-hidden="true"></canvas>
   <svg class="ekg-bg" viewBox="0 0 1200 500" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
     <defs>
       <linearGradient id="ekg-grad" x1="0" y1="0" x2="1" y2="0">
         <stop offset="0" stop-color="#1b3a5f" stop-opacity=".2"/>
-        <stop offset=".55" stop-color="#ff8a2b" stop-opacity=".55"/>
-        <stop offset="1" stop-color="#ffb066" stop-opacity=".9"/>
+        <stop offset=".55" stop-color="#ff8a2b" stop-opacity=".5"/>
+        <stop offset="1" stop-color="#ffb066" stop-opacity=".85"/>
       </linearGradient>
     </defs>
-    <path d="M -20 260 L 180 260 L 240 180 L 320 330 L 400 240 L 480 300 L 560 220 L 660 280 L 760 200 L 860 300 L 960 240 L 1060 290 L 1220 260"
+    <path d="M -20 300 L 180 300 L 240 210 L 320 380 L 400 280 L 480 350 L 560 250 L 660 330 L 760 210 L 860 350 L 960 260 L 1060 340 L 1220 300"
       fill="none" stroke="url(#ekg-grad)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
       stroke-dasharray="2600" stroke-dashoffset="2600">
       <animate attributeName="stroke-dashoffset" from="2600" to="0" dur="4.5s" fill="freeze" calcMode="spline" keySplines="0.4 0 0.2 1" keyTimes="0;1"/>
@@ -239,7 +262,7 @@
         <a class="btn ghost" href="https://github.com/motedb/motedb" target="_blank" rel="noopener" data-i18n="hero.cta2">查看源码</a>
       </div>
     </div>
-    <div class="hero-mark">
+    <div class="hero-mark" id="heroMark">
       <img src="logo-mark-dark.png" height="300" alt="MoteDB logo">
     </div>
   </div>
@@ -491,7 +514,7 @@ function setLang(l){
     const v = I18N[l][el.dataset.i18n];
     if (v !== undefined) el.innerHTML = v;
   });
-  document.querySelectorAll('[data-copy]').forEach(b => { b.textContent = I18N[l]['copy']; });
+  document.querySelectorAll('[data-copy]').forEach(b => { b.textContent = I18N[LANG]['copy']; });
   document.getElementById('langBtn').textContent = l === 'zh' ? 'EN' : '中文';
   document.title = l === 'zh'
     ? 'MoteDB — 具身智能的多模态嵌入式数据库'
@@ -529,6 +552,81 @@ const cio = new IntersectionObserver(es => {
   });
 }, { threshold: 0.6 });
 document.querySelectorAll('.cnt').forEach(el => cio.observe(el));
+
+/* ── hero particle network (brand: data nodes) ── */
+(function(){
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const cv = document.getElementById('pcv'), ctx = cv.getContext('2d');
+  const hero = document.querySelector('.hero');
+  let W, H, pts = [], raf;
+  function size(){
+    W = cv.width = hero.offsetWidth;
+    H = cv.height = hero.offsetHeight;
+  }
+  function seed(){
+    pts = Array.from({length: Math.min(46, Math.floor(W/28))}, () => ({
+      x: Math.random()*W, y: Math.random()*H,
+      vx: (Math.random()-.5)*.35, vy: (Math.random()-.5)*.35,
+      r: Math.random()*1.6+.7
+    }));
+  }
+  function frame(){
+    ctx.clearRect(0,0,W,H);
+    for (const p of pts){
+      p.x += p.vx; p.y += p.vy;
+      if (p.x < 0 || p.x > W) p.vx *= -1;
+      if (p.y < 0 || p.y > H) p.vy *= -1;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, 6.283);
+      ctx.fillStyle = 'rgba(120,170,255,.5)';
+      ctx.fill();
+    }
+    for (let i = 0; i < pts.length; i++)
+      for (let j = i+1; j < pts.length; j++){
+        const dx = pts[i].x-pts[j].x, dy = pts[i].y-pts[j].y, d = dx*dx+dy*dy;
+        if (d < 12000){
+          ctx.beginPath();
+          ctx.moveTo(pts[i].x, pts[i].y); ctx.lineTo(pts[j].x, pts[j].y);
+          ctx.strokeStyle = `rgba(120,170,255,${.14*(1-d/12000)})`;
+          ctx.stroke();
+        }
+      }
+    raf = requestAnimationFrame(frame);
+  }
+  size(); seed(); frame();
+  addEventListener('resize', () => { size(); seed(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) cancelAnimationFrame(raf);
+    else raf = requestAnimationFrame(frame);
+  });
+})();
+
+/* ── card tilt + glow follow ── */
+document.querySelectorAll('.card').forEach(card => {
+  card.addEventListener('mousemove', e => {
+    const r = card.getBoundingClientRect();
+    const px = (e.clientX - r.left) / r.width, py = (e.clientY - r.top) / r.height;
+    card.style.setProperty('--mx', (px*100)+'%');
+    card.style.setProperty('--my', (py*100)+'%');
+    if (!matchMedia('(prefers-reduced-motion: reduce)').matches){
+      const rx = (py - .5) * -5, ry = (px - .5) * 5;
+      card.style.transform = `translateY(-3px) perspective(700px) rotateX(${rx}deg) rotateY(${ry}deg)`;
+    }
+  });
+  card.addEventListener('mouseleave', () => { card.style.transform = ''; });
+});
+
+/* ── hero mark parallax ── */
+(function(){
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const hm = document.getElementById('heroMark'), hero = document.querySelector('.hero');
+  hero.addEventListener('mousemove', e => {
+    const r = hero.getBoundingClientRect();
+    const dx = (e.clientX - r.left) / r.width - .5, dy = (e.clientY - r.top) / r.height - .5;
+    hm.style.transform = `translate(${dx*14}px, ${dy*10}px)`;
+  });
+  hero.addEventListener('mouseleave', () => { hm.style.transform = ''; });
+})();
 </script>
 </body>
 </html>
