@@ -3,151 +3,195 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MoteDB — 具身智能的多模态嵌入式数据库</title>
-<meta name="description" content="MoteDB 是面向具身智能的嵌入式多模态数据库引擎：一个 SQL 引擎原生承载向量、时序、文本与二进制。采集、运输、部署三种形态，嵌入式零运维。">
-<meta property="og:title" content="MoteDB — The multimodal embedded database for embodied intelligence">
-<meta property="og:description" content="One SQL engine natively carrying vectors, time series, text, and binary. Capture, transport, deploy — three forms, one experience.">
+<title>MoteDB — 具身智能的多模态嵌入式数据库 | Embodied AI Database</title>
+<meta name="description" content="MoteDB 是面向具身智能的嵌入式多模态数据库引擎：一个 SQL 引擎原生承载向量、时序、文本与二进制。Rust 编写，嵌入式零运维，支持单文件快照与只读容器分发。 | The multimodal embedded database engine for embodied intelligence — vectors, time series, text and binary in one SQL engine.">
+<meta name="keywords" content="MoteDB, embedded database, embodied AI, robotics, vector database, time series, multimodal, MCAP, Rust, SQLite alternative, 具身智能, 嵌入式数据库, 多模态, 向量检索">
+<meta name="author" content="MoteDB">
+<link rel="canonical" href="https://motedb.github.io/motedb/">
 <meta property="og:type" content="website">
+<meta property="og:site_name" content="MoteDB">
+<meta property="og:url" content="https://motedb.github.io/motedb/">
+<meta property="og:title" content="MoteDB — 具身智能的多模态嵌入式数据库">
+<meta property="og:description" content="一个 SQL 引擎，原生承载向量、时序、文本与二进制。采集、运输、部署三种形态，嵌入式零运维。MIT 开源。">
+<meta property="og:image" content="https://motedb.github.io/motedb/logo-lockup.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="MoteDB — The multimodal embedded database for embodied intelligence">
+<meta name="twitter:description" content="Vectors, time series, text and binary in one embedded SQL engine. Capture, transport, deploy — three forms, one experience. MIT licensed.">
+<meta name="twitter:image" content="https://motedb.github.io/motedb/logo-lockup.png">
+<meta name="theme-color" content="#0a0f16">
 <link rel="icon" type="image/png" href="favicon.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "MoteDB",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Linux, Windows",
+  "description": "AI-native embedded multimodal database for embodied intelligence — vectors, time series, text and binary in one SQL engine. Rust, MIT licensed.",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "license": "https://opensource.org/licenses/MIT",
+  "codeRepository": "https://github.com/motedb/motedb",
+  "programmingLanguage": ["Rust", "Python", "JavaScript", "Go"],
+  "keywords": "embedded database, embodied AI, vector search, time series, multimodal, MCAP, robotics"
+}
+</script>
 <style>
   :root{
-    --navy:#1b3a5f; --navy2:#12283f; --orange:#ee7623; --orange2:#ff8c42;
-    --bg:#ffffff; --alt:#f6f8fa; --card:#ffffff; --line:#e3e9f0;
-    --txt:#16283c; --dim:#5a6b7e; --faint:#8b9aac;
+    --bg:#0a0f16; --bg2:#0c1220; --card:#101827; --card2:#0d1420;
+    --line:#1b2739; --line2:#253449;
+    --txt:#e8eef5; --dim:#93a3b8; --faint:#5d6f85;
+    --orange:#ff8a2b; --orange2:#ffb066; --navy:#1b3a5f;
+    --glow-o:rgba(255,138,43,.35);
     --mono:'SF Mono','Cascadia Code',Consolas,'JetBrains Mono',monospace;
-    --shadow:0 1px 3px rgba(22,40,60,.06),0 8px 24px rgba(22,40,60,.05);
   }
   *{margin:0;padding:0;box-sizing:border-box}
   html{scroll-behavior:smooth}
-  body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',Roboto,sans-serif;line-height:1.65;-webkit-font-smoothing:antialiased}
-  ::selection{background:rgba(238,118,35,.22)}
-  a{color:var(--navy);text-decoration:none}
-  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',Roboto,sans-serif;line-height:1.7;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  ::selection{background:rgba(255,138,43,.3)}
+  a{color:var(--orange2);text-decoration:none}
+  .wrap{max-width:1100px;margin:0 auto;padding:0 24px}
 
-  /* nav */
-  nav{position:sticky;top:0;z-index:50;background:rgba(255,255,255,.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
-  .nav-in{max-width:1080px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;gap:26px}
-  .logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:19px;color:var(--navy);letter-spacing:.2px}
-  .logo svg{flex:none}
+  .gridbg{position:fixed;inset:0;z-index:0;pointer-events:none;
+    background-image:linear-gradient(rgba(90,160,255,.045) 1px,transparent 1px),
+                     linear-gradient(90deg,rgba(90,160,255,.045) 1px,transparent 1px);
+    background-size:44px 44px;
+    mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 30%,transparent 100%);
+    -webkit-mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 30%,transparent 100%)}
+  main,nav,footer{position:relative;z-index:1}
+
+  nav{position:sticky;top:0;z-index:50;background:rgba(10,15,22,.78);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+  .nav-in{max-width:1100px;margin:0 auto;padding:13px 24px;display:flex;align-items:center;gap:26px}
+  .logo{display:flex;align-items:center;gap:11px;font-weight:800;font-size:19px;color:var(--txt)}
   .nav-links{margin-left:auto;display:flex;gap:20px;align-items:center;font-size:14.5px;font-weight:500}
   .nav-links a{color:var(--dim);transition:color .15s}
-  .nav-links a:hover{color:var(--navy)}
-  .lang{border:1px solid var(--line);background:none;border-radius:7px;padding:5px 12px;font-size:13px;font-weight:600;color:var(--navy);cursor:pointer;font-family:inherit}
-  .lang:hover{border-color:var(--orange);color:var(--orange)}
-  .nav-gh{display:flex;align-items:center;gap:6px;padding:7px 14px;border:1px solid var(--line);border-radius:8px;color:var(--navy)!important;font-weight:600}
+  .nav-links a:hover{color:var(--orange2)}
+  .lang{border:1px solid var(--line2);background:transparent;border-radius:7px;padding:5px 12px;font-size:13px;font-weight:600;color:var(--txt);cursor:pointer;font-family:inherit;transition:border-color .15s}
+  .lang:hover{border-color:var(--orange)}
+  .nav-gh{display:flex;align-items:center;gap:6px;padding:7px 14px;border:1px solid var(--line2);border-radius:8px;color:var(--txt)!important;font-weight:600}
   .nav-gh:hover{border-color:var(--orange)}
   @media(max-width:760px){.nav-links a:not(.nav-gh):not(.lang){display:none}}
 
-  /* hero */
-  .hero{position:relative;overflow:hidden;background:
-    radial-gradient(700px 360px at 85% 20%,rgba(238,118,35,.06),transparent 60%),
-    radial-gradient(600px 320px at 10% 80%,rgba(27,58,95,.05),transparent 60%)}
-  .hero .wrap{display:grid;grid-template-columns:1.15fr .85fr;gap:40px;align-items:center;padding-top:84px;padding-bottom:72px}
-  @media(max-width:860px){.hero .wrap{grid-template-columns:1fr}}
-  .ver-badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12.5px;color:var(--navy);border:1px solid var(--line);background:var(--alt);padding:5px 14px;border-radius:999px;margin-bottom:24px}
-  .ver-badge .dot{width:7px;height:7px;border-radius:50%;background:var(--orange);box-shadow:0 0 8px rgba(238,118,35,.6)}
-  h1{font-size:clamp(32px,5vw,52px);line-height:1.16;font-weight:800;letter-spacing:-.5px;color:var(--navy)}
-  h1 em{font-style:normal;color:var(--orange)}
+  .hero{position:relative;padding:92px 0 76px;overflow:hidden}
+  .hero .wrap{position:relative;display:grid;grid-template-columns:1.12fr .88fr;gap:44px;align-items:center}
+  @media(max-width:900px){.hero .wrap{grid-template-columns:1fr}}
+  .ekg-bg{position:absolute;inset:0;pointer-events:none;opacity:.55;width:100%;height:100%}
+  .ver-badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12.5px;color:var(--orange2);border:1px solid rgba(255,138,43,.4);background:rgba(255,138,43,.07);padding:5px 14px;border-radius:999px;margin-bottom:26px;box-shadow:0 0 18px rgba(255,138,43,.12)}
+  .ver-badge .dot{width:7px;height:7px;border-radius:50%;background:var(--orange);animation:pulse-dot 2s infinite}
+  @keyframes pulse-dot{0%,100%{box-shadow:0 0 0 0 rgba(255,138,43,.5)}50%{box-shadow:0 0 0 6px rgba(255,138,43,0)}}
+  h1{font-size:clamp(32px,5vw,54px);line-height:1.14;font-weight:800;letter-spacing:-.5px;color:var(--txt)}
+  h1 em{font-style:normal;background:linear-gradient(90deg,var(--orange),var(--orange2) 60%,#ffd9ad);-webkit-background-clip:text;background-clip:text;color:transparent}
   .hero p.sub{margin:22px 0 30px;font-size:clamp(15px,2vw,17.5px);color:var(--dim);max-width:600px}
-  .hero p.sub b{color:var(--navy);font-weight:600}
-  .installs{display:flex;flex-direction:column;gap:10px;max-width:520px}
-  .inst{display:flex;align-items:stretch;background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden;font-family:var(--mono);font-size:13.5px;box-shadow:var(--shadow)}
-  .inst .tag{flex:none;width:72px;text-align:center;padding:11px 0;color:var(--faint);border-right:1px solid var(--line);font-size:11px;letter-spacing:1px;align-self:center}
-  .inst code{flex:1;padding:11px 16px;color:var(--txt)}
-  .inst code .p{color:var(--orange);font-weight:600}
-  .inst button{flex:none;background:none;border:none;border-left:1px solid var(--line);color:var(--faint);padding:0 15px;cursor:pointer;font-size:12.5px}
-  .inst button:hover{color:var(--orange)}
-  .inst button.ok{color:var(--orange)}
-  .soon{display:inline-block;font-size:10px;color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:1px 6px;margin-left:8px;vertical-align:1px;font-family:inherit}
+  .hero p.sub b{color:var(--txt);font-weight:600}
+  .installs{display:flex;flex-direction:column;gap:10px;max-width:540px}
+  .inst{display:flex;align-items:stretch;background:rgba(13,20,32,.85);border:1px solid var(--line2);border-radius:10px;overflow:hidden;font-family:var(--mono);font-size:13.5px;transition:border-color .15s}
+  .inst:hover{border-color:#33465e}
+  .inst .tag{flex:none;width:72px;text-align:center;padding:11px 0;color:var(--faint);border-right:1px solid var(--line2);font-size:11px;letter-spacing:1px;align-self:center}
+  .inst code{flex:1;padding:11px 16px;color:#d7e2ee}
+  .inst code .p{color:var(--orange2);font-weight:600}
+  .inst button{flex:none;background:none;border:none;border-left:1px solid var(--line2);color:var(--faint);padding:0 15px;cursor:pointer;font-size:12.5px;transition:color .12s}
+  .inst button:hover{color:var(--orange2)}
+  .soon{display:inline-block;font-size:10px;color:var(--faint);border:1px solid var(--line2);border-radius:4px;padding:1px 6px;margin-left:8px;vertical-align:1px;font-family:inherit}
   .hero-ctas{display:flex;gap:13px;margin-top:28px;flex-wrap:wrap}
-  .btn{padding:11px 26px;border-radius:9px;font-size:15px;font-weight:600;transition:transform .12s,box-shadow .12s,border-color .12s}
+  .btn{padding:11px 26px;border-radius:9px;font-size:15px;font-weight:600;transition:transform .12s,box-shadow .15s,background .12s}
   .btn:hover{transform:translateY(-1px)}
-  .btn.primary{background:var(--navy);color:#fff;box-shadow:0 4px 18px rgba(27,58,95,.22)}
-  .btn.primary:hover{background:var(--navy2);box-shadow:0 6px 24px rgba(27,58,95,.3)}
-  .btn.ghost{border:1px solid var(--line);color:var(--navy)}
-  .btn.ghost:hover{border-color:var(--orange);color:var(--orange)}
-  .hero-mark{display:flex;align-items:center;justify-content:center}
-  .hero-mark svg{width:min(320px,70vw);filter:drop-shadow(0 18px 36px rgba(27,58,95,.14))}
+  .btn.primary{background:linear-gradient(135deg,var(--orange),#ff9d4d);color:#1a0d02;box-shadow:0 4px 24px var(--glow-o)}
+  .btn.primary:hover{box-shadow:0 6px 32px rgba(255,138,43,.5)}
+  .btn.ghost{border:1px solid var(--line2);color:var(--txt)}
+  .btn.ghost:hover{border-color:var(--orange)}
+  .hero-mark{display:flex;align-items:center;justify-content:center;position:relative}
+  .hero-mark::before{content:'';position:absolute;width:120%;aspect-ratio:1;border-radius:50%;
+    background:radial-gradient(circle,rgba(255,138,43,.10) 0%,rgba(90,160,255,.06) 40%,transparent 70%);
+    animation:breathe 6s ease-in-out infinite}
+  @keyframes breathe{0%,100%{transform:scale(1);opacity:.8}50%{transform:scale(1.06);opacity:1}}
+  .hero-mark img{width:min(320px,68vw);position:relative;filter:drop-shadow(0 0 34px rgba(120,170,255,.18))}
 
-  /* strip */
-  .strip{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--alt)}
-  .strip .wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;padding:26px 24px;text-align:center}
-  .strip b{display:block;font-size:24px;font-weight:800;color:var(--navy)}
-  .strip b i{font-style:normal;color:var(--orange)}
+  .strip{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:rgba(12,18,32,.6)}
+  .strip .wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;padding:28px 24px;text-align:center}
+  .strip b{display:block;font-size:26px;font-weight:800;font-family:var(--mono);
+    background:linear-gradient(90deg,var(--orange2),#ffd9ad);-webkit-background-clip:text;background-clip:text;color:transparent}
   .strip span{font-size:12.5px;color:var(--faint)}
 
-  /* sections */
   section{padding:84px 0}
-  section.alt{background:var(--alt)}
-  .sec-tag{font-family:var(--mono);font-size:12px;letter-spacing:2px;color:var(--orange);text-transform:uppercase;margin-bottom:12px;font-weight:600}
-  h2{font-size:clamp(25px,4vw,34px);font-weight:800;letter-spacing:-.4px;margin-bottom:14px;color:var(--navy)}
-  .lead{color:var(--dim);max-width:660px;margin-bottom:44px;font-size:16px}
+  section.alt{background:rgba(12,18,32,.55);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .sec-tag{font-family:var(--mono);font-size:12px;letter-spacing:2px;color:var(--orange2);text-transform:uppercase;margin-bottom:12px;font-weight:600}
+  h2{font-size:clamp(25px,4vw,34px);font-weight:800;letter-spacing:-.4px;margin-bottom:14px;color:var(--txt)}
+  .lead{color:var(--dim);max-width:680px;margin-bottom:44px;font-size:16px}
 
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px;transition:border-color .15s,transform .15s,box-shadow .15s}
-  .card:hover{border-color:#c9d6e2;transform:translateY(-2px);box-shadow:var(--shadow)}
-  .card .ic{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:16px;background:rgba(238,118,35,.09);border:1px solid rgba(238,118,35,.25)}
-  .card h3{font-size:17px;margin-bottom:8px;font-weight:700;color:var(--navy)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px;position:relative;overflow:hidden;transition:border-color .18s,transform .18s,box-shadow .18s}
+  .card::before{content:'';position:absolute;inset:0;background:radial-gradient(400px 140px at var(--mx,50%) var(--my,0%),rgba(255,138,43,.07),transparent 60%);opacity:0;transition:opacity .2s;pointer-events:none}
+  .card:hover{border-color:#31465f;transform:translateY(-3px);box-shadow:0 12px 32px rgba(0,0,0,.35)}
+  .card:hover::before{opacity:1}
+  .card .ic{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:16px;background:rgba(255,138,43,.1);border:1px solid rgba(255,138,43,.3)}
+  .card h3{font-size:17px;margin-bottom:8px;font-weight:700;color:var(--txt)}
   .card p{font-size:14px;color:var(--dim)}
-  .card p code{font-family:var(--mono);font-size:12.5px;color:var(--orange);background:rgba(238,118,35,.08);padding:1px 6px;border-radius:5px}
+  .card p code{font-family:var(--mono);font-size:12.5px;color:var(--orange2);background:rgba(255,138,43,.09);padding:1px 6px;border-radius:5px}
 
-  /* lifecycle */
   .life{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:14px;align-items:stretch}
-  @media(max-width:860px){.life{grid-template-columns:1fr}.life .arrow{transform:rotate(90deg);margin:0 auto}}
-  .life .stage{background:#fff;border:1px solid var(--line);border-radius:14px;padding:26px;box-shadow:var(--shadow)}
-  .life .stage .k{font-family:var(--mono);font-size:11px;letter-spacing:2px;color:var(--orange);font-weight:600}
-  .life .stage h3{font-size:19px;margin:8px 0 10px;color:var(--navy)}
+  @media(max-width:880px){.life{grid-template-columns:1fr}.life .arrow{transform:rotate(90deg);margin:0 auto}}
+  .life .stage{background:var(--card2);border:1px solid var(--line);border-radius:14px;padding:26px;transition:border-color .15s}
+  .life .stage:hover{border-color:#31465f}
+  .life .stage .k{font-family:var(--mono);font-size:11px;letter-spacing:2px;color:var(--orange2);font-weight:600}
+  .life .stage h3{font-size:19px;margin:8px 0 10px;color:var(--txt)}
   .life .stage p{font-size:13.5px;color:var(--dim)}
-  .life .stage .f{margin-top:14px;font-family:var(--mono);font-size:12px;color:var(--navy);background:var(--alt);border:1px solid var(--line);border-radius:6px;padding:5px 10px;display:inline-block}
+  .life .stage .f{margin-top:14px;font-family:var(--mono);font-size:12px;color:var(--orange2);background:rgba(255,138,43,.07);border:1px solid rgba(255,138,43,.25);border-radius:6px;padding:5px 10px;display:inline-block}
   .life .arrow{align-self:center;color:var(--orange);font-size:24px;font-weight:700}
 
-  /* quickstart */
   .demo{display:grid;grid-template-columns:1fr 1fr;gap:36px;align-items:center}
-  @media(max-width:860px){.demo{grid-template-columns:1fr}}
+  @media(max-width:880px){.demo{grid-template-columns:1fr}}
   .demo ul{list-style:none;color:var(--dim);font-size:14.5px}
   .demo li{padding:10px 0 10px 26px;position:relative;border-bottom:1px dashed var(--line)}
   .demo li:last-child{border-bottom:none}
   .demo li::before{content:'▸';position:absolute;left:4px;color:var(--orange)}
-  .demo li code{font-family:var(--mono);font-size:12.5px;color:var(--navy);background:var(--alt);padding:1px 6px;border-radius:5px}
-  .term{background:#0f1c2b;border:1px solid var(--navy2);border-radius:14px;overflow:hidden;font-family:var(--mono);font-size:13px;box-shadow:var(--shadow)}
-  .term .bar{display:flex;gap:6px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08)}
-  .term .bar i{width:11px;height:11px;border-radius:50%;background:#2a3a4e}
+  .demo li code{font-family:var(--mono);font-size:12.5px;color:#bcd3ea;background:rgba(90,160,255,.08);padding:1px 6px;border-radius:5px}
+  .term{background:#0a101a;border:1px solid var(--line2);border-radius:14px;overflow:hidden;font-family:var(--mono);font-size:13px;box-shadow:0 16px 40px rgba(0,0,0,.4)}
+  .term .bar{display:flex;gap:6px;padding:12px 14px;border-bottom:1px solid var(--line2);align-items:center}
+  .term .bar i{width:11px;height:11px;border-radius:50%;background:#263449}
   .term .bar i:first-child{background:#e5566d}.term .bar i:nth-child(2){background:#e5b456}.term .bar i:nth-child(3){background:#3fd68f}
-  .term pre{padding:18px;overflow-x:auto;line-height:1.75;color:#c9d6e2}
-  .term .c{color:#6b7f94}.term .k{color:#c792ea}.term .s{color:#7ec9a1}.term .f{color:#6fb3ff}
+  .term .bar .t{margin-left:8px;color:var(--faint);font-size:11.5px}
+  .term pre{padding:18px;overflow-x:auto;line-height:1.75;color:#c9d6e2;min-height:330px}
+  .term .c{color:#5d7189}.term .k{color:#c792ea}.term .s{color:#8fd6a8}.term .f{color:#6fb3ff}
+  .cursor{display:inline-block;width:8px;height:15px;background:var(--orange);vertical-align:-2px;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
 
-  /* sdk */
   .sdk-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
-  .sdk{background:#fff;border:1px solid var(--line);border-radius:14px;padding:26px;box-shadow:var(--shadow)}
-  .sdk .lang{font-family:var(--mono);font-size:12px;color:var(--orange);letter-spacing:1px;font-weight:600}
-  .sdk h3{font-size:18px;margin:6px 0 14px;color:var(--navy)}
-  .sdk .cmd{display:flex;align-items:center;gap:8px;background:var(--alt);border:1px solid var(--line);border-radius:8px;padding:10px 14px;font-family:var(--mono);font-size:12.5px;color:var(--txt)}
+  .sdk{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px;transition:border-color .15s,transform .15s}
+  .sdk:hover{border-color:#31465f;transform:translateY(-2px)}
+  .sdk .lang{font-family:var(--mono);font-size:12px;color:var(--orange2);letter-spacing:1px;font-weight:600}
+  .sdk h3{font-size:18px;margin:6px 0 14px;color:var(--txt)}
+  .sdk .cmd{display:flex;align-items:center;gap:8px;background:#0a101a;border:1px solid var(--line2);border-radius:8px;padding:10px 14px;font-family:var(--mono);font-size:12.5px;color:#d7e2ee}
   .sdk .cmd button{margin-left:auto;background:none;border:none;color:var(--faint);cursor:pointer;font-size:12px}
-  .sdk .cmd button:hover{color:var(--orange)}
-  .sdk a.more{display:inline-block;margin-top:14px;font-size:13.5px;color:var(--navy);font-weight:600}
-  .sdk a.more:hover{color:var(--orange)}
+  .sdk .cmd button:hover{color:var(--orange2)}
+  .sdk a.more{display:inline-block;margin-top:14px;font-size:13.5px;color:var(--orange2);font-weight:600}
+  .sdk a.more:hover{color:#ffd9ad}
 
-  /* cta */
-  .cta-band{background:linear-gradient(135deg,rgba(27,58,95,.05),rgba(238,118,35,.06));border-top:1px solid var(--line)}
-  .cta-band .wrap{text-align:center;padding:64px 24px}
+  .cta-band{position:relative;border-top:1px solid var(--line);background:
+    radial-gradient(600px 200px at 50% 100%,rgba(255,138,43,.09),transparent 70%)}
+  .cta-band .wrap{text-align:center;padding:70px 24px}
   .cta-band h2{margin-bottom:10px}
   .cta-band p{color:var(--dim);margin-bottom:28px}
 
-  /* footer */
   footer{padding:44px 0;font-size:13.5px;color:var(--faint)}
   footer .wrap{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;align-items:center}
-  footer .brand{display:flex;align-items:center;gap:8px;font-weight:700;color:var(--navy);font-size:15px}
+  footer .brand{display:flex;align-items:center;gap:9px;font-weight:700;color:var(--txt);font-size:15px}
   footer a{color:var(--dim)}
-  footer a:hover{color:var(--orange)}
+  footer a:hover{color:var(--orange2)}
   .foot-links{display:flex;gap:20px}
+
+  .reveal{opacity:0;transform:translateY(24px);transition:opacity .6s ease,transform .6s ease}
+  .reveal.in{opacity:1;transform:none}
+  @media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}}
+
+  @media(max-width:900px){.hero{padding-top:64px}}
 </style>
 </head>
 <body>
+<div class="gridbg" aria-hidden="true"></div>
 
 <nav>
   <div class="nav-in">
     <a class="logo" href="#">
-      <img src="logo-mark.png" height="32" alt="MoteDB">
+      <img src="logo-mark-dark.png" height="34" alt="MoteDB">
       mote<b style="color:var(--orange)">DB</b>
     </a>
     <div class="nav-links">
@@ -164,7 +208,22 @@
   </div>
 </nav>
 
+<main>
 <header class="hero">
+  <svg class="ekg-bg" viewBox="0 0 1200 500" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+    <defs>
+      <linearGradient id="ekg-grad" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="#1b3a5f" stop-opacity=".2"/>
+        <stop offset=".55" stop-color="#ff8a2b" stop-opacity=".55"/>
+        <stop offset="1" stop-color="#ffb066" stop-opacity=".9"/>
+      </linearGradient>
+    </defs>
+    <path d="M -20 260 L 180 260 L 240 180 L 320 330 L 400 240 L 480 300 L 560 220 L 660 280 L 760 200 L 860 300 L 960 240 L 1060 290 L 1220 260"
+      fill="none" stroke="url(#ekg-grad)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+      stroke-dasharray="2600" stroke-dashoffset="2600">
+      <animate attributeName="stroke-dashoffset" from="2600" to="0" dur="4.5s" fill="freeze" calcMode="spline" keySplines="0.4 0 0.2 1" keyTimes="0;1"/>
+    </path>
+  </svg>
   <div class="wrap">
     <div>
       <span class="ver-badge"><span class="dot"></span><span data-i18n="hero.badge">v0.15.0 · MIT 开源 · 正式发布</span></span>
@@ -181,54 +240,54 @@
       </div>
     </div>
     <div class="hero-mark">
-      <img src="logo-mark.png" height="300" alt="MoteDB logo">
+      <img src="logo-mark-dark.png" height="300" alt="MoteDB logo">
     </div>
   </div>
 </header>
 
 <div class="strip">
   <div class="wrap">
-    <div><b>1</b><span data-i18n="st.1">引擎 · 三种形态</span></div>
-    <div><b>3</b><span data-i18n="st.2">官方 SDK</span></div>
-    <div><b>5</b><span data-i18n="st.3">平台预构建二进制</span></div>
-    <div><b>4</b><span data-i18n="st.4">模态：向量/时序/文本/BLOB</span></div>
-    <div><b>3</b><span data-i18n="st.5">轮独立发布审计</span></div>
+    <div><b><span class="cnt" data-n="1">0</span></b><span data-i18n="st.1">引擎 · 三种形态</span></div>
+    <div><b><span class="cnt" data-n="3">0</span></b><span data-i18n="st.2">官方 SDK</span></div>
+    <div><b><span class="cnt" data-n="5">0</span></b><span data-i18n="st.3">平台预构建二进制</span></div>
+    <div><b><span class="cnt" data-n="4">0</span></b><span data-i18n="st.4">模态：向量/时序/文本/BLOB</span></div>
+    <div><b><span class="cnt" data-n="3">0</span></b><span data-i18n="st.5">轮独立发布审计</span></div>
   </div>
 </div>
 
 <section id="features">
   <div class="wrap">
-    <div class="sec-tag" data-i18n="ft.tag">// FEATURES</div>
-    <h2 data-i18n="ft.title">为具身 AI 工作负载而生</h2>
-    <p class="lead" data-i18n="ft.lead">不是通用数据库的裁剪版——每个能力都对着机器人数据的真实形状设计。</p>
+    <div class="sec-tag reveal" data-i18n="ft.tag">// FEATURES</div>
+    <h2 class="reveal" data-i18n="ft.title">为具身 AI 工作负载而生</h2>
+    <p class="lead reveal" data-i18n="ft.lead">不是通用数据库的裁剪版——每个能力都对着机器人数据的真实形状设计。</p>
     <div class="grid">
-      <div class="card">
-        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ee7623" stroke-width="2"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7 7.5l3.5 8M17 7.5l-3.5 8M7.5 6h9"/></svg></div>
+      <div class="card reveal">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff8a2b" stroke-width="2"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7 7.5l3.5 8M17 7.5l-3.5 8M7.5 6h9"/></svg></div>
         <h3 data-i18n="f1.t">多模态原生</h3>
         <p data-i18n="f1.d"><code>VECTOR(n)</code> 向量列带索引 KNN、<code>BLOB</code> 字节等值、全文检索与 <code>TIME_BUCKET</code> 时序聚合——同一个 SQL 引擎，同一个事务视图。</p>
       </div>
-      <div class="card">
-        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ee7623" stroke-width="2"><path d="M12 2l8 4.5v9L12 20l-8-4.5v-9L12 2z"/><path d="M12 11L4 6.5M12 11l8-4.5M12 11v9"/></svg></div>
+      <div class="card reveal">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff8a2b" stroke-width="2"><path d="M12 2l8 4.5v9L12 20l-8-4.5v-9L12 2z"/><path d="M12 11L4 6.5M12 11l8-4.5M12 11v9"/></svg></div>
         <h3 data-i18n="f2.t">三种形态一种体验</h3>
         <p data-i18n="f2.d">采集期是高性能目录，运输期是单文件快照（CRC 校验 + zstd），部署期是只读容器直开——<code>EXPORT DB</code> 一条 SQL 串联。</p>
       </div>
-      <div class="card">
-        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ee7623" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 12l5-5M22 2l-5 5"/></svg></div>
+      <div class="card reveal">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff8a2b" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 12l5-5M22 2l-5 5"/></svg></div>
         <h3 data-i18n="f3.t">嵌入式零运维</h3>
         <p data-i18n="f3.d">无服务、无端口、无独立进程。库文件即数据库，索引损坏自动从源数据重建，打开即用。</p>
       </div>
-      <div class="card">
-        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ee7623" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6M9 15l2 2 4-4"/></svg></div>
+      <div class="card reveal">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff8a2b" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6M9 15l2 2 4-4"/></svg></div>
         <h3 data-i18n="f4.t">断电安全内核</h3>
         <p data-i18n="f4.d">temp+fsync+rename 原子发布、WAL 组提交、孤儿段领养、崩溃注入与差分模糊测试持续验证——边缘设备的拔电是常态而非异常。</p>
       </div>
-      <div class="card">
-        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ee7623" stroke-width="2"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg></div>
+      <div class="card reveal">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff8a2b" stroke-width="2"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg></div>
         <h3 data-i18n="f5.t">五平台预构建</h3>
         <p data-i18n="f5.d">macOS (arm64/x64)、Linux (x64/arm64)、Windows 的官方二进制直接安装——交叉编译与冒烟测试在 CI 里逐平台验证。</p>
       </div>
-      <div class="card">
-        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ee7623" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg></div>
+      <div class="card reveal">
+        <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff8a2b" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg></div>
         <h3 data-i18n="f6.t">舰队友好</h3>
         <p data-i18n="f6.d">快照增量重导出、只读容器多读者共存、单调行号空间——为"一台指挥、百台采集"的机器人舰队同步而设计。</p>
       </div>
@@ -238,25 +297,25 @@
 
 <section id="lifecycle" class="alt">
   <div class="wrap">
-    <div class="sec-tag" data-i18n="lf.tag">// ARCHITECTURE</div>
-    <h2 data-i18n="lf.title">数据的三种形态，一条流水线</h2>
-    <p class="lead" data-i18n="lf.lead">具身智能的数据要经历采集、运输、部署。每个阶段对磁盘形态的要求不同——MoteDB 为每一段给最优解，用一条 SQL 串联。</p>
+    <div class="sec-tag reveal" data-i18n="lf.tag">// ARCHITECTURE</div>
+    <h2 class="reveal" data-i18n="lf.title">数据的三种形态，一条流水线</h2>
+    <p class="lead reveal" data-i18n="lf.lead">具身智能的数据要经历采集、运输、部署。每个阶段对磁盘形态的要求不同——MoteDB 为每一段给最优解，用一条 SQL 串联。</p>
     <div class="life">
-      <div class="stage">
+      <div class="stage reveal">
         <div class="k" data-i18n="l1.k">01 · 采集</div>
         <h3 data-i18n="l1.t">高性能目录</h3>
         <p data-i18n="l1.d">机器人本体持续写入。temp+rename 原子发布 + WAL 组提交，拔电安全；全局清单 + 惰性文件，固定开销恒定。</p>
         <div class="f">open("robot.mote")</div>
       </div>
-      <div class="arrow">→</div>
-      <div class="stage">
+      <div class="arrow reveal">→</div>
+      <div class="stage reveal">
         <div class="k" data-i18n="l2.k">02 · 运输</div>
         <h3 data-i18n="l2.t">单文件快照</h3>
         <p data-i18n="l2.d">一条 SQL 打包整库。逐文件 CRC 校验、可选 zstd、弱网续传友好。</p>
         <div class="f">EXPORT DB TO 'snap.mote'</div>
       </div>
-      <div class="arrow">→</div>
-      <div class="stage">
+      <div class="arrow reveal">→</div>
+      <div class="stage reveal">
         <div class="k" data-i18n="l3.k">03 · 部署</div>
         <h3 data-i18n="l3.t">只读容器</h3>
         <p data-i18n="l3.d">固件预置一个文件，打开即查。全部写路径拒绝，多读者共存，地图与知识库随版本分发。</p>
@@ -268,17 +327,17 @@
 
 <section id="quickstart">
   <div class="wrap">
-    <div class="sec-tag" data-i18n="q.tag">// QUICKSTART</div>
-    <h2 data-i18n="q.title">5 分钟：从 MCAP 到可查询的时序库</h2>
+    <div class="sec-tag reveal" data-i18n="q.tag">// QUICKSTART</div>
+    <h2 class="reveal" data-i18n="q.title">5 分钟：从 MCAP 到可查询的时序库</h2>
     <div class="demo">
       <ul>
-        <li data-i18n="q.b1">建表即声明多模态：TIMESERIES(ts) 时序语义、VECTOR(4) 向量列</li>
-        <li data-i18n="q.b2">参数化写入，预编译语句缓存</li>
-        <li data-i18n="q.b3">向量 KNN 用熟悉的 &lt;-&gt; 算符，索引加速</li>
-        <li data-i18n="q.b4">重开自动恢复：WAL 回放 + 段迁移 + 索引自愈</li>
+        <li class="reveal" data-i18n="q.b1">建表即声明多模态：TIMESERIES(ts) 时序语义、VECTOR(4) 向量列</li>
+        <li class="reveal" data-i18n="q.b2">参数化写入，预编译语句缓存</li>
+        <li class="reveal" data-i18n="q.b3">向量 KNN 用熟悉的 &lt;-&gt; 算符，索引加速</li>
+        <li class="reveal" data-i18n="q.b4">重开自动恢复：WAL 回放 + 段迁移 + 索引自愈</li>
       </ul>
-      <div class="term">
-        <div class="bar"><i></i><i></i><i></i></div>
+      <div class="term reveal">
+        <div class="bar"><i></i><i></i><i></i><span class="t">motedb — quickstart</span></div>
         <pre><span class="c"># pip install motedb-python</span>
 <span class="k">from</span> motedb <span class="k">import</span> Database
 
@@ -286,15 +345,14 @@ db = Database(<span class="s">"robot.mote"</span>)
 db.execute(<span class="s">"CREATE TABLE poses (
   ts TIMESTAMP, sid INT, emb VECTOR(4)
 ) TIMESERIES(ts)"</span>)
-db.executemany(<span class="s">"INSERT INTO poses VALUES (?,?,?)"</span>,
-               poses)
+db.executemany(<span class="s">"INSERT INTO poses VALUES (?,?,?)"</span>, poses)
 
 <span class="c"># 向量 KNN：最近的 5 个位姿</span>
 hits = db.query(<span class="s">"SELECT ts, sid FROM poses
   ORDER BY emb &lt;-&gt; [0.1,0.2,0.3,0.4] LIMIT 5"</span>)
 
 <span class="c"># 运输：整库打成单文件快照</span>
-db.execute(<span class="s">"EXPORT DB TO 'fleet.mote'"</span>)</pre>
+db.execute(<span class="s">"EXPORT DB TO 'fleet.mote'"</span>)<span class="cursor"></span></pre>
       </div>
     </div>
   </div>
@@ -302,23 +360,23 @@ db.execute(<span class="s">"EXPORT DB TO 'fleet.mote'"</span>)</pre>
 
 <section id="sdks" class="alt">
   <div class="wrap">
-    <div class="sec-tag" data-i18n="sk.tag">// SDK</div>
-    <h2 data-i18n="sk.title">三个官方 SDK，同一套语义</h2>
-    <p class="lead" data-i18n="sk.lead">值映射开箱即用：向量 ↔ 数组、BLOB ↔ 字节、时间戳 ↔ 微秒。没有第三方的半成品绑定。</p>
+    <div class="sec-tag reveal" data-i18n="sk.tag">// SDK</div>
+    <h2 class="reveal" data-i18n="sk.title">三个官方 SDK，同一套语义</h2>
+    <p class="lead reveal" data-i18n="sk.lead">值映射开箱即用：向量 ↔ 数组、BLOB ↔ 字节、时间戳 ↔ 微秒。没有第三方的半成品绑定。</p>
     <div class="sdk-grid">
-      <div class="sdk">
+      <div class="sdk reveal">
         <div class="lang">RUST · crates.io</div>
         <h3>motedb</h3>
         <div class="cmd"><span>cargo add motedb</span><button onclick="cp(this)" data-copy="复制" data-ok="✓">复制</button></div>
         <a class="more" href="https://github.com/motedb/motedb" target="_blank" rel="noopener" data-i18n="sk.more">文档与示例 →</a>
       </div>
-      <div class="sdk">
+      <div class="sdk reveal">
         <div class="lang">PYTHON · PyPI</div>
         <h3>motedb-python</h3>
         <div class="cmd"><span>pip install motedb-python</span><button onclick="cp(this)" data-copy="复制" data-ok="✓">复制</button></div>
         <a class="more" href="https://github.com/motedb/motedb" target="_blank" rel="noopener" data-i18n="sk.more">文档与示例 →</a>
       </div>
-      <div class="sdk">
+      <div class="sdk reveal">
         <div class="lang">NODE.JS · npm<span class="soon" data-i18n="sk.soon">发布配置中</span></div>
         <h3>motedb</h3>
         <div class="cmd"><span>npm install motedb</span><button onclick="cp(this)" data-copy="复制" data-ok="✓">复制</button></div>
@@ -338,11 +396,12 @@ db.execute(<span class="s">"EXPORT DB TO 'fleet.mote'"</span>)</pre>
     </div>
   </div>
 </section>
+</main>
 
 <footer>
   <div class="wrap">
     <div class="brand">
-      <img src="logo-mark.png" height="24" alt="MoteDB">
+      <img src="logo-mark-dark.png" height="26" alt="">
       mote<b style="color:var(--orange)">DB</b>
     </div>
     <div>© 2026 MoteDB · MIT License</div>
@@ -363,7 +422,6 @@ const I18N = {
     'hero.t1':'具身智能的','hero.t2':'多模态嵌入式数据库',
     'hero.sub':'一个 SQL 引擎，原生承载 <b>向量 · 时序 · 文本 · 二进制</b>。从机器人数据采集到舰队分发——嵌入式零运维，打开即用。',
     'npm.soon':'发布配置中','hero.cta1':'5 分钟上手','hero.cta2':'查看源码',
-    'copy':'复制','ok':'✓',
     'st.1':'引擎 · 三种形态','st.2':'官方 SDK','st.3':'平台预构建二进制','st.4':'模态：向量/时序/文本/BLOB','st.5':'轮独立发布审计',
     'ft.tag':'// FEATURES','ft.title':'为具身 AI 工作负载而生',
     'ft.lead':'不是通用数据库的裁剪版——每个能力都对着机器人数据的真实形状设计。',
@@ -396,7 +454,6 @@ const I18N = {
     'hero.t1':'The multimodal embedded database','hero.t2':'for embodied intelligence',
     'hero.sub':'One SQL engine natively carrying <b>vectors · time series · text · binary</b>. From robot data capture to fleet distribution — embedded, zero-ops, ready on open.',
     'npm.soon':'coming soon','hero.cta1':'Get started in 5 min','hero.cta2':'View source',
-    'copy':'Copy','ok':'✓',
     'st.1':'engine · three forms','st.2':'official SDKs','st.3':'prebuilt platforms','st.4':'modalities: vector/ts/text/BLOB','st.5':'independent release audits',
     'ft.tag':'// FEATURES','ft.title':'Built for embodied-AI workloads',
     'ft.lead':'Not a trimmed general-purpose database — every capability is shaped by the real anatomy of robot data.',
@@ -434,9 +491,7 @@ function setLang(l){
     const v = I18N[l][el.dataset.i18n];
     if (v !== undefined) el.innerHTML = v;
   });
-  document.querySelectorAll('[data-copy]').forEach(b => {
-    b.textContent = I18N[l]['copy'];
-  });
+  document.querySelectorAll('[data-copy]').forEach(b => { b.textContent = I18N[l]['copy']; });
   document.getElementById('langBtn').textContent = l === 'zh' ? 'EN' : '中文';
   document.title = l === 'zh'
     ? 'MoteDB — 具身智能的多模态嵌入式数据库'
@@ -445,7 +500,7 @@ function setLang(l){
 function toggleLang(){ setLang(LANG === 'zh' ? 'en' : 'zh'); }
 setLang(LANG);
 
-/* ── copy buttons ── */
+/* ── copy ── */
 function cp(btn){
   const src = btn.parentElement.querySelector('code') || btn.parentElement.querySelector('span');
   navigator.clipboard.writeText(src.innerText.trim()).then(() => {
@@ -453,6 +508,27 @@ function cp(btn){
     setTimeout(() => { btn.textContent = I18N[LANG]['copy']; }, 1200);
   });
 }
+
+/* ── scroll reveal ── */
+const io = new IntersectionObserver(es => {
+  es.forEach(e => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+}, { threshold: 0.12 });
+document.querySelectorAll('.reveal').forEach(el => io.observe(el));
+
+/* ── stat counters ── */
+const cio = new IntersectionObserver(es => {
+  es.forEach(e => {
+    if (!e.isIntersecting) return;
+    const el = e.target, n = +el.dataset.n, t0 = performance.now();
+    (function tick(t){
+      const p = Math.min((t - t0) / 900, 1);
+      el.textContent = Math.round(n * (1 - Math.pow(1 - p, 3)));
+      if (p < 1) requestAnimationFrame(tick);
+    })(t0);
+    cio.unobserve(el);
+  });
+}, { threshold: 0.6 });
+document.querySelectorAll('.cnt').forEach(el => cio.observe(el));
 </script>
 </body>
 </html>

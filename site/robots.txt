@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://motedb.github.io/motedb/sitemap.xml
