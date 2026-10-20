@@ -91,9 +91,13 @@ jobs:
 
   node-alpine:
     # musl: the only place the motedb-linux-x64-musl platform package and the
-    # loader's libc detection get exercised end to end.
+    # loader's libc detection get exercised end to end. Non-blocking until the
+    # musl platform packages are actually published (node-publish.yml has
+    # their matrix entries commented out pending a PR run) — until then this
+    # job is expected to fail at the loader and must not open an issue.
     needs: resolve
     if: contains(needs.resolve.outputs.langs, 'node')
+    continue-on-error: true
     runs-on: ubuntu-latest
     container: node:22-alpine
     steps:

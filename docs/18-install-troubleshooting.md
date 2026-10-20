@@ -83,8 +83,8 @@ edge installs small.
 **How loading works.** `motedb` is a pure-JS loader; the compiled addon lives
 in one platform package pulled in through `optionalDependencies`:
 `motedb-darwin-arm64`, `motedb-darwin-x64`, `motedb-linux-x64-gnu`,
-`motedb-linux-arm64-gnu`, `motedb-linux-x64-musl`, `motedb-linux-arm64-musl`,
-`motedb-win32-x64-msvc`. Exactly one of them should be installed:
+`motedb-linux-arm64-gnu`, `motedb-win32-x64-msvc`. Exactly one of them should
+be installed:
 
 ```bash
 npm ls | grep motedb-
@@ -107,10 +107,15 @@ missing. Causes, most common first:
    cdylib next to `index.js` as `motedb.<platform>-<arch>[-libc].node` or set
    `MOTEDB_NODE_LIB=/abs/path/to/motedb.node`.
 
-**Alpine / musl.** The loader detects musl (from `/usr/bin/ldd` or the process
-report) and requires `motedb-linux-<arch>-musl`. If the error message says
-`-gnu` inside an Alpine container, the detection failed — open an issue with
-the output of `node -p "process.report.getReport().header"`.
+**Alpine / musl.** No musl platform packages are published yet (the build
+step exists in `node-publish.yml`; the matrix entries are enabled once a PR
+run proves them). The loader already detects musl — from `/usr/bin/ldd` or
+the process report — and will require `motedb-linux-<arch>-musl` as soon as
+it exists; today it reports `not found for linux-x64-musl`, which is
+expected: build from source inside the Alpine image (Rust ≥ 1.87,
+`apk add build-base`). If the message says `-gnu` inside an Alpine container,
+the detection itself failed — open an issue with the output of
+`node -p "process.report.getReport().header"`.
 
 **Electron.** The addon is built against Node-API, which is ABI-stable across
 Node and Electron versions; no `electron-rebuild` needed.

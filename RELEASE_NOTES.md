@@ -95,9 +95,10 @@ BLOB 在 int 过滤查询下的双缺陷(装载门只匹配 Text tag + 输出臂
 ## 已知限制
 
 > 发布渠道现状(2026-10-20 更新): crates.io `motedb` 0.15.0 与 PyPI
-> `motedb-python` 0.15.0 **均已上线**。npm `motedb` 尚未首发 —— 流水线已切
-> npmjs.org 无作用域包(7 平台: macOS arm64/x64、Linux x64/arm64 gnu+musl、
-> Windows x64),待仓库配置 NPM_TOKEN secret 后由 v* tag 触发。
+> `motedb-python` 0.15.0 **均已上线**。npm `motedb` 随 v0.15.1 首发 —— 流水线
+> 已切 npmjs.org 无作用域包(5 平台: macOS arm64/x64、Linux x64/arm64 glibc、
+> Windows x64);musl/Alpine 平台包的构建步骤已就位, 待 PR 验证后在后续 patch
+> 放开矩阵。
 
 - timestamp 索引覆盖 ts 首列表;非首列 ts 的 query_timestamp_range
   走扫描(与 v0.14 相同)

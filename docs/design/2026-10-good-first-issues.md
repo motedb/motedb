@@ -40,8 +40,10 @@ drops the two paragraphs about the message.
 **Labels:** good first issue · ci · python
 
 `pip install motedb-python` has no wheel for musl Linux, so Alpine containers
-fall back to a source build that needs Rust 1.87. The Node binding already
-ships musl binaries (`node-publish.yml`); do the same for Python in
+fall back to a source build that needs Rust 1.87. The Node binding is adding
+musl binaries the same way (`node-publish.yml` has the Alpine-container build
+step; its matrix entries are enabled after a PR run proves them); do the same
+for Python in
 `.github/workflows/python-wheels.yml`: add `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl` matrix entries using `maturin-action` with
 `manylinux: musllinux_1_2`. Note the Linux Python build is already

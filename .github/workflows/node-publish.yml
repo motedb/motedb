@@ -266,10 +266,15 @@ jobs:
         run: |
           set -e
           pub() {
-            local d="$1" name try
+            local d="$1" name ver try
             name=$(jq -r .name "$d/package.json")
-            if npm view "$name" version >/dev/null 2>&1; then
-              echo "  $name already on npm — skip"; return 0
+            ver=$(jq -r .version "$d/package.json")
+            # Compare the PINNED version, not mere existence: after a version
+            # bump the old package is on npm but this version is not, and
+            # skipping would leave root's optionalDependencies pointing at a
+            # version that never ships (E404 for every consumer).
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "  $name@$ver already on npm — skip"; return 0
             fi
             for try in 1 2 3; do
               echo "::group::publish $name (attempt $try)"

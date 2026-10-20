@@ -51,7 +51,9 @@ MOTEDB_NODE_LIB=/abs/path/to/motedb.node node your-test.js
 
 Prebuilt binaries ship as per-platform optional dependencies, built by
 `.github/workflows/node-publish.yml`: macOS arm64/x64, Linux x64/arm64
-(glibc **and** musl — Alpine containers work), Windows x64. The loader picks
-the musl package automatically when it detects a musl libc. If `npm install`
-ran with `--no-optional`, or you are on an unlisted platform, build from
-source as above. Troubleshooting: `docs/18-install-troubleshooting.md`.
+(glibc), Windows x64. musl (Alpine) packages are wired up in the workflow but
+not published yet — the loader already detects musl and will pick
+`motedb-linux-<arch>-musl` once it exists; until then build from source on
+Alpine. If `npm install` ran with `--no-optional`, or you are on an unlisted
+platform, build from source as above. Troubleshooting:
+`docs/18-install-troubleshooting.md`.

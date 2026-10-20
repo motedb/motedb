@@ -13,15 +13,19 @@
 > `motedb-python` 0.15.0 **已上线**(RELEASE_NOTES 的"待 token/待登记"已过时),
 > 只有 npm `motedb` 未首发。Phase 0 的发布动作因此收窄为 npm 一项。
 >
-> **Phase 0 进度(2026-10-20)**:工程部分已完成 — npm musl ×2 目标 + 加载器
-> libc 检测 + 流水线 NPM_TOKEN 守卫;`scripts/release_smoke.sh` + `make
+> **Phase 0 进度(2026-10-20)**:工程部分已完成 — npm 加载器 libc 检测 +
+> 流水线 NPM_TOKEN 守卫 + musl Alpine 容器构建步骤(矩阵条目暂注释,待 PR
+> 验证后放开 —— 首发不与未验证目标耦合);`scripts/release_smoke.sh` + `make
 > release-smoke[-local]` + `release-smoke.yml`(tag 触发,失败自动开 issue),
 > Python/Rust 两路对已发布 0.15.0 实测通过;README/docs/01/02/RELEASE_NOTES
-> 六处失真修正;docs/18 排障;CONTRIBUTING/SECURITY/issue 表单 ×3/PR 模板;
+> 八处失真修正;docs/18 排障;CONTRIBUTING/SECURITY/issue 表单 ×3/PR 模板;
 > good-first-issue 草稿 ×10(`2026-10-good-first-issues.md`)。
-> **待管理员**:① 仓库 secret `NPM_TOKEN` → 推 tag 首发 npm;② 开通
-> Discussions(Q&A/Show & Tell/Ideas/Robotics data);③ 按草稿创建 10 条
-> issue 并建标签;④ 官网安装卡片在 motedb.github.io 仓库(本仓库仅 llms.txt 源)。
+> **v0.15.1 发布**:三渠道同版本 —— crates.io / PyPI 刷新(修正后的 README
+> 上包页)+ npm 首发(5 平台)。
+> **待管理员**:① 开通 Discussions(Q&A/Show & Tell/Ideas/Robotics data);
+> ② 按草稿创建 10 条 issue 并建标签;③ 官网安装卡片在 motedb.github.io 仓库
+> (本仓库仅 llms.txt 源);④ musl:开一个只改 package.json targets + 取消
+> 矩阵注释的 PR,node-publish 的 PR 触发会 build-only 验证 7 目标,绿了即合。
 
 ---
 
@@ -48,7 +52,7 @@ Phase 2  W7-8   向量索引工业化 (旋钮 SQL 化/写入吞吐/PQ spike) ─
 
 | 维度 | 现状 (v0.15.0) | 行业参照 (2026-10) | 目标 (W12) |
 |---|---|---|---|
-| 可安装性 | crates.io `motedb` 0.15.0 ✅ 已上线;PyPI `motedb-python` 0.15.0 ✅ 已上线;**npm `motedb` 未首发**(待 NPM_TOKEN);README/docs 安装指令多处失真(已修) | `pip install` 三秒跑通是底线;竞品全渠道首发即通 | 三渠道同版本、7 平台(npm +musl×2 已配)、指令零失真、release smoke 守门 |
+| 可安装性 | crates.io `motedb` 0.15.0 ✅ 已上线;PyPI `motedb-python` 0.15.0 ✅ 已上线;npm `motedb` 随 v0.15.1 首发(5 平台);README/docs 安装指令多处失真(已修) | `pip install` 三秒跑通是底线;竞品全渠道首发即通 | 三渠道同版本、7 平台(npm musl ×2 经 PR 验证后放开)、指令零失真、release smoke 守门 |
 | 训练生态 | MCAP 进得来、无出口:Parquet 支持 0、LeRobot 支持 0、DataLoader 0 | LeRobot v3 = 事实标准(46+ 本体社区集);Rerun 0.32 自带 PyTorch dataloader + SQL catalog | LeRobot v3 双向互认 + 官方 DataLoader recipe |
 | 基准公信力 | 自测 220K×384 vs FAISS(compete_vec_industry.py);Apple Silicon 自跑 | LanceDB 发布 10B 级公开基准;第三方横评(LanceDB/Chroma/sqlite-vec)已成文 | +1M 档、+LanceDB/sqlite-vec/DuckDB-VSS,`make bench-industry` 可复现 |
 | 向量索引 | Vamana + SQ8(4x)已实现;旋钮(max_degree/search_list_size/alpha/beam_width)未暴露到 SQL/Python;写入 24K vecs/s;PQ 仅注释 | 多索引/量化/旋钮是标配;写入 ~100K vecs/s 量级 | 旋钮 SQL 化、batch 写入 ≥80K vecs/s、PQ go/no-go 有决议 |
@@ -73,18 +77,20 @@ Phase 2  W7-8   向量索引工业化 (旋钮 SQL 化/写入吞吐/PQ spike) ─
 `motedb` 在 PyPI 仍空闲,未来若要占用可发一个依赖 `motedb-python` 的元包,
 不改现有名字。README L58 原写 `pip install motedb` 已修正。
 
-**npm** — ❌ `motedb` 尚未首发。`node-publish.yml` 已切 registry.npmjs.org,
+**npm** — `motedb` 随 **v0.15.1 首发**(5 平台:macOS arm64/x64、Linux
+x64/arm64 glibc、Windows x64)。`node-publish.yml` 已切 registry.npmjs.org,
 本次补齐:
-- package.json napi.targets + optionalDependencies 补 `x86_64-unknown-linux-musl`
-  / `aarch64-unknown-linux-musl`(7 平台);workflow 矩阵用 napi-rs Alpine 镜像
-  构建 musl(x64 在容器内跑 smoke,arm64 交叉编译,显式设 CC/linker 走镜像内
-  `aarch64-linux-musl-gcc`——**首次 CI 跑需确认**)
 - `index.js` 加载器按 `/usr/bin/ldd` / `process.report` 检测 musl,平台包后缀
-  `-gnu|-musl|-msvc` 完整化;Node 绑定 `default-features = false`,无 jemalloc
-  musl 兼容风险
-- publish job 增 NPM_TOKEN 缺失即明确报错;陈旧的 GitHub Packages 头注释更正
-- **待管理员**:npmjs.org 建 automation token → 仓库 secret `NPM_TOKEN` →
-  推 v* tag 首发
+  `-gnu|-musl|-msvc` 完整化;错误信息指向 docs/18
+- publish job 增 NPM_TOKEN 缺失即明确报错;陈旧的 GitHub Packages 头注释更正;
+  冒烟脚本落盘 `smoke_ci.js`(release smoke 复用)
+- **musl ×2(x86_64 / aarch64)**:Alpine 容器构建步骤已写入工作流(napi-rs
+  镜像,arm64 交叉编译显式设 CC/linker),但**矩阵条目注释、package.json 仍 5
+  目标** —— `publish` 需全矩阵绿,未经 CI 验证的目标不能有机会卡住首发。
+  放开路径:一个只改 package.json targets/optionalDependencies + 取消矩阵注释
+  的 PR;node-publish 对 `bindings/node/**` 的 PR 触发会 build-only 验证 7 目标
+  并 dry-run 发布,绿了合入,下个 patch 发出 musl 平台包(Node 绑定
+  `default-features = false`,无 jemalloc musl 兼容风险)
 
 ### 2. release smoke(发布门,防"发了但装不上")
 
