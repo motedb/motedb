@@ -256,17 +256,19 @@ jobs:
         # root loader whose optionalDependencies point at them). Auth comes
         # from setup-node's .npmrc + NODE_AUTH_TOKEN. `napi pre-publish` is
         # deliberately NOT used: it assumes a GitHub release flow we don't run.
-        # Idempotent + burst-safe: skips packages already on the registry
+        # Idempotent + burst-safe: skips versions already on the registry
         # (EPUBLISHCONFLICT would otherwise abort the loop on re-runs) and
-        # paces publishes ~3 min apart with retries — npm's anti-spam
-        # heuristics reject rapid-fire new-package creation from new accounts.
+        # paces publishes with escalating retries — npm's anti-spam
+        # heuristics reject rapid-fire new-package creation from new accounts
+        # (v0.15.1 tag run: the one brand-new platform package burned all 3
+        # fast retries; a cooldown + re-dispatch is the recovery path).
         working-directory: bindings/node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
           pub() {
-            local d="$1" name ver try
+            local d="$1" name ver try wait
             name=$(jq -r .name "$d/package.json")
             ver=$(jq -r .version "$d/package.json")
             # Compare the PINNED version, not mere existence: after a version
@@ -276,16 +278,21 @@ jobs:
             if npm view "$name@$ver" version >/dev/null 2>&1; then
               echo "  $name@$ver already on npm — skip"; return 0
             fi
-            for try in 1 2 3; do
-              echo "::group::publish $name (attempt $try)"
+            # Escalating backoff: anti-spam blocks clear after a cooldown,
+            # not immediately — fast retries just burn the attempts.
+            for try in 1 2 3 4 5; do
+              echo "::group::publish $name@$ver (attempt $try)"
               if (cd "$d" && npm publish --access public); then
-                echo "::endgroup::"; echo "  published $name"; return 0
+                echo "::endgroup::"; echo "  published $name@$ver"; return 0
               fi
               echo "::endgroup::"
-              [ "$try" = 3 ] && break
-              echo "  retry in 180s (npm anti-spam/rate heuristics)"; sleep 180
+              [ "$try" = 5 ] && break
+              case "$try" in
+                1) wait=120 ;; 2) wait=300 ;; 3) wait=600 ;; *) wait=900 ;;
+              esac
+              echo "  retry in ${wait}s (npm anti-spam/rate heuristics)"; sleep "$wait"
             done
-            echo "::error::gave up publishing $name after 3 attempts"
+            echo "::error::gave up publishing $name@$ver after 5 attempts"
             return 1
           }
           # 主包最优先 — 它是 `npm install motedb` 的入口; 平台包是
@@ -293,5 +300,5 @@ jobs:
           # (失败让 job 标红以便跟踪, 但其余包继续发)。
           pub . || exit 1
           rc=0
-          for d in npm/*/; do pub "$d" || rc=1; sleep 90; done
+          for d in npm/*/; do pub "$d" || rc=1; sleep 120; done
           exit $rc
