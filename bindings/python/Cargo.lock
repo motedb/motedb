@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "motedb"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arc-swap",
  "base64",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "motedb-python"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "motedb",
  "pyo3",

@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.15.1] — 2026-10-20
+
+发布渠道与安装体验 patch(docs/design/2026-10-industry-parity-plan.md Phase 0)。
+**无引擎改动,存储格式与 API 不变**;crates.io / PyPI 刷新为修正后的 README,
+npm `motedb` 首发。
+
+- **🔑 npm 首发**: `motedb` 无作用域包 + 5 平台预构建(macOS arm64/x64、Linux
+  x64/arm64 glibc、Windows x64)。`index.js` 加载器重写平台后缀解析 — 完整
+  `-gnu|-musl|-msvc` 三元组, musl 检测(`/usr/bin/ldd` / `process.report`,
+  与 napi-rs 生成的加载器同一启发式), 错误信息指向排障文档; 流水线
+  NPM_TOKEN 缺失即明确报错, 冒烟脚本落盘为 `bindings/node/smoke_ci.js`
+  (release smoke 复用)。musl ×2 的 Alpine 容器构建步骤已写入工作流, 矩阵条目
+  暂注释 — `publish` 需全矩阵绿, 未经 CI 验证的目标不与首发耦合, 经 PR
+  build-only 验证后在后续 patch 放开
+- **release smoke(发布门)**: `scripts/release_smoke.sh` 从三个注册表安装
+  **已发布**产物到一次性环境跑 README 示例(`--local` 验工作树, `--wait` 等
+  注册表传播); `make release-smoke[-local]`; `.github/workflows/release-smoke.yml`
+  v* tag 触发(Python ×4 平台 / Node ×4 + Alpine 容器 / Rust), 失败自动开或
+  追评 issue。Python 与 Rust 两路对已发布 0.15.0 实测通过
+- **文档失真清零 ×8**: README `pip install motedb` → `motedb-python`(PyPI 包名
+  自始即为后者)、crate 版本 `0.12` → `0.15` ×2、Node SDK 状态行; docs/01 与
+  docs/02 的 `motedb = "0.1"`、Rust 1.70 → 1.87(实际 MSRV)、`yourusername`
+  占位 URL; Node README 的 `NODE_LIB` → `MOTEDB_NODE_LIB`(原环境变量不存在,
+  且 `require()` 不能直接加载 `.dylib`, 改为拷贝为 `.node`); RELEASE_NOTES
+  已知限制改为真实渠道状态(crates.io / PyPI 0.15.0 已上线)
+- **新文档**: `docs/18-install-troubleshooting.md` — 三渠道包名对照、每语言
+  十秒验证一行命令(Python 条对 0.15.0 实测)、Python 轮子覆盖矩阵、Node 平台包
+  装载错误逐因排查、Rust MSRV/特性/交叉编译; docs/README 索引补 17/18
+- **社区地基**: `CONTRIBUTING.md`(CI 全部质量门的本地命令表、变更纪律、提交
+  规范)、`SECURITY.md`(范围/私密报送/SLA/既有加固)、issue 表单 ×3(bug /
+  安装问题 / 功能请求)+ config(关闭空白 issue, 指向 Discussions 与私密报送)、
+  PR 模板; good-first-issue 草稿 ×10(`docs/design/2026-10-good-first-issues.md`,
+  含 macOS jemalloc `background_thread` 噪音修法、Python musllinux 轮子、
+  README doctest 化等)
+- **设计文档**: `docs/design/2026-10-industry-parity-plan.md` — 行业对齐提升
+  计划(12 周三阶段: 装得上 / 连得上 / 立得住), 含 2026-10 行业调研结论与
+  差距总账
+
 ## [0.15.0] — 2026-10-17
 
 ### 存储文件布局收敛 (docs/design/2026-10-file-layout{,-plan}.md, P1~P4)
