@@ -20,8 +20,15 @@
 > Python/Rust 两路对已发布 0.15.0 实测通过;README/docs/01/02/RELEASE_NOTES
 > 八处失真修正;docs/18 排障;CONTRIBUTING/SECURITY/issue 表单 ×3/PR 模板;
 > good-first-issue 草稿 ×10(`2026-10-good-first-issues.md`)。
-> **v0.15.1 发布**:三渠道同版本 —— crates.io / PyPI 刷新(修正后的 README
-> 上包页)+ npm 首发(5 平台)。
+> **v0.15.1 发布(2026-10-20 收口)**:crates.io / PyPI 全绿;npm 根包 + 4/5
+> 平台包(darwin×2、linux-gnu×2)0.15.1 已上线,本地实测安装+冒烟通过。唯一
+> 遗留:`motedb-win32-x64-msvc`(全新包名)被 npm 新账号反垃圾拦截,tag 运行
+> 3 次重试 + 手动重发 5 次递增退避(120/300/600/900s)均未在窗口内解除 —
+> **恢复路径 = 冷却数小时后 Actions 里再点一次 Run workflow(node-publish,
+> main)**,幂等检查只补这一个包;或从失败的 run 下载 win32 构建产物本地
+> `npm publish`。Windows 用户在此之前 `npm install motedb` 得到 optional-dep
+> 警告(macOS/Linux 不受影响)。release-smoke 的 tag 运行因等根包超时开过
+> issue #1 — npm 齐后 dispatch release-smoke(version=0.15.1)取绿色记录并关闭。
 > **待管理员**:① 开通 Discussions(Q&A/Show & Tell/Ideas/Robotics data);
 > ② 按草稿创建 10 条 issue 并建标签;③ 官网安装卡片在 motedb.github.io 仓库
 > (本仓库仅 llms.txt 源);④ musl:开一个只改 package.json targets + 取消
