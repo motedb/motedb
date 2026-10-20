@@ -26,10 +26,12 @@ It is an embedded database purpose-built for edge devices such as home robots, A
 ### Advanced Topics
 - **Performance Tuning**: [./12-performance.md](./12-performance.md) - Configuration, tuning, and monitoring
 - **Data Types**: [./13-data-types.md](./13-data-types.md) - `Value` enum and schema design
+- **Hybrid Search & Arrow/pandas Interop**: [./17-hybrid-arrow.md](./17-hybrid-arrow.md) - RRF fusion, `query_arrow()` / `query_pandas()`
 
 ### Best Practices
 - **Production Experience**: [./15-best-practices.md](./15-best-practices.md) - Architecture, writes, and indexing strategies
 - **FAQ**: [./16-faq.md](./16-faq.md) - Debugging, deployment, and troubleshooting
+- **Install Troubleshooting**: [./18-install-troubleshooting.md](./18-install-troubleshooting.md) - Package names per registry, platform coverage, loader errors
 
 ## 🚀 Core Features
 
@@ -111,8 +113,9 @@ db.commit_transaction(tx_id)?;
 
 ## 🔗 Quick Links
 
-- [GitHub Repository](https://github.com/yourusername/motedb)
+- [GitHub Repository](https://github.com/motedb/motedb)
 - [API Documentation](https://docs.rs/motedb)
+- [Website](https://motedb.github.io/)
 
 ## 📝 Version Information
 

@@ -1,0 +1,156 @@
+name: Release smoke (published packages)
+
+# Post-publish gate. On every v* tag: wait until the three registries show
+# the version, then `pip install` / `npm install` / `cargo add` it into
+# throwaway environments on each platform and run the README examples
+# (scripts/release_smoke.sh). A failure opens (or bumps) a tracking issue so
+# a broken release is never silent. Runnable by hand for any version.
+#
+# This job installs the PUBLISHED artifacts — it does not build anything from
+# the tree, so it only passes once publish.yml / python-wheels.yml /
+# node-publish.yml have all landed for the same tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to smoke (e.g. 0.15.0). Empty = the tag, else Cargo.toml."
+        required: false
+        default: ""
+      langs:
+        description: "Comma-separated subset of python,node,rust"
+        required: false
+        default: "python,node,rust"
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  # Registries lag their publish workflows by minutes; poll up to 30 min.
+  SMOKE_WAIT: "1800"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      langs: ${{ steps.v.outputs.langs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: |
+          v="${{ github.event.inputs.version }}"
+          if [ -z "$v" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              v="${GITHUB_REF_NAME#v}"
+            else
+              v="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+            fi
+          fi
+          l="${{ github.event.inputs.langs }}"
+          [ -n "$l" ] || l="python,node,rust"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "langs=$l" >> "$GITHUB_OUTPUT"
+          echo "smoking v$v ($l)"
+
+  python:
+    needs: resolve
+    if: contains(needs.resolve.outputs.langs, 'python')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - shell: bash
+        run: scripts/release_smoke.sh -v "${{ needs.resolve.outputs.version }}" -l python --wait "$SMOKE_WAIT"
+
+  node:
+    needs: resolve
+    if: contains(needs.resolve.outputs.langs, 'node')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - shell: bash
+        run: scripts/release_smoke.sh -v "${{ needs.resolve.outputs.version }}" -l node --wait "$SMOKE_WAIT"
+
+  node-alpine:
+    # musl: the only place the motedb-linux-x64-musl platform package and the
+    # loader's libc detection get exercised end to end.
+    needs: resolve
+    if: contains(needs.resolve.outputs.langs, 'node')
+    runs-on: ubuntu-latest
+    container: node:22-alpine
+    steps:
+      - run: apk add --no-cache bash curl git
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: scripts/release_smoke.sh -v "${{ needs.resolve.outputs.version }}" -l node --wait "$SMOKE_WAIT"
+
+  rust:
+    needs: resolve
+    if: contains(needs.resolve.outputs.langs, 'rust')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - shell: bash
+        run: scripts/release_smoke.sh -v "${{ needs.resolve.outputs.version }}" -l rust --wait "$SMOKE_WAIT"
+
+  report:
+    needs: [resolve, python, node, node-alpine, rust]
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          RESULTS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const version = process.env.VERSION;
+            const results = JSON.parse(process.env.RESULTS);
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const title = `Release smoke failed for v${version}`;
+            const table = Object.entries(results)
+              .filter(([name]) => name !== 'resolve')
+              .map(([name, r]) => `| ${name} | ${r.result} |`)
+              .join('\n');
+            const body = [
+              `The install-and-run smoke for the **published** v${version} packages failed.`,
+              '',
+              `Run: ${runUrl}`,
+              '',
+              '| job | result |', '|---|---|', table,
+              '',
+              'Reproduce locally: `scripts/release_smoke.sh -v ' + version + '` (see docs/18-install-troubleshooting.md).',
+              'Until this is green, users may be unable to install this version — fix forward with a patch release rather than re-tagging.',
+            ].join('\n');
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const existing = open.find((i) => i.title === title && !i.pull_request);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `Failed again: ${runUrl}\n\n| job | result |\n|---|---|\n${table}`,
+              });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }

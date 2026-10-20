@@ -1,0 +1,64 @@
+name: Installation problem
+description: pip / npm / cargo install fails, or the module does not load.
+title: "[install] "
+labels: ["install"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please read [docs/18-install-troubleshooting.md](https://github.com/motedb/motedb/blob/main/docs/18-install-troubleshooting.md)
+        first — the package names differ per registry (`pip install motedb-python`, `npm install motedb`,
+        `cargo add motedb`) and most reports are covered there.
+  - type: dropdown
+    id: lang
+    attributes:
+      label: Language
+      options:
+        - Python (pip install motedb-python)
+        - Node.js (npm install motedb)
+        - Rust (cargo add motedb)
+        - Go (bindings/go)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version you tried to install
+      placeholder: "0.15.0"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS / architecture / libc
+      description: "`uname -a` (or `ver` on Windows). On Linux say glibc or musl (Alpine)."
+      placeholder: "Linux 6.8 aarch64, Debian 12 (glibc 2.36) / Alpine 3.20 (musl) / macOS 15 arm64 / Windows 11 x64"
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime version
+      description: "`python -V && python -m pip --version` / `node -v && npm -v` / `rustc -V && cargo -V`"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Full output
+      description: Everything the command printed, unedited. For Node loader errors include `npm ls | grep motedb-`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment details
+      description: "Container / CI image, proxy or private registry mirror, `--no-optional` / `--omit=optional`, pnpm/yarn, virtualenv/conda, anything non-default."

@@ -55,7 +55,7 @@ cargo run --example hello_world
 For the multimodal features (vector / full-text / spatial search), see
 [`examples/crud.rs`](examples/crud.rs) and the [indexes overview](docs/06-indexes-overview.md).
 
-Python bindings (`pip install motedb`) — bulk load and columnar fetch are
+Python bindings (`pip install motedb-python`, imported as `motedb`) — bulk load and columnar fetch are
 first-class:
 
 ```python
@@ -276,9 +276,11 @@ Every push runs through three CI workflows:
 | Language | Package | Status |
 |---|---|---|
 | Rust | `motedb` (crates.io) | stable |
-| Python | `motedb-python` (PyPI) | stable |
-| Node.js | `motedb` (npm, bindings/node, napi-rs v3) | preview (linux-gnu builds; musl not yet) |
+| Python | `motedb-python` (PyPI, `import motedb`) | stable |
+| Node.js | `motedb` (npm, bindings/node, napi-rs v3) | preview — prebuilt for macOS arm64/x64, Linux x64/arm64 (gnu + musl), Windows x64 |
 | Go | `bindings/go` (cgo) | preview |
+
+Installation problems? See [docs/18-install-troubleshooting.md](docs/18-install-troubleshooting.md).
 
 ## Installation
 
@@ -289,13 +291,13 @@ cargo add motedb
 Or in `Cargo.toml`:
 ```toml
 [dependencies]
-motedb = "0.12"
+motedb = "0.15"
 ```
 
 For minimal edge builds (no tokenizer, no parallelism), disable default features:
 ```toml
 [dependencies]
-motedb = { version = "0.12", default-features = false, features = ["jemalloc"] }
+motedb = { version = "0.15", default-features = false, features = ["jemalloc"] }
 ```
 
 ## Configuration
@@ -364,6 +366,7 @@ Full guides live in [`docs/`](docs/):
 - [Batch operations](docs/04-batch-operations.md) · [Transactions](docs/05-transactions.md)
 - Indexes: [overview](docs/06-indexes-overview.md) · [column](docs/07-column-index.md) · [vector](docs/08-vector-index.md) · [text](docs/09-text-index.md) · [spatial](docs/10-spatial-index.md) · [timestamp](docs/11-timestamp-index.md)
 - [Performance tuning](docs/12-performance.md) · [Data types](docs/13-data-types.md) · [API reference](docs/14-api-reference.md) · [Best practices](docs/15-best-practices.md) · [FAQ](docs/16-faq.md)
+- [Hybrid search & Arrow/pandas interop](docs/17-hybrid-arrow.md) · [Install troubleshooting](docs/18-install-troubleshooting.md)
 
 API docs: <https://docs.rs/motedb>
 

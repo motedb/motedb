@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & usage help
+    url: https://github.com/motedb/motedb/discussions/categories/q-a
+    about: "\"How do I…\", \"is this expected?\", schema design — ask in Discussions."
+  - name: Security vulnerability
+    url: https://github.com/motedb/motedb/security/advisories/new
+    about: Crash from crafted input, path traversal, silent data loss — report privately (see SECURITY.md).
+  - name: Show & tell
+    url: https://github.com/motedb/motedb/discussions/categories/show-and-tell
+    about: Built something on MoteDB? Robot, pipeline, benchmark — we would love to see it.

@@ -1,0 +1,50 @@
+name: Feature request
+description: A capability MoteDB should have — SQL syntax, an API, a format, a platform.
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Not sure it fits? Open a [Discussion](https://github.com/motedb/motedb/discussions) first.
+        Out of scope by design (see `docs/design/`): distributed / clustered mode, a client-server daemon,
+        a visualization frontend, full DuckDB-level SQL parity.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and why the current engine makes it hard. Concrete data shapes (rows, dimensions, rates) help a lot.
+    validations:
+      required: true
+  - type: dropdown
+    id: scenario
+    attributes:
+      label: Scenario
+      options:
+        - On-robot / edge capture (power-fail safety, low memory)
+        - Training-data pipeline (MCAP / LeRobot / Parquet / DataLoader)
+        - Retrieval (vector / FTS / hybrid / trajectory)
+        - Time series / episodes / alignment (ASOF JOIN etc.)
+        - SQL surface / types
+        - SDK / bindings / platform support
+        - Tooling (CLI, doctor, MCP, observability)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: The SQL or API you would like to write. Pseudocode is fine.
+      render: sql
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What you do today instead (another tool, a workaround), and why it falls short.
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to implement this with guidance.

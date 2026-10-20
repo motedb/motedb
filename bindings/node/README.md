@@ -41,8 +41,17 @@ db.close();
 ```bash
 cd bindings/node
 cargo build --release
-# dev loader picks up target/release/libmotedb_node.dylib (or .so/.dll):
-NODE_LIB=target/release/libmotedb_node.dylib node your-test.js
+# Node only dlopen()s files named *.node — copy the cdylib under the napi
+# layout name and the loader in index.js picks it up (dev layout):
+cp target/release/libmotedb_node.dylib motedb.darwin-arm64.node   # .so on Linux, .dll on Windows
+node your-test.js
+# …or point the loader at any *.node file explicitly:
+MOTEDB_NODE_LIB=/abs/path/to/motedb.node node your-test.js
 ```
 
-Multi-platform prebuilt binaries ship via napi-rs CLI in CI (`motedb.darwin-arm64.node` etc.).
+Prebuilt binaries ship as per-platform optional dependencies, built by
+`.github/workflows/node-publish.yml`: macOS arm64/x64, Linux x64/arm64
+(glibc **and** musl — Alpine containers work), Windows x64. The loader picks
+the musl package automatically when it detects a musl libc. If `npm install`
+ran with `--no-optional`, or you are on an unlisted platform, build from
+source as above. Troubleshooting: `docs/18-install-troubleshooting.md`.

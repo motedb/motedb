@@ -8,8 +8,11 @@ Add the dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-motedb = "0.1"
+motedb = "0.15"
 ```
+
+Python and Node.js users: `pip install motedb-python` / `npm install motedb`
+(see [02-installation.md](./02-installation.md) for the full matrix).
 
 ## Basic Usage
 

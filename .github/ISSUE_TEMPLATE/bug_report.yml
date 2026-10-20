@@ -1,0 +1,73 @@
+name: Bug report
+description: Something returns the wrong result, panics, corrupts data or hangs.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Install / import problems have their own template ("Installation problem").
+        Security-relevant bugs (crash from crafted input, path traversal, data loss): please use
+        private reporting instead — see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: MoteDB version
+      description: "`cargo tree -i motedb`, `python -c \"import importlib.metadata as m; print(m.version('motedb-python'))\"`, or `node -p \"require('motedb/package.json').version\"`"
+      placeholder: "0.15.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where you hit it
+      options:
+        - Rust crate
+        - Python (motedb-python)
+        - Node.js (motedb)
+        - Go binding
+        - motedb-cli
+        - SQL (any surface)
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "macOS 15 arm64 / Ubuntu 24.04 x86_64 (glibc) / Alpine 3.20 (musl) / Windows 11 x64"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Actual behaviour, including the full error message or panic backtrace (`RUST_BACKTRACE=1`).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: |
+        The smallest schema + statements (or code) that shows the problem. Starting from an empty
+        database is ideal. If it needs an existing database file, say whether you can share it.
+      render: sql
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Output with `RUST_LOG=motedb=debug` (Rust) or the equivalent logger in your language, if relevant."
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: "Preset (`for_edge` / `for_robotics` / `for_embodied` / default) and any overridden `DBConfig` fields, read-only container or not."
