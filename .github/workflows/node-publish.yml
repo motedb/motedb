@@ -3,13 +3,16 @@ name: Node SDK publish (npm)
 # Multi-platform prebuilt napi binaries → npmjs.org (unscoped):
 #   motedb (main, pure JS loader) + one platform package per target:
 #   motedb-darwin-arm64 / -darwin-x64 / -linux-x64-gnu / -linux-arm64-gnu /
-#   -linux-x64-musl / -linux-arm64-musl / -win32-x64-msvc
+#   -win32-x64-msvc
 # Triggers on v* tags (publish) and PRs touching the binding (build-only).
 # 🔑 Publishing needs the NPM_TOKEN repository secret (an npmjs.org automation
 #   token with publish rights on the motedb* packages). The publish job fails
 #   fast with a clear message when it is missing.
-# musl targets build inside the napi-rs Alpine image (host runners are glibc);
-#   the x64 one also runs the smoke there, arm64-musl is cross-compiled.
+# musl (Alpine) targets: the Alpine-container build step below is wired up but
+#   the two matrix entries stay commented out until a PR run has proven them —
+#   `publish` needs every matrix job green, so an unproven target must not be
+#   able to block a release. Enable them together with the matching
+#   package.json targets/optionalDependencies.
 
 on:
   push:
@@ -46,15 +49,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          # musl: GitHub runners are glibc, so build in the napi-rs Alpine
-          # image (same recipe as the napi-rs project template). The image
-          # carries the aarch64-linux-musl cross toolchain for the arm64 one.
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
+          # musl: GitHub runners are glibc, so these build in the napi-rs
+          # Alpine image (same recipe as the napi-rs project template; the
+          # image carries the aarch64-linux-musl cross toolchain). Commented
+          # out until proven by a PR run — see the header note.
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-musl
+          #   docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
+          # - os: ubuntu-latest
+          #   target: aarch64-unknown-linux-musl
+          #   docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
@@ -98,6 +102,14 @@ jobs:
           options: -v ${{ github.workspace }}:/build -w /build/bindings/node -e CARGO_TERM_COLOR=always
           run: |
             set -e
+            # 容器自带 Node 18, 而 @napi-rs/cli 的依赖树 (@inquirer/core) 已要求
+            # Node≥20 (styleText) 且 --no-save 无锁文件每次拉最新 — 曾于 2026-10-20
+            # 上游漂移打破构建。装固定版本的官方 musl Node, 消除漂移。
+            NODE_ARCH=$(uname -m); [ "$NODE_ARCH" = "x86_64" ] && NODE_ARCH=x64
+            NODE_VER=v22.14.0
+            wget -qO- "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-linux-$NODE_ARCH-musl.tar.xz" \
+              | tar xJ -C /usr/local --strip-components=1
+            node -v | grep -Eq '^v2[2-9]' || { echo "node upgrade failed: $(node -v)"; exit 1; }
             rustup target add ${{ matrix.target }}
             if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
               # zstd-sys compiles C: point cc + the linker at the image's cross toolchain.
