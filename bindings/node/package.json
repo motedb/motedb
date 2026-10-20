@@ -1,8 +1,29 @@
 {
   "name": "motedb",
   "version": "0.15.0",
-  "description": "AI-native embedded multimodal database — Node.js bindings.",
+  "description": "AI-native embedded multimodal database for embodied AI & robotics — vectors, time series, full text and binary in one embedded SQL engine. Node.js bindings (napi-rs).",
   "license": "MIT",
+  "homepage": "https://motedb.github.io",
+  "bugs": {
+    "url": "https://github.com/motedb/motedb/issues"
+  },
+  "keywords": [
+    "database",
+    "embedded-database",
+    "multimodal-database",
+    "vector-database",
+    "vector-search",
+    "time-series",
+    "full-text-search",
+    "sql",
+    "robotics",
+    "embodied-ai",
+    "edge-ai",
+    "mcap",
+    "sqlite-alternative",
+    "rust",
+    "napi-rs"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/motedb/motedb.git"

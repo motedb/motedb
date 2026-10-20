@@ -13,13 +13,17 @@ license-files = ["licenses/LICENSE"]
 keywords = [
     "database",
     "embedded-database",
+    "multimodal-database",
+    "vector-database",
     "vector-search",
     "full-text-search",
     "spatial",
     "time-series",
     "rag",
     "robotics",
+    "embodied-ai",
     "edge-ai",
+    "mcap",
     "sql",
 ]
 classifiers = [
@@ -43,7 +47,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/motedb/motedb"
+Homepage = "https://motedb.github.io"
 Repository = "https://github.com/motedb/motedb"
 Source = "https://github.com/motedb/motedb"
 Issues = "https://github.com/motedb/motedb/issues"

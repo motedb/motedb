@@ -6,11 +6,11 @@ rust-version = "1.87"
 description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
 license = "MIT"
 repository = "https://github.com/motedb/motedb"
-homepage = "https://github.com/motedb/motedb"
+homepage = "https://motedb.github.io"
 documentation = "https://docs.rs/motedb"
 readme = "README.md"
-keywords = ["database", "embedded", "vector", "multimodal"]
-categories = ["database", "embedded", "algorithms"]
+keywords = ["database", "embedded", "vector", "multimodal", "robotics"]
+categories = ["database-implementations", "database", "embedded", "science::robotics"]
 authors = ["motedb <motedb@126.com>"]
 publish = true
 # Exclude non-publish artifacts from the crates.io package: agent working
