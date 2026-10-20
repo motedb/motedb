@@ -271,5 +271,5 @@ jobs:
             echo "::error::gave up publishing $name after 3 attempts"
             return 1
           }
-          for d in npm/*/; do pub "$d" || exit 1; done
+          for d in npm/*/; do pub "$d" || exit 1; sleep 90; done
           pub . || exit 1
