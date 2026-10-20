@@ -1,12 +1,15 @@
 name: Node SDK publish (npm)
 
-# Multi-platform prebuilt napi binaries → GitHub Packages (npm registry):
-#   @motedb/motedb (main) + @motedb/motedb-darwin-arm64 / -darwin-x64 /
-#   -linux-x64-gnu / -linux-arm64-gnu / -win32-x64-msvc
+# Multi-platform prebuilt napi binaries → npmjs.org (unscoped):
+#   motedb (main, pure JS loader) + one platform package per target:
+#   motedb-darwin-arm64 / -darwin-x64 / -linux-x64-gnu / -linux-arm64-gnu /
+#   -linux-x64-musl / -linux-arm64-musl / -win32-x64-msvc
 # Triggers on v* tags (publish) and PRs touching the binding (build-only).
-# 🔑 GitHub Packages needs NO user secret — the built-in GITHUB_TOKEN with
-#   packages:write publishes; public packages install without auth via
-#   `@motedb:registry=https://npm.pkg.github.com` in the consumer's .npmrc.
+# 🔑 Publishing needs the NPM_TOKEN repository secret (an npmjs.org automation
+#   token with publish rights on the motedb* packages). The publish job fails
+#   fast with a clear message when it is missing.
+# musl targets build inside the napi-rs Alpine image (host runners are glibc);
+#   the x64 one also runs the smoke there, arm64-musl is cross-compiled.
 
 on:
   push:
@@ -43,6 +46,15 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # musl: GitHub runners are glibc, so build in the napi-rs Alpine
+          # image (same recipe as the napi-rs project template). The image
+          # carries the aarch64-linux-musl cross toolchain for the arm64 one.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
@@ -54,19 +66,23 @@ jobs:
           node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.docker }}
         with:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.docker }}
         with:
           workspaces: bindings/node
           key: ${{ matrix.target }}
 
       - name: Install napi CLI
+        if: ${{ !matrix.docker }}
         working-directory: bindings/node
         run: npm install --no-save @napi-rs/cli@3.10.8
 
       - name: Build (napi layout)
+        if: ${{ !matrix.docker }}
         working-directory: bindings/node
         shell: bash
         run: |
@@ -74,34 +90,33 @@ jobs:
           ARGS=(--release --platform --target ${{ matrix.target }} --js false --dts false)
           npx napi build "${ARGS[@]}"
 
+      - name: Build (napi layout, musl in Alpine container)
+        if: ${{ matrix.docker }}
+        uses: addnab/docker-run-action@v3
+        with:
+          image: ${{ matrix.docker }}
+          options: -v ${{ github.workspace }}:/build -w /build/bindings/node -e CARGO_TERM_COLOR=always
+          run: |
+            set -e
+            rustup target add ${{ matrix.target }}
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+              # zstd-sys compiles C: point cc + the linker at the image's cross toolchain.
+              export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+            fi
+            npm install --no-save @napi-rs/cli@3.10.8
+            npx napi build --release --platform --target ${{ matrix.target }} --js false --dts false
+            if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+              node smoke_ci.js
+            fi
+
       - name: Smoke (JS loader)
         if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu'
         working-directory: bindings/node
         shell: bash
-        run: |
-          # 🔑 require resolves FILE-relative — write the smoke INTO the
-          # package dir and require './index.js' (the old /tmp/smoke.js +
-          # '../bindings/node' resolved to /bindings/node: MODULE_NOT_FOUND).
-          cat > smoke-ci.js <<'JS'
-          const Database = require('./index.js');
-          const os = require('node:os'), path = require('node:path'), fs = require('node:fs');
-          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'motedb-ci-'));
-          const db = new Database(path.join(dir, 't.mote'));
-          db.execute('CREATE TABLE t (id INT PRIMARY KEY, emb VECTOR(2), data BLOB)');
-          for (let i = 0; i < 10; i++) {
-            db.execute('INSERT INTO t VALUES (?, ?, ?)',
-              [i, [i, -i], Buffer.from([1, 2, i])]);
-          }
-          const nn = db.query('SELECT id FROM t ORDER BY emb <-> [5, -5] LIMIT 1');
-          if (nn[0].id !== 5) throw new Error('knn ' + JSON.stringify(nn));
-          db.checkpoint();
-          const again = new Database(path.join(dir, 't.mote'));
-          if (again.query('SELECT COUNT(*) AS n FROM t')[0].n !== 10) throw new Error('reopen');
-          again.close();
-          fs.rmSync(dir, { recursive: true, force: true });
-          console.log('smoke OK');
-          JS
-          node smoke-ci.js && rm -f smoke-ci.js
+        # smoke_ci.js is committed (also reused by scripts/release_smoke.sh);
+        # it requires './index.js' FILE-relative, so run it from the package dir.
+        run: node smoke_ci.js
 
       - name: Upload binding artifact
         uses: actions/upload-artifact@v4
@@ -172,7 +187,8 @@ jobs:
 
   publish:
     needs: [build, package]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # workflow_dispatch 允许在 npm 反垃圾拦截后从 main 手动慢速重发 (无需新标签)
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -215,21 +231,45 @@ jobs:
             [ -f "$pkg/$main" ] || { echo "MISSING $pkg/$main"; missing=1; }
           done
           [ "$missing" = 0 ] || exit 1
+      - name: Check NPM_TOKEN is configured
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::error::NPM_TOKEN repository secret is not set — cannot publish to npmjs.org. Create an automation token at https://www.npmjs.com/settings/~/tokens and add it under Settings → Secrets → Actions."
+            exit 1
+          fi
       - name: Publish platform packages + root
-        # 🔑 Plain `npm publish` per package — napi pre-publish embeds
-        # npmjs-registry assumptions that don't hold for GitHub Packages.
-        # Registry comes from each package.json's publishConfig; auth from
-        # setup-node's .npmrc + NODE_AUTH_TOKEN (the built-in GITHUB_TOKEN
-        # with packages:write). A future npmjs mirror: add NPM_TOKEN and a
-        # second pass with registry-url: registry.npmjs.org.
+        # 🔑 Plain `npm publish` per package (platform packages first, then the
+        # root loader whose optionalDependencies point at them). Auth comes
+        # from setup-node's .npmrc + NODE_AUTH_TOKEN. `napi pre-publish` is
+        # deliberately NOT used: it assumes a GitHub release flow we don't run.
+        # Idempotent + burst-safe: skips packages already on the registry
+        # (EPUBLISHCONFLICT would otherwise abort the loop on re-runs) and
+        # paces publishes ~3 min apart with retries — npm's anti-spam
+        # heuristics reject rapid-fire new-package creation from new accounts.
         working-directory: bindings/node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
-          for d in npm/*/; do
-            echo "::group::publish ${d}"
-            (cd "$d" && npm publish --access public) || exit 1
-            echo "::endgroup::"
-          done
-          npm publish --access public
+          pub() {
+            local d="$1" name try
+            name=$(jq -r .name "$d/package.json")
+            if npm view "$name" version >/dev/null 2>&1; then
+              echo "  $name already on npm — skip"; return 0
+            fi
+            for try in 1 2 3; do
+              echo "::group::publish $name (attempt $try)"
+              if (cd "$d" && npm publish --access public); then
+                echo "::endgroup::"; echo "  published $name"; return 0
+              fi
+              echo "::endgroup::"
+              [ "$try" = 3 ] && break
+              echo "  retry in 180s (npm anti-spam/rate heuristics)"; sleep 180
+            done
+            echo "::error::gave up publishing $name after 3 attempts"
+            return 1
+          }
+          for d in npm/*/; do pub "$d" || exit 1; done
+          pub . || exit 1
