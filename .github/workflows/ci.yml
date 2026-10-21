@@ -131,6 +131,7 @@ jobs:
         #     hardware-speed assumptions shared runners can't meet. Tracked in
         #     BENCHMARK.md instead.
         run: |
+          set +e
           cargo test --workspace --all-features -- \
             --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ \
@@ -150,13 +151,29 @@ jobs:
             --skip test_scalability_latency \
             --skip test_scalability_memory \
             --skip test_durability_large_dataset_checkpoint_recovery \
-            --skip test_performance_guarantees
+            --skip test_performance_guarantees \
+            > /tmp/ci-test.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            # 🔑 Anonymous-readable failure surface: the trailing `Running
+            # tests/…` line before the failure block names the failing
+            # binary. (The separate diagnostics step proved unreliable — its
+            # `{ } || …` grouping suppressed set -e and silently skipped.)
+            grep -E "Running (tests|unittests)|FAILED|panicked at|^failures:" /tmp/ci-test.log \
+              | tail -8 | while IFS= read -r line; do
+                echo "::error title=integration-fail::$line"
+              done
+            echo "---- tail of test log ----"
+            tail -30 /tmp/ci-test.log
+          fi
+          exit $rc
       - name: cargo test (workspace, hardware-threshold tests skipped) [attempt 2]
         id: ci2
         if: steps.ci1.outcome == 'failure'
         env:
           CI: "1"
         run: |
+          set +e
           cargo test --workspace --all-features -- \
             --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ \
@@ -176,7 +193,22 @@ jobs:
             --skip test_scalability_latency \
             --skip test_scalability_memory \
             --skip test_durability_large_dataset_checkpoint_recovery \
-            --skip test_performance_guarantees
+            --skip test_performance_guarantees \
+            > /tmp/ci-test.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            # 🔑 Anonymous-readable failure surface: the trailing `Running
+            # tests/…` line before the failure block names the failing
+            # binary. (The separate diagnostics step proved unreliable — its
+            # `{ } || …` grouping suppressed set -e and silently skipped.)
+            grep -E "Running (tests|unittests)|FAILED|panicked at|^failures:" /tmp/ci-test.log \
+              | tail -8 | while IFS= read -r line; do
+                echo "::error title=integration-fail::$line"
+              done
+            echo "---- tail of test log ----"
+            tail -30 /tmp/ci-test.log
+          fi
+          exit $rc
       - name: verdict
         if: always()
         run: |

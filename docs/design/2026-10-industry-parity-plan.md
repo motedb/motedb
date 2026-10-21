@@ -16,12 +16,24 @@
 > NULL 保留、按列名映射(乱序/子集/缺列补 NULL)、重开持久;**pyarrow 双向互认
 > 实测通过**(MoteDB 写 → pyarrow 逐值校验含 fixed_size_list/ts[us]/NULL/blob;
 > pyarrow 写 snappy → 导入)。SPATIAL 列明确报错。examples/parquet_interop.rs。
+>
+> §5 后半 **EXPORT LEROBOT 已落地并互认**(eaf5c06):`EXPORT LEROBOT <table> TO
+> '<dir>' [FPS n] [TASKS col]`,表须为 CREATE EPISODE TABLE。规格以官方 writer
+> (lerobot 0.6.1, v3.0)参考产物逐文件解剖定标(info.json/stats.json/tasks/
+> episodes/data 五件套, shape(1,)→标量列, VECTOR→fixed_size_list<element>,
+> 逐维统计)。**官方 LeRobotDataset 加载导出目录实测通过**(episodes/frames/
+> tasks 计数、joint 逐值、task join、frame_index 全对)— MCAP→SQL→LeRobot
+> 管线打通。examples/lerobot_interop.rs + 测试 ×3。已知边界:全部 episode 落
+> file-000(按大小轮转后续)、视频列不支持(v1 范围外)、分位数 nearest-rank 近似。
+>
 > 顺带发现并修复一个数据丢失级引擎 bug:read_vectors/read_spatial 跳过 NULL 行,
 > 消费侧 7 处只前进线性归并在遇到 NULL 后游标冲尾 → **任何含 NULL 向量的表,
 > 无 WHERE 全表扫描整列静默变 NULL,compaction 会把丢失永久写回**(merge.rs 两处)。
 > 修复 = ColumnarSSTable::scatter_by_row_id 精确散射,回归测试 ×2。
-> 待办:LeRobot v3 映射层(§5 后半)、Python 绑定 export_parquet/import_parquet、
-> DataLoader(§6)、公开基准(§7)、MCP(§8)。
+> 遗留:CI ubuntu integration 连续失败(macOS/本地全绿;已修 ci.yml 诊断步骤的
+> 未配对大括号但注解仍未产出,Docker Linux 容器复现中);Python 绑定
+> export_parquet/import_parquet/export_lerobot;DataLoader(§6)、公开基准(§7)、
+> MCP(§8)。
 >
 > **开工时修正**:核对三个注册表后发现 crates.io `motedb` 0.15.0 与 PyPI
 > `motedb-python` 0.15.0 **已上线**(RELEASE_NOTES 的"待 token/待登记"已过时),
