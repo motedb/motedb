@@ -191,8 +191,12 @@ jobs:
           # 🔑 K-debug: cargo 顶层一次跑时，crashing binary 会以 exit 101
           # 中断整个套件且不留 FAILED 行。逐 bin 运行并把每个 bin 的退出码
           # 通过 ::error:: annotations 上报（匿名可读）。
+          # 2026-10-21 修复: 曾有一行多余的 `} || echo …`（未配对大括号）
+          # 让本步骤自身以 exit 2 崩溃，逐 bin 上报从未生效过；同时对
+          # rc=101（真实测试失败，有 FAILED 行）也提取失败测试名，不再只
+          # 处理非 101 的编译错误。
           {
-            echo "### mac integration per-binary status"
+            echo "### integration per-binary status ($RUNNER_OS)"
             BINS=$(cargo test --workspace --all-features -- --list 2>/dev/null \
               | grep -E "^Running|^ " >/dev/null; cargo test --workspace \
               --all-features --no-run 2>&1 | grep -oE "Executable tests/[a-z0-9_]+\.rs" \
@@ -213,14 +217,13 @@ jobs:
                 --skip test_performance_guarantees --no-fail-fast \
                 > /tmp/one.log 2>&1
               rc=$?
-              echo "::error title=mac-integration::$t exit=$rc"
-              if [ $rc -ne 0 ] && [ $rc -ne 101 ]; then
-                grep -E "panicked at|FAILED" /tmp/one.log | head -5 \
+              echo "::error title=integration-$RUNNER_OS::$t exit=$rc"
+              if [ $rc -ne 0 ]; then
+                grep -E "^test .* FAILED|^failures:|panicked at" /tmp/one.log | head -8 \
                   | while read -r line; do echo "::error ::$line"; done
               fi
             done
           } || echo "per-binary diagnostics done" >> "$GITHUB_STEP_SUMMARY"
-          } || echo "diagnostics pass done" >> "$GITHUB_STEP_SUMMARY"
 
 
   # ── Cross-compile: aarch64-unknown-linux-gnu (build only) ────────────────
