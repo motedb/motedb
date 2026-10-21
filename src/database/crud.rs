@@ -4433,46 +4433,16 @@ fn build_column_segment(
     let tag = col_sst.column_tags.get(col_idx);
     match tag {
         Some(ColumnTypeTag::Vector) => {
-            // read_vectors returns (row_id, vec) pairs in row order (i=0..n);
-            // map each to its original row index by re-iterating in lockstep.
+            // read_vectors returns (row_id, vec) pairs with NULL and deleted
+            // rows skipped; scatter_by_row_id maps them back exactly.
             let decoded = col_sst.read_vectors(col_idx)?;
-            let mut per_row: Vec<Option<Vec<f32>>> = vec![None; num_rows];
-            let mut di = 0usize;
-            for i in 0..num_rows {
-                if col_sst.row_map.is_deleted(i) {
-                    continue;
-                }
-                // read_vectors skips nulls too; its k-th output corresponds to
-                // the k-th non-null, non-deleted row. Match by row_id.
-                let expected_key = col_sst.row_map.key(i) & 0xFFFFFFFF;
-                while di < decoded.len() && decoded[di].0 != expected_key {
-                    di += 1;
-                }
-                if di < decoded.len() {
-                    per_row[i] = Some(decoded[di].1.clone());
-                    di += 1;
-                }
-            }
-            Ok(ColumnarSegment::Vector(per_row))
+            Ok(ColumnarSegment::Vector(col_sst.scatter_by_row_id(&decoded)))
         }
         Some(ColumnTypeTag::Spatial) => {
             let decoded = col_sst.read_spatial(col_idx)?;
-            let mut per_row: Vec<Option<crate::types::Geometry>> = vec![None; num_rows];
-            let mut di = 0usize;
-            for i in 0..num_rows {
-                if col_sst.row_map.is_deleted(i) {
-                    continue;
-                }
-                let expected_key = col_sst.row_map.key(i) & 0xFFFFFFFF;
-                while di < decoded.len() && decoded[di].0 != expected_key {
-                    di += 1;
-                }
-                if di < decoded.len() {
-                    per_row[i] = Some(decoded[di].1.clone());
-                    di += 1;
-                }
-            }
-            Ok(ColumnarSegment::Spatial(per_row))
+            Ok(ColumnarSegment::Spatial(
+                col_sst.scatter_by_row_id(&decoded),
+            ))
         }
         Some(ColumnTypeTag::Text) => Ok(ColumnarSegment::Text(col_sst.read_text(col_idx)?)),
         // 🔖 BLOB rides the text layout; consumers dispatch on the schema's

@@ -2843,6 +2843,33 @@ impl ColumnarSSTable {
         }
         Ok(result)
     }
+
+    /// Scatter decoded `(row_id, value)` pairs — as produced by
+    /// [`ColumnarSSTable::read_vectors`] / [`ColumnarSSTable::read_spatial`],
+    /// which skip NULL and deleted rows — back onto per-row-index slots.
+    ///
+    /// The forward-only linear merge this replaces silently dropped every
+    /// entry after the first NULL cell: searching for the NULL row's key ran
+    /// the cursor to the end of the decoded list, so ALL later rows decoded
+    /// as None. A table with any NULL vector lost the whole column on plain
+    /// scans (`SELECT emb FROM t` with no WHERE), and compaction rewrote that
+    /// loss permanently. Row ids are unique within a segment, so a hash
+    /// scatter is exact.
+    pub fn scatter_by_row_id<T: Clone>(&self, decoded: &[(RowId, T)]) -> Vec<Option<T>> {
+        let mut per = vec![None; self.num_rows];
+        let by_row: std::collections::HashMap<RowId, &T> =
+            decoded.iter().map(|(k, v)| (*k, v)).collect();
+        for i in 0..self.num_rows {
+            if self.row_map.is_deleted(i) {
+                continue;
+            }
+            let ek = self.row_map.key(i) & 0xFFFFFFFF;
+            if let Some(v) = by_row.get(&ek) {
+                per[i] = Some((*v).clone());
+            }
+        }
+        per
+    }
 }
 
 // ── Columnar SSTable Builder ───────────────────────────────────────

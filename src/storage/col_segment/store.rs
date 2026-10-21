@@ -1215,7 +1215,6 @@ impl ColSegmentStore {
             } else {
                 Vec::new()
             };
-            let n_seg = seg.sst.num_rows;
             let pvector: Vec<Vec<Option<Vec<f32>>>> = if !lazy_project {
                 project_cols
                     .iter()
@@ -1227,22 +1226,7 @@ impl ColSegmentStore {
                             )
                         {
                             let decoded = seg.sst.read_vectors(pc).unwrap_or_default();
-                            let mut per = vec![None; n_seg];
-                            let mut di = 0usize;
-                            for i in 0..n_seg {
-                                if seg.sst.row_map.is_deleted(i) {
-                                    continue;
-                                }
-                                let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                                while di < decoded.len() && decoded[di].0 != ek {
-                                    di += 1;
-                                }
-                                if di < decoded.len() {
-                                    per[i] = Some(decoded[di].1.clone());
-                                    di += 1;
-                                }
-                            }
-                            per
+                            seg.sst.scatter_by_row_id(&decoded)
                         } else {
                             Vec::new()
                         }
@@ -1262,22 +1246,7 @@ impl ColSegmentStore {
                             )
                         {
                             let decoded = seg.sst.read_spatial(pc).unwrap_or_default();
-                            let mut per = vec![None; n_seg];
-                            let mut di = 0usize;
-                            for i in 0..n_seg {
-                                if seg.sst.row_map.is_deleted(i) {
-                                    continue;
-                                }
-                                let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                                while di < decoded.len() && decoded[di].0 != ek {
-                                    di += 1;
-                                }
-                                if di < decoded.len() {
-                                    per[i] = Some(decoded[di].1.clone());
-                                    di += 1;
-                                }
-                            }
-                            per
+                            seg.sst.scatter_by_row_id(&decoded)
                         } else {
                             Vec::new()
                         }
@@ -1971,22 +1940,7 @@ impl ColSegmentStore {
                         )
                     {
                         let decoded = seg.sst.read_vectors(pc).unwrap_or_default();
-                        let mut per = vec![None; n];
-                        let mut di = 0usize;
-                        for i in 0..n {
-                            if seg.sst.row_map.is_deleted(i) {
-                                continue;
-                            }
-                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                            while di < decoded.len() && decoded[di].0 != ek {
-                                di += 1;
-                            }
-                            if di < decoded.len() {
-                                per[i] = Some(decoded[di].1.clone());
-                                di += 1;
-                            }
-                        }
-                        per
+                        seg.sst.scatter_by_row_id(&decoded)
                     } else {
                         Vec::new()
                     }

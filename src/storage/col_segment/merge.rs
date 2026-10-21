@@ -81,41 +81,13 @@ impl SegmentCursor {
             {
                 // Map read_vectors (row_id, vec) pairs to per-row-index options.
                 let decoded = seg.sst.read_vectors(ci).unwrap_or_default();
-                let mut per = vec![None; n];
-                let mut di = 0usize;
-                for i in 0..n {
-                    if seg.sst.row_map.is_deleted(i) {
-                        continue;
-                    }
-                    let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                    while di < decoded.len() && decoded[di].0 != ek {
-                        di += 1;
-                    }
-                    if di < decoded.len() {
-                        per[i] = Some(decoded[di].1.clone());
-                        di += 1;
-                    }
-                }
+                let per = seg.sst.scatter_by_row_id(&decoded);
                 ColData::Vector(per)
             } else if ci < seg.sst.column_tags.len()
                 && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Spatial)
             {
                 let decoded = seg.sst.read_spatial(ci).unwrap_or_default();
-                let mut per = vec![None; n];
-                let mut di = 0usize;
-                for i in 0..n {
-                    if seg.sst.row_map.is_deleted(i) {
-                        continue;
-                    }
-                    let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                    while di < decoded.len() && decoded[di].0 != ek {
-                        di += 1;
-                    }
-                    if di < decoded.len() {
-                        per[i] = Some(decoded[di].1.clone());
-                        di += 1;
-                    }
-                }
+                let per = seg.sst.scatter_by_row_id(&decoded);
                 ColData::Spatial(per)
             } else {
                 ColData::Opaque
