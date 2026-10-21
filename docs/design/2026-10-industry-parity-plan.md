@@ -1,6 +1,6 @@
 # 技术方案:行业对齐提升计划 — v0.16「装得上」/ v0.17「连得上」/ v1.0-rc「立得住」
 
-> 状态:**Phase 0 进行中**(2026-10-20 开工)。基于 v0.15.0 代码库通读 + 2026-10
+> 状态:**Phase 1 进行中**(2026-10-20 开工,Phase 0 已收口)。基于 v0.15.0 代码库通读 + 2026-10
 > 行业调研(LanceDB 10B 公开基准 / sqlite-vec / DuckDB-VSS / Rerun 0.32 data layer /
 > Foxglove agentic 平台 / LeRobot v3 事实标准)。
 > 结论:**内核工程与具身原语已在行业水准之上;差距集中在分发渠道、训练生态
@@ -8,6 +8,20 @@
 > 原则:延续 2026-10-embodied-roadmap 的不做清单;每项附涉及文件与验收判据;
 > **已有能力不重做**(SQ8 量化、EXPLAIN、FAISS 对照基准、query_arrow、
 > fresh_graph 增量构建均已在库内,本计划只做暴露与扩面)。
+>
+> **Phase 1 进度(2026-10-21)**:§5 的 Parquet 核心已落地 — `EXPORT TABLE t TO
+> 'x.parquet'` / `IMPORT PARQUET 'x' INTO t`(src/export/parquet.rs,arrow-array/
+> schema/parquet 59.3.1,MSRV 1.85,feature `parquet` 默认开、default-edge 可关)。
+> 全类型往返(INT/FLOAT/BOOL/TEXT/TIMESTAMP/VECTOR→FixedSizeList<f32>/BLOB→Binary)、
+> NULL 保留、按列名映射(乱序/子集/缺列补 NULL)、重开持久;**pyarrow 双向互认
+> 实测通过**(MoteDB 写 → pyarrow 逐值校验含 fixed_size_list/ts[us]/NULL/blob;
+> pyarrow 写 snappy → 导入)。SPATIAL 列明确报错。examples/parquet_interop.rs。
+> 顺带发现并修复一个数据丢失级引擎 bug:read_vectors/read_spatial 跳过 NULL 行,
+> 消费侧 7 处只前进线性归并在遇到 NULL 后游标冲尾 → **任何含 NULL 向量的表,
+> 无 WHERE 全表扫描整列静默变 NULL,compaction 会把丢失永久写回**(merge.rs 两处)。
+> 修复 = ColumnarSSTable::scatter_by_row_id 精确散射,回归测试 ×2。
+> 待办:LeRobot v3 映射层(§5 后半)、Python 绑定 export_parquet/import_parquet、
+> DataLoader(§6)、公开基准(§7)、MCP(§8)。
 >
 > **开工时修正**:核对三个注册表后发现 crates.io `motedb` 0.15.0 与 PyPI
 > `motedb-python` 0.15.0 **已上线**(RELEASE_NOTES 的"待 token/待登记"已过时),
