@@ -32,6 +32,7 @@ It is an embedded database purpose-built for edge devices such as home robots, A
 - **Production Experience**: [./15-best-practices.md](./15-best-practices.md) - Architecture, writes, and indexing strategies
 - **FAQ**: [./16-faq.md](./16-faq.md) - Debugging, deployment, and troubleshooting
 - **Install Troubleshooting**: [./18-install-troubleshooting.md](./18-install-troubleshooting.md) - Package names per registry, platform coverage, loader errors
+- **Training DataLoader**: [./19-training-dataloader.md](./19-training-dataloader.md) - PyTorch `MoteDataset`, LeRobot round-trip shape
 
 ## 🚀 Core Features
 

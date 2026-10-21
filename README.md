@@ -341,6 +341,10 @@ EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
   `LEAD`, `FIRST_VALUE`, `LAST_VALUE` + aggregates `OVER (PARTITION BY …
   ORDER BY …)` (RANGE peer-group default frame)
 - Scalar functions: `UPPER`/`LOWER`/`LENGTH`/`TRIM`/`SUBSTR`/`REPLACE`/`CONCAT` (skips NULL args, SQLite/Postgres semantics; `||` propagates NULL)/`INSTR`/`COALESCE`/`ROUND` (binary-exact decimal rounding)/`ABS`/arithmetic
+- Interop: `EXPORT TABLE t TO 'x.parquet'` / `IMPORT PARQUET 'x' INTO t`
+  (pyarrow/pandas/DuckDB round-trip), `EXPORT LEROBOT <episode-table> TO
+  'dir/' [FPS n] [TASKS col]` — a LeRobot v3 dataset the official
+  `LeRobotDataset` loads directly
 - Multimodal predicates: `MATCH(col) AGAINST('q')` (BM25 ranked FTS;
   multi-word default is AND, explicit `a OR b` unions — FTS5-compatible),
   vector `<->`/`<~>` ordering (DiskANN ANN), geometry `loc <-> ST_POINT(x, y)`

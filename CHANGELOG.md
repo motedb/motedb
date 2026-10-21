@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### 训练生态互操作 (Phase 1 §5/§6, docs/design/2026-10-industry-parity-plan.md)
+
+- **🔑 Parquet 双向**: `EXPORT TABLE t TO 'x.parquet'` / `IMPORT PARQUET 'x'
+  INTO t` — 全类型往返(INT/FLOAT/BOOL/TEXT/TIMESTAMP/VECTOR→FixedSizeList<
+  f32>/BLOB→Binary), NULL 保留, 按列名映射(乱序/子集/缺列补 NULL), 有损方向
+  报错; arrow-array/schema/parquet 59.3.1(MSRV 1.85), feature `parquet`
+  默认开(default-edge 可关)。pyarrow 双向互认实测。Python: `export_parquet` /
+  `import_parquet`
+- **🔑 EXPORT LEROBOT**: EPISODE 表 → LeRobot v3 数据集目录(官方 writer 逐文件
+  定标), 官方 `LeRobotDataset` 加载互认实测 — MCAP→SQL→训练管线打通。Python:
+  `export_lerobot(table, dir, fps, tasks=)`
+- **修复(数据丢失级)**: 含 NULL 向量的表, 无 WHERE 全表扫描整列静默变 NULL,
+  且 compaction 将丢失永久写回 — read_vectors/read_spatial 的 7 处只前进线性
+  归并改为 `scatter_by_row_id` 精确散射; 回归测试 ×2
+- **PyTorch DataLoader**: `from motedb.torch import MoteDataset` — 列式一次
+  载入 + 逐行零拷贝视图, fork-safe; docs/19 + examples/torch_dataloader.py
+- CI: 测试步骤失败时直接发逐行注解(替代从未生效的独立诊断步骤)
+
 ## [0.15.1] — 2026-10-20
 
 发布渠道与安装体验 patch(docs/design/2026-10-industry-parity-plan.md Phase 0)。

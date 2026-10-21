@@ -20,6 +20,7 @@ crate-type = ["cdylib"]
 motedb-core = { path = "../..", package = "motedb", default-features = false, features = [
     "tokenizer-jieba",
     "rayon",
+    "parquet",
 ] }
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 
