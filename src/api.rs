@@ -197,7 +197,9 @@ fn open_engine_shared(
             _ => db_path.clone(),
         }
     });
-    let mut reg = connection_registry().lock().unwrap();
+    let mut reg = connection_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if let Some((weak, live)) = reg.get(&key) {
         if let Some(arc) = weak.upgrade() {
             live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -571,7 +573,9 @@ impl Database {
         // connection performs the real shutdown; earlier closes detach.
         if let Some(key) = &self.reg_key {
             let last = {
-                let reg = connection_registry().lock().unwrap();
+                let reg = connection_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 match reg.get(key) {
                     Some((weak, live)) => {
                         let remains = live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -588,7 +592,9 @@ impl Database {
                 }
             };
             if last {
-                let mut reg = connection_registry().lock().unwrap();
+                let mut reg = connection_registry()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 reg.remove(key);
             } else {
                 return Ok(());

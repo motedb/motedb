@@ -55,6 +55,11 @@ fn files_under(p: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // 🔑 read_dir order is filesystem-dependent (APFS/ext4/overlayfs differ)
+    // — with an unsorted list the LCG corrupted different files per platform,
+    // making this suite flap on Linux runners only. Sorted = the corruption
+    // pattern is a pure function of the seed bytes.
+    v.sort();
     v
 }
 
