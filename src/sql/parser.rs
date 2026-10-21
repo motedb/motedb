@@ -239,9 +239,66 @@ impl Parser {
                         _ => return Err(self.error("Expected destination path string after TO")),
                     };
                     Statement::ExportDataset { name, path }
+                } else if matches!(&self.current().token_type, TokenType::Table)
+                    || matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("TABLE"))
+                {
+                    // 🔖 EXPORT TABLE t TO 'path.parquet' (parquet dump).
+                    // TABLE is a keyword token, but accept a plain identifier
+                    // too in case tokenization rules change.
+                    self.advance();
+                    let table = match self.current().token_type.clone() {
+                        TokenType::Identifier(t) => {
+                            self.advance();
+                            t
+                        }
+                        _ => return Err(self.error("Expected table name after EXPORT TABLE")),
+                    };
+                    if !matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("TO"))
+                    {
+                        return Err(self.error("Expected TO after EXPORT TABLE name"));
+                    }
+                    self.advance();
+                    let path = match self.current().token_type.clone() {
+                        TokenType::String(p) => {
+                            self.advance();
+                            p
+                        }
+                        _ => return Err(self.error("Expected destination path string after TO")),
+                    };
+                    Statement::ExportTable { table, path }
                 } else {
-                    return Err(self.error("Expected DATASET or DB after EXPORT"));
+                    return Err(self.error("Expected TABLE, DATASET or DB after EXPORT"));
                 }
+            }
+            TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("IMPORT") => {
+                // 🔖 IMPORT PARQUET 'path' INTO table
+                self.advance();
+                if !matches!(&self.current().token_type, TokenType::Identifier(ref f) if f.eq_ignore_ascii_case("PARQUET"))
+                {
+                    return Err(self.error("Expected PARQUET after IMPORT"));
+                }
+                self.advance();
+                let path = match self.current().token_type.clone() {
+                    TokenType::String(p) => {
+                        self.advance();
+                        p
+                    }
+                    _ => return Err(self.error("Expected source path string after IMPORT PARQUET")),
+                };
+                if !matches!(&self.current().token_type, TokenType::Into)
+                    && !matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("INTO"))
+                {
+                    return Err(self.error("Expected INTO after IMPORT PARQUET path"));
+                }
+                self.advance();
+                let table = match self.current().token_type.clone() {
+                    TokenType::Identifier(t) => {
+                        self.advance();
+                        t
+                    }
+                    _ => return Err(self.error("Expected table name after INTO")),
+                };
+                Statement::ImportParquet { path, table }
             }
             _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, DESCRIBE, BEGIN, COMMIT, or ROLLBACK")),
         };

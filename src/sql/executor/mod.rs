@@ -2057,6 +2057,13 @@ impl QueryExecutor {
         }
     }
 
+    /// Engine handle for the interop modules (`src/export/`) — schema reads
+    /// and batch-insert plumbing. Crate-internal on purpose: the public API
+    /// surface is `crate::Database`.
+    pub(crate) fn db_handle(&self) -> &Arc<MoteDB> {
+        &self.db
+    }
+
     /// Reset per-query state. Called before each execute.
     pub fn reset_last_insert_id(&self) {
         self.last_insert_id
@@ -2095,6 +2102,8 @@ impl QueryExecutor {
                 | Statement::DropDataset { .. }
                 | Statement::ExportDataset { .. }
                 | Statement::ExportDb { .. }
+                | Statement::ExportTable { .. }
+                | Statement::ImportParquet { .. }
                 | Statement::BeginTransaction
                 | Statement::CommitTransaction
                 | Statement::RollbackTransaction
@@ -2193,6 +2202,19 @@ impl QueryExecutor {
                         stats.stored_bytes,
                         if compressed { " (compressed)" } else { "" }
                     ),
+                })
+            }
+            Statement::ExportTable { table, path } => {
+                let rows = self.export_table_parquet(&table, std::path::Path::new(&path))?;
+                Ok(QueryResult::Definition {
+                    message: format!("table '{table}' exported to '{path}': {rows} rows"),
+                })
+            }
+            Statement::ImportParquet { path, table } => {
+                let rows = self.import_parquet(std::path::Path::new(&path), &table)?;
+                Ok(QueryResult::Select {
+                    columns: vec!["rows".into()],
+                    rows: vec![vec![Value::Integer(rows as i64)]],
                 })
             }
             Statement::CreateTable(c) => self.execute_create_table(c),
@@ -2701,6 +2723,19 @@ impl QueryExecutor {
                         stats.stored_bytes,
                         if *compressed { " (compressed)" } else { "" }
                     ),
+                }
+            }
+            Statement::ExportTable { table, path } => {
+                let rows = self.export_table_parquet(table, std::path::Path::new(path))?;
+                StreamingQueryResult::Definition {
+                    message: format!("table '{table}' exported to '{path}': {rows} rows"),
+                }
+            }
+            Statement::ImportParquet { path, table } => {
+                let rows = self.import_parquet(std::path::Path::new(path), table)?;
+                StreamingQueryResult::SelectReady {
+                    columns: vec!["rows".into()],
+                    rows: vec![vec![Value::Integer(rows as i64)]],
                 }
             }
             Statement::ExportDataset { name, path } => {

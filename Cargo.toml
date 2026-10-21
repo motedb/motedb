@@ -99,6 +99,13 @@ phf = { version = "0.11", features = ["macros"] }
 # 🔌 Optional dependencies: Tokenizer plugins (feature-gated)
 jieba-rs = { version = "0.7", optional = true }
 
+# 📦 Parquet interop (feature `parquet`, on by default; `default-edge` excludes).
+# Minimal arrow surface — arrow-array/schema only, no umbrella `arrow` crate.
+# MSRV 1.85 (≤ our 1.87). Compression codecs: snap (pyarrow default) + zstd.
+arrow-array = { version = "59.3.1", optional = true }
+arrow-schema = { version = "59.3.1", optional = true }
+parquet = { version = "59.3.1", default-features = false, features = ["arrow", "snap", "zstd"], optional = true }
+
 # 🔍/🧠 jemalloc (memory profiling + OS-purge allocator) — 🔑 TARGET-GATED:
 # tikv-jemalloc-sys (C) cannot build on windows-msvc, so the crates only
 # exist on non-MSVC targets. The `jemalloc` feature stays enableable
@@ -135,7 +142,7 @@ clap = { version = "4.4", features = ["derive"] }
 # Enable jieba tokenizer by default
 [features]
 # Full build: jieba + parallelism + jemalloc (memory-efficient allocator with OS purge)
-default = ["tokenizer-jieba", "rayon", "jemalloc"]
+default = ["tokenizer-jieba", "rayon", "jemalloc", "parquet"]
 default-edge = ["jemalloc"]  # Edge/IoT minimal: no tokenizer, no rayon, jemalloc allocator
 # 可选分词器插件
 tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
@@ -147,6 +154,8 @@ mem-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 # ⚡ 数据并行化（可选，减少二进制大小 ~200KB）
 rayon = ["dep:rayon"]  # 启用 Rayon 并行处理
+# 📦 Parquet 导入导出（EXPORT TABLE TO / IMPORT PARQUET）
+parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 
 [profile.release]
 opt-level = 3

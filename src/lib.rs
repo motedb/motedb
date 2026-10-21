@@ -208,6 +208,9 @@ pub mod ffi; // 🚀 P1: Row cache for performance
 // 🔄 Modular database module (refactored from database_legacy.rs)
 pub mod database;
 
+// 📦 Ecosystem interop: parquet import/export (feature `parquet`).
+pub mod export;
+
 mod api;
 mod error; // 内部 API 包装层
 

@@ -72,6 +72,16 @@ pub enum Statement {
         path: String,
         compressed: bool,
     },
+    /// 🔖 EXPORT TABLE t TO 'path.parquet' — parquet dump via Arrow.
+    ExportTable {
+        table: String,
+        path: String,
+    },
+    /// 🔖 IMPORT PARQUET 'path' INTO t — batch-load parquet columns by name.
+    ImportParquet {
+        path: String,
+        table: String,
+    },
     RollbackTransaction,
     /// SAVEPOINT name
     Savepoint(String),
