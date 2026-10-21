@@ -11,6 +11,9 @@
 #                       engine code — the compete suite drives the Python
 #                       binding, which otherwise benchmarks the last PyPI
 #                       install, not your working tree.
+#   make bench-industry Multi-engine vector benchmark (MoteDB vs FAISS/
+#                       LanceDB/sqlite-vec/DuckDB-VSS/usearch), 220K×384 default;
+#                       N=/DIM= override; renders docs/benchmark_report_<date>.md.
 #   make release-smoke  Install the PUBLISHED packages (crates.io / PyPI / npm,
 #                       version from Cargo.toml) into throwaway envs and run
 #                       the README examples. The post-release gate; CI runs it
@@ -21,7 +24,7 @@
 #
 # See docs/benchmark_methodology.md for what is measured and how.
 
-.PHONY: compete compete-quick compete-full test wheel release-smoke release-smoke-local
+.PHONY: compete compete-quick compete-full test wheel release-smoke release-smoke-local bench-industry
 
 LANGS ?= python,node,rust
 
@@ -44,6 +47,9 @@ wheel:
 
 release-smoke:
 	./scripts/release_smoke.sh -l $(LANGS)
+
+bench-industry:
+	PYTHON=$(or $(PYTHON),python3) ./scripts/bench_industry.sh
 
 release-smoke-local:
 	./scripts/release_smoke.sh -l $(LANGS) --local

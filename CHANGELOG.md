@@ -18,6 +18,14 @@
   归并改为 `scatter_by_row_id` 精确散射; 回归测试 ×2
 - **PyTorch DataLoader**: `from motedb.torch import MoteDataset` — 列式一次
   载入 + 逐行零拷贝视图, fork-safe; docs/19 + examples/torch_dataloader.py
+- **🔑 MCP server (§8)**: `python -m motedb.mcp <db>` — stdio JSON-RPC,
+  6 个 tools(list_tables/describe/query/vector_search/episodes/doctor);
+  引擎级只读门(Database(read_only=True), 写被引擎拒绝而非字符串嗅探),
+  多读者共存。docs/20-mcp.md; pyo3 构造器新增 read_only kwarg
+- **🔑 多引擎公开基准 (§7)**: `make bench-industry` — MoteDB vs FAISS/
+  LanceDB/sqlite-vec/DuckDB-VSS/usearch, 同语料同暴力 ground truth,
+  N/DIM 规模参数化, 方法学随数据发布(含不利行)。220K×384 实测: MoteDB
+  DiskANN recall@10 1.0000 / p50 0.57ms。docs/benchmark_report_2026-10-21.md
 - CI: 测试步骤失败时直接发逐行注解(替代从未生效的独立诊断步骤)
 
 ## [0.15.1] — 2026-10-20

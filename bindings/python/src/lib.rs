@@ -505,25 +505,38 @@ struct PyDatabase {
 
 #[pymethods]
 impl PyDatabase {
-    /// Database(path, preset=None, create=True, durability=None, periodic_ms=None)
+    /// Database(path, preset=None, create=True, durability=None, periodic_ms=None,
+    ///          read_only=False)
     ///
     /// durability: WAL fsync policy — "synchronous" | "group_commit" |
     /// "periodic" (+ periodic_ms, default 100) | "nosync". Overrides the
     /// preset's level. See README for the durability/throughput tradeoffs.
+    /// read_only: engine-level read-only open (multi-reader coexistence, all
+    /// write statements rejected) — the safe handle form for tools/agents.
     #[new]
-    #[pyo3(signature = (path, preset=None, create=true, durability=None, periodic_ms=None))]
+    #[pyo3(signature = (path, preset=None, create=true, durability=None, periodic_ms=None, read_only=false))]
     fn new(
         path: &str,
         preset: Option<&str>,
         create: bool,
         durability: Option<&str>,
         periodic_ms: Option<u64>,
+        read_only: bool,
     ) -> PyResult<Self> {
         // 🔑 容器模式 auto-route: a MOTESNAP container file opens read-only
         // (mirrors the Rust Database::open behavior this binding's
         // create-or-open heuristic would otherwise bypass).
         if motedb_core::database::snapshot::is_motesnap_container(std::path::Path::new(path)) {
             let db = Database::open_readonly(path).map_err(py_err)?;
+            return Ok(Self { db });
+        }
+        if read_only {
+            // Regular directory: engine-level read-only via config (the
+            // container branch above already returned). Durability knobs are
+            // irrelevant to a reader.
+            let mut config = config_for_preset(preset, None, None, path)?;
+            config.read_only = true;
+            let db = Database::open_with_config(path, config).map_err(py_err)?;
             return Ok(Self { db });
         }
         let config = config_for_preset(preset, durability, periodic_ms, path)?;
