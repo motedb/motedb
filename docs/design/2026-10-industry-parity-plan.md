@@ -30,8 +30,10 @@
 > 消费侧 7 处只前进线性归并在遇到 NULL 后游标冲尾 → **任何含 NULL 向量的表,
 > 无 WHERE 全表扫描整列静默变 NULL,compaction 会把丢失永久写回**(merge.rs 两处)。
 > 修复 = ColumnarSSTable::scatter_by_row_id 精确散射,回归测试 ×2。
-> 遗留:CI ubuntu integration 连续失败(macOS/本地全绿;已修 ci.yml 诊断步骤的
-> 未配对大括号但注解仍未产出,Docker Linux 容器复现中);Python 绑定
+> 遗留(CI ubuntu 事件已收口):35a19ca 上 ubuntu integration 连续两次失败,次日
+> eaf5c06(改动更多)双平台全绿 — 属 publish.yml 记载的已知间歇死锁(index-builder/
+> group-commit condvar),非回归。顺手加固:测试步骤失败时直接发逐行注解(匿名可读,
+> 替代从未生效的独立诊断步骤;该死锁本身另立 follow-up)。待办:Python 绑定
 > export_parquet/import_parquet/export_lerobot;DataLoader(§6)、公开基准(§7)、
 > MCP(§8)。
 >
