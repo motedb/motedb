@@ -2129,8 +2129,27 @@ impl Parser {
 
         if self.match_token(TokenType::Tables) {
             Ok(Statement::ShowTables)
+        } else if matches!(&self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("INDEXES"))
+        {
+            // 🔖 SHOW INDEXES [FROM table]
+            self.advance();
+            let table = if matches!(&self.current().token_type, TokenType::From)
+                || matches!(&self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("FROM"))
+            {
+                self.advance();
+                match self.current().token_type.clone() {
+                    TokenType::Identifier(t) => {
+                        self.advance();
+                        Some(t)
+                    }
+                    _ => return Err(self.error("Expected table name after SHOW INDEXES FROM")),
+                }
+            } else {
+                None
+            };
+            Ok(Statement::ShowIndexes { table })
         } else {
-            Err(self.error("Expected TABLES after SHOW"))
+            Err(self.error("Expected TABLES or INDEXES after SHOW"))
         }
     }
 

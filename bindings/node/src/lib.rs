@@ -25,15 +25,29 @@ fn st_err(e: motedb_core::StorageError) -> Error {
     Error::new(Status::GenericFailure, format!("{e}"))
 }
 
-/// One params-array element → engine Value. Typed attempts run in a fixed
-/// order (integer → float → bool → buffer → string → vector); a failed
-/// conversion is not an error — it just means "not this type".
+/// One params-array element → engine Value.
+///
+/// 🔑 P0 correctness: JS numbers are ALL doubles, and napi's `get::<i64>`
+/// does not fail on a double — it TRUNCATES (9.9 → 9, 1e-7 → 0). An
+/// integer-first probe therefore corrupted every non-integral param.
+/// Numbers are probed as f64 (strict — non-numbers fail cleanly) and split
+/// by fract(); BigInt converts through its own lossless API.
 fn elem_to_mote(arr: &Array, i: u32) -> Result<MValue> {
-    if let Some(x) = arr.get::<i64>(i).ok().flatten() {
-        return Ok(MValue::Integer(x));
+    if let Some(f) = arr.get::<f64>(i).ok().flatten() {
+        if f.is_finite() && f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 {
+            return Ok(MValue::Integer(f as i64));
+        }
+        return Ok(MValue::Float(f));
     }
-    if let Some(x) = arr.get::<f64>(i).ok().flatten() {
-        return Ok(MValue::Float(x));
+    if let Some(b) = arr.get::<napi::bindgen_prelude::BigInt>(i).ok().flatten() {
+        let (v, lossless) = b.get_i64();
+        if !lossless {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("BigInt parameter at index {i} does not fit in i64"),
+            ));
+        }
+        return Ok(MValue::Integer(v));
     }
     if let Some(x) = arr.get::<bool>(i).ok().flatten() {
         return Ok(MValue::Bool(x));

@@ -116,6 +116,10 @@ def query_pandas(self, sql, params=None):
 
 # Attach the interop methods to the pyo3 Database class (heap type — setattr
 # on the class works; verified in test).
+# Snapshot API naming parity with Node/Rust: the native method is
+# export_to(dest, compressed); expose the export_snapshot spelling too.
+_Database.export_snapshot = _Database.export_to
+
 _Database.query_arrow = query_arrow
 _Database.query_pandas = query_pandas
 _Database.export_parquet = export_parquet

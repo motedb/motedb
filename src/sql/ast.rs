@@ -48,6 +48,10 @@ pub enum Statement {
     DropIndex(DropIndexStmt),
     AlterTable(AlterTableStmt),
     ShowTables,
+    /// 🔖 SHOW INDEXES [FROM table] — index catalog as rows.
+    ShowIndexes {
+        table: Option<String>,
+    },
     DescribeTable(String), // table name
     BeginTransaction,
     CommitTransaction,

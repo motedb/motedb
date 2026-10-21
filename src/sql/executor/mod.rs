@@ -2242,6 +2242,7 @@ impl QueryExecutor {
             Statement::DropIndex(d) => self.execute_drop_index(d),
             Statement::AlterTable(a) => self.execute_alter_table(a),
             Statement::ShowTables => self.execute_show_tables(),
+            Statement::ShowIndexes { table } => self.execute_show_indexes(table.clone()),
             Statement::DescribeTable(table_name) => self.execute_describe_table(table_name),
             Statement::BeginTransaction => self.execute_begin_transaction(),
             Statement::CommitTransaction => self.execute_commit_transaction(),
@@ -2828,6 +2829,15 @@ impl QueryExecutor {
                         QueryResult::Definition { message } => message,
                         _ => "Tables shown".to_string(),
                     },
+                }
+            }
+            Statement::ShowIndexes { table } => {
+                let result = self.execute_show_indexes(table.clone())?;
+                match result {
+                    QueryResult::Select { columns, rows } => {
+                        StreamingQueryResult::SelectReady { columns, rows }
+                    }
+                    _ => unreachable!("execute_show_indexes always yields Select"),
                 }
             }
             Statement::DescribeTable(table_name) => {
@@ -20998,6 +21008,34 @@ impl QueryExecutor {
             .map(|table_name| vec![Value::text(table_name)])
             .collect();
 
+        Ok(QueryResult::Select { columns, rows })
+    }
+
+    /// Execute SHOW INDEXES [FROM table] — index catalog as rows.
+    fn execute_show_indexes(&self, table: Option<String>) -> Result<QueryResult> {
+        let tables = match &table {
+            Some(t) => vec![t.clone()],
+            None => self.db.list_tables()?,
+        };
+        let columns = vec![
+            "Table".to_string(),
+            "Index".to_string(),
+            "Column".to_string(),
+            "Type".to_string(),
+        ];
+        let mut rows = Vec::new();
+        for t in tables {
+            // The authoritative catalog is the index registry (CREATE INDEX
+            // lands here; TableSchema::indexes is not maintained).
+            for idx in self.db.index_registry.list_table_indexes(&t) {
+                rows.push(vec![
+                    Value::text(idx.table_name.clone()),
+                    Value::text(idx.name.clone()),
+                    Value::text(idx.column_name.clone()),
+                    Value::text(format!("{:?}", idx.index_type).to_lowercase()),
+                ]);
+            }
+        }
         Ok(QueryResult::Select { columns, rows })
     }
 

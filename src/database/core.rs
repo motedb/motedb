@@ -412,7 +412,17 @@ impl MoteDB {
         if path.extension().and_then(|e| e.to_str()) == Some("mote") {
             return path.to_path_buf();
         }
-        if path.is_dir() && (path.join("lsm").is_dir() || path.join("wal").is_dir()) {
+        // 🔑 An EXISTING directory that looks like a database opens verbatim.
+        // The marker set spans layouts: `lsm/`+`wal/` (legacy), `meta.bin` /
+        // `columnar_ms/` (P1+ lazy layout — wal/ only materializes on first
+        // write, so the old markers missed freshly unpacked snapshots and
+        // open() fell through to the sibling-`.mote` rule → ENOENT).
+        if path.is_dir()
+            && (path.join("meta.bin").is_file()
+                || path.join("columnar_ms").is_dir()
+                || path.join("lsm").is_dir()
+                || path.join("wal").is_dir())
+        {
             return path.to_path_buf();
         }
         path.with_extension("mote")

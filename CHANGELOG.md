@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### 功能测试轮修复 (2026-10-22 外部功能测试 24/27 → 全绿)
+
+- **🔴 P0 Node 浮点参数静默截断**: `arr.get::<i64>` 对 JS double 不报错而是
+  向零截断(9.9→9, 1e-7→0, 123.456→123), f64 分支不可达 — 任何 `?` 传入的
+  非整数 number 全部损坏(FLOAT/DOUBLE 列通杀)。BigInt 更写 9 读 null。
+  修复 = f64 先探(napi 严格语义对非 number 干净失败)按 fract() 分流
+  Integer/Float(≤2^53), BigInt 走 get_i64 无损转换(超范围显式报错)。
+  smoke_ci.js 回归: 9.9/-2.75/1e-7/2.0/123n 逐值断言
+- **快照往还(ENOENT / already exists)**: resolve_open_path 的目录判定标记
+  还是旧布局(lsm/||wal/) — P1 惰性布局的解包快照(首写前无 wal/)判定不中,
+  落到"兄弟 .mote"规则打开不存在的路径。Python 的 import_snapshot 同中
+  (观感即"Python 没有快照 API")。修复 = 标记集扩为 meta.bin/columnar_ms/
+  lsm/wal; unpack 接受已存在的**空** dest 目录(mkdir-then-import 自然用法),
+  非空仍拒。Node openSnapshot/Python import_snapshot/Rust open_snapshot 三路
+  往返回归全绿; Python 加 export_snapshot 别名(与 Node/Rust 命名对齐,
+  原生名 export_to 保留)
+- **SHOW INDEXES [FROM t]**: 引擎语法新增(parser 原只认 SHOW TABLES), 数据
+  源为权威的 index_registry(TableSchema::indexes 不维护); 输出
+  Table/Index/Column/Type 四列
+
 ### 训练生态互操作 (Phase 1 §5/§6, docs/design/2026-10-industry-parity-plan.md)
 
 - **🔑 Parquet 双向**: `EXPORT TABLE t TO 'x.parquet'` / `IMPORT PARQUET 'x'

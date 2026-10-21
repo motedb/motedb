@@ -231,11 +231,21 @@ fn copy_and_hash<R: Read, W: Write>(src: &mut R, dst: &mut W) -> Result<u32> {
 /// written (the caller should remove it — importing again is idempotent
 /// from the archive side).
 pub fn unpack_snapshot(src: &Path, dest_dir: &Path) -> Result<SnapshotStats> {
-    if dest_dir.exists() {
+    // An existing destination is fine only when EMPTY (the natural
+    // `mkdir dest && import` shape); a non-empty one would mix files.
+    if dest_dir.is_file() {
         return Err(StorageError::InvalidData(format!(
-            "import destination already exists: {}",
+            "import destination is a file: {}",
             dest_dir.display()
         )));
+    }
+    if let Ok(rd) = std::fs::read_dir(dest_dir) {
+        if rd.flatten().next().is_some() {
+            return Err(StorageError::InvalidData(format!(
+                "import destination exists and is not empty: {}",
+                dest_dir.display()
+            )));
+        }
     }
     std::fs::create_dir_all(dest_dir)?;
     let mut f = std::fs::File::open(src)?;
