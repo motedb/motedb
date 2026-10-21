@@ -239,6 +239,76 @@ impl Parser {
                         _ => return Err(self.error("Expected destination path string after TO")),
                     };
                     Statement::ExportDataset { name, path }
+                } else if matches!(&self.current().token_type, TokenType::Identifier(ref l) if l.eq_ignore_ascii_case("LEROBOT"))
+                {
+                    // 🔖 EXPORT LEROBOT t TO 'dir' [FPS n] [TASKS col]
+                    self.advance();
+                    let table = match self.current().token_type.clone() {
+                        TokenType::Identifier(t) => {
+                            self.advance();
+                            t
+                        }
+                        _ => {
+                            return Err(
+                                self.error("Expected table name after EXPORT LEROBOT")
+                            )
+                        }
+                    };
+                    if !matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("TO"))
+                    {
+                        return Err(self.error("Expected TO after EXPORT LEROBOT table"));
+                    }
+                    self.advance();
+                    let path = match self.current().token_type.clone() {
+                        TokenType::String(p) => {
+                            self.advance();
+                            p
+                        }
+                        _ => {
+                            return Err(
+                                self.error("Expected destination directory string after TO")
+                            )
+                        }
+                    };
+                    let mut fps = None;
+                    let mut task_column = None;
+                    loop {
+                        if matches!(&self.current().token_type, TokenType::Identifier(ref k) if k.eq_ignore_ascii_case("FPS"))
+                        {
+                            self.advance();
+                            fps = Some(match self.current().token_type.clone() {
+                                TokenType::PureInteger(n) => {
+                                    self.advance();
+                                    if n <= 0 {
+                                        return Err(self.error("FPS expects a positive integer"));
+                                    }
+                                    n as u32
+                                }
+                                _ => {
+                                    return Err(
+                                        self.error("Expected integer after FPS")
+                                    )
+                                }
+                            });
+                        } else if matches!(&self.current().token_type, TokenType::Identifier(ref k) if k.eq_ignore_ascii_case("TASKS"))
+                        {
+                            self.advance();
+                            task_column = Some(match self.current().token_type.clone() {
+                                TokenType::Identifier(c) => {
+                                    self.advance();
+                                    c
+                                }
+                                _ => {
+                                    return Err(
+                                        self.error("Expected column name after TASKS")
+                                    )
+                                }
+                            });
+                        } else {
+                            break;
+                        }
+                    }
+                    Statement::ExportLerobot { table, path, fps, task_column }
                 } else if matches!(&self.current().token_type, TokenType::Table)
                     || matches!(&self.current().token_type, TokenType::Identifier(ref t) if t.eq_ignore_ascii_case("TABLE"))
                 {

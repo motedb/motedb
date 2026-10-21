@@ -4,4 +4,5 @@
 //! ecosystem (pyarrow, pandas, DuckDB, LeRobot) speaks Parquet, so Parquet is
 //! the bridge everything else (LeRobot export, DataLoader recipes) builds on.
 
+pub mod lerobot;
 pub mod parquet;

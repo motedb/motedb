@@ -2103,6 +2103,7 @@ impl QueryExecutor {
                 | Statement::ExportDataset { .. }
                 | Statement::ExportDb { .. }
                 | Statement::ExportTable { .. }
+                | Statement::ExportLerobot { .. }
                 | Statement::ImportParquet { .. }
                 | Statement::BeginTransaction
                 | Statement::CommitTransaction
@@ -2208,6 +2209,24 @@ impl QueryExecutor {
                 let rows = self.export_table_parquet(&table, std::path::Path::new(&path))?;
                 Ok(QueryResult::Definition {
                     message: format!("table '{table}' exported to '{path}': {rows} rows"),
+                })
+            }
+            Statement::ExportLerobot {
+                table,
+                path,
+                fps,
+                task_column,
+            } => {
+                let opts = crate::export::lerobot::LeRobotOptions {
+                    fps: fps.unwrap_or(30),
+                    task_column: task_column.clone(),
+                };
+                let s = self.export_table_lerobot(&table, std::path::Path::new(&path), &opts)?;
+                Ok(QueryResult::Definition {
+                    message: format!(
+                        "LeRobot dataset at '{path}': {} episodes, {} frames, {} tasks (fps {})",
+                        s.episodes, s.frames, s.tasks, opts.fps
+                    ),
                 })
             }
             Statement::ImportParquet { path, table } => {
@@ -2729,6 +2748,24 @@ impl QueryExecutor {
                 let rows = self.export_table_parquet(table, std::path::Path::new(path))?;
                 StreamingQueryResult::Definition {
                     message: format!("table '{table}' exported to '{path}': {rows} rows"),
+                }
+            }
+            Statement::ExportLerobot {
+                table,
+                path,
+                fps,
+                task_column,
+            } => {
+                let opts = crate::export::lerobot::LeRobotOptions {
+                    fps: fps.unwrap_or(30),
+                    task_column: task_column.clone(),
+                };
+                let s = self.export_table_lerobot(table, std::path::Path::new(path), &opts)?;
+                StreamingQueryResult::Definition {
+                    message: format!(
+                        "LeRobot dataset at '{path}': {} episodes, {} frames, {} tasks (fps {})",
+                        s.episodes, s.frames, s.tasks, opts.fps
+                    ),
                 }
             }
             Statement::ImportParquet { path, table } => {

@@ -77,6 +77,13 @@ pub enum Statement {
         table: String,
         path: String,
     },
+    /// 🔖 EXPORT LEROBOT t TO 'dir' [FPS n] [TASKS col] — LeRobot v3 dataset.
+    ExportLerobot {
+        table: String,
+        path: String,
+        fps: Option<u32>,
+        task_column: Option<String>,
+    },
     /// 🔖 IMPORT PARQUET 'path' INTO t — batch-load parquet columns by name.
     ImportParquet {
         path: String,

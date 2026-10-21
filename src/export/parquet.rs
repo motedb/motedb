@@ -74,7 +74,7 @@ impl crate::sql::QueryExecutor {
 }
 
 #[cfg(feature = "parquet")]
-mod imp {
+pub(crate) mod imp {
     use std::fs::File;
     use std::path::Path;
     use std::sync::Arc;
@@ -274,7 +274,7 @@ mod imp {
     /// produced. We control the SQL (`SELECT *` carries no clauses), so the
     /// streaming variant passes its iterator through untouched; the
     /// columnar variant materializes via the standard conversion path.
-    fn rows_of(
+    pub(crate) fn rows_of(
         res: StreamingQueryResult,
     ) -> crate::Result<Box<dyn Iterator<Item = crate::Result<Vec<Value>>> + Send>> {
         if matches!(res, StreamingQueryResult::SelectColumnar { .. }) {
