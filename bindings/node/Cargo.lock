@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "motedb"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "arc-swap",
  "arrow-array",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "motedb-node"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "base64 0.22.1",
  "motedb",

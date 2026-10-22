@@ -1,6 +1,6 @@
 [package]
 name = "motedb-node"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2021"
 description = "Node.js bindings for MoteDB — AI-native embedded multimodal database."
 license = "MIT"
