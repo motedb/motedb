@@ -323,6 +323,8 @@ pub enum DataType {
     Geometry,
     /// Binary large object — raw bytes (X'0aff' literals, sensor payloads).
     Blob,
+    /// DATE — calendar days ('2026-10-22' literals coerced on insert).
+    Date,
 }
 
 /// CREATE INDEX statement

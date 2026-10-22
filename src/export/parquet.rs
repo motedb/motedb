@@ -153,6 +153,7 @@ pub(crate) mod imp {
             ColumnType::Boolean => DataType::Boolean,
             ColumnType::Text => DataType::Utf8,
             ColumnType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+            ColumnType::Date => DataType::Date32,
             ColumnType::Tensor(dim) => DataType::FixedSizeList(
                 // Nullable item: FixedSizeListBuilder (and pyarrow) emit
                 // nullable elements; declaring non-null fails the writer's
@@ -219,6 +220,14 @@ pub(crate) mod imp {
                     rows.iter()
                         .map(|r| match r.get(ci) {
                             Some(Value::Text(s)) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                ColumnType::Date => Arc::new(arrow_array::Date32Array::from(
+                    rows.iter()
+                        .map(|r| match r.get(ci) {
+                            Some(Value::Date(d)) => Some(d.days()),
                             _ => None,
                         })
                         .collect::<Vec<_>>(),
@@ -394,6 +403,13 @@ pub(crate) mod imp {
             ))
         };
         match target {
+            ColumnType::Date => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::Date32Array>()
+                    .ok_or_else(mismatch)?;
+                Ok(Value::Date(crate::types::Date::from_days(a.value(r))))
+            }
             ColumnType::Integer => match arr.data_type() {
                 DataType::Int64 => {
                     let a = arr
@@ -600,6 +616,7 @@ pub(crate) mod imp {
             ColumnType::Boolean => "BOOLEAN",
             ColumnType::Text => "TEXT",
             ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::Date => "DATE",
             ColumnType::Tensor(_) => "VECTOR",
             ColumnType::Blob => "BLOB",
             ColumnType::Spatial => "SPATIAL",

@@ -304,6 +304,14 @@ fn decode_buffered_value(
             let v = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
             Value::Timestamp(crate::types::Timestamp::from_micros(v))
         }
+        Some(ColumnTypeTag::Date) => {
+            let off = row_idx * 8;
+            if off + 8 > raw.len() {
+                return Value::Null;
+            }
+            let v = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+            Value::Date(crate::types::Date::from_days(v as i32))
+        }
         Some(ColumnTypeTag::Float) => {
             let off = row_idx * 8;
             if off + 8 > raw.len() {
@@ -1349,6 +1357,12 @@ impl ColSegmentStore {
                                             ))
                                         })
                                     }
+                                    // 🔖 Date: decode as Value::Date (days as i64 fixed).
+                                    ColumnType::Date => {
+                                        fopt.as_ref().and_then(|f| f.get_i64(i)).map(|days| {
+                                            Value::Date(crate::types::Date::from_days(days as i32))
+                                        })
+                                    }
                                     _ => {
                                         fopt.as_ref().and_then(|f| f.get_i64(i)).map(Value::Integer)
                                     }
@@ -1399,6 +1413,9 @@ impl ColSegmentStore {
                                 ColumnType::Timestamp => f.get_i64(i).map(|m| {
                                     Value::Timestamp(crate::types::Timestamp::from_micros(m))
                                 }),
+                                ColumnType::Date => f
+                                    .get_i64(i)
+                                    .map(|d| Value::Date(crate::types::Date::from_days(d as i32))),
                                 _ => Some(Value::Null),
                             }
                         } else {
@@ -1430,6 +1447,10 @@ impl ColSegmentStore {
                                         ))
                                     })
                                 }
+
+                                (Some(Some(f)), _, ColumnType::Date) => f.get_i64(i).map(|days| {
+                                    Value::Date(crate::types::Date::from_days(days as i32))
+                                }),
                                 (_, _, ColumnType::Spatial) => pspatial
                                     .get(pi)
                                     .and_then(|p| p.get(i))
@@ -2141,6 +2162,10 @@ impl ColSegmentStore {
                                 ColumnType::Integer => f.get_i64(i).map(Value::Integer),
                                 ColumnType::Float => f.get_f64(i).map(Value::Float),
                                 ColumnType::Boolean => f.get_bool(i).map(Value::Bool),
+
+                                ColumnType::Date => f
+                                    .get_i64(i)
+                                    .map(|d| Value::Date(crate::types::Date::from_days(d as i32))),
                                 ColumnType::Timestamp => f.get_i64(i).map(|m| {
                                     Value::Timestamp(crate::types::Timestamp::from_micros(m))
                                 }),
@@ -2164,6 +2189,9 @@ impl ColSegmentStore {
                                 (Some(Some(f)), _, ColumnType::Boolean) => {
                                     f.get_bool(i).map(Value::Bool)
                                 }
+                                (Some(Some(f)), _, ColumnType::Date) => f
+                                    .get_i64(i)
+                                    .map(|m| Value::Date(crate::types::Date::from_days(m as i32))),
                                 (Some(Some(f)), _, ColumnType::Timestamp) => {
                                     f.get_i64(i).map(|m| {
                                         Value::Timestamp(crate::types::Timestamp::from_micros(m))

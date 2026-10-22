@@ -312,7 +312,7 @@ impl Segment {
         use crate::types::ColumnType;
         let n = self.row_count;
         match ct {
-            ColumnType::Integer | ColumnType::Timestamp => {
+            ColumnType::Integer | ColumnType::Timestamp | ColumnType::Date => {
                 let seg = self.sst.read_fixed_i64(col_idx).ok()?;
                 let valid = ValidityBitmap::from_null_bytes(seg.null_bitmap_bytes(), n);
                 Some(ColumnVector::from_i64_slice(seg.raw_i64_slice(), valid))
@@ -986,6 +986,7 @@ fn push_fixed_value(row: &mut Vec<crate::types::Value>, v: i64, ct: &crate::type
         ColumnType::Timestamp => {
             row.push(Value::Timestamp(crate::types::Timestamp::from_micros(v)))
         }
+        ColumnType::Date => row.push(Value::Date(crate::types::Date::from_days(v as i32))),
         _ => row.push(Value::Null),
     }
 }
@@ -1005,11 +1006,18 @@ fn decode_cached_value(
             Value::Integer(m) if matches!(ct, ColumnType::Timestamp) => {
                 Value::Timestamp(crate::types::Timestamp::from_micros(m))
             }
+            Value::Integer(m) if matches!(ct, ColumnType::Date) => {
+                Value::Date(crate::types::Date::from_days(m as i32))
+            }
             v => v,
         },
         (CachedCol::Fixed(f), ColumnType::Integer) => {
             f.get_i64(idx).map(Value::Integer).unwrap_or(Value::Null)
         }
+        (CachedCol::Fixed(f), ColumnType::Date) => f
+            .get_i64(idx)
+            .map(|d| Value::Date(crate::types::Date::from_days(d as i32)))
+            .unwrap_or(Value::Null),
         (CachedCol::Fixed(f), ColumnType::Float) => {
             f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null)
         }

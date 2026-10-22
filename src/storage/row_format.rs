@@ -112,6 +112,8 @@ pub enum ColDecoder {
     FixedFloat,
     FixedBool,
     FixedTimestamp,
+    /// DATE — same 8-byte fixed layout (i64 days), decodes Value::Date.
+    FixedDate,
     VarText,
     /// Raw bytes column (BLOB) — var region holds verbatim bytes.
     VarBlob,
@@ -188,6 +190,13 @@ impl SchemaDecodeContext {
                     }
                     fixed_count += 1;
                     col_decoders.push(ColDecoder::FixedTimestamp);
+                }
+                ColumnType::Date => {
+                    if i < 64 {
+                        fixed_idx_map[i] = fixed_count as u8;
+                    }
+                    fixed_count += 1;
+                    col_decoders.push(ColDecoder::FixedDate);
                 }
                 ColumnType::Text => {
                     var_col_count += 1;
@@ -333,6 +342,17 @@ impl SchemaDecodeContext {
                         Value::Timestamp(Timestamp::from_micros(i64::from_le(
                             std::ptr::read_unaligned(ptr as *const i64),
                         )))
+                    };
+                    out.push(val);
+                }
+                ColDecoder::FixedDate => {
+                    let off = HEADER_SIZE + self.fixed_idx_map[i] as usize * FIXED_COL_SIZE;
+                    let val = unsafe {
+                        let ptr = data.as_ptr().add(off);
+                        Value::Date(crate::types::Date::from_days(i64::from_le(
+                            std::ptr::read_unaligned(ptr as *const i64),
+                        )
+                            as i32))
                     };
                     out.push(val);
                 }
@@ -531,6 +551,17 @@ impl SchemaDecodeContext {
                     };
                     self.row_buf.push(val);
                 }
+                ColDecoder::FixedDate => {
+                    let off = HEADER_SIZE + self.fixed_idx_map[i] as usize * FIXED_COL_SIZE;
+                    let val = unsafe {
+                        let ptr = data.as_ptr().add(off);
+                        Value::Date(crate::types::Date::from_days(i64::from_le(
+                            std::ptr::read_unaligned(ptr as *const i64),
+                        )
+                            as i32))
+                    };
+                    self.row_buf.push(val);
+                }
                 ColDecoder::VarText => {
                     if var_idx < var_entry_count {
                         let (v_off, v_len) = var_entries[var_idx];
@@ -676,6 +707,7 @@ impl ColumnarRowSet {
                 ColumnType::Tensor(_) | ColumnType::Spatial | ColumnType::Blob => {
                     ColumnArray::Values(Vec::new())
                 }
+                ColumnType::Date => ColumnArray::Values(Vec::new()),
             })
             .collect();
         Self {
@@ -883,6 +915,16 @@ pub fn decode_row_into_columns(
                     }
                 }
             }
+            ColDecoder::FixedDate => {
+                let off = HEADER_SIZE + ctx.fixed_idx_map[i] as usize * FIXED_COL_SIZE;
+                if off + FIXED_COL_SIZE <= data.len() {
+                    let arr: [u8; 8] = data[off..off + 8].try_into().unwrap_or([0; 8]);
+                    let days = i64::from_le_bytes(arr) as i32;
+                    if let ColumnArray::Values(ref mut v) = col_arr {
+                        v.push(Value::Date(crate::types::Date::from_days(days)));
+                    }
+                }
+            }
             ColDecoder::VarText => {
                 if var_idx < var_entry_count {
                     let (v_off, v_len) = var_entries[var_idx];
@@ -1010,6 +1052,9 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
             (Value::Timestamp(ts), ColumnType::Timestamp) => {
                 buf.extend_from_slice(&ts.as_micros().to_le_bytes());
             }
+            (Value::Date(d), ColumnType::Date) => {
+                buf.extend_from_slice(&(d.days() as i64).to_le_bytes());
+            }
             (Value::Text(t), ColumnType::Text) => {
                 let off = var_data.len() as u32;
                 var_data.extend_from_slice(t.as_bytes());
@@ -1119,6 +1164,9 @@ pub fn encode_into(row: &[Value], col_types: &[ColumnType], buf: &mut Vec<u8>) -
             }
             (Value::Timestamp(ts), ColumnType::Timestamp) => {
                 buf.extend_from_slice(&ts.as_micros().to_le_bytes());
+            }
+            (Value::Date(d), ColumnType::Date) => {
+                buf.extend_from_slice(&(d.days() as i64).to_le_bytes());
             }
             (Value::Text(t), ColumnType::Text) => {
                 var_entries.push((i, t.as_bytes().to_vec()));
@@ -2227,6 +2275,9 @@ fn decode_fixed(bytes: &[u8], col_type: &ColumnType) -> Value {
         ColumnType::Float => Value::Float(f64::from_le_bytes(arr)),
         ColumnType::Boolean => Value::Bool(bytes[0] != 0),
         ColumnType::Timestamp => Value::Timestamp(Timestamp::from_micros(i64::from_le_bytes(arr))),
+        ColumnType::Date => {
+            Value::Date(crate::types::Date::from_days(i64::from_le_bytes(arr) as i32))
+        }
         _ => Value::Null,
     }
 }

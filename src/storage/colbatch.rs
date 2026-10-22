@@ -278,7 +278,9 @@ impl ColumnVector {
 
     pub fn with_type_capacity(ct: &ColumnType, cap: usize) -> Self {
         let data = match ct {
-            ColumnType::Integer | ColumnType::Timestamp => ColData::I64(Vec::with_capacity(cap)),
+            ColumnType::Integer | ColumnType::Timestamp | ColumnType::Date => {
+                ColData::I64(Vec::with_capacity(cap))
+            }
             ColumnType::Float => ColData::F64(Vec::with_capacity(cap)),
             ColumnType::Boolean => ColData::Bool(Vec::with_capacity(cap.div_ceil(64))),
             ColumnType::Text => ColData::Utf8(Vec::with_capacity(cap)),
@@ -468,6 +470,14 @@ pub fn i64_vec_as_timestamp(cv: &ColumnVector, i: usize) -> Value {
     match &cv.data {
         ColData::I64(v) => Value::Timestamp(Timestamp::from_micros(v[i])),
         _ => Value::Null,
+    }
+}
+
+/// 🔖 VEC: raw i64 of an I64-batch cell (DATE days) — None on NULL/mismatch.
+pub fn i64_vec_get(cv: &ColumnVector, i: usize) -> Option<i64> {
+    match &cv.data {
+        ColData::I64(v) => v.get(i).copied(),
+        _ => None,
     }
 }
 

@@ -1742,6 +1742,7 @@ impl Parser {
             TokenType::Text => DataType::Text,
             TokenType::Boolean => DataType::Boolean,
             TokenType::Timestamp => DataType::Timestamp,
+            TokenType::Identifier(name) if name.to_uppercase() == "DATE" => DataType::Date,
             TokenType::Geometry => DataType::Geometry,
             TokenType::Identifier(name) if name.to_uppercase() == "POINT3D" => DataType::Geometry,
             TokenType::Identifier(name) if name.to_uppercase() == "BLOB" => DataType::Blob,

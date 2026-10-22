@@ -485,7 +485,15 @@ impl StreamingQueryResult {
                                                 )
                                             })
                                         }
-                                        _ => f.get_i64(idx).map(Value::Integer),
+                                        crate::types::ColumnType::Date => f.get_i64(idx).map(|d| {
+                                            Value::Date(crate::types::Date::from_days(d as i32))
+                                        }),
+                                        other_ct => f.get_i64(idx).map(Value::Integer).map(|v| {
+                                            if std::env::var_os("MOTE_TRACE_DECODE").is_some() {
+                                                eprintln!("MARK executor {:?}", other_ct);
+                                            }
+                                            v
+                                        }),
                                     }
                                     .unwrap_or(Value::Null),
                                 );
@@ -750,7 +758,15 @@ impl StreamingQueryResult {
                                                 )
                                             })
                                         }
-                                        _ => f.get_i64(idx).map(Value::Integer),
+                                        crate::types::ColumnType::Date => f.get_i64(idx).map(|d| {
+                                            Value::Date(crate::types::Date::from_days(d as i32))
+                                        }),
+                                        other_ct => f.get_i64(idx).map(Value::Integer).map(|v| {
+                                            if std::env::var_os("MOTE_TRACE_DECODE").is_some() {
+                                                eprintln!("MARK executor {:?}", other_ct);
+                                            }
+                                            v
+                                        }),
                                     }
                                     .unwrap_or(Value::Null),
                                 );
@@ -3997,6 +4013,8 @@ impl QueryExecutor {
                                     Value::Text(_) | Value::TextDoc(_) => ColumnType::Text,
                                     Value::Bool(_) => ColumnType::Boolean,
                                     Value::Timestamp(_) => ColumnType::Timestamp,
+                                    Value::Date(_) => ColumnType::Date,
+                                    Value::Date(_) => ColumnType::Date,
                                     Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
                                     Value::Spatial(_) => ColumnType::Spatial,
                                     Value::Blob(_) => ColumnType::Blob,
@@ -4145,6 +4163,7 @@ impl QueryExecutor {
                             Value::Text(_) | Value::TextDoc(_) => ColumnType::Text,
                             Value::Bool(_) => ColumnType::Boolean,
                             Value::Timestamp(_) => ColumnType::Timestamp,
+                            Value::Date(_) => ColumnType::Date,
                             Value::Vector(v) => ColumnType::Tensor(v.len()),
                             Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
                             Value::Spatial(_) => ColumnType::Spatial,
@@ -13191,6 +13210,7 @@ impl QueryExecutor {
                     Value::Text(_) | Value::TextDoc(_) => ColumnType::Text,
                     Value::Bool(_) => ColumnType::Boolean,
                     Value::Timestamp(_) => ColumnType::Timestamp,
+                    Value::Date(_) => ColumnType::Date,
                     Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
                     Value::Spatial(_) => ColumnType::Spatial,
                     Value::Blob(_) => ColumnType::Blob,
@@ -13564,6 +13584,8 @@ impl QueryExecutor {
                                         Value::Text(_) | Value::TextDoc(_) => ColumnType::Text,
                                         Value::Bool(_) => ColumnType::Boolean,
                                         Value::Timestamp(_) => ColumnType::Timestamp,
+                                        Value::Date(_) => ColumnType::Date,
+                                        Value::Date(_) => ColumnType::Date,
                                         Value::Tensor(t) => ColumnType::Tensor(t.dimension()),
                                         Value::Spatial(_) => ColumnType::Spatial,
                                         Value::Blob(_) => ColumnType::Blob,
@@ -20282,6 +20304,7 @@ impl QueryExecutor {
                     DataType::Text => ColumnType::Text,
                     DataType::Boolean => ColumnType::Boolean,
                     DataType::Timestamp => ColumnType::Timestamp,
+                    DataType::Date => ColumnType::Date,
                     DataType::Vector(dim) => ColumnType::Tensor(dim.unwrap_or(128)),
                     DataType::Geometry => ColumnType::Spatial,
                     DataType::Blob => ColumnType::Blob,
@@ -20948,6 +20971,8 @@ impl QueryExecutor {
                     super::ast::DataType::Text => ColumnType::Text,
                     super::ast::DataType::Boolean => ColumnType::Boolean,
                     super::ast::DataType::Timestamp => ColumnType::Timestamp,
+                    super::ast::DataType::Date => ColumnType::Date,
+                    DataType::Date => ColumnType::Date,
                     super::ast::DataType::Vector(dim) => ColumnType::Tensor(dim.unwrap_or(128)),
                     super::ast::DataType::Geometry => ColumnType::Spatial,
                     super::ast::DataType::Blob => ColumnType::Blob,

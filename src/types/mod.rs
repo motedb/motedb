@@ -1,5 +1,6 @@
 //! Multi-modal data types for MoteDB
 
+mod date;
 mod spatial;
 mod table;
 mod tensor;
@@ -9,6 +10,7 @@ mod timestamp;
 pub use spatial::{BoundingBox, BoundingBox3D, Geometry, Point, Point3D};
 mod comp_sum;
 pub use comp_sum::CompSum;
+pub use date::Date;
 pub use table::{
     ColumnDef, ColumnType, EpisodeConfig, IndexDef, IndexType, TTLDuration, TableSchema, TableType,
 };
@@ -220,6 +222,9 @@ pub enum Value {
     /// Timestamp data
     Timestamp(Timestamp),
 
+    /// DATE (days since Unix epoch)
+    Date(Date),
+
     /// Null value
     Null,
 }
@@ -259,6 +264,20 @@ impl PartialOrd for Value {
             (Value::Blob(a), Value::Blob(b)) => Some(a.as_slice().cmp(b.as_slice())),
             (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
+            (Value::Date(a), Value::Date(b)) => a.partial_cmp(b),
+            (Value::Date(a), Value::Text(s)) => {
+                Date::parse(s.as_str()).and_then(|d| a.partial_cmp(&d))
+            }
+            (Value::Text(s), Value::Date(b)) => {
+                Date::parse(s.as_str()).and_then(|d| d.partial_cmp(b))
+            }
+            (Value::Date(a), Value::Timestamp(b)) => {
+                (a.days() as i64).partial_cmp(&b.as_micros().div_euclid(86_400_000_000))
+            }
+            (Value::Timestamp(a), Value::Date(b)) => b
+                .days()
+                .partial_cmp(&(a.as_micros().div_euclid(86_400_000_000) as i32))
+                .map(|o| o.reverse()),
             (Value::Integer(a), Value::Float(b)) => int_float_cmp(*a, *b),
             (Value::Float(a), Value::Integer(b)) => int_float_cmp(*b, *a).map(|o| o.reverse()),
             // Timestamp vs Integer: compare timestamp micros to integer value
@@ -326,6 +345,17 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Value::Date(a), Value::Date(b)) => a == b,
+            // 🚨 Date vs Text: parse 'YYYY-MM-DD' so `WHERE d = '2026-10-22'`
+            // works on DATE columns (mirrors Timestamp-vs-Text).
+            (Value::Date(a), Value::Text(s)) => Date::parse(s.as_str()).is_some_and(|d| a == &d),
+            (Value::Text(s), Value::Date(b)) => Date::parse(s.as_str()).is_some_and(|d| &d == b),
+            (Value::Date(a), Value::Timestamp(b)) => {
+                a.days() as i64 == b.as_micros().div_euclid(86_400_000_000)
+            }
+            (Value::Timestamp(a), Value::Date(b)) => {
+                a.as_micros().div_euclid(86_400_000_000) == b.days() as i64
+            }
             (Value::Integer(a), Value::Float(b)) => int_float_eq(*a, *b),
             (Value::Float(a), Value::Integer(b)) => int_float_eq(*b, *a),
             (Value::Timestamp(a), Value::Integer(b)) => a.as_micros() == *b,
@@ -377,6 +407,10 @@ impl std::hash::Hash for Value {
                 state.write_u8(0); // numeric discriminant (same as Integer/Float)
                 canonical_float_bits(f).hash(state);
             }
+            Value::Date(d) => {
+                state.write_u8(0); // numeric discriminant
+                canonical_float_bits(d.days() as f64).hash(state);
+            }
             other => {
                 state.write_u8(5);
                 format!("{:?}", other).hash(state);
@@ -420,6 +454,7 @@ impl Value {
             Value::Text(s) => format!("t:{}", s),
             Value::Bool(b) => format!("b:{}", b),
             Value::Timestamp(t) => format!("ts:{}", t.as_micros()),
+            Value::Date(d) => format!("d:{}", d.days()),
             _ => format!("{:?}", self),
         }
     }

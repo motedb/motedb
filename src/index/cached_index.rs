@@ -74,6 +74,7 @@ impl FastKey {
             Value::Bool(b) => FastKey::Bool(*b),
             Value::Text(s) => FastKey::Text(Arc::clone(&s.0)), // unwrap ArcString -> Arc<str>
             Value::Timestamp(ts) => FastKey::Timestamp(ts.as_micros_u64()),
+            Value::Date(d) => FastKey::Integer(d.days() as i64),
             Value::Null => FastKey::Null,
             Value::Vector(_) => FastKey::Complex(7),
             Value::Tensor(_) => FastKey::Complex(8),

@@ -306,6 +306,13 @@ impl VecPred {
                         None => lit,
                     }
                 }
+                // 🔖 DATE 同理: 'YYYY-MM-DD' 预解析为天数 i64, I64 批比较才通
+                (Value::Text(s), Some(ColumnType::Date)) => {
+                    match crate::types::Date::parse(s.as_str()) {
+                        Some(d) => Value::Integer(d.days() as i64),
+                        None => lit,
+                    }
+                }
                 _ => lit,
             };
             return Some((pos, lit));
@@ -1573,7 +1580,7 @@ pub fn try_vec_group_by(
             s.col.is_none_or(|c| {
                 matches!(
                     batchless_type(cts, needed[c]),
-                    ColumnType::Integer | ColumnType::Timestamp
+                    ColumnType::Integer | ColumnType::Timestamp | ColumnType::Date
                 )
             })
         });
@@ -2704,11 +2711,15 @@ pub fn try_vec_projection(
         remap_pred(p, &needed);
     }
     // 投影列的批内位 + Timestamp 语义标记（I64 批需包装回 Value::Timestamp）。
-    let proj_meta: Vec<(usize, bool)> = proj
+    let proj_meta: Vec<(usize, bool, bool)> = proj
         .iter()
         .map(|&p| {
             let bi = needed.iter().position(|&x| x == p).expect("proj in needed");
-            (bi, matches!(cts.get(p), Some(ColumnType::Timestamp)))
+            (
+                bi,
+                matches!(cts.get(p), Some(ColumnType::Timestamp)),
+                matches!(cts.get(p), Some(ColumnType::Date)),
+            )
         })
         .collect();
 
@@ -2788,10 +2799,14 @@ pub fn try_vec_projection(
             let i = r as usize;
             let row: Vec<Value> = proj_meta
                 .iter()
-                .map(|&(bi, is_ts)| {
+                .map(|&(bi, is_ts, is_date)| {
                     let cv = &batch.cols[bi];
                     if is_ts {
                         crate::storage::colbatch::i64_vec_as_timestamp(cv, i)
+                    } else if is_date {
+                        crate::storage::colbatch::i64_vec_get(cv, i)
+                            .map(|d| Value::Date(crate::types::Date::from_days(d as i32)))
+                            .unwrap_or(Value::Null)
                     } else {
                         cv.get(i)
                     }
@@ -2929,7 +2944,13 @@ pub fn try_vec_filter_topk(
     let cts = schema.col_types();
     let key_ok = matches!(
         cts.get(order_col),
-        Some(ColumnType::Integer | ColumnType::Float | ColumnType::Boolean | ColumnType::Timestamp)
+        Some(
+            ColumnType::Integer
+                | ColumnType::Float
+                | ColumnType::Boolean
+                | ColumnType::Timestamp
+                | ColumnType::Date
+        )
     );
     if !key_ok {
         return Ok(None);

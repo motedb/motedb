@@ -43,6 +43,7 @@ impl MoteDB {
         ensure_open!(self);
         // 1. Get table schema
         let schema = self.table_registry.get_table(table_name)?;
+        Self::coerce_row_to_schema(&schema, &mut row);
 
         // 1.5 Check primary key uniqueness for non-AUTO_INCREMENT tables.
         // 🔑 AUTO_INCREMENT tables check too when the caller supplies an
@@ -908,6 +909,23 @@ impl MoteDB {
             if matches!(ct, crate::types::ColumnType::Float) {
                 if let Some(crate::types::Value::Integer(v)) = row.get(i) {
                     row[i] = crate::types::Value::Float(*v as f64);
+                }
+            }
+            // 🔖 DATE columns accept string literals 'YYYY-MM-DD' (and
+            // datetime strings — truncated to the date part) and TIMESTAMP
+            // values (truncated to the UTC day).
+            if matches!(ct, crate::types::ColumnType::Date) {
+                match row.get(i) {
+                    Some(crate::types::Value::Text(t)) => {
+                        if let Some(d) = crate::types::Date::parse(t.as_str()) {
+                            row[i] = crate::types::Value::Date(d);
+                        }
+                    }
+                    Some(crate::types::Value::Timestamp(ts)) => {
+                        let days = ts.as_micros().div_euclid(86_400_000_000) as i32;
+                        row[i] = crate::types::Value::Date(crate::types::Date::from_days(days));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2875,6 +2893,13 @@ impl MoteDB {
             return self.fast_batch_insert_explicit(table_name, rows, &schema);
         }
 
+        // 1.5 🔖 Coerce literal forms to schema types (DATE ← 'YYYY-MM-DD',
+        // Float ← Integer, …) before validation — the batch API path and the
+        // SQL INSERT path both land here, so this is the single choke point.
+        for row in rows.iter_mut() {
+            Self::coerce_row_to_schema(&schema, row);
+        }
+
         // 2. Validate all rows
         for (idx, row) in rows.iter().enumerate() {
             schema.validate_row(row).map_err(|e| {
@@ -3491,6 +3516,22 @@ impl MoteDB {
                         row[i] = crate::types::Value::Timestamp(
                             crate::types::Timestamp::from_micros(*m),
                         );
+                    }
+                }
+                // 🔖 DATE 同理: Text 'YYYY-MM-DD' / Timestamp → Date(否则
+                // 列式 Date writer 的 _ => 0 兜底静默落 0)。
+                if matches!(ct, crate::types::ColumnType::Date) {
+                    match row.get(i) {
+                        Some(crate::types::Value::Text(t)) => {
+                            if let Some(d) = crate::types::Date::parse(t.as_str()) {
+                                row[i] = crate::types::Value::Date(d);
+                            }
+                        }
+                        Some(crate::types::Value::Integer(m)) => {
+                            row[i] =
+                                crate::types::Value::Date(crate::types::Date::from_days(*m as i32));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -4276,6 +4317,11 @@ impl Iterator for TableRowStreamingIterator {
                                         )
                                     })
                                 }
+                                Some(crate::types::ColumnType::Date) => f.get_i64(idx).map(|d| {
+                                    crate::types::Value::Date(crate::types::Date::from_days(
+                                        d as i32,
+                                    ))
+                                }),
                                 _ => f.get_i64(idx).map(crate::types::Value::Integer),
                             }
                             .unwrap_or(crate::types::Value::Null),

@@ -922,9 +922,38 @@ impl QueryExecutor {
                                             Some(ColumnType::Float) => (0..seg.sst.num_rows)
                                                 .map(|i| f.get_f64(i).map(Value::Float))
                                                 .collect(),
-                                            _ => (0..seg.sst.num_rows)
-                                                .map(|i| f.get_i64(i).map(Value::Integer))
+                                            // 🔑 Calendar types must decode as
+                                            // their Value variant — the old
+                                            // Integer fallback read TIMESTAMP
+                                            // micros (and DATE days) back as
+                                            // plain integers on this plain-scan
+                                            // path.
+                                            Some(ColumnType::Timestamp) => (0..seg.sst.num_rows)
+                                                .map(|i| {
+                                                    f.get_i64(i).map(|m| {
+                                                        Value::Timestamp(
+                                                            crate::types::Timestamp::from_micros(m),
+                                                        )
+                                                    })
+                                                })
                                                 .collect(),
+                                            Some(ColumnType::Date) => (0..seg.sst.num_rows)
+                                                .map(|i| {
+                                                    f.get_i64(i).map(|d| {
+                                                        Value::Date(crate::types::Date::from_days(
+                                                            d as i32,
+                                                        ))
+                                                    })
+                                                })
+                                                .collect(),
+                                            other_ct => {
+                                                if std::env::var_os("MOTE_TRACE_DECODE").is_some() {
+                                                    eprintln!("MARK scan.rs {:?}", other_ct);
+                                                }
+                                                (0..seg.sst.num_rows)
+                                                    .map(|i| f.get_i64(i).map(Value::Integer))
+                                                    .collect()
+                                            }
                                         },
                                         Err(_) => vec![None; seg.sst.num_rows],
                                     }
@@ -1219,6 +1248,7 @@ impl QueryExecutor {
                                         // `ORDER BY ts LIMIT k` to the full
                                         // scan+sort path (11.7ms vs 0.5ms).
                                         | Some(crate::types::ColumnType::Timestamp)
+                                        | Some(crate::types::ColumnType::Date)
                                 );
                                 if is_numeric {
                                     let is_float = matches!(
@@ -2121,7 +2151,10 @@ impl QueryExecutor {
             if fc < col_types.len()
                 && matches!(
                     col_types[fc],
-                    ColumnType::Integer | ColumnType::Timestamp | ColumnType::Boolean
+                    ColumnType::Integer
+                        | ColumnType::Timestamp
+                        | ColumnType::Boolean
+                        | ColumnType::Date
                 )
             {
                 let i64_pred: Box<dyn Fn(Option<i64>) -> bool> = match i64_op {

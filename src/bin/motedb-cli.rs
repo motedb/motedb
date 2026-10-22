@@ -341,6 +341,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
                 Value::Spatial(_) => 12,
                 Value::TextDoc(_) => 12,
                 Value::Timestamp(_) => 19,
+                Value::Date(d) => d.to_iso().len(),
             };
             if i < widths.len() {
                 widths[i] = widths[i].max(len);
@@ -414,6 +415,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
                 Value::Timestamp(ts) => {
                     format!("{} μs", ts.as_micros())
                 }
+                Value::Date(d) => d.to_iso(),
             };
             print!(" {:width$} ", s, width = width);
             if i < row.len() - 1 {

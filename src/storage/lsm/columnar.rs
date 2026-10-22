@@ -182,6 +182,9 @@ pub enum ColumnTypeTag {
     /// + byte payload; UTF-8 agnostic). Distinct tag so decode paths wrap
     /// values as Value::Blob instead of lossy Value::Text.
     Blob = 7,
+    /// DATE — rides the FIXED 8-byte layout as i64 days (decode wraps
+    /// Value::Date; distinct tag so scans round-trip the calendar type).
+    Date = 8,
 }
 
 impl ColumnTypeTag {
@@ -195,6 +198,7 @@ impl ColumnTypeTag {
             ColumnType::Tensor(_) => Self::Vector,
             ColumnType::Spatial => Self::Spatial,
             ColumnType::Blob => Self::Blob,
+            ColumnType::Date => Self::Date,
         }
     }
 
@@ -208,19 +212,20 @@ impl ColumnTypeTag {
             Self::Vector => ColumnType::Tensor(0), // dim reconstructed from segment header
             Self::Spatial => ColumnType::Spatial,
             Self::Blob => ColumnType::Blob,
+            Self::Date => ColumnType::Date,
         }
     }
 
     pub(crate) fn is_fixed(&self) -> bool {
         matches!(
             self,
-            Self::Integer | Self::Float | Self::Bool | Self::Timestamp
+            Self::Integer | Self::Float | Self::Bool | Self::Timestamp | Self::Date
         )
     }
 
     fn fixed_size(&self) -> usize {
         match self {
-            Self::Integer | Self::Float | Self::Timestamp => 8,
+            Self::Integer | Self::Float | Self::Timestamp | Self::Date => 8,
             Self::Bool => 1,
             _ => 0,
         }
@@ -3035,6 +3040,14 @@ impl ColumnarSSTableBuilder {
                     };
                     buf.extend_from_slice(&ts.to_le_bytes());
                 }
+                ColumnTypeTag::Date => {
+                    let d = match value {
+                        Value::Date(d) => d.days() as i64,
+                        Value::Null => i64::MIN,
+                        _ => 0,
+                    };
+                    buf.extend_from_slice(&d.to_le_bytes());
+                }
                 ColumnTypeTag::Text => {
                     // 🔑 Builder in-memory format: [len: u32 LE][bytes] per
                     // value (NULL/empty → len 0; NULLness is tracked
@@ -3255,6 +3268,14 @@ impl ColumnarSSTableBuilder {
                     };
                     buf.extend_from_slice(&ts.to_le_bytes());
                 }
+                ColumnTypeTag::Date => {
+                    let d = match value {
+                        Value::Date(d) => d.days() as i64,
+                        Value::Null => i64::MIN,
+                        _ => 0,
+                    };
+                    buf.extend_from_slice(&d.to_le_bytes());
+                }
                 ColumnTypeTag::Text => {
                     let s = match value {
                         Value::Text(t) => t.as_str().to_string(),
@@ -3401,7 +3422,7 @@ impl ColumnarSSTableBuilder {
             let mut row = Vec::with_capacity(col_types.len());
             for (ci, tag) in self.column_tags.iter().enumerate() {
                 match tag {
-                    ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                    ColumnTypeTag::Integer | ColumnTypeTag::Timestamp | ColumnTypeTag::Date => {
                         let buf = &self.column_buffers[ci];
                         let off = i * 8;
                         if off + 8 > buf.len() {

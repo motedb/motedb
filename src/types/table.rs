@@ -83,6 +83,8 @@ pub struct EpisodeConfig {
 pub enum ColumnType {
     /// Timestamp (i64 microseconds)
     Timestamp,
+    /// DATE — days since Unix epoch (i32), calendar semantics
+    Date,
     /// Text/String
     Text,
     /// Tensor/Vector with dimension
@@ -503,6 +505,11 @@ impl TableSchema {
                     true
                 }
 
+                // 🔖 DATE: Date value, ISO string (parsed at coerce time),
+                // or Timestamp (truncated to the UTC day).
+                (ColumnType::Date, crate::types::Value::Date(_)) => true,
+                (ColumnType::Date, crate::types::Value::Text(_)) => true,
+                (ColumnType::Date, crate::types::Value::Timestamp(_)) => true,
                 // Legacy types
                 (ColumnType::Timestamp, crate::types::Value::Timestamp(_)) => true,
                 (ColumnType::Timestamp, crate::types::Value::Text(_)) => true, // ISO date string parsed at insert time
