@@ -112,3 +112,35 @@ println!("vectors={} avg_neighbors={:.1}", stats.total_vectors, stats.avg_neighb
 
 - Previous: [07 Column Index](./07-column-index.md)
 - Next: [09 Text Index](./09-text-index.md)
+
+
+## Build/query tuning knobs (v0.15.3+)
+
+```sql
+CREATE VECTOR INDEX vi ON t(emb) WITH (
+  metric = 'l2',             -- or 'cosine'
+  max_degree = 32,           -- R: neighbors per node (default 64, range 8..=256)
+  build_search_list = 40,    -- construction beam (default: adaptive 300/150/80
+                             --   by graph size; lower = faster build)
+  search_list = 300          -- query-time L (default 300)
+);
+```
+
+Validated on 100K×384 synthetic corpora (clustered + uniform, self- and
+noised-queries, recall@10 = 1.0000 in all cells):
+
+| shape | config | build | vs default |
+|---|---|---|---|
+| clustered | default (R64/adaptive) | 80.5s | 1× |
+| clustered | R=32, bef=40 | 33.7s | **2.4×** |
+| uniform | default | 277.3s | 1× |
+| uniform | R=32, bef=40 | 163.3s | **1.7×** |
+| uniform | R=16, bef=40 | 104.9s | **2.6×** |
+
+Build time floors around ~33s at 100K (vector write + pin + graph flush);
+below R=32 the knob savings shrink. For production embeddings, validate
+recall on YOUR data before pushing aggressive knobs — synthetic corpora
+flatter graph quality.
+
+**Query forms**: `emb <-> [1,2,3]` (vector literal), `emb <-> '[1, 2, 3]'`
+(quoted bracketed string), and `emb <-> ?` (parameter) are all accepted.

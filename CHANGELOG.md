@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **🔑 向量索引旋钮 SQL 化 (§9)**: `CREATE VECTOR INDEX ... WITH (metric=,
+  max_degree=, build_search_list=, search_list=)` — R 与构建束宽可调,
+  构建束宽由硬编码阶梯(300/150/80)改为可覆盖。双形验证(100K×384 聚簇+
+  均匀, 自查询+加噪查询, recall@10 全 1.0000): R32/bef40 聚簇 2.4×(80.5→
+  33.7s)、均匀 1.7×(277→163s); R16 均匀 2.6×。docs/08 调优表。默认值未动
+  (真实嵌入语料验证后再评估大 N 自适应默认)
+- **修复(正确性)**: `ORDER BY emb <-> '[1,2,3]'`(带引号的方括号串)曾静默
+  落入"排序器跳过表达式键"路径返回任意顺序 — KNN 快路径现接受该拼写
+  (仓库自身示例曾用此形式); 三拼写(裸向量/带引号/参数)回归测试
+- **修复(死代码复活)**: CREATE INDEX 的 WITH 子句从未可达 — WITH 是
+  关键字 token, 旧匹配查 Identifier 永不命中; metric 值也要求字符串字面量
+  而非标识符(带引号 'l2'/'cosine')
+
 - **perf(vector-index build)**: 构建期钉住精确 f32 向量快照(arc-swap 无锁
   读)——robust_prune 逐对取向量从"两次共享锁+每次 1.5KB 反量化分配"变为
   等待无关的 Arc 克隆,且 prune 判距不再携带 SQ8 量化误差;mutation 自动

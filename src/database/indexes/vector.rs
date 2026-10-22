@@ -38,6 +38,7 @@ impl MoteDB {
         name: &str,
         dimension: usize,
         metric: Option<&str>,
+        vector_opts: &[(String, f64)],
     ) -> Result<()> {
         ensure_open!(self);
         // 🎯 统一路径：{db}.mote/indexes/vector_{name}/
@@ -52,7 +53,44 @@ impl MoteDB {
             _ => crate::distance::DistanceKind::Euclidean, // default L2
         };
 
-        let config = VamanaConfig::default().with_metric(distance_kind);
+        let mut config = VamanaConfig::default().with_metric(distance_kind);
+        // 🔖 SQL knobs: WITH (max_degree=…, build_search_list=…, search_list=…)
+        for (key, value) in vector_opts {
+            match key.as_str() {
+                "max_degree" => {
+                    let v = *value as usize;
+                    if !(8..=256).contains(&v) {
+                        return Err(crate::MoteDBError::InvalidArgument(format!(
+                            "max_degree must be in 8..=256, got {v}"
+                        )));
+                    }
+                    config.max_degree = v;
+                }
+                "build_search_list" => {
+                    let v = *value as usize;
+                    if v < 8 {
+                        return Err(crate::MoteDBError::InvalidArgument(
+                            "build_search_list must be >= 8".into(),
+                        ));
+                    }
+                    config.build_search_list = Some(v);
+                }
+                "search_list" => {
+                    let v = *value as usize;
+                    if v < 10 {
+                        return Err(crate::MoteDBError::InvalidArgument(
+                            "search_list must be >= 10".into(),
+                        ));
+                    }
+                    config.search_list_size = v;
+                }
+                other => {
+                    return Err(crate::MoteDBError::InvalidArgument(format!(
+                        "unknown vector index option '{other}'"
+                    )));
+                }
+            }
+        }
         let index = DiskANNIndex::create(&index_dir, dimension, config)?;
         let index_arc = Arc::new(RwLock::new(index));
         self.vector_indexes

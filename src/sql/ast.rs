@@ -340,6 +340,10 @@ pub struct CreateIndexStmt {
     /// Text-index tokenizer: None = default whitespace, Some((name, param))
     /// e.g. ("ngram", Some(2)) — `USING TOKENIZER ngram(2)`.
     pub tokenizer: Option<(String, Option<usize>)>,
+    /// 🔖 Vector-index build/query knobs from `WITH (max_degree=…,
+    /// build_search_list=…, search_list=…)` — (key, value) pairs, applied
+    /// by create_vector_index onto VamanaConfig. Empty = defaults.
+    pub vector_opts: Vec<(String, f64)>,
 }
 
 #[derive(Debug, Clone)]

@@ -1862,6 +1862,7 @@ impl Parser {
                         index_type: IndexType::Text,
                         metric: None,
                         tokenizer: Some((name, param)),
+                        vector_opts: Vec::new(),
                     });
                 }
             }
@@ -1912,11 +1913,15 @@ impl Parser {
             index_type
         };
 
-        // Parse optional WITH clause: WITH (metric = 'l2' | 'cosine')
+        // Parse optional WITH clause: WITH (metric = 'l2' | 'cosine',
+        // max_degree = 64, build_search_list = 80, search_list = 300)
         let mut metric = None;
-        let token_type = self.current().token_type.clone();
-        if let TokenType::Identifier(ref id) = token_type {
-            if id.to_uppercase() == "WITH" {
+        let mut vector_opts: Vec<(String, f64)> = Vec::new();
+        // 🔑 WITH is a KEYWORD token (TokenType::With, shared with CTEs) —
+        // the old Identifier("WITH") match never fired, making the whole
+        // WITH clause (incl. metric) unreachable dead code.
+        if matches!(self.current().token_type, TokenType::With) {
+            {
                 self.advance(); // consume WITH
                 self.expect(TokenType::LParen)?;
 
@@ -1928,7 +1933,17 @@ impl Parser {
 
                     match key_upper.as_str() {
                         "METRIC" => {
-                            let value = self.parse_identifier()?;
+                            // 🔑 metric values are STRING literals ('l2') —
+                            // the old parse_identifier() expected bare words
+                            // (dead code, never exercised until WITH became
+                            // reachable).
+                            let value = match self.current().token_type.clone() {
+                                TokenType::String(s) => {
+                                    self.advance();
+                                    s
+                                }
+                                _ => self.parse_identifier()?,
+                            };
                             let value_lower = value.to_lowercase();
                             match value_lower.as_str() {
                                 "l2" | "euclidean" => metric = Some("l2".to_string()),
@@ -1941,9 +1956,28 @@ impl Parser {
                                 }
                             }
                         }
+                        "MAX_DEGREE" | "BUILD_SEARCH_LIST" | "SEARCH_LIST" => {
+                            let value = match self.current().token_type.clone() {
+                                TokenType::PureInteger(n) => {
+                                    self.advance();
+                                    n as f64
+                                }
+                                TokenType::Number(n) => {
+                                    self.advance();
+                                    n
+                                }
+                                _ => {
+                                    return Err(MoteDBError::ParseError(format!(
+                                        "WITH option '{}' expects a number",
+                                        key
+                                    )))
+                                }
+                            };
+                            vector_opts.push((key.to_lowercase(), value));
+                        }
                         _ => {
                             return Err(MoteDBError::ParseError(format!(
-                                "Unknown WITH option '{}'. Supported: metric",
+                                "Unknown WITH option '{}'. Supported: metric, max_degree, build_search_list, search_list",
                                 key
                             )))
                         }
@@ -1966,6 +2000,7 @@ impl Parser {
             index_type: final_index_type,
             metric,
             tokenizer,
+            vector_opts,
         })
     }
 

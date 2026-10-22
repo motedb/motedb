@@ -20589,8 +20589,12 @@ impl QueryExecutor {
                     metadata.metric = stmt.metric.clone();
                     self.db.index_registry.register(metadata)?;
 
-                    self.db
-                        .create_vector_index(&index_name, dim, stmt.metric.as_deref())?;
+                    self.db.create_vector_index(
+                        &index_name,
+                        dim,
+                        stmt.metric.as_deref(),
+                        &stmt.vector_opts,
+                    )?;
                 } else {
                     unreachable!("Already validated column type");
                 }
@@ -23960,6 +23964,30 @@ impl QueryExecutor {
                     (Expr::Column(col), Expr::Literal(Value::Vector(vec))) => {
                         let cosine = matches!(*op, BinaryOperator::CosineDistance);
                         (col.clone(), vec.clone(), order_by.asc, cosine)
+                    }
+                    // 🔑 Quoted form `emb <-> '[1, 2, 3]'` — the literal
+                    // parses as TEXT, the fast path bails, and the fallback
+                    // sorter silently skips expression keys → ARBITRARY
+                    // order (our own examples used this spelling). Accept a
+                    // bracketed-vector string here instead of mis-sorting.
+                    (Expr::Column(col), Expr::Literal(Value::Text(s)))
+                        if s.starts_with('[') && s.ends_with(']') =>
+                    {
+                        let parsed: Option<Vec<f32>> = s[1..s.len() - 1]
+                            .split(',')
+                            .map(|p| p.trim().parse::<f32>().ok())
+                            .collect();
+                        if let Some(vec) = parsed.filter(|v| !v.is_empty()) {
+                            let cosine = matches!(*op, BinaryOperator::CosineDistance);
+                            (
+                                col.clone(),
+                                crate::types::ArcVec::new(vec),
+                                order_by.asc,
+                                cosine,
+                            )
+                        } else {
+                            return Ok(None);
+                        }
                     }
                     (Expr::Column(_col), _other) => {
                         return Ok(None);

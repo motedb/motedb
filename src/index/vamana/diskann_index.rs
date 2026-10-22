@@ -1263,12 +1263,11 @@ impl DiskANNIndex {
 
         // 1. 搜索候选邻居 (adaptive ef: smaller for mature graphs)
         let graph_size = self.vectors.len();
-        let ef_construction = if graph_size < 1000 {
-            300
-        } else if graph_size < 10000 {
-            150
-        } else {
-            80
+        let ef_construction = match self.config.build_search_list {
+            Some(n) => n,
+            None if graph_size < 1000 => 300,
+            None if graph_size < 10000 => 150,
+            None => 80,
         };
         let candidates = self.greedy_search(&query_vec, medoid_id, ef_construction)?;
 
@@ -1467,12 +1466,11 @@ impl DiskANNIndex {
 
         // 2. 搜索新候选邻居 (adaptive ef)
         let graph_size = self.vectors.len();
-        let ef_construction = if graph_size < 1000 {
-            300
-        } else if graph_size < 10000 {
-            150
-        } else {
-            80
+        let ef_construction = match self.config.build_search_list {
+            Some(n) => n,
+            None if graph_size < 1000 => 300,
+            None if graph_size < 10000 => 150,
+            None => 80,
         };
         let candidates = self.greedy_search(&query_vec, medoid_id, ef_construction)?;
 

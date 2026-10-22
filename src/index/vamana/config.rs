@@ -21,6 +21,12 @@ pub struct VamanaConfig {
     /// Beam width for search
     pub beam_width: usize,
 
+    /// 🔖 Build-time ef override (`WITH (build_search_list=N)`). None = the
+    /// size-adaptive ladder in incremental_insert_into_graph (300/150/80);
+    /// Some(N) pins the construction beam — the dominant per-node build cost
+    /// knob (halving it ≈ halves build time at the cost of edge quality).
+    pub build_search_list: Option<usize>,
+
     /// Distance metric (L2 or Cosine)
     pub metric: DistanceKind,
 }
@@ -36,6 +42,7 @@ impl Default for VamanaConfig {
             graph_cache_capacity: None,
             alpha: 1.2,
             beam_width: 48,                  // 🔧 折中: 32 → 48 (介于32和64之间)
+            build_search_list: None,         // 自适应阶梯 (见 incremental_insert_into_graph)
             metric: DistanceKind::Euclidean, // 默认 L2（和 SQL <-> 一致）
         }
     }
@@ -65,6 +72,7 @@ impl VamanaConfig {
             graph_cache_capacity: None,
             alpha: 1.2,
             beam_width: max_degree / 2,
+            build_search_list: None,
             metric: DistanceKind::Euclidean,
         }
     }
@@ -85,6 +93,7 @@ impl VamanaConfig {
             graph_cache_capacity: None,
             alpha: 1.2,
             beam_width: max_degree,
+            build_search_list: None,
             metric: DistanceKind::Euclidean,
         }
     }
