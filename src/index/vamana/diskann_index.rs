@@ -106,6 +106,11 @@ impl VectorStorage {
         self.vectors.pin_all()
     }
 
+    /// 🔥 Build mode: pin the exact f32 set (see SQ8Vectors::pin_exact).
+    fn pin_exact(&self, exact: Vec<(RowId, Vec<f32>)>) {
+        self.vectors.pin_exact(exact)
+    }
+
     fn unpin_all(&self) {
         self.vectors.unpin_all();
     }
@@ -433,6 +438,10 @@ impl DiskANNIndex {
         // times and the bounded LRU thrashes on that pattern (measured
         // 2.48 ms/row at 40K — the dominant build cost).
         self.vectors.pin_all()?;
+        // 🔥 Exact-vector pin: prune's per-pair `get()` calls become
+        // wait-free Arc clones (no locks, no dequantize allocation) and
+        // prune distances stop carrying SQ8 quantization error.
+        self.vectors.pin_exact(vectors);
         let graph = self.batch_build_graph(&ids);
         self.vectors.unpin_all();
         graph?;

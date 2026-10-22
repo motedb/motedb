@@ -86,6 +86,16 @@ pub struct SQ8Vectors {
     /// (re-reads + write-lock churn per miss). Pinned entries are immutable
     /// snapshots — any mutation (insert/delete) drops the pin.
     pinned: Arc<RwLock<Option<HashMap<RowId, Arc<QuantizedVector>>>>>,
+
+    /// 🔥 BUILD MODE (exact): the complete f32 set pinned in RAM, written
+    /// once by the graph build (which owns the original vectors) and read
+    /// wait-free via arc-swap. robust_prune fetches decompressed vectors
+    /// per candidate PAIR through `get()`; even with the quantized pin that
+    /// path paid two shared-lock acquisitions + a 1.5KB dequantize
+    /// allocation per call (sampled: the dominant build cost — 100K×384
+    /// uniform took 215s). Exact vectors also make prune decisions
+    /// quantization-error-free.
+    pinned_f32: arc_swap::ArcSwapAny<Option<Arc<HashMap<RowId, Arc<Vec<f32>>>>>>,
 }
 
 /// 🔑 A2 搜索期读守卫: 三把锁 (tombstones Mutex / offsets RwLock /
@@ -152,6 +162,7 @@ impl SQ8Vectors {
             file_path,
             tombstones: Arc::new(Mutex::new(HashSet::new())),
             pinned: Arc::new(RwLock::new(None)),
+            pinned_f32: arc_swap::ArcSwapAny::from(None),
         })
     }
 
@@ -253,6 +264,7 @@ impl SQ8Vectors {
             file_path,
             tombstones: Arc::new(Mutex::new(HashSet::new())),
             pinned: Arc::new(RwLock::new(None)),
+            pinned_f32: arc_swap::ArcSwapAny::from(None),
         })
     }
 
@@ -345,6 +357,14 @@ impl SQ8Vectors {
     }
 
     pub fn get(&self, row_id: RowId) -> Option<Arc<Vec<f32>>> {
+        // 🔥 Exact build pin first: wait-free load + Arc clone, no locks,
+        // no dequantize allocation. Only set during graph construction.
+        if let Some(map) = self.pinned_f32.load().as_ref() {
+            if let Some(v) = map.get(&row_id) {
+                return Some(Arc::clone(v));
+            }
+            return None;
+        }
         // 🔑 PERF: read-lock fast path (peek, no LRU touch).
         {
             let cache = self.cache.read();
@@ -491,8 +511,17 @@ impl SQ8Vectors {
         Ok(())
     }
 
+    /// Pin the EXACT f32 vectors for the build (takes ownership — the
+    /// caller's `Vec<(RowId, Vec<f32>)>` is usually the build input itself).
+    pub fn pin_exact(&self, exact: Vec<(RowId, Vec<f32>)>) {
+        let map: HashMap<RowId, Arc<Vec<f32>>> =
+            exact.into_iter().map(|(id, v)| (id, Arc::new(v))).collect();
+        self.pinned_f32.store(Some(Arc::new(map)));
+    }
+
     /// Drop the pinned set (returns the memory).
     pub fn unpin_all(&self) {
+        self.pinned_f32.store(None);
         *self.pinned.write() = None;
     }
 
@@ -548,6 +577,7 @@ impl SQ8Vectors {
         let offset = self.append_quantized(row_id, &qvec)?;
 
         // Pinned snapshots are stale the moment anything mutates.
+        self.pinned_f32.store(None);
         *self.pinned.write() = None;
         // Update the authoritative offset map; a re-inserted (previously
         // deleted) id comes back to life
