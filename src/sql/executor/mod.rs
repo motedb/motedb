@@ -4295,9 +4295,9 @@ impl QueryExecutor {
         // below paid a name→position string lookup per (row × column) —
         // 100K rows × C columns of hash lookups for what are constants.
         enum ProjCell {
-            Pos(Option<usize>),                 // plain column by position
+            Pos(Option<usize>),         // plain column by position
             GroupedName(Option<usize>), // grouped output column
-            Expr(Expr),                         // general expression
+            Expr(Expr),                 // general expression
             Star,
         }
         let proj_plan: Vec<ProjCell> = proj_columns
