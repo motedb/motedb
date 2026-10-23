@@ -73,6 +73,13 @@
 > (本仓库仅 llms.txt 源);④ musl:开一个只改 package.json targets + 取消
 > 矩阵注释的 PR,node-publish 的 PR 触发会 build-only 验证 7 目标,绿了即合。
 
+> **Phase 2 进度(2026-10-21)**:§10a DATE 类型端到端(~20 处接线 + 双绑定,
+> 81cf485/a9b033e,CI 绿);§10b 显式窗口帧 ROWS/RANGE BETWEEN(parser +
+> 帧位置表执行器,含 RANGE 数值区间/DESC/空帧/DISTINCT-only 去重语义,
+> test_window_frames ×8 + SQL 回归 214 绿);§10c ts 索引放开首列限制
+> (index_row_timestamp 行内首个 Value::Timestamp,test_ts_index_nonfirst ×3)。
+> §10 剩余:DECIMAL(暂缓)、BLOB 标量函数、差分扩面。下一步 §11 1.0 准备。
+
 ---
 
 ## 0. 总览与依赖关系
@@ -289,9 +296,22 @@ bindings/python/src/lib.rs
 - **DECIMAL**(i128+scale 定点)/ **DATE**(i32 天):ColumnType 两成员 →
   row_format → 列段(复用 Fixed)→ evaluator 算术/比较/聚合 → Python
   (decimal.Decimal / datetime.date)→ Arrow(Decimal128 / Date32)
-- **显式窗口帧** `ROWS/RANGE BETWEEN`:parser + 窗口执行器帧边界
-- **timestamp 索引放开列位限制**:非首列 ts 走扫描的已知缺口 — 允许
-  `CREATE TIMESTAMP INDEX ON t(ts)` 任意列位(LazyTsIndex 扩展)
+  - ✅ DATE 已完成(v0.15.x):`Value::Date` 端到端 ~20 处接线 + 双绑定
+    映射 + `tests/test_date_type.rs`。DECIMAL 待评估(Fixed 段 8 字节
+    限制,接线成本与 DATE 同量级,暂缓)
+- ✅ **显式窗口帧** `ROWS/RANGE BETWEEN`(2026-10-21):parser
+  (`parse_frame_bound`,bound 词不保留、`match_keyword_ident` 匹配)+
+  窗口执行器帧位置表。语义:ROWS 物理行;RANGE 无偏移走 peer 组;
+  RANGE 数值偏移 = 单数值/时间键值区间(DESC 取反坐标 + 二分);聚合
+  start=UNBOUNDED PRECEDING 时保留单调累加器快路径,其余逐帧精确重算
+  (DISTINCT 仅在声明 DISTINCT 时去重);FIRST/LAST_VALUE 按帧;排序/
+  偏移函数忽略帧。边界校验(start 不得晚于 end 等)+ GROUPS/INTERVAL
+  明确报错。`tests/test_window_frames.rs` 8 测试。
+- ✅ **timestamp 索引放开列位限制**(2026-10-21):`index_row_timestamp`
+  从 `row.first()` 改为行内第一个 `Value::Timestamp`(= rebuild 的
+  第一 Timestamp 列语义),非首列 ts 表写入即入索引,不再等
+  checkpoint/reopen。`tests/test_ts_index_nonfirst.rs` 3 测试(含双
+  ts 列不泄漏)。
 - BLOB 标量函数残余缺口清零(v0.13 遗留清单)
 - 差分测试扩面:DECIMAL/DATE 对 SQLite/DuckDB 对拍(既有差分框架直接加形状)
 

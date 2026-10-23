@@ -4045,6 +4045,7 @@ impl QueryExecutor {
             WindowFunc,
             Option<Vec<String>>,
             Option<Vec<OrderByExpr>>,
+            Option<crate::sql::ast::WindowFrame>,
         )> = Vec::new();
         // 🔑 Two-track rewriting, ONE spec collection (from the marker pass):
         //   proj_columns — stmt.columns with every WindowFunction node →
@@ -4079,6 +4080,7 @@ impl QueryExecutor {
                 WindowFunc,
                 Option<Vec<String>>,
                 Option<Vec<OrderByExpr>>,
+                Option<crate::sql::ast::WindowFrame>,
             )>,
             marker_names: &mut Vec<String>,
         ) {
@@ -4087,10 +4089,17 @@ impl QueryExecutor {
                     func,
                     partition_by,
                     order_by,
+                    frame,
                 } => {
                     let k = *next;
                     *next += 1;
-                    specs.push((k, func.clone(), partition_by.clone(), order_by.clone()));
+                    specs.push((
+                        k,
+                        func.clone(),
+                        partition_by.clone(),
+                        order_by.clone(),
+                        frame.as_deref().cloned(),
+                    ));
                     // 🔑 Pick a marker name that does NOT collide with a real
                     // column — a user table with a literal `__winval_0` column
                     // used to be silently OVERWRITTEN by the window value.
@@ -4211,7 +4220,7 @@ impl QueryExecutor {
         // ordering silently degraded to GROUP BY output order — which is
         // hash-unstable (same query returned different rn across runs).
         // Rewrite each non-column key to the aliased output column name.
-        for (_k, _func, _part, order_by) in win_specs.iter_mut() {
+        for (_k, _func, _part, order_by, _frame) in win_specs.iter_mut() {
             if let Some(ords) = order_by {
                 for oe in ords.iter_mut() {
                     if matches!(oe.expr, Expr::Column(_)) {
@@ -4238,14 +4247,15 @@ impl QueryExecutor {
         // unified expression projection (below) resolves the marker columns
         // like any other reference — nested windows (`SUM(v) OVER () + 1`)
         // evaluate through the same path.
-        for (_k, func, partition_by, order_by) in &win_specs {
+        for (_k, func, partition_by, order_by, frame) in &win_specs {
             Self::compute_window(
                 &mut full_rows,
                 &schema,
                 func,
                 partition_by.as_ref(),
                 order_by.as_ref(),
-            );
+                frame.as_ref(),
+            )?;
         }
         let num_schema = schema.columns.len();
         if !win_specs.is_empty() {
@@ -4254,7 +4264,7 @@ impl QueryExecutor {
             // pushes (projection lookups silently returned NULL). Names come
             // from the collision-safe marker pass (marker_names[k]).
             let mut cols = schema.columns.clone();
-            for (k, _, _, _) in &win_specs {
+            for (k, _, _, _, _) in &win_specs {
                 cols.push(crate::types::ColumnDef::new(
                     marker_names[marker_base + k].clone(),
                     ColumnType::Text, // value shapes vary; projection only copies
@@ -4417,6 +4427,7 @@ impl QueryExecutor {
             func,
             partition_by,
             order_by,
+            frame,
         } = e
         {
             use crate::sql::ast::WindowFunc;
@@ -4477,6 +4488,32 @@ impl QueryExecutor {
                     s.push_str(&format!(" ORDER BY {}", keys.join(", ")));
                 }
             }
+            if let Some(f) = frame {
+                use crate::sql::ast::FrameBound;
+                let unit = match f.units {
+                    crate::sql::ast::FrameUnits::Rows => "ROWS",
+                    crate::sql::ast::FrameUnits::Range => "RANGE",
+                };
+                let b = |bd: &FrameBound| -> String {
+                    match bd {
+                        FrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".into(),
+                        FrameBound::Preceding(n) => format!("{} PRECEDING", n),
+                        FrameBound::CurrentRow => "CURRENT ROW".into(),
+                        FrameBound::Following(n) => format!("{} FOLLOWING", n),
+                        FrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".into(),
+                    }
+                };
+                if f.end == FrameBound::CurrentRow {
+                    s.push_str(&format!(" {} {}", unit, b(&f.start)));
+                } else {
+                    s.push_str(&format!(
+                        " {} BETWEEN {} AND {}",
+                        unit,
+                        b(&f.start),
+                        b(&f.end)
+                    ));
+                }
+            }
             return s;
         }
         match e {
@@ -4504,13 +4541,19 @@ impl QueryExecutor {
     }
 
     /// Compute a window function over rows, appending the result column.
+    ///
+    /// `frame` is the explicit ROWS/RANGE frame (None ⇒ SQL default). Errors
+    /// only for RANGE-offset frames whose ORDER BY key cannot be resolved or
+    /// is non-numeric.
+    #[allow(clippy::too_many_arguments)]
     fn compute_window(
         rows: &mut [Vec<Value>],
         schema: &crate::types::TableSchema,
         func: &crate::sql::ast::WindowFunc,
         partition_by: Option<&Vec<String>>,
         order_by: Option<&Vec<crate::sql::ast::OrderByExpr>>,
-    ) {
+        frame: Option<&crate::sql::ast::WindowFrame>,
+    ) -> Result<()> {
         use crate::sql::ast::WindowFunc;
         // Resolve partition column positions
         let part_cols: Vec<usize> = partition_by
@@ -4573,13 +4616,15 @@ impl QueryExecutor {
                     std::cmp::Ordering::Equal
                 });
             }
-            // 🔑 Peer-group frame boundaries (partition-level): with ORDER BY,
-            // the frame ends at the current row's PEER GROUP (RANGE UNBOUNDED
-            // PRECEDING TO CURRENT ROW — the SQL default); without ORDER BY,
-            // the whole partition. Shared by aggregates and LAST_VALUE.
-            let boundary: Vec<usize> = if order_keys.is_empty() {
-                let end = indices.len().saturating_sub(1);
-                vec![end; indices.len()]
+            // 🔑 Peer-group bounds (partition-level): with ORDER BY, each
+            // position's peer group is [peer_start, peer_end] — the SQL
+            // default frame ends at the current row's peer group (RANGE
+            // UNBOUNDED PRECEDING TO CURRENT ROW); without ORDER BY, the
+            // whole partition is one peer group. Shared by aggregates,
+            // FIRST/LAST_VALUE and RANGE frames.
+            let n_part = indices.len();
+            let (peer_start, peer_end): (Vec<usize>, Vec<usize>) = if order_keys.is_empty() {
+                (vec![0; n_part], vec![n_part.saturating_sub(1); n_part])
             } else {
                 let key_of = |pos: usize| -> Vec<Value> {
                     order_keys
@@ -4587,20 +4632,186 @@ impl QueryExecutor {
                         .map(|&(p, _)| rows[indices[pos]].get(p).cloned().unwrap_or(Value::Null))
                         .collect()
                 };
-                let mut boundary = Vec::with_capacity(indices.len());
+                let mut starts = Vec::with_capacity(n_part);
+                let mut ends = Vec::with_capacity(n_part);
                 let mut pos = 0usize;
-                while pos < indices.len() {
+                while pos < n_part {
                     let mut end = pos;
                     let cur_key = key_of(pos);
-                    while end + 1 < indices.len() && key_of(end + 1) == cur_key {
+                    while end + 1 < n_part && key_of(end + 1) == cur_key {
                         end += 1;
                     }
                     for _ in pos..=end {
-                        boundary.push(end);
+                        starts.push(pos);
+                        ends.push(end);
                     }
                     pos = end + 1;
                 }
-                boundary
+                (starts, ends)
+            };
+            // 🔑 Explicit frame → per-position [start, end_excl) table.
+            // Only framed functions (aggregates, FIRST/LAST_VALUE) honor it;
+            // ranking and offset functions (ROW_NUMBER/RANK/DENSE_RANK/LAG/
+            // LEAD) ignore frames per SQL standard.
+            let frame_pos: Option<Vec<(usize, usize)>> = match frame {
+                None => None,
+                Some(_)
+                    if !matches!(
+                        func,
+                        crate::sql::ast::WindowFunc::Agg { .. }
+                            | crate::sql::ast::WindowFunc::FirstValue { .. }
+                            | crate::sql::ast::WindowFunc::LastValue { .. }
+                    ) =>
+                {
+                    None
+                }
+                Some(fr) => {
+                    let n = n_part;
+                    let mut out: Vec<(usize, usize)> = Vec::with_capacity(n);
+                    match fr.units {
+                        FrameUnits::Rows => {
+                            for pos in 0..n {
+                                let s = match fr.start {
+                                    FrameBound::UnboundedPreceding => 0,
+                                    FrameBound::Preceding(k) => pos.saturating_sub(k as usize),
+                                    FrameBound::CurrentRow => pos,
+                                    FrameBound::Following(k) => (pos + k as usize).min(n),
+                                    FrameBound::UnboundedFollowing => n,
+                                };
+                                let e = match fr.end {
+                                    FrameBound::UnboundedPreceding => 0,
+                                    FrameBound::Preceding(k) => {
+                                        let kk = k as usize;
+                                        if pos >= kk {
+                                            pos - kk + 1
+                                        } else {
+                                            0
+                                        }
+                                    }
+                                    FrameBound::CurrentRow => pos + 1,
+                                    FrameBound::Following(k) => (pos + k as usize + 1).min(n),
+                                    FrameBound::UnboundedFollowing => n,
+                                };
+                                out.push((s.min(n), e.min(n)));
+                            }
+                        }
+                        FrameUnits::Range if !fr.has_offset() => {
+                            // Peer-group semantics: CURRENT ROW spans the whole
+                            // peer group (offset bounds excluded by the guard).
+                            for pos in 0..n {
+                                let s = match fr.start {
+                                    FrameBound::UnboundedPreceding => 0,
+                                    FrameBound::CurrentRow => peer_start[pos],
+                                    _ => n,
+                                };
+                                let e = match fr.end {
+                                    FrameBound::CurrentRow => peer_end[pos] + 1,
+                                    FrameBound::UnboundedFollowing => n,
+                                    _ => 0,
+                                };
+                                out.push((s, e));
+                            }
+                        }
+                        FrameUnits::Range => {
+                            // Value interval on the single ORDER BY key: rows with
+                            // key within ±offset of the current row's key. The
+                            // parser guarantees exactly one ORDER BY expression;
+                            // here it must also RESOLVE to a numeric column.
+                            if order_keys.len() != 1 {
+                                return Err(MoteDBError::Query(
+                                "RANGE frame with offset requires the single ORDER BY key to resolve to a column"
+                                    .into(),
+                            ));
+                            }
+                            let (kcol, kasc) = order_keys[0];
+                            // Ok(None) = NULL key (legit — falls back to the
+                            // peer group); Err = non-numeric key type, which
+                            // has no offset semantics (Postgres errors too).
+                            let key_of_row = |idx: usize| -> Result<Option<f64>> {
+                                match rows[idx].get(kcol) {
+                                    Some(Value::Integer(i)) => Ok(Some(*i as f64)),
+                                    Some(Value::Float(f)) => Ok(Some(*f)),
+                                    Some(Value::Timestamp(ts)) => Ok(Some(ts.as_millis() as f64)),
+                                    Some(Value::Date(d)) => Ok(Some(d.days() as f64)),
+                                    Some(Value::Null) => Ok(None),
+                                    Some(other) => Err(MoteDBError::Query(format!(
+                                        "RANGE frame with offset requires a numeric/timestamp ORDER BY key, got non-numeric value {:?}",
+                                        other
+                                    ))),
+                                    None => Ok(None),
+                                }
+                            };
+                            // Coordinate L[j]: negate for DESC so L is
+                            // non-decreasing over the sorted partition — the
+                            // interval search then works identically both ways.
+                            let coord: Vec<Option<f64>> = indices
+                                .iter()
+                                .map(|&idx| {
+                                    key_of_row(idx).map(|v| v.map(|v| if kasc { v } else { -v }))
+                                })
+                                .collect::<Result<_>>()?;
+                            let non_null = |c: &Option<f64>| c.is_some();
+                            let first_nn = coord.iter().position(non_null).unwrap_or(n);
+                            let last_nn_excl = coord
+                                .iter()
+                                .rposition(non_null)
+                                .map(|p| p + 1)
+                                .unwrap_or(first_nn);
+                            // first index in the non-null run with coord >= x / > x
+                            let first_ge = |x: f64| -> usize {
+                                let (mut lo, mut hi) = (first_nn, last_nn_excl);
+                                while lo < hi {
+                                    let mid = (lo + hi) / 2;
+                                    if coord[mid].unwrap() >= x {
+                                        hi = mid;
+                                    } else {
+                                        lo = mid + 1;
+                                    }
+                                }
+                                lo
+                            };
+                            let first_gt = |x: f64| -> usize {
+                                let (mut lo, mut hi) = (first_nn, last_nn_excl);
+                                while lo < hi {
+                                    let mid = (lo + hi) / 2;
+                                    if coord[mid].unwrap() > x {
+                                        hi = mid;
+                                    } else {
+                                        lo = mid + 1;
+                                    }
+                                }
+                                lo
+                            };
+                            for pos in 0..n {
+                                // NULL current key: the offset is undefined —
+                                // standard behavior is to fall back to the peer
+                                // group (all NULL keys peer together).
+                                let (s, e) = match coord[pos] {
+                                    None => (peer_start[pos], peer_end[pos] + 1),
+                                    Some(li) => {
+                                        let s = match fr.start {
+                                            FrameBound::UnboundedPreceding => 0,
+                                            FrameBound::Preceding(k) => first_ge(li - k as f64),
+                                            FrameBound::CurrentRow => peer_start[pos],
+                                            FrameBound::Following(k) => first_ge(li + k as f64),
+                                            FrameBound::UnboundedFollowing => n,
+                                        };
+                                        let e = match fr.end {
+                                            FrameBound::UnboundedPreceding => 0,
+                                            FrameBound::Preceding(k) => first_gt(li - k as f64),
+                                            FrameBound::CurrentRow => peer_end[pos] + 1,
+                                            FrameBound::Following(k) => first_gt(li + k as f64),
+                                            FrameBound::UnboundedFollowing => n,
+                                        };
+                                        (s, e)
+                                    }
+                                };
+                                out.push((s.min(n), e.min(n)));
+                            }
+                        }
+                    }
+                    Some(out)
+                }
             };
             // Compute window values
             match func {
@@ -4703,12 +4914,27 @@ impl QueryExecutor {
                     }
                 }
                 WindowFunc::FirstValue { expr } => {
-                    let first = indices
-                        .first()
-                        .and_then(|&idx| Self::eval_expr_on_row(expr, &rows[idx], schema).ok())
-                        .unwrap_or(Value::Null);
-                    for &idx in &indices {
-                        rows[idx].push(first.clone());
+                    // Default frame: the partition's first row. Explicit
+                    // frame: the first row IN the frame (empty frame ⇒ NULL).
+                    let vals: Vec<Value> = indices
+                        .iter()
+                        .map(|&idx| {
+                            Self::eval_expr_on_row(expr, &rows[idx], schema).unwrap_or(Value::Null)
+                        })
+                        .collect();
+                    for (pos, &idx) in indices.iter().enumerate() {
+                        let v = match &frame_pos {
+                            None => vals.first().cloned().unwrap_or(Value::Null),
+                            Some(fp) => {
+                                let (s, e) = fp[pos];
+                                if s < e {
+                                    vals[s].clone()
+                                } else {
+                                    Value::Null
+                                }
+                            }
+                        };
+                        rows[idx].push(v);
                     }
                 }
                 WindowFunc::LastValue { expr } => {
@@ -4724,7 +4950,17 @@ impl QueryExecutor {
                         })
                         .collect();
                     for (pos, &idx) in indices.iter().enumerate() {
-                        let v = vals[boundary[pos]].clone();
+                        let v = match &frame_pos {
+                            None => vals[peer_end[pos]].clone(),
+                            Some(fp) => {
+                                let (s, e) = fp[pos];
+                                if s < e {
+                                    vals[e - 1].clone()
+                                } else {
+                                    Value::Null
+                                }
+                            }
+                        };
                         rows[idx].push(v);
                     }
                 }
@@ -4752,14 +4988,36 @@ impl QueryExecutor {
                         })
                         .collect();
 
-                    // 🔑 DISTINCT aggregates: recompute the frame exactly —
-                    // dedup inside [partition start .. peer-group end] (an
-                    // incremental accumulator can't un-count rows). O(frame²)
-                    // worst case, acceptable for the small frames DISTINCT
-                    // windows are used on.
-                    if *distinct {
+                    // 🔑 Per-position frame bounds: default frame = [partition
+                    // start .. peer-group end]; explicit frame overrides.
+                    let starts: Vec<usize> = match &frame_pos {
+                        None => vec![0; indices.len()],
+                        Some(fp) => fp.iter().map(|(s, _)| *s).collect(),
+                    };
+                    let ends: Vec<usize> = match &frame_pos {
+                        None => peer_end.iter().map(|&e| e + 1).collect(),
+                        Some(fp) => fp.iter().map(|(_, e)| *e).collect(),
+                    };
+                    // 🔑 Cumulative fast path: a start bound of UNBOUNDED
+                    // PRECEDING makes the frame [0 .. end(pos)) with end
+                    // non-decreasing for every legal end bound (ROWS counts
+                    // grow with pos; RANGE peer ends advance with peer
+                    // groups; RANGE interval ends grow with the key) — so a
+                    // running accumulator stays exact. Any other start bound
+                    // (or DISTINCT, which cannot un-count) recomputes each
+                    // row's frame exactly.
+                    let cumulative = match frame {
+                        None => true,
+                        Some(f) => f.start == crate::sql::ast::FrameBound::UnboundedPreceding,
+                    };
+                    if *distinct || !cumulative {
+                        // Exact per-row recompute. Dedup applies ONLY to
+                        // DISTINCT — the COUNT(*) frame values are all
+                        // Bool(true) and a shared dedup collapsed any frame
+                        // to a count of 1.
                         for (pos, &idx) in indices.iter().enumerate() {
-                            let frame = &vals[..boundary[pos] + 1];
+                            let (s, e) = (starts[pos], ends[pos]);
+                            let win: &[Value] = if s < e { &vals[s..e] } else { &vals[..0] };
                             let mut seen = std::collections::HashSet::new();
                             let mut sum_i: i64 = 0;
                             let mut sum_f: f64 = 0.0;
@@ -4767,13 +5025,15 @@ impl QueryExecutor {
                             let mut count_non_null: i64 = 0;
                             let mut min_v: Option<Value> = None;
                             let mut max_v: Option<Value> = None;
-                            for v in frame.iter() {
+                            for v in win.iter() {
                                 if matches!(v, Value::Null) {
                                     continue;
                                 }
-                                let one = vec![v.clone()];
-                                if !seen.insert(row_dedup_key(&one)) {
-                                    continue;
+                                if *distinct {
+                                    let one = vec![v.clone()];
+                                    if !seen.insert(row_dedup_key(&one)) {
+                                        continue;
+                                    }
                                 }
                                 match v {
                                     Value::Integer(i) => {
@@ -4833,7 +5093,8 @@ impl QueryExecutor {
                         }
                     } else {
                         // Running accumulators: exact SUM (i64 + f64), COUNT,
-                        // MIN/MAX scan. Recomputed per peer group boundary.
+                        // MIN/MAX scan, folding forward through each row's
+                        // frame end (monotonic — see `cumulative` above).
                         let mut sum_i: i64 = 0;
                         let mut sum_f: f64 = 0.0;
                         let mut any_float = false;
@@ -4890,7 +5151,7 @@ impl QueryExecutor {
                         for (pos, &idx) in indices.iter().enumerate() {
                             fold_next(
                                 &mut upto,
-                                boundary[pos] + 1,
+                                ends[pos],
                                 &mut sum_i,
                                 &mut sum_f,
                                 &mut any_float,
@@ -4936,6 +5197,7 @@ impl QueryExecutor {
                 row.push(Value::Null);
             }
         }
+        Ok(())
     }
 
     /// Execute a `TableRef::Subquery` body — any query `Statement` shape

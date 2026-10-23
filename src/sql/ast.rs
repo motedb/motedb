@@ -433,6 +433,10 @@ pub enum Expr {
         func: WindowFunc,
         partition_by: Option<Vec<String>>,  // PARTITION BY columns
         order_by: Option<Vec<OrderByExpr>>, // ORDER BY in window
+        /// Explicit frame: `ROWS/RANGE BETWEEN b1 AND b2` (or single-bound
+        /// shorthand). None ⇒ SQL default frame (RANGE UNBOUNDED PRECEDING TO
+        /// CURRENT ROW when ORDER BY present, whole partition otherwise).
+        frame: Option<Box<WindowFrame>>,
     },
 
     /// IN expression: column IN (val1, val2, ...) or column IN (SELECT ...)
@@ -677,11 +681,11 @@ pub enum WindowFunc {
     /// `arg` is None only for COUNT(*). `distinct` mirrors
     /// COUNT(DISTINCT v) / SUM(DISTINCT v).
     ///
-    /// Frame semantics (SQL default, no explicit frame support yet):
-    /// - no ORDER BY → the whole partition for every row;
-    /// - with ORDER BY → running aggregate over rows from the partition start
-    ///   through the current row's PEER GROUP (RANGE UNBOUNDED PRECEDING TO
-    ///   CURRENT ROW), matching SQLite/PostgreSQL defaults.
+    /// Frame semantics: with no explicit frame, no ORDER BY → the whole
+    /// partition for every row; with ORDER BY → running aggregate over rows
+    /// from the partition start through the current row's PEER GROUP
+    /// (RANGE UNBOUNDED PRECEDING TO CURRENT ROW), matching SQLite/PostgreSQL
+    /// defaults. An explicit ROWS/RANGE frame overrides both.
     Agg {
         func: WindowAggFunc,
         arg: Option<Box<Expr>>,
@@ -697,4 +701,77 @@ pub enum WindowAggFunc {
     Avg,
     Min,
     Max,
+}
+
+/// Explicit window frame: `ROWS|RANGE BETWEEN <start> AND <end>`, or the
+/// single-bound shorthand `ROWS <start>` (end defaults to CURRENT ROW).
+///
+/// - ROWS: bounds count physical rows.
+/// - RANGE: UNBOUNDED/CURRENT ROW follow peer-group semantics; numeric
+///   offsets (N PRECEDING/FOLLOWING) are value intervals on the single
+///   ORDER BY key (requires exactly one numeric/timestamp key).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrame {
+    pub units: FrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnits {
+    Rows,
+    Range,
+}
+
+/// One frame boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
+}
+
+impl WindowFrame {
+    /// SQL-validity: start may not be UNBOUNDED FOLLOWING, end may not be
+    /// UNBOUNDED PRECEDING, and start must not be "after" end.
+    pub fn validate(&self) -> Result<(), String> {
+        use FrameBound::*;
+        if self.start == UnboundedFollowing {
+            return Err("frame start cannot be UNBOUNDED FOLLOWING".into());
+        }
+        if self.end == UnboundedPreceding {
+            return Err("frame end cannot be UNBOUNDED PRECEDING".into());
+        }
+        // Ordinal rank with Preceding/Following magnitudes folded in:
+        // larger rank = later position in the partition.
+        let rank = |b: &FrameBound| -> Option<(i32, i64)> {
+            match b {
+                UnboundedPreceding => Some((0, 0)),
+                Preceding(n) => Some((1, -*n)),
+                CurrentRow => Some((2, 0)),
+                Following(n) => Some((3, *n)),
+                UnboundedFollowing => Some((4, 0)),
+            }
+        };
+        let (sr, sm) = rank(&self.start).unwrap();
+        let (er, em) = rank(&self.end).unwrap();
+        if (sr, sm) > (er, em) {
+            return Err("frame start bound cannot be after its end bound".into());
+        }
+        Ok(())
+    }
+
+    /// True when any bound carries a numeric offset (RANGE value-interval
+    /// semantics kick in only then).
+    pub fn has_offset(&self) -> bool {
+        matches!(
+            self.start,
+            FrameBound::Preceding(_) | FrameBound::Following(_)
+        ) || matches!(
+            self.end,
+            FrameBound::Preceding(_) | FrameBound::Following(_)
+        )
+    }
 }

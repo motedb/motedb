@@ -345,7 +345,10 @@ EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
   fixed-point, UNION ALL bodies, chained CTEs)
 - Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`,
   `LEAD`, `FIRST_VALUE`, `LAST_VALUE` + aggregates `OVER (PARTITION BY …
-  ORDER BY …)` (RANGE peer-group default frame)
+  ORDER BY … [ROWS|RANGE BETWEEN <bound> AND <bound>])` — explicit frames
+  (ROWS physical rows; RANGE peer groups or value intervals like
+  `RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING` on the numeric/timestamp
+  order key; default RANGE peer-group frame)
 - Scalar functions: `UPPER`/`LOWER`/`LENGTH`/`TRIM`/`SUBSTR`/`REPLACE`/`CONCAT` (skips NULL args, SQLite/Postgres semantics; `||` propagates NULL)/`INSTR`/`COALESCE`/`ROUND` (binary-exact decimal rounding)/`ABS`/arithmetic
 - Interop: `EXPORT TABLE t TO 'x.parquet'` / `IMPORT PARQUET 'x' INTO t`
   (pyarrow/pandas/DuckDB round-trip), `EXPORT LEROBOT <episode-table> TO

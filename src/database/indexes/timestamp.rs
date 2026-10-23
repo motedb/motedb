@@ -17,9 +17,9 @@ use std::sync::{Arc, OnceLock};
 /// The on-disk file materializes on the first WRITE-path use (row indexing,
 /// recovery insert, rebuild). Read-only paths (range query, stats, flush,
 /// checkpoint rebuild) treat an uninitialized index as empty — uninitialized
-/// ⟺ no TIMESTAMP-first row was ever inserted in any run, so they have
-/// nothing to read. Databases without TIMESTAMP columns never create the
-/// file or the `indexes/` directory.
+/// ⟺ no row with a Timestamp column value was ever inserted in any run, so
+/// they have nothing to read. Databases without TIMESTAMP columns never
+/// create the file or the `indexes/` directory.
 #[derive(Clone)]
 pub(crate) struct LazyTsIndex {
     path: PathBuf,
@@ -105,10 +105,10 @@ impl MoteDB {
         // lazy index file (a TIMESTAMP-free database must not materialize
         // indexes/ at checkpoint).
         //
-        // NOTE: the "index initialized" check is NOT sufficient here — tables
-        // whose timestamp column is not FIRST are indexed only by this scan
-        // (index_row_timestamp handles ts-first rows only), so an
-        // uninitialized index can still have indexable rows in segments.
+        // NOTE: the "index initialized" check is NOT sufficient here —
+        // runtime inserts index rows as they land (index_row_timestamp), so
+        // an uninitialized index can still have indexable rows in segments
+        // written by paths that skip it (e.g. legacy bulk loads).
         let any_ts_table = self.table_registry.list_tables()?.iter().any(|t| {
             self.table_registry
                 .get_table(t)

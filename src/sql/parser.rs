@@ -712,12 +712,103 @@ impl Parser {
             }
             order_by = Some(ords);
         }
+        // ROWS / RANGE frame clause. ROWS/RANGE are not lexer keywords —
+        // they arrive as Identifiers (case-preserving), matched
+        // case-insensitively. Grammar:
+        //   ROWS  BETWEEN b1 AND b2 | ROWS  b1 (end = CURRENT ROW)
+        //   RANGE BETWEEN b1 AND b2 | RANGE b1
+        let mut frame = None;
+        if let TokenType::Identifier(w) = self.current().token_type.clone() {
+            let units = match w.to_uppercase().as_str() {
+                "ROWS" => crate::sql::ast::FrameUnits::Rows,
+                "RANGE" => crate::sql::ast::FrameUnits::Range,
+                // GROUPS is a standard frame unit we don't support yet —
+                // surface a clear error instead of "expected )".
+                "GROUPS" => {
+                    return Err(self.error("GROUPS frames are not supported (use ROWS or RANGE)"))
+                }
+                _ => {
+                    self.expect(TokenType::RParen)?;
+                    return Ok(Expr::WindowFunction {
+                        func,
+                        partition_by,
+                        order_by,
+                        frame: None,
+                    });
+                }
+            };
+            self.advance();
+            let (start, end) = if self.match_token(TokenType::Between) {
+                let s = self.parse_frame_bound()?;
+                self.expect(TokenType::And)?;
+                let e = self.parse_frame_bound()?;
+                (s, e)
+            } else {
+                (
+                    self.parse_frame_bound()?,
+                    crate::sql::ast::FrameBound::CurrentRow,
+                )
+            };
+            let f = crate::sql::ast::WindowFrame { units, start, end };
+            f.validate().map_err(|e| self.error(&e))?;
+            // RANGE with numeric offsets is a value interval on the single
+            // ORDER BY key — require that key at parse time.
+            if matches!(units, crate::sql::ast::FrameUnits::Range) && f.has_offset() {
+                let n_keys = order_by.as_ref().map(|o| o.len()).unwrap_or(0);
+                if n_keys != 1 {
+                    return Err(
+                        self.error("RANGE frame with offset requires exactly one ORDER BY key")
+                    );
+                }
+            }
+            frame = Some(Box::new(f));
+        }
         self.expect(TokenType::RParen)?;
         Ok(Expr::WindowFunction {
             func,
             partition_by,
             order_by,
+            frame,
         })
+    }
+
+    /// One frame boundary: UNBOUNDED PRECEDING | UNBOUNDED FOLLOWING |
+    /// N PRECEDING | N FOLLOWING | CURRENT ROW. N must be a non-negative
+    /// integer literal (INTERVAL offsets are not supported yet). The bound
+    /// words stay unreserved — matched via `match_keyword_ident` so a column
+    /// named `rows`/`range`/`current` still lexes normally elsewhere.
+    fn parse_frame_bound(&mut self) -> Result<crate::sql::ast::FrameBound> {
+        if self.match_keyword_ident("UNBOUNDED") {
+            if self.match_keyword_ident("PRECEDING") {
+                return Ok(crate::sql::ast::FrameBound::UnboundedPreceding);
+            }
+            self.expect_keyword_ident("FOLLOWING")?;
+            return Ok(crate::sql::ast::FrameBound::UnboundedFollowing);
+        }
+        if self.match_keyword_ident("CURRENT") {
+            self.expect_keyword_ident("ROW")?;
+            return Ok(crate::sql::ast::FrameBound::CurrentRow);
+        }
+        match self.current().token_type.clone() {
+            TokenType::PureInteger(n) => {
+                if n < 0 {
+                    return Err(self.error("frame offset must be non-negative"));
+                }
+                self.advance();
+                if self.match_keyword_ident("PRECEDING") {
+                    Ok(crate::sql::ast::FrameBound::Preceding(n))
+                } else {
+                    self.expect_keyword_ident("FOLLOWING")?;
+                    Ok(crate::sql::ast::FrameBound::Following(n))
+                }
+            }
+            TokenType::Identifier(w) if w.eq_ignore_ascii_case("interval") => Err(self.error(
+                "INTERVAL frame offsets are not supported yet (use an integer offset)",
+            )),
+            _ => Err(self.error(
+                "expected frame bound: UNBOUNDED PRECEDING|FOLLOWING, N PRECEDING|FOLLOWING, or CURRENT ROW",
+            )),
+        }
     }
 
     fn parse_with_clause(&mut self) -> Result<(Vec<CteDef>, bool)> {

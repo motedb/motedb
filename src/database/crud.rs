@@ -2101,15 +2101,22 @@ impl MoteDB {
         Ok(n)
     }
     /// Maintain the in-memory timestamp index after a row lands (runtime
-    /// insert paths). Mirrors the WAL-recovery fill: when a row's FIRST
-    /// value is a Timestamp, index ts → row_id. Without this,
-    /// `query_timestamp_range` returned nothing until the next
-    /// checkpoint/reopen — the index was only populated by recovery and
-    /// rebuild_timestamp_index. The index is a row-id filter: entries for
-    /// later-deleted rows are tolerated (liveness is checked when rows are
-    /// fetched), exactly like recovery-built entries.
+    /// insert paths). Mirrors the rebuild/recovery fill: index the row's
+    /// FIRST timestamp column (wherever it sits — v1 required ts-first rows
+    /// via `row.first()`, so non-first-column ts tables were only indexed at
+    /// checkpoint/reopen, leaving `query_timestamp_range` empty until then).
+    /// The index is a row-id filter: entries for later-deleted rows are
+    /// tolerated (liveness is checked when rows are fetched), exactly like
+    /// recovery-built entries.
     pub(crate) fn index_row_timestamp(&self, row: &Row, row_id: RowId) {
-        if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
+        // First Value::Timestamp anywhere in the row == the first
+        // Timestamp-typed column's value (typed storage guarantees earlier
+        // columns never carry Timestamp values), matching
+        // rebuild_timestamp_index's schema-position() pick.
+        if let Some(crate::types::Value::Timestamp(ts)) = row
+            .iter()
+            .find(|v| matches!(v, crate::types::Value::Timestamp(_)))
+        {
             // Write path: materializes the index file on first TIMESTAMP row.
             let ts_idx = self.timestamp_index.ensure();
             if let Ok(idx) = ts_idx {
