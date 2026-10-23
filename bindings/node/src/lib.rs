@@ -103,6 +103,8 @@ fn value_to_json(v: &MValue) -> serde_json::Value {
         MValue::Bool(b) => serde_json::Value::Bool(*b),
         MValue::Text(t) => serde_json::Value::String(t.as_str().to_string()),
         MValue::Timestamp(t) => serde_json::Value::Number(t.as_micros().into()),
+        // 🔖 DATE → 'YYYY-MM-DD' (ISO string round-trips on insert/compare).
+        MValue::Date(d) => serde_json::Value::String(d.to_iso()),
         MValue::Vector(vec) => {
             let items: Vec<serde_json::Value> = vec
                 .iter()

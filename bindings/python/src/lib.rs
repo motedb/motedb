@@ -78,6 +78,10 @@ fn mote_to_py(v: &MValue) -> PyObject {
                 list.into_py(py)
             }
             MValue::Timestamp(ts) => ts.as_micros().into_py(py),
+            // 🔖 DATE → 'YYYY-MM-DD' string (datetime.date optional-dependency
+            // is not worth the coupling; the ISO form round-trips through
+            // inserts via Date::parse and compares against string literals).
+            MValue::Date(d) => d.to_iso().into_py(py),
             // Spatial: {"type": "Point3D", "x": .., "y": .., "z": ..} /
             // {"type": "Point", "x": .., "y": ..} / {"type": "LineString",
             // "points": [[x, y], ...]} / {"type": "Polygon", ...} — round
