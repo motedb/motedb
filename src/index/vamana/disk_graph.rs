@@ -278,7 +278,7 @@ impl DiskGraph {
         // 10K nodes ≈ 550ms of syscall storm; the mmap is already mapped.
         let inbound = {
             let mut map: HashMap<RowId, u32> = HashMap::new();
-            let mut push = |ns: Vec<RowId>, map: &mut HashMap<RowId, u32>| {
+            let push = |ns: Vec<RowId>, map: &mut HashMap<RowId, u32>| {
                 for n in ns {
                     *map.entry(n).or_insert(0) += 1;
                 }
