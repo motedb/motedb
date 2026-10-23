@@ -343,3 +343,43 @@ fn range_offset_timestamp_key_micros() {
         vec!["NULL", "NULL", "10", "30", "50"]
     );
 }
+
+#[test]
+fn partition_by_combined_with_frames() {
+    // 🔒 PARTITION BY × 显式帧四组合(行滚动/值区间/LAG/DISTINCT 帧倒数)
+    // — 每分区 v=10..50。期望值手工推导。
+    let (_dir, db) = setup();
+    // setup() 建的 m 是单分区 g 列 (id<=5 'a', 6..10 'b', v=10..50 每分区)。
+    let q = |expr: &str| -> Vec<String> {
+        let sql = format!("SELECT id, {expr} AS w FROM m ORDER BY id");
+        let r = db.execute(&sql).unwrap().materialize().unwrap();
+        let (_c, rows) = r.select_rows().unwrap();
+        rows.iter()
+            .map(|r| match &r[1] {
+                Value::Integer(i) => i.to_string(),
+                Value::Null => "NULL".into(),
+                other => format!("{:?}", other),
+            })
+            .collect()
+    };
+    assert_eq!(
+        q("SUM(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"),
+        vec!["30", "60", "90", "120", "90", "130", "210", "240", "270", "190"],
+        "per-partition rolling 3 (a: 10..50, b: 60..100)"
+    );
+    assert_eq!(
+        q("SUM(v) OVER (PARTITION BY g ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING)"),
+        vec!["30", "60", "90", "120", "90", "130", "210", "240", "270", "190"],
+        "per-partition value interval (spacing 10 = one neighbor)"
+    );
+    assert_eq!(
+        q("LAG(v) OVER (PARTITION BY g ORDER BY v)"),
+        vec!["NULL", "10", "20", "30", "40", "NULL", "60", "70", "80", "90"],
+        "per-partition lag restarts at NULL"
+    );
+    assert_eq!(
+        q("COUNT(DISTINCT v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)"),
+        vec!["5", "4", "3", "2", "1", "5", "4", "3", "2", "1"],
+        "distinct reverse-cumulative per partition"
+    );
+}
