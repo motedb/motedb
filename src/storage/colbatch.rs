@@ -474,7 +474,12 @@ pub fn i64_vec_as_timestamp(cv: &ColumnVector, i: usize) -> Value {
 }
 
 /// 🔖 VEC: raw i64 of an I64-batch cell (DATE days) — None on NULL/mismatch.
+/// 🔒 MUST check `valid` first: a NULL slot holds a raw 0, which the DATE
+/// materializer turned into 1970-01-01 (star-scan path lost every NULL date).
 pub fn i64_vec_get(cv: &ColumnVector, i: usize) -> Option<i64> {
+    if cv.valid.is_null(i) {
+        return None;
+    }
     match &cv.data {
         ColData::I64(v) => v.get(i).copied(),
         _ => None,

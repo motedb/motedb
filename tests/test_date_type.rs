@@ -127,3 +127,69 @@ fn date_rejects_invalid_literals() {
     assert_eq!(n[0][0], Value::Integer(0));
     let _ = db.close();
 }
+
+/// 🔒 Regression (2026-10-24 test campaign): `SELECT *` with no ORDER BY
+/// takes the VEC M4 star path, whose DATE materializer read the raw I64
+/// batch cell without the `valid` bitmap — every NULL date came back as
+/// 1970-01-01 (epoch 0). Parameterized middle-of-batch NULLs, verified
+/// across executemany's batched-INSERT shape.
+#[test]
+fn null_date_survives_star_scan() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path().join("nd.mote")).unwrap();
+    db.execute("CREATE TABLE ev (id INT PRIMARY KEY AUTO_INCREMENT, d DATE, v FLOAT, i INT)")
+        .unwrap();
+    db.execute_prepared_many(
+        "INSERT INTO ev (d, v, i) VALUES (?, ?, ?)",
+        vec![
+            vec![
+                motedb::types::Value::text("2024-01-15".to_string()),
+                motedb::types::Value::Float(1.5),
+                motedb::types::Value::Integer(1),
+            ],
+            vec![
+                motedb::types::Value::Null,
+                motedb::types::Value::Null,
+                motedb::types::Value::Null,
+            ],
+            vec![
+                motedb::types::Value::text("2024-03-01".to_string()),
+                motedb::types::Value::Float(3.5),
+                motedb::types::Value::Integer(3),
+            ],
+        ],
+    )
+    .unwrap();
+    let r = db
+        .execute("SELECT * FROM ev")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let (_c, rows) = r.select_rows().unwrap();
+    assert_eq!(
+        rows[1][1],
+        motedb::types::Value::Null,
+        "NULL date must stay NULL on the star path"
+    );
+    assert_eq!(
+        rows[0][1],
+        motedb::types::Value::Date(motedb::types::Date::parse("2024-01-15").unwrap())
+    );
+    // Parquet export must not turn the NULL into epoch-day either.
+    let p = dir.path().join("nd.parquet");
+    db.execute(&format!("EXPORT TABLE ev TO '{}'", p.display()))
+        .unwrap();
+    db.execute("CREATE TABLE ev2 (id INT PRIMARY KEY, d DATE, v FLOAT, i INT)")
+        .unwrap();
+    db.execute(&format!("IMPORT PARQUET '{}' INTO ev2", p.display()))
+        .unwrap();
+    let r3 = db
+        .execute("SELECT d FROM ev2 WHERE id = 2")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    assert_eq!(
+        r3.select_rows().unwrap().1[0][0],
+        motedb::types::Value::Null
+    );
+}
