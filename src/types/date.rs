@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn ordering_is_day_ordering() {
         assert!(Date::parse("2026-10-22").unwrap() > Date::parse("2026-10-21").unwrap());
-        assert!(Date::parse("2025-01-1").is_none() == false); // lenient zero-pad
+        assert!(Date::parse("2025-01-1").is_some()); // lenient zero-pad
         assert_eq!(Date::parse("2026-1-1").unwrap().to_iso(), "2026-01-01");
     }
 
