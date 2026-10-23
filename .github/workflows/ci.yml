@@ -32,6 +32,15 @@ jobs:
       - name: cargo clippy (advisory — warnings do not fail the job)
         run: cargo clippy --all-targets --all-features --no-deps
         continue-on-error: true
+      # e3ebb24 shipped a mid-match wildcard in BOTH bindings: every concrete
+      # arm after it became unreachable (a warn-only lint) and Python returned
+      # None for every value. The root-crate clippy above never sees the
+      # binding crates — they are not workspace members. Deny the lint here.
+      - name: bindings check — unreachable_patterns denied
+        run: |
+          for m in bindings/python/Cargo.toml bindings/node/Cargo.toml; do
+            RUSTFLAGS="-D unreachable_patterns" cargo check --manifest-path "$m" --quiet
+          done
 
   # ── Supply-chain: vulnerability + license gate (cargo-deny) ──────────────
   # Fails on any NEW RustSec advisory (vulnerability/unsound). Four known
