@@ -254,9 +254,12 @@ impl DiskGraph {
         // just rebuilt by build_sidecar_index above).
         let index_map = {
             let mut map: HashMap<RowId, u64> = HashMap::new();
+            // 🚀 Buffered: per-entry read_exact over the raw File paid one
+            // syscall per node (220K nodes ≈ 220K syscalls at reopen).
             let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
             idx.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE))
                 .map_err(StorageError::Io)?;
+            let mut idx = std::io::BufReader::with_capacity(1 << 20, idx);
             for _ in 0..index_count {
                 let mut buf = [0u8; 16];
                 if idx.read_exact(&mut buf).is_err() {
@@ -270,13 +273,27 @@ impl DiskGraph {
         };
 
         // 🔑 Rebuild inbound counts by reading every edge list once.
+        // 🚀 Read from the mmap (zero syscalls): the old per-node
+        // seek+read_exact over the File was the entire reopen cost —
+        // 10K nodes ≈ 550ms of syscall storm; the mmap is already mapped.
         let inbound = {
             let mut map: HashMap<RowId, u32> = HashMap::new();
-            let mut rf = rw_file.try_clone().map_err(StorageError::Io)?;
-            for &off in index_map.values() {
-                if let Ok(ns) = read_neighbors_from(&mut rf, off) {
-                    for n in ns {
-                        *map.entry(n).or_insert(0) += 1;
+            let mut push = |ns: Vec<RowId>, map: &mut HashMap<RowId, u32>| {
+                for n in ns {
+                    *map.entry(n).or_insert(0) += 1;
+                }
+            };
+            if let Some(m) = data_mmap.as_ref() {
+                for &off in index_map.values() {
+                    if let Some(ns) = neighbors_from_slice(m, off) {
+                        push(ns, &mut map);
+                    }
+                }
+            } else {
+                let mut rf = rw_file.try_clone().map_err(StorageError::Io)?;
+                for &off in index_map.values() {
+                    if let Ok(ns) = read_neighbors_from(&mut rf, off) {
+                        push(ns, &mut map);
                     }
                 }
             }
@@ -316,27 +333,30 @@ impl DiskGraph {
     /// `torn == true` means the file contains bytes past `eof` (a partially
     /// written record).
     fn scan_eof(file: &mut File) -> Result<(u64, bool)> {
+        use std::io::Read;
         let file_len = file.metadata().map_err(StorageError::Io)?.len();
-        file.seek(SeekFrom::Start(HEADER_SIZE))
-            .map_err(StorageError::Io)?;
+        // 🚀 Buffered scan: the old per-record read_exact paid 2 syscalls
+        // per node (10K nodes ≈ 450ms of pure syscall time at reopen).
+        // Neighbor bytes are read into scratch instead of seek-skipped to
+        // keep the BufReader strictly sequential (memcpy beats seek+refill).
+        let mut reader =
+            std::io::BufReader::with_capacity(1 << 20, file.try_clone().map_err(StorageError::Io)?);
         let mut offset = HEADER_SIZE;
-        let mut buf8 = [0u8; 8];
-        let mut buf4 = [0u8; 4];
+        let mut hdr = [0u8; 12];
+        let mut scratch: Vec<u8> = Vec::new();
 
         loop {
-            if file.read_exact(&mut buf8).is_err() {
+            if reader.read_exact(&mut hdr).is_err() {
                 break;
             }
-            if file.read_exact(&mut buf4).is_err() {
-                break;
-            }
-            let ncount = u32::from_le_bytes(buf4) as usize;
+            let ncount = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
             let record_size = 8 + 4 + (ncount * 8);
             if offset + record_size as u64 > file_len {
                 // Neighbor bytes run past EOF: torn record
                 return Ok((offset, true));
             }
-            if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() {
+            scratch.resize(ncount * 8, 0);
+            if reader.read_exact(&mut scratch).is_err() {
                 break;
             }
             offset += record_size as u64;
@@ -1098,6 +1118,28 @@ fn read_neighbors_from(file: &mut File, offset: u64) -> Result<Vec<RowId>> {
         neighbors.push(u64::from_le_bytes(buf8));
     }
     Ok(neighbors)
+}
+
+/// 🚀 mmap twin of `read_neighbors_from` — parse one edge-list record
+/// directly from mapped bytes (reopen path: zero syscalls per node).
+/// Returns None on out-of-bounds / torn record (caller skips).
+fn neighbors_from_slice(data: &[u8], offset: u64) -> Option<Vec<RowId>> {
+    let off = usize::try_from(offset).ok()?;
+    if off + 12 > data.len() {
+        return None;
+    }
+    let count = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+    let end = off.checked_add(12)?.checked_add(count.checked_mul(8)?)?;
+    if end > data.len() {
+        return None;
+    }
+    let mut neighbors = Vec::with_capacity(count);
+    let mut p = off + 12;
+    for _ in 0..count {
+        neighbors.push(u64::from_le_bytes(data[p..p + 8].try_into().unwrap()));
+        p += 8;
+    }
+    Some(neighbors)
 }
 
 #[cfg(test)]

@@ -233,6 +233,9 @@ impl SQ8Vectors {
             let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
             idx.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE))
                 .map_err(StorageError::Io)?;
+            // 🚀 Buffered: per-entry read_exact over the raw File paid one
+            // syscall per vector at reopen (220K vectors ≈ 220K syscalls).
+            let mut idx = std::io::BufReader::with_capacity(1 << 20, idx);
             for _ in 0..index_count {
                 let mut buf = [0u8; 16];
                 if idx.read_exact(&mut buf).is_err() {
