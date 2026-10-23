@@ -33,7 +33,21 @@ impl MoteDB {
     /// ```ignore
     /// db.create_vector_index("products_embedding", 768)?;
     /// ```
+    ///
+    /// 🔒 1.0 冻结签名(= v0.15.2):旋钮走 [`Self::create_vector_index_with`]。
     pub fn create_vector_index(
+        &self,
+        name: &str,
+        dimension: usize,
+        metric: Option<&str>,
+    ) -> Result<()> {
+        self.create_vector_index_with(name, dimension, metric, &[])
+    }
+
+    /// `create_vector_index` + WITH 旋钮(键值对),来自
+    /// `CREATE VECTOR INDEX ... WITH (max_degree=…, build_search_list=…,
+    /// search_list=…)`。
+    pub fn create_vector_index_with(
         &self,
         name: &str,
         dimension: usize,

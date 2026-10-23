@@ -2303,6 +2303,11 @@ fn decode_var_with_pool(
                 Ok(Value::text_from(s))
             }
         }
+        // 🔖 BLOB: verbatim bytes (encode writes the payload raw). Without
+        // this arm the bytes fell into the vector/bincode guessing below —
+        // decode failed and WHERE-side partial decode silently dropped every
+        // row (LENGTH(blob)/IS NOT NULL returned empty).
+        ColumnType::Blob => Ok(Value::Blob(crate::types::ArcBytes::new(bytes.to_vec()))),
         _ => {
             // Check for tagged bincode value (0xFF prefix)
             if !bytes.is_empty() && bytes[0] == 0xFF {

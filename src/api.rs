@@ -3812,8 +3812,7 @@ impl Database {
     /// let results = db.query(query)?;
     /// ```
     pub fn create_vector_index(&self, index_name: &str, dimension: usize) -> Result<()> {
-        self.inner
-            .create_vector_index(index_name, dimension, None, &[])
+        self.inner.create_vector_index(index_name, dimension, None)
     }
 
     /// 创建全文索引（用于BM25文本搜索）

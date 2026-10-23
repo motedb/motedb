@@ -130,6 +130,9 @@ SELECT COUNT(*) FROM frames WHERE payload = X'00fffe0a0b';  -- 字节等值
 - Python: `params=[..., b"\x00\xff"]` / 取回为 `bytes`;`bytearray` 亦可
 - `LENGTH(blob)` 返回**字节数**(SQLite 语义)
 - 上限 16 MiB/值(防止误将整文件写入行缓冲)
-- 已知 v0.13 缺口: BLOB 列上的标量函数(如 `WHERE LENGTH(payload) = 3`)
-  与 `ORDER BY` 输出在部分执行器路径下返回 NULL;裸投影/等值/时间窗
-  扫描/参数稳定。不可索引
+- 已知 v0.13 缺口 **已清零**(2026-10-22): BLOB 列上的标量函数与谓词
+  (`WHERE LENGTH(payload) > 2`、`IS NOT NULL`)在 segment 合并扫描路径
+  被解码成 NULL 而静默丢行 —— 根因是 MergeCursor 缺 Blob tag 臂 + Text
+  无条件 UTF-8 校验(该游标同时驱动 compaction 重写,不修则压实会把
+  BLOB 永久写成 NULL),及 row_format 部分解码缺 Blob 臂;均已修复并有
+  回归测试(tests/test_blob_where.rs,含 compaction 存活性)。不可索引

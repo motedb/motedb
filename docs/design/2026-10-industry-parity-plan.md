@@ -312,7 +312,23 @@ bindings/python/src/lib.rs
   第一 Timestamp 列语义),非首列 ts 表写入即入索引,不再等
   checkpoint/reopen。`tests/test_ts_index_nonfirst.rs` 3 测试(含双
   ts 列不泄漏)。
-- BLOB 标量函数残余缺口清零(v0.13 遗留清单)
+- ✅ **BLOB 标量函数残余缺口清零**(2026-10-22): v0.13 遗留的
+  `WHERE LENGTH(blob) …` / `IS NOT NULL` 空结果 —— 根因两处:
+  col_segment/merge.rs SegmentCursor 缺 `ColumnTypeTag::Blob` 臂(落
+  Opaque)且 `ColData::Text` 无条件 UTF-8 校验(原始字节 → None →
+  NULL);**该游标同时驱动 compaction 重写,不修则 BLOB 数据在压实时被
+  永久写成 NULL**。顺带补 decode_row 的 Date 臂。row_format.rs
+  decode_var 补 Blob 臂(部分解码路径同样静默丢行)。
+  tests/test_blob_where.rs ×3(谓词/NULL 三值/compaction 存活性)。
+- ✅ **API 冻结**(2026-10-22): docs/api/public-api-baseline.txt
+  (cargo-public-api --simplified, 9480 项)+ scripts/check_public_api.sh
+  (diff 基线,删除/改签名即 fail;发布时 --update)。对比 v0.15.2 清单
+  抓到并修复一处真破坏: WITH 旋钮提交改了
+  `MoteDB::create_vector_index` 签名 → 恢复 v0.15.2 原签名,旋钮走新
+  `create_vector_index_with`。`Value` 补 `#[non_exhaustive]`
+  (StorageError/QueryResult 已有),双绑定加未知变体→null 兜底臂
+  (旧 npm/wheel 不因新引擎损坏)。冻结清单入 docs/14 头部
+  (Rust/Python 20 方法/Node 11 成员)。
 - 差分测试扩面:DECIMAL/DATE 对 SQLite/DuckDB 对拍(既有差分框架直接加形状)
 
 **验收**:`test_fuzz_sql_combinations` 模板纳入新类型;README "Not yet
@@ -332,8 +348,8 @@ supported" 清空或仅剩服务端游标。
   修复 = `TableSchemaLegacyV013` 镜像一次性解码 + 转换(catalog open
   路径 decode 失败时回退)。四版本现全部打开,数据完整(50 行 mig +
   20 行 vector)。矩阵入 `cargo test` 常跑(fixture 进库)。
-- **API 冻结**:cargo public-api 清单 → 补 `#[non_exhaustive]`/收 `#[doc(hidden)]`;
-  Python/Node API 冻结清单入 docs/14-api-reference.md
+- ✅ **API 冻结**(2026-10-22,详见 §10 条目):清单基线 + 复检脚本 +
+  non_exhaustive + create_vector_index 签名恢复 + docs/14 冻结清单
 - ✅ **VERSIONING.md**(2026-10-21):semver 政策 + 存储格式版本政策
   (1.x 内前向兼容、新变体必须追加、破坏性只在 2.0 + 迁移工具承诺)
 - 安全收尾:cargo-audit 与 cargo-deny advisories 重复(deny 已在 CI 每

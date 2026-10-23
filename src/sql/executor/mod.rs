@@ -20862,7 +20862,7 @@ impl QueryExecutor {
                     metadata.metric = stmt.metric.clone();
                     self.db.index_registry.register(metadata)?;
 
-                    self.db.create_vector_index(
+                    self.db.create_vector_index_with(
                         &index_name,
                         dim,
                         stmt.metric.as_deref(),

@@ -190,7 +190,12 @@ impl PartialEq<&str> for ArcString {
 /// Size optimization: large variants (Text, Tensor, Spatial, TextDoc) are
 /// boxed to keep the enum at 16 bytes instead of 40 bytes. This reduces
 /// memory amplification for scalar-heavy rows from 8.6x to ~3.5x.
+///
+/// 🔒 1.0 API freeze: `#[non_exhaustive]` — new variants may arrive in a
+/// minor (DECIMAL is planned); match with a `_` arm. Bindings map unknown
+/// variants to their null representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Value {
     /// Integer value
     Integer(i64),

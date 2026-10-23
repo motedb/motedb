@@ -69,6 +69,9 @@ fn mote_to_py(v: &MValue) -> PyObject {
     Python::with_gil(|py| -> PyObject {
         match v {
             MValue::Null => py.None(),
+            // 🔒 Value is #[non_exhaustive]: unknown (future) variants map
+            // to None so an older wheel never breaks on a newer engine.
+            _ => py.None(),
             MValue::Integer(i) => i.into_py(py),
             MValue::Float(f) => f.into_py(py),
             MValue::Bool(b) => b.into_py(py),

@@ -77,6 +77,17 @@ impl SegmentCursor {
                     Err(_) => ColData::Opaque,
                 }
             } else if ci < seg.sst.column_tags.len()
+                && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Blob)
+            {
+                // 🔖 BLOB rides the text layout (verbatim bytes). Without this
+                // arm the column decoded to NULL for every row — and because
+                // MergeCursor also drives compaction rewrites, the NULLs then
+                // REPLACED the data permanently.
+                match seg.sst.read_binary(ci) {
+                    Ok(seg_data) => ColData::Text(seg_data),
+                    Err(_) => ColData::Opaque,
+                }
+            } else if ci < seg.sst.column_tags.len()
                 && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Vector)
             {
                 // Map read_vectors (row_id, vec) pairs to per-row-index options.
@@ -138,9 +149,20 @@ impl SegmentCursor {
                     ColumnType::Timestamp => f
                         .get_i64(i)
                         .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))),
+                    ColumnType::Date => f
+                        .get_i64(i)
+                        .map(|d| Value::Date(crate::types::Date::from_days(d as i32))),
                     _ => None,
                 },
-                Some(ColData::Text(t)) => t.get_str(i).map(|s| Value::Text(s.into())),
+                // Text layout carries both TEXT and BLOB columns — dispatch on
+                // the declared type (BLOB bytes would fail get_str's UTF-8
+                // validation and silently decode to NULL).
+                Some(ColData::Text(t)) => match ct {
+                    ColumnType::Blob => t
+                        .get_bytes(i)
+                        .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec()))),
+                    _ => t.get_str(i).map(|s| Value::Text(s.into())),
+                },
                 Some(ColData::Vector(cols)) => cols
                     .get(i)
                     .cloned()

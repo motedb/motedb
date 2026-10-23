@@ -2,6 +2,41 @@
 
 Complete API documentation for MoteDB.
 
+## 1.0 API 冻结清单 (2026-10)
+
+自 1.0 起,以下表面进入 semver 冻结(政策见根目录 [VERSIONING.md](../VERSIONING.md));
+清单外的一切视为内部实现,不承诺兼容。
+
+**Rust crate `motedb`** — 冻结面(全部为当前公开项,不做收窄):
+
+- 入口类型:`motedb::Database`(本文件全部方法)、`motedb::MoteDB`、
+  `motedb::QueryResult / StreamingQueryResult / ForEachResult / StreamingControl`
+- 配置:`motedb::DBConfig / AutoCheckpointConfig / DurabilityLevel / LSMConfig / WALConfig`
+- 类型系统:`motedb::types::{Value, ColumnType, ColumnDef, TableSchema, IndexType,
+  Timestamp, Date, Text, Blob(=ArcBytes), Vector(=ArcVec), Geometry, TTLDuration, TableType}`
+- 错误:`motedb::{Result, MoteDBError(=StorageError)}` — `StorageError` 与 `Value`
+  均为 `#[non_exhaustive]`:新变体可在 minor 加入,下游 match 必须带 `_` 臂
+  (绑定层把未知变体映射为各自 null 表示,旧包不因新引擎损坏)
+- 生态互操作:`EXPORT/IMPORT PARQUET`、`EXPORT LEROBOT`(feature `parquet`)、
+  `motedb::tokenizers` 插件系统
+- 明确**不在**冻结面:`motedb::ffi`(C ABI,实验性,见 lib.rs 顶部声明)、
+  `motedb::storage / index / sql / database / catalog` 等模块的内部结构 —
+  它们公开仅为 crate 组织所需,1.x 内可能调整;请只通过上面的入口使用
+
+冻结基线:`docs/api/`(cargo-public-api 清单;新增允许,删除/改签名只在 2.0)。
+
+**Python 包 `motedb`(20 方法)**:`motedb.Database(path, preset, create,
+durability, periodic_ms)` + `execute / executemany / query / fetch_arrays /
+insert_arrays / begin / commit / rollback / checkpoint / close / backup_to /
+export_to / import_mcap / doctor / vacuum / hybrid_search /
+set_vector_cache_budget / vector_cache_budget_bytes`。参数化查询 `?` 占位、
+durability 关键字、容器文件自动只读 — 均为冻结行为。
+
+**Node 包 `motedb`(11 成员)**:`new Database(path)` / `Database.open_readonly /
+open_snapshot`(静态)/ 实例 `execute → ExecResult / query / checkpoint /
+backup_to / export_snapshot / close / doctor`。Date 值 ↔ `'YYYY-MM-DD'` 字符串、
+BLOB ↔ base64、float 参数不被截断 — 冻结行为。
+
 ## Database Struct
 
 ```rust
