@@ -50,7 +50,7 @@ fn vector_index_with_options_parse_and_apply() {
         motedb::QueryResult::Select { rows, .. } => assert_eq!(rows[0][0], top1, "param"),
         other => panic!("{other:?}"),
     }
-    db.close();
+    let _ = db.close();
 }
 
 #[test]
@@ -82,5 +82,5 @@ fn vector_index_with_options_validation_errors() {
         };
         assert!(err.to_string().contains(needle), "{sql} -> {err}");
     }
-    db.close();
+    let _ = db.close();
 }

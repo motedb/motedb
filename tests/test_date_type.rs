@@ -64,7 +64,7 @@ fn date_column_end_to_end() {
         Value::Date(d) => assert_eq!(d.to_iso(), "1999-12-31"),
         other => panic!("after reopen: {other:?}"),
     }
-    db.close();
+    let _ = db.close();
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn date_parquet_roundtrip() {
         }
         other => panic!("{other:?}"),
     }
-    db.close();
+    let _ = db.close();
 }
 
 #[test]
@@ -125,5 +125,5 @@ fn date_rejects_invalid_literals() {
         .query("SELECT COUNT(*) FROM t WHERE d = '2026-01-01'")
         .unwrap();
     assert_eq!(n[0][0], Value::Integer(0));
-    db.close();
+    let _ = db.close();
 }
