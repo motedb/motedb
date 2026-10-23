@@ -20,6 +20,7 @@ cargo +nightly install cargo-fuzz
 |--------|----------------|-------------------|
 | `fuzz_sql_parser` | `Lexer::tokenize` → `Parser::parse` on arbitrary bytes | The hand-written recursive-descent parser (~1780 lines): stack overflow on deep nesting, str-slice panics on multi-byte UTF-8, index panics on malformed tokens. |
 | `fuzz_wal_recover` | `WALManager::open` + `recover()` on an arbitrary `.wal` file | Crash recovery on a partially-written / corrupted WAL (e.g. power loss mid-write): out-of-bounds reads, integer-overflow in frame lengths, decode panics. |
+| `fuzz_parquet_reader` | `IMPORT PARQUET` + full-table SELECT on an arbitrary `.parquet` file | The interop surface added with Parquet export/import (§5): the `parquet` crate's reader plus MoteDB's Arrow→row mapping (fixed_size_list vectors, 4 timestamp units, nested lists, decimals) on truncated / hostile files. Contract: clean `Err`, never a panic. |
 
 ## Running
 
@@ -28,8 +29,9 @@ cargo +nightly install cargo-fuzz
 cargo +nightly fuzz build
 
 # Run a target for a fixed wall-clock budget (recommended):
-cargo +nightly fuzz run fuzz_sql_parser -- -max_total_time=60 -max_len=4096
-cargo +nightly fuzz run fuzz_wal_recover  -- -max_total_time=60 -max_len=4096
+cargo +nightly fuzz run fuzz_sql_parser    -- -max_total_time=60 -max_len=4096
+cargo +nightly fuzz run fuzz_wal_recover   -- -max_total_time=60 -max_len=4096
+cargo +nightly fuzz run fuzz_parquet_reader -- -max_total_time=60 -max_len=16384
 
 # Run continuously until a crash is found:
 cargo +nightly fuzz run fuzz_sql_parser

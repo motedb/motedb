@@ -79,12 +79,17 @@ pub struct EpisodeConfig {
 }
 
 /// Column data type
+///
+/// 🔒 bincode encodes variants by ORDINAL — the catalog (`meta.bin` /
+/// `catalog.bin`) carries these raw. New variants MUST be appended at the
+/// END: inserting one mid-list (DATE was born at index 1 in b0b9cbe)
+/// silently re-types every older database's columns — v0.15.2 payloads
+/// decoded Text as Date and hit UnexpectedEof (caught by the §11 format
+/// migration matrix, tests/test_format_migration.rs).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnType {
     /// Timestamp (i64 microseconds)
     Timestamp,
-    /// DATE — days since Unix epoch (i32), calendar semantics
-    Date,
     /// Text/String
     Text,
     /// Tensor/Vector with dimension
@@ -100,6 +105,9 @@ pub enum ColumnType {
     /// Binary large object — raw bytes (sensor payloads, serialized
     /// messages, image frames). Equality-only: no ordering, no indexing.
     Blob,
+    /// DATE — days since Unix epoch (i32), calendar semantics.
+    /// Appended LAST to keep legacy bincode ordinals stable.
+    Date,
 }
 
 /// Column definition
@@ -251,6 +259,51 @@ pub struct TableSchema {
     /// TTL retention policy (None = keep forever)
     #[serde(default)]
     pub ttl: Option<TTLDuration>,
+}
+
+/// Legacy (v0.12/v0.13) serialized `TableSchema` shape — predates
+/// `episode_config` (added in v0.14). bincode payloads are POSITIONAL, so
+/// the modern shape cannot decode those bytes (a missing middle field
+/// misaligns everything after it). Kept as a one-shot decode mirror for the
+/// catalog open path (see `catalog::registry`).
+#[derive(Debug, Deserialize)]
+pub(crate) struct TableSchemaLegacyV013 {
+    name: String,
+    columns: Vec<ColumnDef>,
+    indexes: Vec<IndexDef>,
+    primary_key_column: Option<String>,
+    #[serde(default)]
+    primary_key_auto_increment: bool,
+    #[serde(default)]
+    auto_increment_start: Option<i64>,
+    #[serde(default)]
+    table_type: TableType,
+    #[serde(default)]
+    timeseries_column: Option<String>,
+    #[serde(default)]
+    ttl: Option<TTLDuration>,
+}
+
+impl From<TableSchemaLegacyV013> for TableSchema {
+    fn from(l: TableSchemaLegacyV013) -> Self {
+        let mut s = TableSchema {
+            name: l.name,
+            columns: l.columns,
+            indexes: l.indexes,
+            primary_key_column: l.primary_key_column,
+            primary_key_auto_increment: l.primary_key_auto_increment,
+            auto_increment_start: l.auto_increment_start,
+            episode_config: None,
+            column_map: HashMap::new(),
+            column_names_cache: None,
+            cached_col_types: Vec::new(),
+            table_type: l.table_type,
+            timeseries_column: l.timeseries_column,
+            ttl: l.ttl,
+        };
+        s.rebuild_column_map();
+        s
+    }
 }
 
 impl TableSchema {

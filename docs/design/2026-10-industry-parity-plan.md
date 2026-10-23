@@ -320,14 +320,26 @@ supported" 清空或仅剩服务端游标。
 
 ### 11. 1.0 准备 (W11)
 
-- **格式迁移矩阵**:CI job 用 v0.12/0.13/0.14/0.15 各发布版二进制生成样本库
-  (每版 ≤5MB 进 tests/fixtures)→ 当前版打开 → 全量查询校验;
+- ✅ **格式迁移矩阵**(2026-10-21):`scripts/gen_format_fixtures.sh` 用各
+  发布 tag 的 worktree 生成真实样本库(v0.12.9/0.13.0/0.14.0/0.15.2,
+  每版 ~30KB,tests/fixtures/formats/),`tests/test_format_migration.rs`
+  打开+查询+重开校验。**矩阵首跑即抓到两个真兼容性 bug**:
+  ① b0b9cbe 把 `ColumnType::Date` 插在枚举第 2 位 —— bincode 按序号编码,
+  v0.15.2 旧库所有 Text 列(序号 1)被静默解码成 Date,数据流错位直至
+  UnexpectedEof,**全部旧库在 HEAD 上打不开**;修复 = Date 挪到枚举末尾
+  + 枚举头部写入"新变体必须追加"的锁注释。② v0.12/v0.13 的 TableSchema
+  无 `episode_config` 字段(v0.14 加入),bincode 位置式编码无法跳读;
+  修复 = `TableSchemaLegacyV013` 镜像一次性解码 + 转换(catalog open
+  路径 decode 失败时回退)。四版本现全部打开,数据完整(50 行 mig +
+  20 行 vector)。矩阵入 `cargo test` 常跑(fixture 进库)。
 - **API 冻结**:cargo public-api 清单 → 补 `#[non_exhaustive]`/收 `#[doc(hidden)]`;
   Python/Node API 冻结清单入 docs/14-api-reference.md
-- **VERSIONING.md**:semver 政策 + 存储格式版本政策(1.x 内前向兼容,破坏性
-  改动只在 2.0;段不可变设计使多数优化可新段生效)
-- 安全收尾:cargo-audit 进 CI(deny 已有);fuzz +parquet reader 目标;
-  SECURITY.md 挂漏洞报送
+- ✅ **VERSIONING.md**(2026-10-21):semver 政策 + 存储格式版本政策
+  (1.x 内前向兼容、新变体必须追加、破坏性只在 2.0 + 迁移工具承诺)
+- 安全收尾:cargo-audit 与 cargo-deny advisories 重复(deny 已在 CI 每
+  commit 跑,此项目视为已覆盖);✅ fuzz +parquet reader 目标
+  (2026-10-21,`fuzz_parquet_reader` —— IMPORT PARQUET 任意字节不崩,
+  首跑 21 分钟 CPU 无发现);SECURITY.md 已有
 - 发布 **v1.0.0-rc1**,公告征集 2 周反馈
 
 ### 12. 内容战役 (W12 收口;素材自 Phase 1 起积累)

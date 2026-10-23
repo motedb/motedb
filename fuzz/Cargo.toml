@@ -20,7 +20,7 @@ cargo-fuzz = true
 # startup on Linux x86_64. The lib also gates its global_allocator on
 # not(fuzzing); this goes further and drops the crate entirely from fuzz
 # builds. `rayon` keeps feature-dependent code paths compiled in.
-motedb = { path = "..", default-features = false, features = ["rayon"] }
+motedb = { path = "..", default-features = false, features = ["rayon", "parquet"] }
 libfuzzer-sys = "0.4"
 
 # cargo-fuzz requires the bin crate type for each target.
@@ -42,3 +42,9 @@ doc = false
 # cargo-fuzz / -Zsanitizer), so we don't set lto here.
 opt-level = 3
 debug = true
+
+[[bin]]
+name = "fuzz_parquet_reader"
+path = "fuzz_targets/fuzz_parquet_reader.rs"
+test = false
+doc = false

@@ -27,6 +27,26 @@ struct RegistryMetadata {
     auto_increment_counters: HashMap<String, i64>,
 }
 
+/// v0.12/v0.13 catalog shape: identical to `RegistryMetadata` except
+/// `TableSchema` lacks `episode_config` (field added in v0.14). bincode is
+/// positional, so the modern struct cannot decode legacy bytes directly —
+/// the open path retries once through this mirror (see §11 format
+/// migration matrix, tests/test_format_migration.rs).
+#[derive(Debug, Deserialize)]
+struct RegistryMetadataV013 {
+    tables: HashMap<String, crate::types::TableSchemaLegacyV013>,
+    #[serde(default)]
+    index_map: HashMap<String, (String, String)>,
+    #[serde(default)]
+    next_table_id: u32,
+    #[serde(default)]
+    table_ids: HashMap<String, u32>,
+    #[serde(default)]
+    id_to_name: HashMap<u32, String>,
+    #[serde(default)]
+    auto_increment_counters: HashMap<String, i64>,
+}
+
 /// Table registry for managing table schemas
 pub struct TableRegistry {
     /// Metadata (protected by RwLock)
@@ -90,8 +110,28 @@ impl TableRegistry {
                 .flatten(),
         };
         let metadata = if let Some(data) = existing {
-            let mut meta: RegistryMetadata = bincode::deserialize(&data)
-                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let mut meta: RegistryMetadata = match bincode::deserialize(&data) {
+                Ok(m) => m,
+                // 🔒 v0.12/v0.13 catalog: TableSchema lacked `episode_config`,
+                // so the modern positional decode misaligns. Retry through
+                // the legacy mirror and convert (episodes are derived data —
+                // None is the faithful value for a pre-v0.14 schema).
+                Err(modern_err) => match bincode::deserialize::<RegistryMetadataV013>(&data) {
+                    Ok(legacy) => RegistryMetadata {
+                        tables: legacy
+                            .tables
+                            .into_iter()
+                            .map(|(k, v)| (k, TableSchema::from(v)))
+                            .collect(),
+                        index_map: legacy.index_map,
+                        next_table_id: legacy.next_table_id,
+                        table_ids: legacy.table_ids,
+                        id_to_name: legacy.id_to_name,
+                        auto_increment_counters: legacy.auto_increment_counters,
+                    },
+                    Err(_) => return Err(StorageError::Serialization(modern_err.to_string())),
+                },
+            };
 
             // Rebuild column maps after deserialization
             for schema in meta.tables.values_mut() {
