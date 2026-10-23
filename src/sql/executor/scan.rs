@@ -946,14 +946,9 @@ impl QueryExecutor {
                                                     })
                                                 })
                                                 .collect(),
-                                            other_ct => {
-                                                if std::env::var_os("MOTE_TRACE_DECODE").is_some() {
-                                                    eprintln!("MARK scan.rs {:?}", other_ct);
-                                                }
-                                                (0..seg.sst.num_rows)
-                                                    .map(|i| f.get_i64(i).map(Value::Integer))
-                                                    .collect()
-                                            }
+                                            _ => (0..seg.sst.num_rows)
+                                                .map(|i| f.get_i64(i).map(Value::Integer))
+                                                .collect(),
                                         },
                                         Err(_) => vec![None; seg.sst.num_rows],
                                     }
