@@ -69,9 +69,6 @@ fn mote_to_py(v: &MValue) -> PyObject {
     Python::with_gil(|py| -> PyObject {
         match v {
             MValue::Null => py.None(),
-            // 🔒 Value is #[non_exhaustive]: unknown (future) variants map
-            // to None so an older wheel never breaks on a newer engine.
-            _ => py.None(),
             MValue::Integer(i) => i.into_py(py),
             MValue::Float(f) => f.into_py(py),
             MValue::Bool(b) => b.into_py(py),
@@ -131,6 +128,11 @@ fn mote_to_py(v: &MValue) -> PyObject {
             // tag so users see WHAT it is instead of garbage.
             MValue::Tensor(_) => "<tensor>".into_py(py),
             MValue::TextDoc(_) => "<textdoc>".into_py(py),
+            // 🔒 Value is #[non_exhaustive]: unknown (future) variants map
+            // to None so an older wheel never breaks on a newer engine.
+            // Must stay the LAST arm — an earlier wildcard shadows every
+            // concrete arm above it (CI e2e: all values became None).
+            _ => py.None(),
         }
     })
 }

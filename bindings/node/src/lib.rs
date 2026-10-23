@@ -118,9 +118,6 @@ fn value_to_json(v: &MValue) -> serde_json::Value {
         }
         MValue::Blob(b) => serde_json::Value::String(BASE64.encode(b.as_slice())),
         MValue::Tensor(_) => serde_json::Value::Null,
-        // 🔒 Value is #[non_exhaustive]: unknown (future) variants map to
-        // null so an older npm package never breaks on a newer engine.
-        _ => serde_json::Value::Null,
         MValue::Spatial(g) => {
             let mut m = serde_json::Map::new();
             match &**g {
@@ -153,6 +150,11 @@ fn value_to_json(v: &MValue) -> serde_json::Value {
             }
             serde_json::Value::Object(m)
         }
+        // 🔒 Value is #[non_exhaustive]: unknown (future) variants map to
+        // null so an older npm package never breaks on a newer engine.
+        // Must stay the LAST arm — an earlier wildcard shadows every
+        // concrete arm above it.
+        _ => serde_json::Value::Null,
     }
 }
 
