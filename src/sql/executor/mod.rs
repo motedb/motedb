@@ -4128,15 +4128,23 @@ impl QueryExecutor {
                 windows_to_null(e);
             }
         }
-        // Execute base query. For GROUP BY / HAVING queries the base result IS        // Execute base query. For GROUP BY / HAVING queries the base result IS        // Execute base query. For GROUP BY / HAVING queries the base result IS        // Execute base query. For GROUP BY / HAVING queries the base result IS
-        // the window source (windows run over aggregated rows, per SQL
-        // standard); its __winval_k projections evaluate to NULL against the
-        // base source, which is fine — they are recomputed below.
-        let base = self.materialize_as_streaming(&base_stmt)?;
-        let (base_cols, base_rows) = match base.materialize()? {
-            QueryResult::Select { columns, rows } => (columns, rows),
-            _ => return Err(MoteDBError::Query("Window base query failed".into())),
-        };
+        // Execute base query — ONLY for GROUP BY / HAVING shapes, where the
+        // base result IS the window source (windows run over aggregated rows,
+        // per SQL standard) and its __winval_k projections evaluate to NULL
+        // against the base source, which is fine — they are recomputed below.
+        // 🚀 Non-grouped queries used to pay a full redundant execution here
+        // (~30% of window-query wall time): the rows were discarded and only
+        // base_cols fed the schema below — now the source scan provides it.
+        let (base_cols, base_rows): (Vec<String>, Vec<Vec<Value>>) =
+            if stmt.group_by.is_some() || stmt.having.is_some() {
+                let base = self.materialize_as_streaming(&base_stmt)?;
+                match base.materialize()? {
+                    QueryResult::Select { columns, rows } => (columns, rows),
+                    _ => return Err(MoteDBError::Query("Window base query failed".into())),
+                }
+            } else {
+                (Vec::new(), Vec::new())
+            };
         // We need the schema to resolve partition/order column positions.
         // Get it from the base query's columns (they correspond to stmt.columns).
         //
@@ -4283,40 +4291,55 @@ impl QueryExecutor {
         // by their base output name instead of row-level evaluation (an
         // aggregate expression cannot be re-evaluated against one row).
         let grouped = stmt.group_by.is_some() || stmt.having.is_some();
+        // 🚀 Pre-resolve projection per output column ONCE: the row loop
+        // below paid a name→position string lookup per (row × column) —
+        // 100K rows × C columns of hash lookups for what are constants.
+        enum ProjCell {
+            Pos(Option<usize>),                 // plain column by position
+            GroupedName(Option<usize>), // grouped output column
+            Expr(Expr),                         // general expression
+            Star,
+        }
+        let proj_plan: Vec<ProjCell> = proj_columns
+            .iter()
+            .map(|c| match c {
+                SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
+                    let bare = name.rsplit('.').next().unwrap_or(name);
+                    ProjCell::Pos(schema.get_column_position(bare))
+                }
+                SelectColumn::Star => ProjCell::Star,
+                SelectColumn::Expr(expr, alias) => {
+                    if grouped && !matches!(expr, Expr::Column(_)) {
+                        let name = alias
+                            .clone()
+                            .unwrap_or_else(|| Self::display_expr_name(expr));
+                        let pos = schema.get_column_position(&name).or_else(|| {
+                            schema.get_column_position(name.rsplit('.').next().unwrap_or(&name))
+                        });
+                        ProjCell::GroupedName(pos)
+                    } else {
+                        ProjCell::Expr(expr.clone())
+                    }
+                }
+            })
+            .collect();
         let mut out_rows: Vec<Vec<Value>> = full_rows
             .iter()
             .map(|row| {
-                proj_columns
+                proj_plan
                     .iter()
-                    .map(|c| match c {
-                        SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
-                            let bare = name.rsplit('.').next().unwrap_or(name);
-                            schema
-                                .get_column_position(bare)
-                                .and_then(|p| row.get(p).cloned())
-                                .unwrap_or(Value::Null)
+                    .map(|pc| match pc {
+                        ProjCell::Pos(p) => {
+                            p.and_then(|p| row.get(p).cloned()).unwrap_or(Value::Null)
                         }
-                        SelectColumn::Star => row.first().cloned().unwrap_or(Value::Null),
-                        SelectColumn::Expr(expr, alias) => {
-                            if grouped && !matches!(expr, Expr::Column(_)) {
-                                // aggregate / group-key output column: take the
-                                // value computed by the base, resolved by its
-                                // output name (alias or canonical display name)
-                                let name = alias
-                                    .clone()
-                                    .unwrap_or_else(|| Self::display_expr_name(expr));
-                                schema
-                                    .get_column_position(&name)
-                                    .or_else(|| {
-                                        schema.get_column_position(
-                                            name.rsplit('.').next().unwrap_or(&name),
-                                        )
-                                    })
-                                    .and_then(|p| row.get(p).cloned())
-                                    .unwrap_or(Value::Null)
-                            } else {
-                                Self::eval_expr_on_row(expr, row, &schema).unwrap_or(Value::Null)
-                            }
+                        ProjCell::Star => row.first().cloned().unwrap_or(Value::Null),
+                        // aggregate / group-key output column: take the value
+                        // computed by the base, resolved by its output name.
+                        ProjCell::GroupedName(p) => {
+                            p.and_then(|p| row.get(p).cloned()).unwrap_or(Value::Null)
+                        }
+                        ProjCell::Expr(expr) => {
+                            Self::eval_expr_on_row(expr, row, &schema).unwrap_or(Value::Null)
                         }
                     })
                     .collect()
@@ -4592,29 +4615,59 @@ impl QueryExecutor {
             })
             .unwrap_or_default();
         // Group row indices by partition key
-        let mut groups: std::collections::HashMap<Vec<String>, Vec<usize>> =
+        // 🚀 Key = Vec<Value> directly (Value: Hash+Eq). The old
+        // format!("{:?}") per cell allocated a String per row per key column
+        // — 100K rows × key cols of pure formatting before any window work.
+        let mut groups: std::collections::HashMap<Vec<Value>, Vec<usize>> =
             std::collections::HashMap::new();
         for (i, row) in rows.iter().enumerate() {
-            let key: Vec<String> = part_cols
+            let key: Vec<Value> = part_cols
                 .iter()
-                .map(|&p| format!("{:?}", row.get(p)))
+                .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
                 .collect();
             groups.entry(key).or_default().push(i);
         }
         // For each partition: sort by order keys, compute window values
         for (_key, mut indices) in groups {
+            // 🚀 Sort keys extracted ONCE per partition (also reused for
+            // peer detection below): sorting used to clone two Values per
+            // COMPARISON (O(n log n) clones), and peer detection allocated a
+            // fresh Vec<Value> per position (O(n) allocs per partition).
+            let mut sort_keys: Vec<Vec<Value>> = if order_keys.is_empty() {
+                Vec::new()
+            } else {
+                indices
+                    .iter()
+                    .map(|&idx| {
+                        order_keys
+                            .iter()
+                            .map(|&(p, _)| rows[idx].get(p).cloned().unwrap_or(Value::Null))
+                            .collect()
+                    })
+                    .collect()
+            };
             if !order_keys.is_empty() {
-                indices.sort_by(|&a, &b| {
-                    for &(col, asc) in &order_keys {
-                        let av = rows[a].get(col).cloned().unwrap_or(Value::Null);
-                        let bv = rows[b].get(col).cloned().unwrap_or(Value::Null);
-                        let cmp = order_by_cmp(&av, &bv);
+                // Sort (key, row_index) pairs once; the keys move through the
+                // sort — no re-extraction, no clones.
+                let mut keyed: Vec<(Vec<Value>, usize)> =
+                    sort_keys.into_iter().zip(indices.into_iter()).collect();
+                keyed.sort_by(|(ka, _), (kb, _)| {
+                    for (ki, &(_, asc)) in order_keys.iter().enumerate() {
+                        let cmp = order_by_cmp(&ka[ki], &kb[ki]);
                         if cmp != std::cmp::Ordering::Equal {
                             return if asc { cmp } else { cmp.reverse() };
                         }
                     }
                     std::cmp::Ordering::Equal
                 });
+                let mut idx_out = Vec::with_capacity(keyed.len());
+                let mut keys_out = Vec::with_capacity(keyed.len());
+                for (k, i) in keyed {
+                    keys_out.push(k);
+                    idx_out.push(i);
+                }
+                indices = idx_out;
+                sort_keys = keys_out;
             }
             // 🔑 Peer-group bounds (partition-level): with ORDER BY, each
             // position's peer group is [peer_start, peer_end] — the SQL
@@ -4626,19 +4679,14 @@ impl QueryExecutor {
             let (peer_start, peer_end): (Vec<usize>, Vec<usize>) = if order_keys.is_empty() {
                 (vec![0; n_part], vec![n_part.saturating_sub(1); n_part])
             } else {
-                let key_of = |pos: usize| -> Vec<Value> {
-                    order_keys
-                        .iter()
-                        .map(|&(p, _)| rows[indices[pos]].get(p).cloned().unwrap_or(Value::Null))
-                        .collect()
-                };
+                // 🚀 Slice comparison over the pre-extracted keys — zero
+                // allocation per position.
                 let mut starts = Vec::with_capacity(n_part);
                 let mut ends = Vec::with_capacity(n_part);
                 let mut pos = 0usize;
                 while pos < n_part {
                     let mut end = pos;
-                    let cur_key = key_of(pos);
-                    while end + 1 < n_part && key_of(end + 1) == cur_key {
+                    while end + 1 < n_part && sort_keys[end + 1] == sort_keys[pos] {
                         end += 1;
                     }
                     for _ in pos..=end {
@@ -4871,10 +4919,21 @@ impl QueryExecutor {
                     // default (or NULL).
                     let off = offset.unwrap_or(1);
                     // Pre-compute the expr value for each row in partition order.
+                    // 🚀 Simple-column fast path: eval_expr_on_row pays a string position
+                    // lookup per row; a plain column reference resolves once.
+                    let apos = match expr.as_ref() {
+                        Expr::Column(n) => {
+                            let bare = n.rsplit('.').next().unwrap_or(n);
+                            schema.get_column_position(bare)
+                        }
+                        _ => None,
+                    };
                     let vals: Vec<Value> = indices
                         .iter()
-                        .map(|&idx| {
-                            Self::eval_expr_on_row(expr, &rows[idx], schema).unwrap_or(Value::Null)
+                        .map(|&idx| match apos {
+                            Some(p) => rows[idx].get(p).cloned().unwrap_or(Value::Null),
+                            None => Self::eval_expr_on_row(expr, &rows[idx], schema)
+                                .unwrap_or(Value::Null),
                         })
                         .collect();
                     for (pos, &idx) in indices.iter().enumerate() {
@@ -4897,10 +4956,21 @@ impl QueryExecutor {
                     // 🔑 LEAD(expr, offset, default): value from `offset` rows
                     // after the current row (default 1).
                     let off = offset.unwrap_or(1);
+                    // 🚀 Simple-column fast path: eval_expr_on_row pays a string position
+                    // lookup per row; a plain column reference resolves once.
+                    let apos = match expr.as_ref() {
+                        Expr::Column(n) => {
+                            let bare = n.rsplit('.').next().unwrap_or(n);
+                            schema.get_column_position(bare)
+                        }
+                        _ => None,
+                    };
                     let vals: Vec<Value> = indices
                         .iter()
-                        .map(|&idx| {
-                            Self::eval_expr_on_row(expr, &rows[idx], schema).unwrap_or(Value::Null)
+                        .map(|&idx| match apos {
+                            Some(p) => rows[idx].get(p).cloned().unwrap_or(Value::Null),
+                            None => Self::eval_expr_on_row(expr, &rows[idx], schema)
+                                .unwrap_or(Value::Null),
                         })
                         .collect();
                     for (pos, &idx) in indices.iter().enumerate() {
@@ -4918,10 +4988,21 @@ impl QueryExecutor {
                 WindowFunc::FirstValue { expr } => {
                     // Default frame: the partition's first row. Explicit
                     // frame: the first row IN the frame (empty frame ⇒ NULL).
+                    // 🚀 Simple-column fast path: eval_expr_on_row pays a string position
+                    // lookup per row; a plain column reference resolves once.
+                    let apos = match expr.as_ref() {
+                        Expr::Column(n) => {
+                            let bare = n.rsplit('.').next().unwrap_or(n);
+                            schema.get_column_position(bare)
+                        }
+                        _ => None,
+                    };
                     let vals: Vec<Value> = indices
                         .iter()
-                        .map(|&idx| {
-                            Self::eval_expr_on_row(expr, &rows[idx], schema).unwrap_or(Value::Null)
+                        .map(|&idx| match apos {
+                            Some(p) => rows[idx].get(p).cloned().unwrap_or(Value::Null),
+                            None => Self::eval_expr_on_row(expr, &rows[idx], schema)
+                                .unwrap_or(Value::Null),
                         })
                         .collect();
                     for (pos, &idx) in indices.iter().enumerate() {
@@ -4945,10 +5026,21 @@ impl QueryExecutor {
                     // peer group — NOT the partition's last row (v1 returned
                     // partition-last, so `LAST_VALUE(v) OVER (ORDER BY id)`
                     // showed the final row's value on every row).
+                    // 🚀 Simple-column fast path: eval_expr_on_row pays a string position
+                    // lookup per row; a plain column reference resolves once.
+                    let apos = match expr.as_ref() {
+                        Expr::Column(n) => {
+                            let bare = n.rsplit('.').next().unwrap_or(n);
+                            schema.get_column_position(bare)
+                        }
+                        _ => None,
+                    };
                     let vals: Vec<Value> = indices
                         .iter()
-                        .map(|&idx| {
-                            Self::eval_expr_on_row(expr, &rows[idx], schema).unwrap_or(Value::Null)
+                        .map(|&idx| match apos {
+                            Some(p) => rows[idx].get(p).cloned().unwrap_or(Value::Null),
+                            None => Self::eval_expr_on_row(expr, &rows[idx], schema)
+                                .unwrap_or(Value::Null),
                         })
                         .collect();
                     for (pos, &idx) in indices.iter().enumerate() {
@@ -4978,11 +5070,22 @@ impl QueryExecutor {
                     let is_count_star = matches!(arg.as_deref(),
                         Some(Expr::Column(n)) if n == "*")
                         || arg.is_none();
+                    // 🚀 Simple-column fast path (see LAG): plain column args
+                    // resolve once instead of per-row string lookups.
+                    let apos = match arg.as_deref() {
+                        Some(Expr::Column(n)) => {
+                            let bare = n.rsplit('.').next().unwrap_or(n);
+                            schema.get_column_position(bare)
+                        }
+                        _ => None,
+                    };
                     let vals: Vec<Value> = indices
                         .iter()
                         .map(|&idx| {
                             if is_count_star {
                                 Value::Bool(true) // COUNT(*): every row counts
+                            } else if let Some(p) = apos {
+                                rows[idx].get(p).cloned().unwrap_or(Value::Null)
                             } else {
                                 Self::eval_expr_on_row(arg.as_ref().unwrap(), &rows[idx], schema)
                                     .unwrap_or(Value::Null)
