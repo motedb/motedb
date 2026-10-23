@@ -561,6 +561,45 @@ def suite_invariant(root):
         db.close()
 
 
+def suite_snapshot(root):
+    # 🔑 P4 snapshot round-trip through the PYTHON binding: export_to()
+    # writes the .mote container, open_snapshot() (added 2026-10 — Python
+    # used to be export-only) unpacks it into a fresh directory and opens it.
+    import shutil
+    path = os.path.join(root, "snap.mote")
+    db = motedb.Database(os.path.join(root, "snap_src.mote"), preset="general")
+    try:
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, "
+                   "v REAL, e VECTOR(3), s TEXT)")
+        for i in range(1, 11):
+            db.execute(f"INSERT INTO t (v, e, s) VALUES ({i * 0.5}, "
+                       f"'[0.1, 0.2, 0.3]', 'row{i}')")
+        db.execute("CREATE TEXT INDEX t_s ON t (s)")
+        db.execute("CREATE VECTOR INDEX t_e ON t (e)")
+        db.checkpoint()
+        stats = db.export_to(path, True)
+        check("container written", stats["files"] >= 1 and os.path.exists(path),
+              str(stats))
+    finally:
+        db.close()
+    dest = os.path.join(root, "snap_restored.mote")
+    shutil.rmtree(dest, ignore_errors=True)
+    db2 = motedb.Database.open_snapshot(path, dest)
+    try:
+        _, r = db2.query("SELECT COUNT(*) FROM t")
+        check("restored rows", r[0][0] == 10, str(r))
+        _, r = db2.query("SELECT id FROM t ORDER BY e <-> '[0.1, 0.2, 0.3]' LIMIT 3")
+        check("knn on restored", [x[0] for x in r] == [1, 2, 3], str(r))
+        _, r = db2.query("SELECT id FROM t WHERE MATCH(s) AGAINST('row7')")
+        check("fts on restored", r[0][0] == 7, str(r))
+        # Quoted vector literal INSERT (write-path unification).
+        db2.execute("INSERT INTO t (v, e, s) VALUES (99.0, '[0.9, 0.8, 0.7]', 'q')")
+        _, r = db2.query("SELECT id FROM t WHERE s = 'q'")
+        check("quoted vector insert", r[0][1] if len(r[0]) > 1 else r[0][0] == 11, str(r))
+    finally:
+        db2.close()
+
+
 SUITES = {
     "multimodal": suite_multimodal,
     "persistence": suite_persistence,
@@ -572,6 +611,7 @@ SUITES = {
     "edits": suite_edits,
     "errors": suite_errors,
     "params": suite_params,
+    "snapshot": suite_snapshot,
     "invariant": suite_invariant,
 }
 

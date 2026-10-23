@@ -928,6 +928,26 @@ impl MoteDB {
                     _ => {}
                 }
             }
+            // 🔖 VECTOR columns accept quoted literals '[0.1, 0.2, …]' — the
+            // SQL lexer has no bracketed-literal token, so the quoted form
+            // arrives as TEXT. KNN predicates already parse this spelling
+            // (executor fast path); INSERT/UPDATE must too or the same query
+            // style that sorts correctly fails to write. Dimension must
+            // match the declared one (a mismatch stays Text and fails
+            // validation with a clear error).
+            if let crate::types::ColumnType::Tensor(dim) = ct {
+                if let Some(crate::types::Value::Text(s)) = row.get(i) {
+                    if s.starts_with('[') && s.ends_with(']') {
+                        let parsed: Option<Vec<f32>> = s[1..s.len() - 1]
+                            .split(',')
+                            .map(|p| p.trim().parse::<f32>().ok())
+                            .collect();
+                        if let Some(v) = parsed.filter(|v| v.len() == *dim) {
+                            row[i] = crate::types::Value::Vector(crate::types::ArcVec::new(v));
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -561,6 +561,22 @@ impl PyDatabase {
         Ok(Self { db })
     }
 
+    /// 🔑 P4: restore a `.mote` snapshot container into a fresh directory and
+    /// open the restored database — Python parity with Node's
+    /// `Database.openSnapshot`. `export_to()` produces the container; this
+    /// closes the round-trip (the Python side used to be export-only).
+    ///
+    ///     db2 = motedb.Database.open_snapshot("snap.mote", "restored_dir")
+    #[classmethod]
+    fn open_snapshot(
+        _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+        src: &str,
+        dest_dir: &str,
+    ) -> PyResult<Self> {
+        let db = Database::open_snapshot(src, dest_dir).map_err(py_err)?;
+        Ok(Self { db })
+    }
+
     /// 🔑 J1 hybrid retrieval: BM25 text list + vector KNN list fused with
     /// Reciprocal Rank Fusion. Returns a list of row dicts (the table's own
     /// columns) with three extra keys:

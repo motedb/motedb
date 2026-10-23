@@ -331,7 +331,7 @@ jobs:
           args: --release
       - name: Install wheel
         run: pip install bindings/python/target/wheels/*.whl
-      - name: Run E2E workload (11 suites)
+      - name: Run E2E workload (12 suites)
         env:
           MOTE_CLI: ${{ github.workspace }}/target/release/motedb-cli
         run: python bindings/python/e2e/e2e_workload.py --root /tmp/e2e

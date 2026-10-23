@@ -25,11 +25,12 @@ Complete API documentation for MoteDB.
 
 冻结基线:`docs/api/`(cargo-public-api 清单;新增允许,删除/改签名只在 2.0)。
 
-**Python 包 `motedb`(20 方法)**:`motedb.Database(path, preset, create,
+**Python 包 `motedb`(21 方法)**:`motedb.Database(path, preset, create,
 durability, periodic_ms)` + `execute / executemany / query / fetch_arrays /
 insert_arrays / begin / commit / rollback / checkpoint / close / backup_to /
 export_to / import_mcap / doctor / vacuum / hybrid_search /
-set_vector_cache_budget / vector_cache_budget_bytes`。参数化查询 `?` 占位、
+set_vector_cache_budget / vector_cache_budget_bytes / open_snapshot**。
+参数化查询 `?` 占位、
 durability 关键字、容器文件自动只读 — 均为冻结行为。
 
 **Node 包 `motedb`(11 成员)**:`new Database(path)` / `Database.open_readonly /
