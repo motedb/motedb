@@ -4731,7 +4731,9 @@ impl QueryExecutor {
                                 match rows[idx].get(kcol) {
                                     Some(Value::Integer(i)) => Ok(Some(*i as f64)),
                                     Some(Value::Float(f)) => Ok(Some(*f)),
-                                    Some(Value::Timestamp(ts)) => Ok(Some(ts.as_millis() as f64)),
+                                    // 🔑 µs — the engine's native Timestamp unit (insert/KNN/recovery all
+                                    // use micros; millis made integer offsets 1000x too wide).
+                                    Some(Value::Timestamp(ts)) => Ok(Some(ts.as_micros() as f64)),
                                     Some(Value::Date(d)) => Ok(Some(d.days() as f64)),
                                     Some(Value::Null) => Ok(None),
                                     Some(other) => Err(MoteDBError::Query(format!(

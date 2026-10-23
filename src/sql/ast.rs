@@ -709,7 +709,10 @@ pub enum WindowAggFunc {
 /// - ROWS: bounds count physical rows.
 /// - RANGE: UNBOUNDED/CURRENT ROW follow peer-group semantics; numeric
 ///   offsets (N PRECEDING/FOLLOWING) are value intervals on the single
-///   ORDER BY key (requires exactly one numeric/timestamp key).
+///   ORDER BY key (requires exactly one numeric/timestamp key). Offset
+///   units: the key's NATIVE engine unit — plain numbers for
+///   INT/FLOAT keys, MICROseconds for TIMESTAMP keys, days for DATE
+///   (INTERVAL syntax is not supported yet).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowFrame {
     pub units: FrameUnits,

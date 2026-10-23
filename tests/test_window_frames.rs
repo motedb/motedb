@@ -294,3 +294,52 @@ fn frame_parse_errors() {
         .expect("text ORDER BY key with RANGE offset must fail");
     assert!(err.to_string().to_lowercase().contains("range"));
 }
+
+#[test]
+fn range_offset_timestamp_key_micros() {
+    // 🔒 Regression: the RANGE-offset coordinate for a TIMESTAMP order key
+    // used as_millis, so integer offsets were interpreted in MILLISECONDS —
+    // `RANGE BETWEEN 2500000 PRECEDING` (user intent 2.5s in µs) actually
+    // meant 2500 seconds and swallowed the whole partition. Offsets are now
+    // in the engine's native unit (µs), matching insert/KNN/recovery.
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path().join("tsframe.mote")).unwrap();
+    db.execute("CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP, v INT)")
+        .unwrap();
+    for i in 1..=5i64 {
+        db.execute(&format!(
+            "INSERT INTO ev (id, ts, v) VALUES ({i}, {}, {})",
+            1_700_000_000_000_000i64 + i * 1_000_000, // 1s spacing (µs)
+            i * 10
+        ))
+        .unwrap();
+    }
+    let q = |expr: &str| -> Vec<String> {
+        let sql = format!("SELECT id, {expr} AS w FROM ev ORDER BY id");
+        let r = db.execute(&sql).unwrap().materialize().unwrap();
+        let (_c, rows) = r.select_rows().unwrap();
+        rows.iter()
+            .map(|r| match &r[1] {
+                Value::Integer(i) => i.to_string(),
+                Value::Null => "NULL".into(),
+                other => format!("{:?}", other),
+            })
+            .collect()
+    };
+    // ±2.5s → each row covers itself ±2 neighbors.
+    assert_eq!(
+        q("SUM(v) OVER (ORDER BY ts RANGE BETWEEN 2500000 PRECEDING AND 2500000 FOLLOWING)"),
+        vec!["60", "100", "150", "140", "120"]
+    );
+    // [v−1s, v] → current + previous.
+    assert_eq!(
+        q("SUM(v) OVER (ORDER BY ts RANGE BETWEEN 1000000 PRECEDING AND 0 PRECEDING)"),
+        vec!["10", "30", "50", "70", "90"]
+    );
+    // Strictly-before window [v−3s, v−2s] (inclusive bounds): i=1,2 empty;
+    // i=3 → {t1}; i=4 → {t1,t2}; i=5 → {t2,t3}.
+    assert_eq!(
+        q("SUM(v) OVER (ORDER BY ts RANGE BETWEEN 3000000 PRECEDING AND 2000000 PRECEDING)"),
+        vec!["NULL", "NULL", "10", "30", "50"]
+    );
+}
