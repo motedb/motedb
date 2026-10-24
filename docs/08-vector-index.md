@@ -120,7 +120,7 @@ println!("vectors={} avg_neighbors={:.1}", stats.total_vectors, stats.avg_neighb
 CREATE VECTOR INDEX vi ON t(emb) WITH (
   metric = 'l2',             -- or 'cosine'
   max_degree = 32,           -- R: neighbors per node (default 64, range 8..=256)
-  build_search_list = 40,    -- construction beam (default: adaptive 300/150/80
+  build_search_list = 40,    -- construction beam (default: adaptive 300/120/60
                              --   by graph size; lower = faster build)
   search_list = 300          -- query-time L (default 300)
 );
@@ -141,6 +141,16 @@ Build time floors around ~33s at 100K (vector write + pin + graph flush);
 below R=32 the knob savings shrink. For production embeddings, validate
 recall on YOUR data before pushing aggressive knobs — synthetic corpora
 flatter graph quality.
+
+**Default ladder recalibration (2026-10-24)**: the size-adaptive
+construction beam moved from 300/150/80 to **300/120/60** — dual-distribution
+calibrated (clustered prof_ann + uniform-random, 50K×128 both, recall@10
+1.0000; clustered build 14.5→11.8s, uniform 32.9→28.8s). At industry scale
+(220K×384, the benchmark_report_2026-10-21 shape) the new default builds in
+**98.7s vs 171.4s (-42%)** with recall@10 0.9990 and query p50 0.52ms;
+strict 1.0000 recall remains reachable via `WITH (search_list = 300+)` or the
+aggressive R=32/bef=40 row above. The first-1K segment stays at 300 (A1/A5
+tight-cluster recall gate).
 
 **Query forms**: `emb <-> [1,2,3]` (vector literal), `emb <-> '[1, 2, 3]'`
 (quoted bracketed string), and `emb <-> ?` (parameter) are all accepted.

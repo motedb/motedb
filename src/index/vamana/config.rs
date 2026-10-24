@@ -22,7 +22,7 @@ pub struct VamanaConfig {
     pub beam_width: usize,
 
     /// 🔖 Build-time ef override (`WITH (build_search_list=N)`). None = the
-    /// size-adaptive ladder in incremental_insert_into_graph (300/150/80);
+    /// size-adaptive ladder in incremental_insert_into_graph (300/120/60, dual-distribution calibrated);
     /// Some(N) pins the construction beam — the dominant per-node build cost
     /// knob (halving it ≈ halves build time at the cost of edge quality).
     pub build_search_list: Option<usize>,

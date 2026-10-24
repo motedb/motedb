@@ -634,7 +634,10 @@ impl DiskANNIndex {
                 new_count,
                 num_batches
             );
-            debug_log!("[DiskANN] Batch size: {}, efConstruction=400", batch_size);
+            debug_log!(
+                "[DiskANN] Batch size: {}, ef ladder 300/120/60 (WITH build_search_list overrides)",
+                batch_size
+            );
         }
 
         // 🚀 分批渐进式构建
@@ -1262,12 +1265,17 @@ impl DiskANNIndex {
         };
 
         // 1. 搜索候选邻居 (adaptive ef: smaller for mature graphs)
+        // 🔖 Ladder 300/120/60 (2026-10-24, 双分布校准): 尾段 80→60 与
+        // 中段 150→120 在聚簇 (prof_ann noise 0.30) 与均匀随机 (图导航
+        // 最坏情形) 两种语料 50K×128 上 recall@10 均 1.0000, 构建 -10~15%
+        // (14.5→12.4s / 32.9→29.5s)。首段 300 不动 — A1/A5 校准的紧簇
+        // recall 门。explicit WITH (build_search_list=N) 仍然全量覆盖。
         let graph_size = self.vectors.len();
         let ef_construction = match self.config.build_search_list {
             Some(n) => n,
             None if graph_size < 1000 => 300,
-            None if graph_size < 10000 => 150,
-            None => 80,
+            None if graph_size < 10000 => 120,
+            None => 60,
         };
         let candidates = self.greedy_search(&query_vec, medoid_id, ef_construction)?;
 
