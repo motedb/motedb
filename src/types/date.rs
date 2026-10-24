@@ -34,6 +34,14 @@ impl Date {
         if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
             return None;
         }
+        // 🔒 Per-month day validation via calendar round-trip: `2024-02-30`
+        // and `2024-04-31` used to pass the flat 1..=31 gate (then silently
+        // normalized to Mar 1 / May 1 by days_from_civil). A real calendar
+        // date survives civil_from_days(days_from_civil(y, m, d)) unchanged.
+        let (ry, rm, rd) = civil_from_days(days_from_civil(y, m, d));
+        if (ry, rm, rd) != (y, m, d) {
+            return None;
+        }
         Some(Self {
             days: days_from_civil(y, m, d),
         })

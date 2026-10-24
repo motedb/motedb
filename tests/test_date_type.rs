@@ -106,25 +106,42 @@ fn date_parquet_roundtrip() {
 
 #[test]
 fn date_rejects_invalid_literals() {
-    // Unparseable strings stay TEXT → later comparisons simply don't match;
-    // the coercion is lenient by design (mirrors Timestamp handling). This
-    // test pins that behavior so a future strict mode is a conscious change.
+    // 🔒 STRICT (2026-10-24 bug hunt, was lenient-by-design before): an
+    // unparseable string in a DATE column used to be stored as raw TEXT
+    // that no date comparison could ever match — silent garbage. Insert
+    // now rejects with a type error naming the column. Calendar-invalid
+    // dates that pass the flat 1..=31 gate (Feb 30, Apr 31) are likewise
+    // rejected via the days_from_civil↔civil_from_days round-trip.
     let dir = tempfile::tempdir().unwrap();
     let db = Database::create(dir.path().join("di.mote")).unwrap();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, d DATE)")
         .unwrap();
-    db.execute_prepared(
+    for bad in ["not-a-date", "2024-02-30", "2024-04-31", "2023-13-01"] {
+        let r = db.execute(&format!("INSERT INTO t VALUES (99, '{bad}')"));
+        assert!(r.is_err(), "'{bad}' must be rejected");
+        let msg = r.err().unwrap().to_string();
+        assert!(
+            msg.contains("Date") || msg.contains("d"),
+            "clear error for '{bad}': {msg}"
+        );
+    }
+    // Parameterized path too (py_to_mote hands strings through).
+    let r = db.execute_prepared(
         "INSERT INTO t VALUES (?, ?)",
         vec![
             Value::Integer(1),
-            Value::Text(motedb::types::ArcString::from("not-a-date")),
+            Value::Text(motedb::types::ArcString::from("2024-02-30")),
         ],
-    )
-    .unwrap();
-    let n = db
-        .query("SELECT COUNT(*) FROM t WHERE d = '2026-01-01'")
-        .unwrap();
-    assert_eq!(n[0][0], Value::Integer(0));
+    );
+    assert!(r.is_err(), "parameterized invalid date must be rejected");
+    // Lenient-but-unambiguous single-digit forms stay accepted (MySQL/SQLite
+    // parity): 2024-1-1 → 2024-01-01.
+    db.execute("INSERT INTO t VALUES (1, '2024-1-1')").unwrap();
+    let n = db.query("SELECT d FROM t WHERE id = 1").unwrap();
+    assert_eq!(
+        n[0][0],
+        Value::Text(motedb::types::ArcString::from("2024-01-01"))
+    );
     let _ = db.close();
 }
 

@@ -558,10 +558,14 @@ impl TableSchema {
                     true
                 }
 
-                // 🔖 DATE: Date value, ISO string (parsed at coerce time),
-                // or Timestamp (truncated to the UTC day).
+                // 🔖 DATE: Date value, a PARSEABLE ISO string (the flat
+                // Text arm used to wave through `2024-02-30`, which coerce
+                // couldn't parse and storage then stored as raw text), or
+                // Timestamp (truncated to the UTC day).
                 (ColumnType::Date, crate::types::Value::Date(_)) => true,
-                (ColumnType::Date, crate::types::Value::Text(_)) => true,
+                (ColumnType::Date, crate::types::Value::Text(t)) => {
+                    crate::types::Date::parse(t.as_str()).is_some()
+                }
                 (ColumnType::Date, crate::types::Value::Timestamp(_)) => true,
                 // Legacy types
                 (ColumnType::Timestamp, crate::types::Value::Timestamp(_)) => true,
