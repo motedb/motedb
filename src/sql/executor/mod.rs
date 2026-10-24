@@ -15900,29 +15900,54 @@ impl QueryExecutor {
     /// using the outer row's data. Columns without a table prefix are left as-is
     /// (they belong to the inner query).
     fn bind_outer_columns(expr: &Expr, outer_row: &[Value], outer_schema: &TableSchema) -> Expr {
+        Self::bind_outer_columns_scoped(expr, outer_row, outer_schema, None)
+    }
+
+    /// 🔒 Scoped outer-ref binding: `inner_id` is the subquery's own FROM
+    /// table/alias (when recursing INSIDE a subquery). Columns prefixed with
+    /// that id are INNER refs and must stay unbound — the old code bound both
+    /// sides of `b.k = a.k` to the outer row (self-join same-table design),
+    /// turning the predicate into `a.k = a.k` (always true) whenever inner
+    /// and outer tables share a bare column name: correlated EXISTS matched
+    /// every row and correlated scalar subqueries counted the whole inner
+    /// table (2026-10-24 round-6 differential probe).
+    fn bind_outer_columns_scoped(
+        expr: &Expr,
+        outer_row: &[Value],
+        outer_schema: &TableSchema,
+        inner_id: Option<&str>,
+    ) -> Expr {
         match expr {
             Expr::Column(name) => {
-                // Bind table-prefixed columns to their outer row values.
-                // Both outer refs (t1.cat) and inner refs (t2.cat) get bound —
-                // inner refs resolve to the same schema position, which is
-                // correct because the outer and inner tables share the same
-                // physical schema (self-join pattern).
+                // Bind table-prefixed columns to their outer row values —
+                // EXCEPT those prefixed with the (sub)query's own table id.
                 if name.contains('.') {
-                    let bare = name.rsplit('.').next().unwrap_or(name);
-                    if let Some(pos) = outer_schema.get_column_position(bare) {
-                        if let Some(v) = outer_row.get(pos) {
-                            return Expr::Literal(v.clone());
+                    let prefix = name.rsplit('.').nth(1).unwrap_or("");
+                    let prefix_bare = prefix.rsplit('.').next().unwrap_or(prefix);
+                    let is_inner = inner_id.is_some_and(|id| prefix_bare == id);
+                    if !is_inner {
+                        let bare = name.rsplit('.').next().unwrap_or(name);
+                        if let Some(pos) = outer_schema.get_column_position(bare) {
+                            if let Some(v) = outer_row.get(pos) {
+                                return Expr::Literal(v.clone());
+                            }
                         }
                     }
                 }
                 expr.clone()
             }
             Expr::Subquery(sub) => {
-                // Recursively bind outer refs inside the subquery's WHERE.
+                // Recursively bind outer refs inside the subquery's WHERE,
+                // scoped so the subquery's OWN table refs stay inner.
                 let mut bound = sub.clone();
+                let scope = Self::subquery_table_id(sub);
                 if let Some(wc) = &bound.where_clause {
-                    bound.where_clause =
-                        Some(Self::bind_outer_columns(wc, outer_row, outer_schema));
+                    bound.where_clause = Some(Self::bind_outer_columns_scoped(
+                        wc,
+                        outer_row,
+                        outer_schema,
+                        scope.as_deref(),
+                    ));
                 }
                 Expr::Subquery(bound)
             }
@@ -15933,10 +15958,15 @@ impl QueryExecutor {
                     stmt: ref mut s, ..
                 } = bound
                 {
+                    let scope = Self::subquery_table_id(s);
                     if let Some(wc) = &s.where_clause {
                         let w = wc.clone();
-                        s.where_clause =
-                            Some(Self::bind_outer_columns(&w, outer_row, outer_schema));
+                        s.where_clause = Some(Self::bind_outer_columns_scoped(
+                            &w,
+                            outer_row,
+                            outer_schema,
+                            scope.as_deref(),
+                        ));
                     }
                 }
                 Expr::Exists(Box::new(bound))
@@ -15946,12 +15976,27 @@ impl QueryExecutor {
             // errored per row and NOT EXISTS silently matched nothing.
             Expr::UnaryOp { op, expr } => Expr::UnaryOp {
                 op: op.clone(),
-                expr: Box::new(Self::bind_outer_columns(expr, outer_row, outer_schema)),
+                expr: Box::new(Self::bind_outer_columns_scoped(
+                    expr,
+                    outer_row,
+                    outer_schema,
+                    inner_id,
+                )),
             },
             Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-                left: Box::new(Self::bind_outer_columns(left, outer_row, outer_schema)),
+                left: Box::new(Self::bind_outer_columns_scoped(
+                    left,
+                    outer_row,
+                    outer_schema,
+                    inner_id,
+                )),
                 op: op.clone(),
-                right: Box::new(Self::bind_outer_columns(right, outer_row, outer_schema)),
+                right: Box::new(Self::bind_outer_columns_scoped(
+                    right,
+                    outer_row,
+                    outer_schema,
+                    inner_id,
+                )),
             },
             Expr::FunctionCall {
                 name,
@@ -15961,11 +16006,22 @@ impl QueryExecutor {
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|a| Self::bind_outer_columns(a, outer_row, outer_schema))
+                    .map(|a| Self::bind_outer_columns_scoped(a, outer_row, outer_schema, inner_id))
                     .collect(),
                 distinct: *distinct,
             },
             _ => expr.clone(),
+        }
+    }
+
+    /// The FROM table/alias of a (sub)query — columns prefixed with this id
+    /// are INNER references (see bind_outer_columns_scoped).
+    fn subquery_table_id(sub: &crate::sql::ast::SelectStmt) -> Option<String> {
+        match sub.from.as_ref() {
+            Some(TableRef::Table { name, alias }) => {
+                Some(alias.clone().unwrap_or_else(|| name.clone()))
+            }
+            _ => None,
         }
     }
 
@@ -18282,9 +18338,13 @@ impl QueryExecutor {
         let column_names: Vec<String> = resolved_cols.iter().map(|(n, _)| n.clone()).collect();
         let col_positions: Vec<Option<usize>> = resolved_cols.into_iter().map(|(_, p)| p).collect();
 
-        // Materialize subqueries first (IN (SELECT...) → IN (literal list))
+        // Materialize subqueries first (IN (SELECT...) → IN (literal list)).
+        // 🔒 Use the CORRELATION-AWARE variant: the plain one eagerly executed
+        // correlated scalar subqueries with their outer refs bare-stripped to
+        // inner columns (b.k = a.k → b.k = b.k, always true) — `WHERE (SELECT
+        // COUNT(*) …) > 0` matched every row (round-6 probe).
         let where_clause = stmt.where_clause.as_ref().unwrap();
-        let where_expr = self.materialize_subqueries(where_clause)?;
+        let where_expr = self.materialize_subqueries_checked(where_clause, Some(&schema))?;
 
         // Check positional evaluation ability
         if !Self::can_eval_positional(&where_expr) {

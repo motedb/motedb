@@ -257,6 +257,22 @@ SELECT * FROM s WHERE t LIKE 'item_9$%%' ESCAPE '$';  -- 命中 "item_9%…"
 落在模式末尾时按字面转义符匹配 (宽松处理, SQLite 在此报错)。
 回归: `tests/test_like_escape.rs` (含 NOT LIKE 组合/语法错误/reopen+索引路径)。
 
+#### 相关子查询 — 外引用绑定 (2026-10-24 修复)
+
+```sql
+-- 相关 EXISTS: 内表 b 的行按外行 a.k 逐行判断 — 只返回在 b 中有同 k 值的 a 行
+SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k);
+-- 相关标量子查询 (SELECT 列表或 WHERE): 每外行执行一次
+SELECT id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a;
+```
+
+规则: 表限定列按前缀区分内外 — 前缀等于子查询 FROM 表/别名的列是
+内引用, 其余前缀 (可在外层解析) 是外引用按外行逐行绑定; 无限定名列
+取**最内层**作用域 (`b.k = k` 中 k 即 b.k)。
+历史 bug (已修, 回归 `tests/test_correlated_subquery.rs`): 内外表裸列
+同名时两侧都被绑到外行 → `b.k = a.k` 恒真 → EXISTS 匹配全部行、
+标量计数恒为内表行数; 以及 WHERE 快路径 eager 执行未绑定相关子查询。
+
 ### ORDER BY
 
 ```rust
