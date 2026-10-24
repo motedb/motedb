@@ -847,6 +847,13 @@ impl MoteDB {
     /// explicit txn COMMITting the same row afterwards must see this stamp
     /// and conflict (autocommit itself serializes under write_lock).
     pub(crate) fn stamp_row_commit_autocommit(&self, table_name: &str, row_ids: &[RowId]) {
+        // 🔒 Only for REAL autocommit writes: in-txn statements route through
+        // here too (e.g. upsert DO UPDATE inside a transaction) — stamping
+        // then made the txn's own COMMIT self-conflict on its write_set rows
+        // (upsert-hits-same-txn-insert regression, round-7).
+        if crate::sql::executor::QueryExecutor::is_in_transaction_tls() {
+            return;
+        }
         let stamp = self.txn_coordinator.allocate_stamp();
         for &r in row_ids {
             *self
