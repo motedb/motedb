@@ -19438,6 +19438,26 @@ impl QueryExecutor {
     }
 
     fn execute_update(&self, stmt: UpdateStmt) -> Result<QueryResult> {
+        // 🔒 Round-7: in explicit txns, flush the shared write buffer (see
+        // below) AND take a statement-start WATERMARK — any row committed by
+        // a concurrent txn after this statement began conflicts at COMMIT
+        // (first-committer-wins). Per-row stamps read AFTER the row value
+        // missed the window where a commit landed between value-read and
+        // stamp-read (fresh stamp + stale value, 7-9/2000 lost); a watermark
+        // is conservative (may over-conflict) but sound.
+        let txn_stmt_watermark = if self.is_in_transaction() {
+            if let Ok(schema0) = self.db.get_table_schema(&stmt.table) {
+                if let Ok(store) = self
+                    .db
+                    .get_or_create_col_segment_store(&stmt.table, schema0.col_types())
+                {
+                    let _ = store.flush_buffer();
+                }
+            }
+            Some(self.db.txn_coordinator.allocate_stamp())
+        } else {
+            None
+        };
         let schema = self.db.get_table_schema(&stmt.table)?;
 
         // 🔑 TimeSeries rows are immutable (append-only ColumnarStore).
@@ -19663,6 +19683,7 @@ impl QueryExecutor {
                         row_id,
                         row.clone(),
                         new_row,
+                        txn_stmt_watermark.unwrap_or(0),
                     )?;
                     self.db.txn_coordinator.record_pending_snapshot(
                         tid,
@@ -19733,6 +19754,17 @@ impl QueryExecutor {
     }
 
     fn execute_delete(&self, stmt: DeleteStmt) -> Result<QueryResult> {
+        // 🔒 Same flush-before-read rationale as execute_update (round-7).
+        if self.is_in_transaction() {
+            if let Ok(schema0) = self.db.get_table_schema(&stmt.table) {
+                if let Ok(store) = self
+                    .db
+                    .get_or_create_col_segment_store(&stmt.table, schema0.col_types())
+                {
+                    let _ = store.flush_buffer();
+                }
+            }
+        }
         // 🔑 Resolve subqueries in WHERE clause before evaluation. Without this,
         // DELETE ... WHERE id NOT IN (SELECT ...) silently matches no rows
         // (the evaluator can't execute subqueries against an SqlRow).
@@ -20237,6 +20269,7 @@ impl QueryExecutor {
                 row_id,
                 storage_old,
                 new_row,
+                self.db.row_commit_stamp_of(&stmt.table, row_id),
             )?;
         }
         self.db
@@ -20378,6 +20411,25 @@ impl QueryExecutor {
         // Note: no early return on empty row_ids — inside a transaction the
         // target row may exist ONLY in the write_set (uncommitted INSERT),
         // which the write_set pass below matches on the PK column.
+        // 🔒 Round-7 parity with the scan path: flush the shared write buffer
+        // (concurrent txn COMMITs append there) + statement-start watermark
+        // for first-committer-wins at COMMIT. Without the flush this PK
+        // fast path read stale bases and silently overwrote concurrent
+        // commits (WHERE pk = … is the hot transactional shape).
+        if self.is_in_transaction() {
+            if let Ok(store) = self
+                .db
+                .get_or_create_col_segment_store(&stmt.table, schema.col_types())
+            {
+                let _ = store.flush_buffer();
+            }
+        }
+        let stmt_watermark = if self.is_in_transaction() {
+            Some(self.db.txn_coordinator.allocate_stamp())
+        } else {
+            None
+        };
+
         let row_ids = self.resolve_pk_row_ids(&stmt.table, schema, target_value)?;
 
         let mut affected_rows = 0;
@@ -20401,9 +20453,24 @@ impl QueryExecutor {
                     None => {} // plain storage row → buffered below
                 }
             }
-            let row = match self.db.get_table_row(&stmt.table, row_id)? {
-                Some(r) => r,
-                None => continue,
+            // 🔒 Narrow write_lock around the row read (in txn): a
+            // concurrent COMMIT's validate→apply gap (stamp first, storage
+            // append after, both under write_lock) could otherwise be read
+            // in-between — stale value + watermark already past the stamp
+            // passed validation and overwrote (round-7 residual losses).
+            // Lock order matches commit-apply (write_lock → store locks);
+            // WAL/file locks are NOT taken on this read path.
+            let row = if in_txn {
+                let _g = self.db.write_lock.lock();
+                match self.db.get_table_row(&stmt.table, row_id)? {
+                    Some(r) => r,
+                    None => continue,
+                }
+            } else {
+                match self.db.get_table_row(&stmt.table, row_id)? {
+                    Some(r) => r,
+                    None => continue,
+                }
             };
 
             // Evaluate assignments positionally against the raw Vec<Value>
@@ -20455,6 +20522,7 @@ impl QueryExecutor {
                         row_id,
                         row.clone(),
                         new_row,
+                        stmt_watermark.unwrap_or(0),
                     )?;
                     self.db.txn_coordinator.record_pending_snapshot(
                         tid,

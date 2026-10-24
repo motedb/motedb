@@ -834,6 +834,28 @@ impl MoteDB {
         self.update_row_with_schema_ref(table_name, row_id, &old_row, new_row, schema)
     }
 
+    /// Current WW registry stamp for a row (read-time anchor for
+    /// first-committer-wins on UPDATE reads).
+    pub fn row_commit_stamp_of(&self, table_name: &str, row_id: RowId) -> u64 {
+        self.row_commit_ts
+            .get(&(table_name.to_string(), row_id))
+            .map(|g| *g)
+            .unwrap_or(0)
+    }
+
+    /// 🔒 WW registry stamp for autocommit row writes — a concurrent
+    /// explicit txn COMMITting the same row afterwards must see this stamp
+    /// and conflict (autocommit itself serializes under write_lock).
+    pub(crate) fn stamp_row_commit_autocommit(&self, table_name: &str, row_ids: &[RowId]) {
+        let stamp = self.txn_coordinator.allocate_stamp();
+        for &r in row_ids {
+            *self
+                .row_commit_ts
+                .entry((table_name.to_string(), r))
+                .or_insert(0) = stamp;
+        }
+    }
+
     /// Core UPDATE implementation — borrows old_row (avoids caller clone).
     pub fn update_row_with_schema_ref(
         &self,
@@ -843,7 +865,9 @@ impl MoteDB {
         new_row: Row,
         schema: &crate::types::TableSchema,
     ) -> Result<()> {
-        self.update_row_with_schema_impl(table_name, row_id, old_row, new_row, schema, false)
+        self.update_row_with_schema_impl(table_name, row_id, old_row, new_row, schema, false)?;
+        self.stamp_row_commit_autocommit(table_name, &[row_id]);
+        Ok(())
     }
 
     /// 🔑 批量 UPDATE: 逐行落缓冲/墓碑/缓存, WAL 全部 deferred 入队,
@@ -1534,7 +1558,9 @@ impl MoteDB {
         row_id: RowId,
         old_row: Row,
     ) -> Result<()> {
-        self.delete_row_impl(table_name, row_id, old_row, false)
+        self.delete_row_impl(table_name, row_id, old_row, false)?;
+        self.stamp_row_commit_autocommit(table_name, &[row_id]);
+        Ok(())
     }
 
     /// 🔑 批量 DELETE: WAL deferred + 语句级栅栏 (同 UPDATE 批量化)。

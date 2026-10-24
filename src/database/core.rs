@@ -153,6 +153,20 @@ pub struct MoteDB {
     /// Incremented on INSERT, decremented on DELETE.
     pub(crate) table_row_count: Arc<DashMap<String, Arc<AtomicU64>>>,
 
+    /// 🔒 WW-conflict registry (2026-10-24 round-7): last commit stamp per
+    /// (table, row). Explicit-txn UPDATE/DELETE buffer absolute rows and are
+    /// applied at COMMIT with NO version-chain arbitration (they bypass
+    /// version_store) — two concurrent `BEGIN; UPDATE v=v+1; COMMIT` loops
+    /// lost exactly half the increments (last-committer-wins on stale
+    /// snapshots). commit_transaction now validates first-committer-wins
+    /// against this registry; autocommit writes stamp it (autocommit already
+    /// serializes under write_lock, but a txn committing over a concurrent
+    /// autocommit write must still detect the conflict).
+    pub(crate) row_commit_ts: Arc<DashMap<(String, RowId), u64>>,
+    /// Monotonic stamp clock for row_commit_ts (separate from write_lsn to
+    /// keep WAL-offset semantics clean).
+    pub(crate) row_commit_clock: Arc<AtomicU64>,
+
     /// Table registry (catalog)
     pub(crate) table_registry: Arc<TableRegistry>,
 
@@ -623,6 +637,8 @@ impl MoteDB {
             read_only: config.read_only,
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
+            row_commit_ts: Arc::new(DashMap::new()),
+            row_commit_clock: Arc::new(AtomicU64::new(1)),
             table_registry,
             index_registry,
             row_cache,
@@ -903,6 +919,8 @@ impl MoteDB {
             read_only: self.read_only,
             pk_lookup: self.pk_lookup.clone(),
             table_row_count: self.table_row_count.clone(),
+            row_commit_ts: self.row_commit_ts.clone(),
+            row_commit_clock: self.row_commit_clock.clone(),
             table_registry: self.table_registry.clone(),
             index_registry: self.index_registry.clone(), // 🆕
             row_cache: self.row_cache.clone(),
@@ -1484,6 +1502,8 @@ impl MoteDB {
             wal,
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
+            row_commit_ts: Arc::new(DashMap::new()),
+            row_commit_clock: Arc::new(AtomicU64::new(1)),
             next_row_id,
             write_lsn,
             write_lock: Arc::new(parking_lot::Mutex::new(())),

@@ -1972,10 +1972,14 @@ impl Database {
                                 new_row[pos] = v;
                             }
                             MoteDB::coerce_row_to_schema(&schema, &mut new_row);
-                            let prior = self
-                                .inner
-                                .txn_coordinator
-                                .record_pending_update(tid, table, row_id, row, new_row)?;
+                            let prior = self.inner.txn_coordinator.record_pending_update(
+                                tid,
+                                table,
+                                row_id,
+                                row,
+                                new_row.clone(),
+                                self.inner.row_commit_stamp_of(table, row_id),
+                            )?;
                             self.inner
                                 .txn_coordinator
                                 .record_pending_snapshot(tid, row_id, table, prior)?;

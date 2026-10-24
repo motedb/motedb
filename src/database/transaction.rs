@@ -251,6 +251,62 @@ impl MoteDB {
             return Ok(());
         }
 
+        // 🔒 Serialize VALIDATION + storage application with autocommit
+        // writes (round-7): validating outside the lock let two commits pass
+        // first-committer-wins simultaneously, then serialize their applies —
+        // the second silently overwrote the first (41/2000 lost in the
+        // guarded repro). Autocommit UPDATE/DELETE hold write_lock for the
+        // whole statement; in-txn UPDATE/DELETE hold it per statement, and
+        // commit holds it from validation through apply.
+        let _commit_write_guard = self.write_lock.lock();
+
+        // 🔒 WW first-committer-wins (2026-10-24 round-7): buffered UPDATEs
+        // and DELETEs bypass version_store (they apply at commit), so two
+        // concurrent BEGIN/UPDATE/COMMIT loops on the same rows lost each
+        // other's increments (last-committer-wins on stale snapshots —
+        // measured exactly 1000/2000 lost in the minimal repro). Validate
+        // every written row against the registry BEFORE any durable effect;
+        // conflict ⇒ Err (caller rolls back / retries).
+        {
+            let (snapshot_ts, read_stamps) = self
+                .txn_coordinator
+                .get_context(txn_id)
+                .map(|c| {
+                    let rs = c.update_read_stamps.read().clone();
+                    (c.snapshot.timestamp, rs)
+                })
+                .unwrap_or((0, Default::default()));
+            let mut rows: Vec<(String, RowId)> =
+                Vec::with_capacity(write_set.len() + pending.len() + pending_deletes.len());
+            for (t, r) in write_set.keys() {
+                rows.push((t.clone(), *r));
+            }
+            for (t, r) in pending.keys() {
+                rows.push((t.clone(), *r));
+            }
+            for (t, r) in pending_deletes.keys() {
+                rows.push((t.clone(), *r));
+            }
+            rows.sort();
+            rows.dedup();
+            // 🔑 SAME clock as snapshot timestamps (version_store). Conflict
+            // anchor per row: the READ stamp when this txn's UPDATE read the
+            // row (fallback: BEGIN snapshot) — closes the between-read-and-
+            // commit window the BEGIN-only check missed.
+            let stamp = self.txn_coordinator.allocate_stamp();
+            for key in rows {
+                let base = read_stamps.get(&key).copied().unwrap_or(snapshot_ts);
+                let mut e = self.row_commit_ts.entry(key.clone()).or_insert(0);
+                if *e > base {
+                    return Err(StorageError::Transaction(format!(
+                        "Write-write conflict on {}.{} (txn {}): row committed by a concurrent transaction since it was read — retry",
+                        key.0, key.1, txn_id
+                    )));
+                }
+                *e = stamp;
+            }
+        }
+
         // 1. Commit in transaction coordinator FIRST (MVCC validation).
         //    If this fails, nothing is written to WAL — no orphaned records.
         let commit_ts = self.txn_coordinator.commit(txn_id)?;

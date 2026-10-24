@@ -91,6 +91,12 @@ pub struct TransactionContext {
     /// Transaction state
     pub state: AtomicU8,
 
+    /// 🔒 WW read stamps (round-7): per-row commit-stamp as seen when this
+    /// txn's UPDATE read the row. Commit validation conflicts when the row's
+    /// registry stamp advanced past the read stamp (first-committer-wins on
+    /// the READ, closing the between-read-and-commit window).
+    pub update_read_stamps: RwLock<HashMap<(String, RowId), u64>>,
+
     /// Write set (local cache of writes) with table metadata
     /// Format: (table_name, RowId) → row_data
     /// 🔑 Keyed by (table_name, row_id) — NOT just row_id — because different
@@ -172,6 +178,7 @@ impl TransactionCoordinator {
             pending_updates: RwLock::new(HashMap::new()),
             pending_deletes: RwLock::new(HashMap::new()),
             read_set: RwLock::new(HashSet::new()),
+            update_read_stamps: RwLock::new(HashMap::new()),
             undo_log: RwLock::new(Vec::new()),
             snapshot,
             savepoints: RwLock::new(Vec::new()), // Initialize empty savepoint stack
@@ -185,6 +192,13 @@ impl TransactionCoordinator {
     /// Commit a transaction
     ///
     /// Returns the commit timestamp for MVCC visibility
+    /// 🔒 WW-registry clock: SAME allocator as snapshot/commit timestamps so
+    /// registry stamps are comparable to BEGIN-time snapshots (first-
+    /// committer-wins detection for buffered UPDATE/DELETE commits).
+    pub fn allocate_stamp(&self) -> Timestamp {
+        self.version_store.allocate_timestamp()
+    }
+
     pub fn commit(&self, txn_id: TransactionId) -> Result<Timestamp> {
         let ctx = self.get_context(txn_id)?;
 
@@ -365,8 +379,24 @@ impl TransactionCoordinator {
         row_id: RowId,
         old_row: Row,
         new_row: Row,
+        read_stamp: u64,
     ) -> Result<Option<(Row, Row)>> {
+        // 🔒 WW read-stamp (round-7): caller passes the row's CURRENT commit
+        // stamp at UPDATE (read) time — validating against the BEGIN snapshot
+        // alone misses the window where a concurrent txn commits BETWEEN this
+        // txn's read and its own commit while the BEGIN clock already ran
+        // past that stamp.
         let ctx = self.get_context(txn_id)?;
+        {
+            let mut rs = ctx.update_read_stamps.write();
+            rs.entry((table_name.to_string(), row_id))
+                .and_modify(|e| {
+                    if read_stamp < *e {
+                        *e = read_stamp;
+                    }
+                })
+                .or_insert(read_stamp);
+        }
         let mut pending = ctx.pending_updates.write();
         let key = (table_name.to_string(), row_id);
         let prior = pending.insert(key, (old_row, new_row));
