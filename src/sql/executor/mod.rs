@@ -25224,7 +25224,7 @@ mod tests {
                     expr: Box::new(Expr::Column(c.into())),
                     pattern: Box::new(Expr::Literal(Value::Text(p.into()))),
                     negated: neg,
-                    escape,
+                    escape: None,
                 });
             }
             // IS NULL / IS NOT NULL
@@ -25298,7 +25298,7 @@ mod tests {
                 expr: Box::new(Expr::Column("t".into())),
                 pattern: Box::new(Expr::Literal(Value::Text("%p%".into()))),
                 negated: false,
-                escape,
+                escape: None,
             }),
         });
         out

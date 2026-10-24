@@ -3287,7 +3287,7 @@ mod tests {
             expr: Box::new(lit_text("hello world")),
             pattern: Box::new(lit_text("%world%")),
             negated: false,
-            escape,
+            escape: None,
         };
         assert_eq!(eval(&like, &r).unwrap(), Value::Bool(true));
 
@@ -3295,7 +3295,7 @@ mod tests {
             expr: Box::new(lit_text("hello")),
             pattern: Box::new(lit_text("%xyz%")),
             negated: true,
-            escape,
+            escape: None,
         };
         assert_eq!(eval(&nlike, &r).unwrap(), Value::Bool(true));
     }
