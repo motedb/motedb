@@ -145,6 +145,8 @@ The full rules are in [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md).
 ## Related links
 
 - 📖 [Documentation](https://github.com/motedb/motedb/tree/main/docs)
+- 📝 [How a 1M-row `ORDER BY` took 1.2 seconds](https://github.com/motedb/motedb/blob/main/docs/design/2026-10-order-by-internals.md)
+  — the 680× write-up: three stacked bugs, and the adversarial harness that found them
 - 🗺️ [Roadmap](https://github.com/motedb/motedb/blob/main/ROADMAP.md)
 - ✅ [Capability manifest](https://github.com/motedb/motedb/blob/main/CAPABILITIES.md)
 - 🤝 [Contributing guide](https://github.com/motedb/motedb/blob/main/CONTRIBUTING.md)
