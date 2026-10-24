@@ -3246,10 +3246,12 @@ impl Parser {
                     TokenType::Like => {
                         self.advance();
                         let pattern = self.parse_expr(4)?;
+                        let escape = self.parse_like_escape()?;
                         Ok(Expr::Like {
                             expr: Box::new(expr),
                             pattern: Box::new(pattern),
                             negated: true,
+                            escape,
                         })
                     }
                     TokenType::Between => {
@@ -3270,10 +3272,12 @@ impl Parser {
             TokenType::Like => {
                 self.advance();
                 let pattern = self.parse_expr(4)?;
+                let escape = self.parse_like_escape()?;
                 Ok(Expr::Like {
                     expr: Box::new(expr),
                     pattern: Box::new(pattern),
                     negated: false,
+                    escape,
                 })
             }
             TokenType::In => {
@@ -3362,6 +3366,29 @@ impl Parser {
             }
         }
         false
+    }
+
+    /// 🔖 Optional `ESCAPE '<single char>'` after a LIKE pattern. `ESCAPE`
+    /// stays an unreserved word (matched case-insensitively as an
+    /// identifier) so a column named escape keeps working.
+    fn parse_like_escape(&mut self) -> Result<Option<char>> {
+        if !self.match_keyword_ident("ESCAPE") {
+            return Ok(None);
+        }
+        match self.current().token_type.clone() {
+            TokenType::PureInteger(_) | TokenType::Identifier(_) => {
+                Err(self.error("ESCAPE requires a single-character string literal"))
+            }
+            TokenType::String(lit) => {
+                self.advance();
+                let mut it = lit.chars();
+                match (it.next(), it.next()) {
+                    (Some(c), None) => Ok(Some(c)),
+                    _ => Err(self.error("ESCAPE requires a SINGLE character (e.g. ESCAPE '$')")),
+                }
+            }
+            _ => Err(self.error("Expected string literal after ESCAPE")),
+        }
     }
 
     /// `match_keyword_ident` with a descriptive error on mismatch.

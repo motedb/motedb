@@ -1362,10 +1362,10 @@ enum CompiledWhere {
     /// col[pos] IN set (O(1)). `negated` = NOT IN; `has_null` = the list/set
     /// contains NULL (SQL 三值逻辑: x NOT IN (…, NULL) → UNKNOWN → false).
     InHash(usize, std::collections::HashSet<Value>, bool, bool),
-    Like(usize, String, bool), // col[pos] LIKE pattern (negated bool)
-    IsNull(usize, bool),       // col[pos] IS NULL / IS NOT NULL
-    And(Vec<CompiledWhere>),   // all must match (short-circuit)
-    Or(Vec<CompiledWhere>),    // any must match (short-circuit)
+    Like(usize, String, bool, Option<char>), // col[pos] LIKE pattern [ESCAPE c] (negated)
+    IsNull(usize, bool),                     // col[pos] IS NULL / IS NOT NULL
+    And(Vec<CompiledWhere>),                 // all must match (short-circuit)
+    Or(Vec<CompiledWhere>),                  // any must match (short-circuit)
 }
 
 impl CompiledWhere {
@@ -1486,12 +1486,12 @@ impl CompiledWhere {
                     }
                 }))
             }
-            CompiledWhere::Like(pos, pattern, negated) => {
+            CompiledWhere::Like(pos, pattern, negated, esc) => {
                 // 🔑 SQL 三值逻辑：NULL LIKE / NULL NOT LIKE → UNKNOWN → false
                 // （negated 不能翻转 NULL 的结果）。非文本类型交给原生求值。
                 let v = row.get(*pos)?;
                 let matches = match v {
-                    Value::Text(s) => Self::like_match(s, pattern),
+                    Value::Text(s) => like_match_esc(s.as_str(), pattern.as_str(), *esc),
                     Value::Null => return Some(false),
                     _ => return None,
                 };
@@ -1520,63 +1520,10 @@ impl CompiledWhere {
         }
     }
 
-    /// SQL LIKE pattern match: % = any chars, _ = single char
-    fn like_match(text: &str, pattern: &str) -> bool {
-        let mut ti = 0;
-        let mut pi = 0;
-        let mut star_pi = None;
-        let mut star_ti = None;
-        let pbytes = pattern.as_bytes();
-        let tbytes = text.as_bytes();
-        loop {
-            if pi < pbytes.len() {
-                if pbytes[pi] == b'%' {
-                    pi += 1;
-                    if pi >= pbytes.len() {
-                        return true;
-                    } // trailing %
-                    star_pi = Some(pi);
-                    star_ti = Some(ti);
-                } else if ti < tbytes.len() && (pbytes[pi] == b'_' || pbytes[pi] == tbytes[ti]) {
-                    pi += 1;
-                    ti += 1;
-                } else if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
-                    // 🔑 回溯耗尽检查：star_ti 已到文本末尾意味着 % 已吞尽全部
-                    // 文本仍无法让后续模式字符匹配 —— 再回溯只会 ti 无限增长，
-                    // pi 原地弹跳 = 死循环（BUG #36，like("abc", "%x%") 即触发）。
-                    if sti >= tbytes.len() {
-                        return false;
-                    }
-                    // backtrack: consume one more char for the %
-                    let new_ti = sti + 1;
-                    ti = new_ti;
-                    star_ti = Some(new_ti);
-                    pi = spi;
-                } else {
-                    return false;
-                }
-            } else {
-                // 模式耗尽：文本也必须耗尽，否则唯一机会是让上一个 % 吞掉
-                // 剩余文本前缀、把 star 之后的模式重新锚到更靠后的位置
-                //（后缀锚定模式如 '%a'：必须回溯到最后的 'a' 才能命中，
-                //  BUG #39 —— 旧代码在循环外直接判 ti>=len，'%a' 永不匹配）。
-                if ti >= tbytes.len() {
-                    return true;
-                }
-                if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
-                    if sti >= tbytes.len() {
-                        return false;
-                    }
-                    let new_ti = sti + 1;
-                    ti = new_ti;
-                    star_ti = Some(new_ti);
-                    pi = spi;
-                } else {
-                    return false;
-                }
-            }
-        }
-    }
+    /// 🔖 LIKE with an optional single-char escape (`ESCAPE '$'`): the byte
+    /// after the escape char matches literally — including `%`, `_` and the
+    /// escape itself. A TRAILING escape char (dangling) matches the escape
+    /// literally (lenient; SQLite errors — documented in docs/03).
 
     /// Collect all column positions referenced by this compiled WHERE.
     /// Used for partial row decode optimization.
@@ -1589,7 +1536,7 @@ impl CompiledWhere {
             | CompiledWhere::Gt(pos, _)
             | CompiledWhere::Ge(pos, _)
             | CompiledWhere::InHash(pos, ..)
-            | CompiledWhere::Like(pos, _, _)
+            | CompiledWhere::Like(pos, _, _, _)
             | CompiledWhere::IsNull(pos, _) => {
                 positions.push(*pos);
             }
@@ -1702,12 +1649,12 @@ impl CompiledWhere {
                     }
                 }))
             }
-            CompiledWhere::Like(pos, pattern, negated) => {
+            CompiledWhere::Like(pos, pattern, negated, esc) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
                 // 🔑 同上：NULL LIKE/NOT LIKE → false，非文本回退原生求值
                 let v = row.get(*idx)?;
                 let matches = match v {
-                    Value::Text(s) => Self::like_match(s, pattern),
+                    Value::Text(s) => like_match_esc(s.as_str(), pattern.as_str(), *esc),
                     Value::Null => return Some(false),
                     _ => return None,
                 };
@@ -1906,6 +1853,87 @@ impl PartialOrd for SortKey {
 impl Ord for SortKey {
     fn cmp(&self, other: &Self) -> Ordering {
         order_by_cmp(&self.0, &other.0)
+    }
+}
+
+pub(crate) fn like_match_esc(text: &str, pattern: &str, esc: Option<char>) -> bool {
+    let mut ti = 0;
+    let mut pi = 0;
+    let mut star_pi = None;
+    let mut star_ti = None;
+    let pbytes = pattern.as_bytes();
+    let tbytes = text.as_bytes();
+    let escb = esc.map(|c| c as u8);
+    loop {
+        if pi < pbytes.len() {
+            if let Some(e) = escb {
+                if pbytes[pi] == e {
+                    // escaped literal byte (must exist; dangling = literal esc)
+                    if pi + 1 >= pbytes.len() {
+                        return ti < tbytes.len() && tbytes[ti] == e && ti + 1 == tbytes.len();
+                    }
+                    if ti < tbytes.len() && pbytes[pi + 1] == tbytes[ti] {
+                        pi += 2;
+                        ti += 1;
+                        continue;
+                    } else if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
+                        if sti >= tbytes.len() {
+                            return false;
+                        }
+                        ti = sti + 1;
+                        star_ti = Some(ti);
+                        pi = spi;
+                        continue;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            if pbytes[pi] == b'%' {
+                pi += 1;
+                if pi >= pbytes.len() {
+                    return true;
+                } // trailing %
+                star_pi = Some(pi);
+                star_ti = Some(ti);
+            } else if ti < tbytes.len() && (pbytes[pi] == b'_' || pbytes[pi] == tbytes[ti]) {
+                pi += 1;
+                ti += 1;
+            } else if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
+                // 🔑 回溯耗尽检查：star_ti 已到文本末尾意味着 % 已吞尽全部
+                // 文本仍无法让后续模式字符匹配 —— 再回溯只会 ti 无限增长，
+                // pi 原地弹跳 = 死循环（BUG #36，like("abc", "%x%") 即触发）。
+                if sti >= tbytes.len() {
+                    return false;
+                }
+                // backtrack: consume one more char for the %
+                let new_ti = sti + 1;
+                ti = new_ti;
+                star_ti = Some(new_ti);
+                pi = spi;
+            } else {
+                return false;
+            }
+        } else {
+            // 模式耗尽：文本也必须耗尽，否则唯一机会是让上一个 % 吞掉
+            // 剩余文本前缀、把 star 之后的模式重新锚到更靠后的位置
+            //（后缀锚定模式如 '%a'：必须回溯到最后的 'a' 才能命中，
+            //  BUG #39 —— 旧代码在循环外直接判 ti>=len，'%a' 永不匹配）。
+            if ti >= tbytes.len() {
+                return true;
+            }
+            if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
+                if sti >= tbytes.len() {
+                    return false;
+                }
+                let new_ti = sti + 1;
+                ti = new_ti;
+                star_ti = Some(new_ti);
+                pi = spi;
+            } else {
+                return false;
+            }
+        }
     }
 }
 
@@ -9501,7 +9529,12 @@ impl QueryExecutor {
     }
 
     /// Simple LIKE pattern matching: % = any sequence, _ = single char
-    fn simple_like_match(text: &str, pattern: &str) -> bool {
+    fn simple_like_match_esc(text: &str, pattern: &str, esc: Option<char>) -> bool {
+        like_match_esc(text, pattern, esc)
+    }
+
+    #[allow(dead_code)]
+    fn simple_like_match_dp(text: &str, pattern: &str) -> bool {
         let t: Vec<char> = text.chars().collect();
         let p: Vec<char> = pattern.chars().collect();
         let mut dp = vec![vec![false; p.len() + 1]; t.len() + 1];
@@ -10766,6 +10799,7 @@ impl QueryExecutor {
                 expr,
                 pattern,
                 negated,
+                escape,
             } => {
                 if let Expr::Column(col_name) = expr.as_ref() {
                     let pos = schema.get_column_position(if col_name.contains('.') {
@@ -10774,7 +10808,7 @@ impl QueryExecutor {
                         col_name
                     })?;
                     if let Expr::Literal(Value::Text(s)) = pattern.as_ref() {
-                        Some(CompiledWhere::Like(pos, s.to_string(), *negated))
+                        Some(CompiledWhere::Like(pos, s.to_string(), *negated, *escape))
                     } else {
                         None
                     }
@@ -11325,6 +11359,7 @@ impl QueryExecutor {
                 expr: inner,
                 pattern,
                 negated,
+                escape,
             } => {
                 let e = Self::substitute_expr(inner, params)?;
                 let p = Self::substitute_expr(pattern, params)?;
@@ -11332,6 +11367,7 @@ impl QueryExecutor {
                     expr: Box::new(e),
                     pattern: Box::new(p),
                     negated: *negated,
+                    escape: *escape,
                 })
             }
             Expr::FunctionCall {
@@ -11595,6 +11631,7 @@ impl QueryExecutor {
                 expr,
                 pattern,
                 negated,
+                escape,
             } => {
                 let val = Self::eval_expr_on_row(expr, row, schema)?;
                 let pat = Self::eval_expr_on_row(pattern, row, schema)?;
@@ -11603,7 +11640,9 @@ impl QueryExecutor {
                     return Ok(Value::Null);
                 }
                 let matches = match (&val, &pat) {
-                    (Value::Text(s), Value::Text(p)) => Self::simple_like_match(s, p),
+                    (Value::Text(s), Value::Text(p)) => {
+                        Self::simple_like_match_esc(s.as_str(), p.as_str(), *escape)
+                    }
                     _ => false,
                 };
                 Ok(Value::Bool(if *negated { !matches } else { matches }))
@@ -14379,10 +14418,12 @@ impl QueryExecutor {
                 expr,
                 pattern,
                 negated,
+                escape,
             } => Ok(Expr::Like {
                 expr: Box::new(self.materialize_subqueries(expr)?),
                 pattern: Box::new(self.materialize_subqueries(pattern)?),
                 negated: *negated,
+                escape: *escape,
             }),
 
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
@@ -19110,7 +19151,7 @@ impl QueryExecutor {
                 }
             }
             CompiledWhere::InHash(p, _, _, _) => out.push(*p),
-            CompiledWhere::Like(p, _, _) => out.push(*p),
+            CompiledWhere::Like(p, _, _, _) => out.push(*p),
             CompiledWhere::IsNull(p, _) => out.push(*p),
         }
     }
@@ -25183,6 +25224,7 @@ mod tests {
                     expr: Box::new(Expr::Column(c.into())),
                     pattern: Box::new(Expr::Literal(Value::Text(p.into()))),
                     negated: neg,
+                    escape,
                 });
             }
             // IS NULL / IS NOT NULL
@@ -25256,6 +25298,7 @@ mod tests {
                 expr: Box::new(Expr::Column("t".into())),
                 pattern: Box::new(Expr::Literal(Value::Text("%p%".into()))),
                 negated: false,
+                escape,
             }),
         });
         out

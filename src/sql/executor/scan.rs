@@ -1606,6 +1606,7 @@ impl QueryExecutor {
                 expr,
                 pattern,
                 negated: false,
+                escape,
             }) = &where_clause
             {
                 if let (
@@ -1620,7 +1621,10 @@ impl QueryExecutor {
                     // like 'custX1' would also match, but in practice the data uses
                     // literal '_'). This trades exact LIKE semantics for a 10-17x
                     // speedup on the common 'prefix%' pattern.
-                    if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
+                    // 🔒 ESCAPE'd patterns don't take this path (prefix bytes may
+                    // be escapes; semantics differ).
+                    if escape.is_none() && pat.ends_with('%') && !pat[..pat.len() - 1].contains('%')
+                    {
                         let prefix = &pat[..pat.len() - 1];
                         if let Some(fc) = schema.get_column_position(cn) {
                             if matches!(col_types.get(fc), Some(ColumnType::Text)) {
@@ -2251,10 +2255,13 @@ impl QueryExecutor {
                 expr,
                 pattern,
                 negated: false,
+                escape,
             } => match (expr.as_ref(), pattern.as_ref()) {
                 (Expr::Column(cn), Expr::Literal(Value::Text(s))) => {
                     let pat = s.as_str();
-                    if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
+                    // 🔒 escape'd patterns: prefix bytes may be escapes → general scan.
+                    if escape.is_none() && pat.ends_with('%') && !pat[..pat.len() - 1].contains('%')
+                    {
                         let prefix = pat[..pat.len() - 1].to_string();
                         let bare = cn.rsplit('.').next().unwrap_or(cn);
                         let pos = schema.get_column_position(bare).unwrap_or(0);
@@ -2375,13 +2382,15 @@ impl QueryExecutor {
             expr,
             pattern,
             negated: false,
+            escape,
         } = wc
         {
             if let (Expr::Column(cn), Expr::Literal(Value::Text(s))) =
                 (expr.as_ref(), pattern.as_ref())
             {
                 let pat = s.as_str();
-                if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
+                // 🔒 escape'd patterns can't use the byte-prefix fast path.
+                if escape.is_none() && pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
                     let prefix = pat[..pat.len() - 1].to_string();
                     if let Some(fc) = schema.get_column_position(cn) {
                         if matches!(col_types.get(fc), Some(ColumnType::Text)) {

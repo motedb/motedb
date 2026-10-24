@@ -107,6 +107,7 @@ impl QueryExecutor {
                     expr,
                     pattern,
                     negated: false,
+                    escape,
                 } = wc
                 {
                     // COUNT(*) WHERE col LIKE 'prefix%' — zero-alloc prefix scan.
@@ -116,7 +117,10 @@ impl QueryExecutor {
                     ) = (expr.as_ref(), pattern.as_ref())
                     {
                         let pat = s.as_str();
-                        if pat.ends_with('%')
+                        // 🔒 escaped prefix: the leading bytes may be escapes —
+                        // only the no-escape shape is a plain prefix scan.
+                        if escape.is_none()
+                            && pat.ends_with('%')
                             && !pat[..pat.len() - 1].contains('%')
                             && schema
                                 .get_column_position(cn)

@@ -480,11 +480,15 @@ pub enum Expr {
     /// NOT EXISTS is represented as UnaryOp::Not around this.
     Exists(Box<Statement>),
 
-    /// LIKE expression: column LIKE pattern
+    /// LIKE expression: `column LIKE pattern [ESCAPE 'c']`
     Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
+        /// 🔖 Optional single-char escape (`LIKE 'a$_b' ESCAPE '$'`): the
+        /// escaped byte (including `%`, `_` and the escape itself) matches
+        /// literally. None = SQL default (no escape, `%`/`_` wildcards only).
+        escape: Option<char>,
     },
 
     /// IS NULL expression

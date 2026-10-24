@@ -242,6 +242,21 @@ let results = db.query("
 ")?;
 ```
 
+#### LIKE … ESCAPE — 字面匹配 % / _ / 转义符 (2026-10-24+)
+
+```sql
+-- '$' 后的字符按字面匹配: 只命中文本恰为 "100% sure" 的行
+SELECT * FROM s WHERE t LIKE '100$% sure' ESCAPE '$';
+-- 双写转义符 = 字面转义符: 命中 "a$b"
+SELECT * FROM s WHERE t LIKE 'a$$b' ESCAPE '$';
+-- ⚠️ LIKE 是全串匹配 — 字面前缀过滤需尾随未转义通配:
+SELECT * FROM s WHERE t LIKE 'item_9$%%' ESCAPE '$';  -- 命中 "item_9%…"
+```
+
+规则: ESCAPE 取单字符字面量 (多字符/非字面量报解析错误); 转义符悬空
+落在模式末尾时按字面转义符匹配 (宽松处理, SQLite 在此报错)。
+回归: `tests/test_like_escape.rs` (含 NOT LIKE 组合/语法错误/reopen+索引路径)。
+
 ### ORDER BY
 
 ```rust

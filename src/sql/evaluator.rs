@@ -493,6 +493,7 @@ impl ExprEvaluator {
                 expr,
                 pattern,
                 negated,
+                escape,
             } => {
                 let val = self.eval(expr, row)?;
                 let pattern_val = self.eval(pattern, row)?;
@@ -504,7 +505,7 @@ impl ExprEvaluator {
                 }
 
                 let matches = if let (Value::Text(s), Value::Text(p)) = (val, pattern_val) {
-                    self.like_match_cached(&s, &p)
+                    self.like_match_cached(&s, &p, *escape)
                 } else {
                     false
                 };
@@ -2541,7 +2542,12 @@ impl ExprEvaluator {
     /// ⚡ LIKE pattern matching with compilation cache (5-10x faster)
     /// Caches compiled patterns for repeated use
     #[inline]
-    fn like_match_cached(&self, text: &str, pattern: &str) -> bool {
+    fn like_match_cached(&self, text: &str, pattern: &str, escape: Option<char>) -> bool {
+        // 🔖 ESCAPE'd patterns bypass the compile cache (the key would need
+        // the escape char folded in; escaped patterns are rare).
+        if escape.is_some() {
+            return crate::sql::executor::like_match_esc(text, pattern, escape);
+        }
         // Fast path: check read-only cache first.
         // 🚀 parking_lot::RwLock read 直接返回 guard（无 poison 检查）。
         {
@@ -3281,6 +3287,7 @@ mod tests {
             expr: Box::new(lit_text("hello world")),
             pattern: Box::new(lit_text("%world%")),
             negated: false,
+            escape,
         };
         assert_eq!(eval(&like, &r).unwrap(), Value::Bool(true));
 
@@ -3288,6 +3295,7 @@ mod tests {
             expr: Box::new(lit_text("hello")),
             pattern: Box::new(lit_text("%xyz%")),
             negated: true,
+            escape,
         };
         assert_eq!(eval(&nlike, &r).unwrap(), Value::Bool(true));
     }
