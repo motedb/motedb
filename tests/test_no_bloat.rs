@@ -198,21 +198,31 @@ fn test_no_memory_leak_in_queries() {
     insert_test_rows(&db, 5000);
     // Warm up
     let _ = fast_count(&db, "SELECT * FROM bench");
-    let initial_rss = get_rss_mb();
 
-    // Run 500 queries
+    // 🔒 Steady-state slope, not absolute warm-up: the first query burst
+    // grows RSS from cold allocator arenas (jemalloc per-thread caches,
+    // dirty-page retention) — under a parallel test battery that warm-up
+    // crossed the old flat 15MB budget and flaked (16.7MB measured; 6/6
+    // green solo). A leak grows WITHOUT BOUND, so the assertion targets
+    // the SECOND identical window after the first has reached the
+    // cache/arena high-water.
     for _ in 0..500 {
         let _ = fast_count(&db, "SELECT * FROM bench WHERE tag = 'US'");
         let _ = fast_count(&db, "SELECT * FROM bench");
     }
+    let warmed_rss = get_rss_mb();
 
+    for _ in 0..500 {
+        let _ = fast_count(&db, "SELECT * FROM bench WHERE tag = 'US'");
+        let _ = fast_count(&db, "SELECT * FROM bench");
+    }
     let final_rss = get_rss_mb();
-    let growth = final_rss - initial_rss;
+    let growth = final_rss - warmed_rss;
     assert!(
         growth < 15.0,
-        "RSS grew {:.1}MB after 500 queries (initial={:.1}, final={:.1})",
+        "RSS grew {:.1}MB in the SECOND 500-query window (warmed={:.1}, final={:.1})",
         growth,
-        initial_rss,
+        warmed_rss,
         final_rss
     );
 }
