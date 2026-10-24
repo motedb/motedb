@@ -409,11 +409,13 @@ fn correlated_subquery_in_select_currently_uncorrelated() {
 }
 
 #[test]
-fn correlated_subquery_in_where_currently_uncorrelated() {
+fn correlated_subquery_in_where_per_dept() {
     let (db, _dir) = emp_db();
-    // CORRECT SQL: only bob (id=2, dept 10, salary 200 > avg 150) qualifies.
-    // CURRENT (BUGGY): outer ref unresolved → subquery computes global AVG
-    // = (100+200+150+300)/4 = 187.5. WHERE salary > 187.5 → bob(200), eve(300).
+    // 🔒 FIXED (2026-10-24, round-6 hunt — was "currently_uncorrelated"):
+    // scoped outer binding (e2.* stays inner, e.* binds per outer row).
+    // Per-dept AVG: dept10 = 150, dept20 = 150 (dave's NULL skipped), and
+    // eve's NULL dept → empty group → AVG NULL → 300 > NULL is UNKNOWN.
+    // → only bob (200 > 150) qualifies.
     let r = rows(
         &db,
         "SELECT id FROM emp e \
@@ -428,11 +430,10 @@ fn correlated_subquery_in_where_currently_uncorrelated() {
         .collect();
     let mut ids_sorted = ids.clone();
     ids_sorted.sort();
-    // Document current bug: returns global-AVG-based filter, not per-dept.
     assert_eq!(
         ids_sorted,
-        vec![2, 5],
-        "correlated subquery in WHERE returns global-AVG result (known bug)"
+        vec![2],
+        "correlated subquery filters per-dept (bob only)"
     );
 }
 
