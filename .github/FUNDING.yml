@@ -1,0 +1,11 @@
+# MoteDB is maintained by one person, on evenings and weekends.
+# If MoteDB saved you time, or if you depend on it to run a robot in
+# production, a small GitHub Sponsors contribution is what keeps it going.
+#
+# See the community page for everything else:
+# https://github.com/motedb/motedb/blob/main/community/README.md
+
+github: [motedb]
+# Once a second funding route exists (or if you prefer not to use GitHub
+# Sponsors), replace the line above with:
+# custom: ["<your-funding-url>"]
