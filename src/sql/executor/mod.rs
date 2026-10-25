@@ -6595,9 +6595,7 @@ impl QueryExecutor {
             let composite_key = self.db.make_composite_key(table, row_id);
             if let Some(store) = self.db.col_segment_stores.get(table) {
                 if let Some(row) = store.get(composite_key) {
-                    self.db
-                        .row_cache
-                        .put(table.to_string(), row_id, row.clone());
+                    let _ = self.db.row_cache.put_if_absent(table, row_id, row.clone());
                     let sql_row = row_to_sql_row(&row, &schema)?;
                     let mut prefixed = SqlRow::new();
                     prefixed.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
@@ -23251,9 +23249,10 @@ impl QueryExecutor {
             if self.db.has_col_segment_store(table_name) {
                 if let Some(store) = self.db.col_segment_stores.get(table_name) {
                     if let Some(row) = store.get(composite_key) {
-                        self.db
+                        let _ = self
+                            .db
                             .row_cache
-                            .put(table_name.to_string(), row_id, row.clone());
+                            .put_if_absent(table_name, row_id, row.clone());
                         let sql_row = row_to_sql_row(&row, &schema)?;
                         let mut prefixed_row = SqlRow::new();
                         prefixed_row
@@ -23303,10 +23302,13 @@ impl QueryExecutor {
                         StorageError::InvalidData(format!("Deserialization failed: {}", e))
                     })?;
 
-                    // Populate row_cache for future hot-path lookups
-                    self.db
+                    // Populate row_cache for future hot-path lookups.
+                    // 🔒 put_if_absent (round-9): read fills must not overwrite
+                    // a committer's fresh entry (cache poisoning).
+                    let _ = self
+                        .db
                         .row_cache
-                        .put(table_name.to_string(), row_id, row.clone());
+                        .put_if_absent(table_name, row_id, row.clone());
 
                     // 🚀 Fast path for SELECT *: skip HashMap conversion entirely
                     //     Direct positional projection from Vec<Value> — saves 2*N HashMap

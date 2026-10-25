@@ -580,9 +580,12 @@ impl ColSegmentStore {
         for (key, ts, row) in rows {
             buf.add_values(*key, *ts, false, row)?;
         }
-        let n = buf.num_rows as u64;
+        // 🔑 Inside the write_buf critical section: a store outside the lock
+        // could land AFTER a concurrent flush's drain+publish counter update
+        // and resurrect a stale count (round-9 protocol).
+        self.buffered_count
+            .store(buf.num_rows as u64, Ordering::Relaxed);
         drop(buf);
-        self.buffered_count.store(n, Ordering::Relaxed);
         // Auto-compaction disabled during append_rows — it can deadlock
         // when merge_segments reads column data while holding write locks.
         // Compaction runs on demand via ensure_query_visibility or compact_once.
@@ -597,9 +600,9 @@ impl ColSegmentStore {
         self.in_hash_cache.write().clear();
         let mut buf = self.write_buf.lock();
         buf.add_values(key, ts, false, row)?;
-        let n = buf.num_rows as u64;
+        self.buffered_count
+            .store(buf.num_rows as u64, Ordering::Relaxed);
         drop(buf);
-        self.buffered_count.store(n, Ordering::Relaxed);
         Ok(())
     }
 
@@ -624,9 +627,9 @@ impl ColSegmentStore {
         // with num_rows). The actual values are never read for deleted rows.
         let placeholder: Vec<Value> = col_types.iter().map(|_| Value::Null).collect();
         buf.add_values(key, ts, true, &placeholder)?;
-        let n = buf.num_rows as u64;
+        self.buffered_count
+            .store(buf.num_rows as u64, Ordering::Relaxed);
         drop(buf);
-        self.buffered_count.store(n, Ordering::Relaxed);
         Ok(())
     }
 
@@ -729,40 +732,51 @@ impl ColSegmentStore {
     /// the same lock — calling `flush_buffer` from there would deadlock since
     /// parking_lot::Mutex is NOT reentrant).
     fn flush_buffer_locked(&self) -> Result<()> {
-        // Snapshot col_types once — the fresh builder inherits this layout.
-        let col_types = self.col_types.load();
-        // Take buffer contents out, replace with a fresh builder, release the lock fast.
-        let buf_path = self.dir.join(".writebuf.tmp");
-        let mut old_buf = {
-            let mut guard = self.write_buf.lock();
-            // 🚀 继承 compact_storage 标志到新 builder
-            let compact = self
-                .compact_storage
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let mut fresh = ColumnarSSTableBuilder::new(&buf_path, (**col_types).clone());
-            fresh.compact_storage = compact;
-            std::mem::replace(&mut *guard, fresh)
+        // 🔒 Round-9 flush protocol (fixes the lost-update transfer drift):
+        // the OLD sequence (swap the live buffer out → write the segment file
+        // → publish) left the flushed rows visible in NEITHER view during the
+        // file I/O. A concurrent point read then returned the stale segment
+        // version — and a reader's row_cache refill PUBLISHED that stale value
+        // over the committer's fresh one, so a later UPDATE computed on a base
+        // one commit behind while its statement watermark had already passed
+        // the conflicting commit stamp (first-committer-wins could not catch
+        // it). Protocol now:
+        //   1. under write_buf: SNAPSHOT the buffer (rows stay live in buf),
+        //   2. write the segment file from the snapshot with NO locks held,
+        //   3. under write_buf: drain the flushed prefix + publish the segment
+        //      atomically. Readers hold write_buf across [buf check + segment
+        //      list snapshot], so a row is always in exactly one view.
+        let (mut snapshot, n) = {
+            let guard = self.write_buf.lock();
+            let n = guard.num_rows;
+            if n == 0 {
+                return Ok(());
+            }
+            (guard.snapshot(), n)
         };
-        if old_buf.num_rows == 0 {
-            return Ok(());
-        }
         let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{:010}.sst", id));
         // finish() writes to builder.path; set it to the numbered path first.
-        old_buf.path = path.clone();
-        old_buf.finish()?;
+        snapshot.path = path.clone();
+        snapshot.finish()?;
         let seg = Arc::new(Segment::open(&path, id)?);
         // Record in manifest (fsync'd) BEFORE exposing in memory.
         self.manifest.lock().add_segment(self.table_id, id)?;
         {
+            let mut guard = self.write_buf.lock();
+            guard.drain_prefix(n);
             let mut list = self.segs().as_ref().clone();
             list.push(seg);
             self.segments.store(Arc::new(list));
+            // 🔑 Inside the same critical section as the drain: the counter
+            // must never observe a state the buffer didn't have (the old
+            // unconditional store(0) clobbered concurrent-append increments).
+            self.buffered_count
+                .store(guard.num_rows as u64, Ordering::Relaxed);
         }
         // Invalidate all query caches (data changed).
         self.groupby_cache.write().clear();
         self.in_hash_cache.write().clear();
-        self.buffered_count.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -934,14 +948,18 @@ impl ColSegmentStore {
     pub fn get(&self, key: u64) -> Option<Vec<Value>> {
         // Snapshot col_types once — used by both buffer-decode and segment-decode.
         let col_types = self.col_types.load();
-        // 🚀 Fast path: if the write buffer is empty (common steady-state after
-        // flush), skip the Mutex lock + rposition scan entirely. Saves ~20-40ns
-        // per point query (the lock acquire/release + iterator setup overhead).
-        if self.buffered_count.load(Ordering::Relaxed) > 0 {
-            // 🔑 Check the write buffer FIRST — it may hold a newer version (UPDATE)
-            // or a tombstone (DELETE) that supersedes the segment data. Without this,
-            // a DELETE whose tombstone is still in the buffer (lazy flush) would be
-            // invisible to get(), which would return the stale live row from a segment.
+        // 🔒 Round-9: hold write_buf across [buffer check + segment list
+        // snapshot]. flush_buffer_locked drains the flushed prefix and
+        // publishes the segment inside ONE write_buf critical section, so a
+        // reader that misses the buffer is guaranteed a segment list that
+        // already includes the flushed rows — the old code sampled the buffer
+        // and the segment list on opposite sides of a flush, reading a
+        // version one flush behind (lost-update transfer drift root cause).
+        // 🚀 Fast path (buffered_count == 0): the counter is maintained inside
+        // the write_buf critical sections (append/drain), so 0 implies no
+        // flush is mid-publish with our data — the segment list can be
+        // snapshotted lock-free.
+        let segs = if self.buffered_count.load(Ordering::Relaxed) > 0 {
             let buf = self.write_buf.lock();
             if let Some(idx) = buf.keys.iter().rposition(|&k| k == key) {
                 // Found in buffer — newest version (rposition = last occurrence).
@@ -960,8 +978,10 @@ impl ColSegmentStore {
                 }
                 return Some(row);
             }
-        }
-        let segs = self.segs();
+            self.segs()
+        } else {
+            self.segs()
+        };
         for seg in segs.iter().rev() {
             // Check if this segment contains the key using the sparse fence
             // index (O(1) memory, ~16KB disk read for the key block).
@@ -1001,7 +1021,10 @@ impl ColSegmentStore {
             return None;
         }
         let ct = col_types[col_pos].clone();
-        if self.buffered_count.load(Ordering::Relaxed) > 0 {
+        // 🔒 Round-9: buf check + segment snapshot under one write_buf lock
+        // (see get()). buffered_count == 0 fast path is safe: the counter is
+        // only zeroed inside the drain+publish critical section.
+        let segs = if self.buffered_count.load(Ordering::Relaxed) > 0 {
             let buf = self.write_buf.lock();
             if let Some(idx) = buf.keys.iter().rposition(|&k| k == key) {
                 if buf.deleted[idx] {
@@ -1012,8 +1035,10 @@ impl ColSegmentStore {
                 }
                 return Some(crate::types::Value::Null);
             }
-        }
-        let segs = self.segs();
+            self.segs()
+        } else {
+            self.segs()
+        };
         for seg in segs.iter().rev() {
             if let Some(idx) = seg.sst.find_row_by_key(key) {
                 if seg.sst.row_map.is_deleted(idx) {
@@ -1041,7 +1066,9 @@ impl ColSegmentStore {
         if col_pos.iter().any(|&p| p >= col_types.len()) {
             return None;
         }
-        if self.buffered_count.load(Ordering::Relaxed) > 0 {
+        // 🔒 Round-9: buf check + segment snapshot under one write_buf lock
+        // (see get()).
+        let segs = if self.buffered_count.load(Ordering::Relaxed) > 0 {
             let buf = self.write_buf.lock();
             if let Some(idx) = buf.keys.iter().rposition(|&k| k == key) {
                 if buf.deleted[idx] {
@@ -1060,8 +1087,10 @@ impl ColSegmentStore {
                         .collect(),
                 );
             }
-        }
-        let segs = self.segs();
+            self.segs()
+        } else {
+            self.segs()
+        };
         for seg in segs.iter().rev() {
             if let Some(idx) = seg.sst.find_row_by_key(key) {
                 if seg.sst.row_map.is_deleted(idx) {
@@ -3174,8 +3203,10 @@ impl ColSegmentStore {
     ) -> MultiAggResult {
         use crate::sql::ast::BinaryOperator;
         let _ = self.flush_buffer();
-        let need_dedup = self.may_have_duplicate_keys();
+        let mut need_dedup = self.may_have_duplicate_keys();
         let segs = self.segments_snapshot();
+        // 🔒 post-snapshot recheck (round-8): see vector_exec M1 comment.
+        need_dedup |= self.may_have_duplicate_keys_nobuf();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
         } else {
@@ -4570,6 +4601,14 @@ impl ColSegmentStore {
     /// Merges all active segments into one, deduplicating keys and dropping
     /// tombstoned/superseded versions.
     pub fn compact_once(&self) -> Result<()> {
+        // 🔒 Round-9: snapshot the merge set UNDER flush_merge_lock. The old
+        // shape (snapshot → lock inside merge_segments) let a flush publish a
+        // NEWER segment between the snapshot and the merge; the merge output
+        // (older data) was then appended at the list TAIL, so point reads
+        // (.rev() scan) and later rank-based merges preferred the older
+        // version over the newer outside segment — the durable transfer-drift
+        // residue.
+        let _guard = self.flush_merge_lock.lock();
         let old_segs: Vec<Arc<Segment>> = {
             let segs = self.segs();
             if segs.len() < COMPACTION_SEGMENT_THRESHOLD {
@@ -4577,13 +4616,15 @@ impl ColSegmentStore {
             }
             segs.iter().cloned().collect()
         };
-        self.merge_segments(old_segs)
+        self.merge_segments_locked(old_segs)
     }
 
     /// Force-merge ALL segments into one, ignoring the count threshold.
     /// Used by sync_col_segment_to_sstables so legacy aggregate paths see
     /// the complete dataset in a single SSTable. No-op if < 2 segments.
     pub fn force_compact_all(&self) -> Result<()> {
+        // 🔒 Round-9: same lock-first snapshot protocol as compact_once.
+        let _guard = self.flush_merge_lock.lock();
         let old_segs: Vec<Arc<Segment>> = {
             let segs = self.segs();
             if segs.len() < 2 {
@@ -4591,7 +4632,7 @@ impl ColSegmentStore {
             }
             segs.iter().cloned().collect()
         };
-        self.merge_segments(old_segs)
+        self.merge_segments_locked(old_segs)
     }
 
     /// Return the maximum row_id (key & 0xFFFFFFFF) across all segments + buffer.
@@ -4616,34 +4657,14 @@ impl ColSegmentStore {
 
     /// Shared merge logic: merge `old_segs` into one new segment, dedup keys
     /// (newest version wins), drop tombstones, update manifest + GC old files.
-    fn merge_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
-        if old_segs.is_empty() {
-            return Ok(());
-        }
-        // Serialize with flush_buffer: wait for any in-progress flush to
-        // complete before merging, and hold the lock so no new flush can
-        // create a segment that this merge would miss.
-        let _guard = self.flush_merge_lock.lock();
-        self.merge_segments_locked(old_segs)
-    }
-
-    /// Merge assuming the caller already holds `flush_merge_lock`. Used by
-    /// `add_column_type` (which already holds the lock — calling `merge_segments`
-    /// from there would deadlock since parking_lot::Mutex is NOT reentrant).
+    /// Merge assuming the caller already holds `flush_merge_lock`.
+    /// 🔒 Round-9: every caller now snapshots its merge set UNDER the lock
+    /// (see compact_once / compact_small_tail / add_column_type) — an
+    /// unlocked snapshot could exclude a concurrently-flushed NEWER segment
+    /// while the merged output (older data) took the list tail position,
+    /// inverting newest-wins.
     fn merge_segments_locked(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
         self.merge_segments_locked_with_default(old_segs, None, false)
-    }
-
-    /// Merge a SUBSET of segments (the newest tail) preserving tombstones.
-    /// A tombstone's older live version may live in a base segment outside
-    /// the merge set — dropping it (the full-merge behavior) would resurrect
-    /// that row. Used by tiered compaction (`compact_small_tail`).
-    fn merge_tail_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
-        if old_segs.is_empty() {
-            return Ok(());
-        }
-        let _guard = self.flush_merge_lock.lock();
-        self.merge_segments_locked_with_default(old_segs, None, true)
     }
 
     /// Tiered compaction: when a much larger base segment exists and the
@@ -4654,6 +4675,12 @@ impl ColSegmentStore {
     /// Returns true when a tail merge ran; false = caller should fall back
     /// to a full merge (the tail is then large, so a full merge is amortized).
     fn compact_small_tail(&self) -> Result<bool> {
+        // 🔒 Round-9: tail selection under flush_merge_lock — see
+        // compact_once. A flush publishing a segment between an unlocked
+        // snapshot and the merge left the new (newer) segment outside the
+        // merge set while the merged output (older data) took the tail
+        // position, inverting newest-wins for its keys.
+        let _guard = self.flush_merge_lock.lock();
         let segs = self.segs();
         if segs.len() < COMPACTION_SEGMENT_THRESHOLD {
             return Ok(false);
@@ -4665,7 +4692,7 @@ impl ColSegmentStore {
         }
         let old_segs: Vec<Arc<Segment>> = segs[1..].to_vec();
         drop(segs);
-        self.merge_tail_segments(old_segs)?;
+        self.merge_segments_locked_with_default(old_segs, None, true)?;
         Ok(true)
     }
 
@@ -4716,6 +4743,12 @@ impl ColSegmentStore {
             /// Index into old_segs; higher = newer (append order = age).
             rank: u32,
             idx: usize,
+            /// Row timestamp (already lazy-loaded above). The equal-key
+            /// winner prefers the HIGHEST timestamp — belt-and-braces with
+            /// rank: timestamps come from the monotonic write clock, so a
+            /// future merge-set-selection regression cannot resurrect an old
+            /// version purely via list position (round-9 hardening).
+            ts: u64,
         }
         impl PartialEq for MergeHead {
             fn eq(&self, o: &Self) -> bool {
@@ -4730,10 +4763,13 @@ impl ColSegmentStore {
         }
         impl Ord for MergeHead {
             // Max-heap inversion: pops the SMALLEST key; among equal keys
-            // the LARGEST rank — the newest version wins, exactly the old
-            // first-seen-wins over a newest-first iteration.
+            // the LARGEST (ts, rank) — the newest version wins, exactly the
+            // old first-seen-wins over a newest-first iteration.
             fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-                o.key.cmp(&self.key).then(self.rank.cmp(&o.rank))
+                o.key
+                    .cmp(&self.key)
+                    .then(self.ts.cmp(&o.ts))
+                    .then(self.rank.cmp(&o.rank))
             }
         }
 
@@ -4745,6 +4781,7 @@ impl ColSegmentStore {
                     key: seg.sst.row_map.key(0),
                     rank: rank as u32,
                     idx: 0,
+                    ts: seg.sst.row_map.timestamp_loaded(0),
                 });
             }
         }
@@ -4796,6 +4833,7 @@ impl ColSegmentStore {
                     key: seg.sst.row_map.key(next),
                     rank: head.rank,
                     idx: next,
+                    ts: seg.sst.row_map.timestamp_loaded(next),
                 });
             }
             // Drain older duplicates of the same key (newest already
@@ -4809,6 +4847,7 @@ impl ColSegmentStore {
                         key: dseg.sst.row_map.key(dnext),
                         rank: dup.rank,
                         idx: dnext,
+                        ts: dseg.sst.row_map.timestamp_loaded(dnext),
                     });
                 }
             }

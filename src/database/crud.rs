@@ -622,12 +622,11 @@ impl MoteDB {
         let composite_key = self.make_composite_key(table_name, row_id);
         if let Some(store) = self.col_segment_stores.get(table_name) {
             if let Some(row) = store.get(composite_key) {
-                let row_arc = Arc::new(row);
-                self.row_cache
-                    .put_arc(table_name.to_string(), row_id, Arc::clone(&row_arc));
-                return Ok(Some(
-                    Arc::try_unwrap(row_arc).unwrap_or_else(|a| (*a).clone()),
-                ));
+                // 🔒 put_if_absent (round-9): a read fill must never overwrite
+                // a committer's fresh entry (cache poisoning → stale UPDATE
+                // bases that first-committer-wins cannot detect).
+                let _ = self.row_cache.put_if_absent(table_name, row_id, row.clone());
+                return Ok(Some(row));
             }
             // Not in any segment — key doesn't exist (store is authoritative).
             return Ok(None);
@@ -649,12 +648,8 @@ impl MoteDB {
         if let Some(col_sst) = self.columnar_sstables.get(table_name) {
             let key = self.make_composite_key(table_name, row_id);
             if let Some(row) = col_sst.get_row(key, schema.col_types()) {
-                let row_arc = Arc::new(row);
-                self.row_cache
-                    .put_arc(table_name.to_string(), row_id, Arc::clone(&row_arc));
-                return Ok(Some(
-                    Arc::try_unwrap(row_arc).unwrap_or_else(|a| (*a).clone()),
-                ));
+                let _ = self.row_cache.put_if_absent(table_name, row_id, row.clone());
+                return Ok(Some(row));
             }
             return Ok(None);
         }
@@ -688,9 +683,7 @@ impl MoteDB {
                 StorageError::Serialization(format!("Failed to deserialize row {}: {}", row_id, e))
             })?;
 
-            let row_arc = Arc::new(row);
-            self.row_cache
-                .put_arc(table_name.to_string(), row_id, Arc::clone(&row_arc));
+            let _ = self.row_cache.put_if_absent(table_name, row_id, row.clone());
 
             if let Some((next_row_id, count, stride)) =
                 self.row_cache.check_prefetch(table_name, row_id)
@@ -698,9 +691,7 @@ impl MoteDB {
                 self.trigger_prefetch(table_name, next_row_id, count, stride);
             }
 
-            Ok(Some(
-                Arc::try_unwrap(row_arc).unwrap_or_else(|a| (*a).clone()),
-            ))
+            Ok(Some(row))
         } else {
             Ok(None)
         }

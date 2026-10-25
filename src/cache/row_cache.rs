@@ -307,6 +307,24 @@ impl RowCache {
         cache.put(key, row_arc);
     }
 
+    /// Fill-if-absent (round-9): read-path cache fills must never OVERWRITE an
+    /// existing entry. A reader can legally observe a pre-commit value and
+    /// then fill the cache after a committer (which `put`s the fresh value
+    /// under the write lock) has already installed it — an unconditional put
+    /// would publish the stale value over the fresh one, and a later UPDATE
+    /// would compute its base from it while first-committer-wins validation
+    /// passes (the statement watermark postdates the conflicting commit).
+    /// Atomic per-entry via the shard write lock. Returns true if inserted.
+    pub fn put_if_absent(&self, table_name: &str, row_id: RowId, row: Row) -> bool {
+        let key = (table_hash(table_name), row_id);
+        let mut cache = self.cache[self.shard_index(&key)].write();
+        if cache.peek(&key).is_some() {
+            return false;
+        }
+        cache.put(key, Arc::new(row));
+        true
+    }
+
     /// Put a row into cache using &str table name (avoids String allocation).
     /// 🔑 PERF: hot INSERT path — saves a to_string() per insert.
     pub fn put_ref(&self, table_name: &str, row_id: RowId, row: Row) {

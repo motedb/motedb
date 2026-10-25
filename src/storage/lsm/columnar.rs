@@ -2942,6 +2942,99 @@ impl ColumnarSSTableBuilder {
         }
     }
 
+    /// Deep-copy snapshot of the buffered rows (round-9 flush protocol).
+    /// `flush_buffer_locked` clones the live buffer, writes the segment file
+    /// from the clone with NO locks held, and only then drains the flushed
+    /// prefix from the live buffer under the write_buf lock — so the rows
+    /// stay continuously visible to readers (never "in flight" between the
+    /// buffer and the published segment).
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            column_types: self.column_types.clone(),
+            column_tags: self.column_tags.clone(),
+            num_rows: self.num_rows,
+            keys: self.keys.clone(),
+            timestamps: self.timestamps.clone(),
+            deleted: self.deleted.clone(),
+            column_buffers: self.column_buffers.iter().map(|b| b.as_slice().to_vec()).collect(),
+            null_flags: self.null_flags.to_vec(),
+            finished: false,
+            compact_storage: self.compact_storage,
+        }
+    }
+
+    /// Remove the first `n` rows (the flushed prefix) from the live buffer.
+    /// Complements `snapshot()`: the snapshot captured exactly the first n
+    /// rows in append order (concurrent appends only ever extend the tail).
+    /// Variable-length columns (Text/Blob: `[len:u32][bytes]`; Vector:
+    /// `[dim:u16][f32×dim]`) are re-parsed to find each prefix entry.
+    pub(crate) fn drain_prefix(&mut self, n: usize) {
+        let n = n.min(self.num_rows);
+        if n == 0 {
+            return;
+        }
+        self.keys.drain(..n);
+        self.timestamps.drain(..n);
+        self.deleted.drain(..n);
+        for flags in self.null_flags.iter_mut() {
+            flags.drain(..n);
+        }
+        for (ci, buf) in self.column_buffers.iter_mut().enumerate() {
+            match self.column_tags.get(ci) {
+                Some(tag) if tag.is_fixed() => {
+                    let es = tag.fixed_size().max(1);
+                    buf.drain(..(n * es).min(buf.len()));
+                }
+                Some(ColumnTypeTag::Text) | Some(ColumnTypeTag::Blob) => {
+                    let mut pos = 0usize;
+                    for _ in 0..n {
+                        if pos + 4 > buf.len() {
+                            break;
+                        }
+                        let len = u32::from_le_bytes([
+                            buf[pos],
+                            buf[pos + 1],
+                            buf[pos + 2],
+                            buf[pos + 3],
+                        ]) as usize;
+                        pos += 4 + len;
+                    }
+                    buf.drain(..pos.min(buf.len()));
+                }
+                Some(ColumnTypeTag::Vector) => {
+                    let mut pos = 0usize;
+                    for _ in 0..n {
+                        if pos + 2 > buf.len() {
+                            break;
+                        }
+                        let dim = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+                        pos += 2 + dim * 4;
+                    }
+                    buf.drain(..pos.min(buf.len()));
+                }
+                Some(ColumnTypeTag::Spatial) => {
+                    // [escape-encoded len-prefix][bincode(Geometry)] per row
+                    // (see spatial_prefix_write / spatial_prefix_read).
+                    let mut pos = 0usize;
+                    for _ in 0..n {
+                        match ColumnarSSTable::spatial_prefix_read(buf, pos) {
+                            Some((len, prefix_w)) => pos += prefix_w + len,
+                            None => break,
+                        }
+                    }
+                    buf.drain(..pos.min(buf.len()));
+                }
+                _ => {
+                    // Unknown tag — cannot parse; drop everything to avoid
+                    // desynchronizing column data from keys/null_flags.
+                    buf.clear();
+                }
+            }
+        }
+        self.num_rows -= n;
+    }
+
     /// Estimated heap bytes consumed by this builder's buffers. Used to trigger
     /// flushes based on memory pressure rather than a fixed row count.
     pub fn buffered_bytes(&self) -> usize {
@@ -4173,5 +4266,77 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// Round-9 flush protocol: `snapshot()` + `drain_prefix(n)` must keep the
+    /// live builder's column buffers exactly in sync with keys/null_flags for
+    /// EVERY column layout (fixed, text/blob, vector, spatial). A mis-parsed
+    /// prefix in any variable-length column silently shifts that column's
+    /// values across rows — data corruption, not an error.
+    #[test]
+    fn snapshot_and_drain_prefix_preserve_all_column_layouts() {
+        use crate::types::{ArcBytes, ArcString, ArcVec};
+        let col_types = vec![
+            ColumnType::Integer,   // fixed 8B
+            ColumnType::Text,      // [len u32][bytes]
+            ColumnType::Tensor(3), // [dim u16][f32×dim]
+            ColumnType::Blob,      // [len u32][bytes]
+            ColumnType::Boolean,   // fixed 1B
+        ];
+        let mut b = ColumnarSSTableBuilder::new("/tmp/does-not-matter.sst", col_types.clone());
+        let rows: Vec<Vec<Value>> = (0..5)
+            .map(|i: i64| {
+                vec![
+                    Value::Integer(i),
+                    Value::Text(ArcString(std::sync::Arc::from(format!("row-{i}-tail")))),
+                    Value::Vector(ArcVec::new(vec![i as f32, 2.0, 3.0])),
+                    Value::Blob(ArcBytes::new(vec![0xAA; (i + 1) as usize])), // variable per row
+                    Value::Bool(i % 2 == 0),
+                ]
+            })
+            .collect();
+        for (i, row) in rows.iter().enumerate() {
+            b.add_values(100 + i as u64, 1000 + i as u64, false, row).unwrap();
+        }
+        // Concurrent append AFTER the snapshot point (rows the flush must NOT
+        // touch — they stay live in the buffer).
+        b.add_values(200, 2000, false, &rows[4]).unwrap();
+
+        let n = 5;
+        let mut snap = b.snapshot();
+        assert_eq!(snap.num_rows, 6, "snapshot must capture the live buffer");
+        snap.drain_prefix(1); // snapshot keeps everything; drain only on live
+        assert_eq!(snap.num_rows, 5);
+
+        b.drain_prefix(n);
+        assert_eq!(b.num_rows, 1, "only the post-snapshot row remains");
+        assert_eq!(b.keys, vec![200u64]);
+        assert_eq!(b.deleted, vec![false]);
+        assert_eq!(b.null_flags[0], vec![false]);
+
+        // Column buffers must still decode the surviving row correctly.
+        let key_ts = (b.keys[0], b.timestamps[0]);
+        assert_eq!(key_ts, (200, 2000));
+        // Integer column: 8 bytes for the one remaining row.
+        assert_eq!(b.column_buffers[0].len(), 8);
+        let i = i64::from_le_bytes(b.column_buffers[0][0..8].try_into().unwrap());
+        assert_eq!(i, 4);
+        // Text column: [len][bytes] of "row-4-tail".
+        let t = &b.column_buffers[1];
+        let len = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
+        assert_eq!(len, "row-4-tail".len());
+        assert_eq!(&t[4..4 + len], b"row-4-tail");
+        // Vector column: [dim=3][12 bytes].
+        let v = &b.column_buffers[2];
+        assert_eq!(v.len(), 2 + 3 * 4);
+        assert_eq!(u16::from_le_bytes(v[0..2].try_into().unwrap()), 3);
+        // Blob column: 5 payload bytes (i=4 → i+1).
+        let bl = &b.column_buffers[3];
+        let blen = u32::from_le_bytes(bl[0..4].try_into().unwrap()) as usize;
+        assert_eq!(blen, 5);
+        assert_eq!(bl[4..].len(), 5);
+        // Bool column: exactly 1 byte.
+        assert_eq!(b.column_buffers[4].len(), 1);
+        assert_eq!(b.column_buffers[4][0], 1); // i=4 → even → true
     }
 }

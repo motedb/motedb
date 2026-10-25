@@ -133,13 +133,40 @@ UPDATE 的 PK 快路径行读窄持锁以关闭提交 validate→apply 间隙的
 宽, 冲突率略高但无丢失); 冲突在紧乒乓循环下重试率可观 (~每 2 次成
 功 1 次冲突), 生产负载间隔下可忽略。
 
-## 🔴 已知未修复: 并发双行转账漂移 (round-8, 发版阻断项)
+## ✅ 并发双行转账漂移 (round-9 已归零, 2026-10-23)
 
-3 写线程 × 双语句事务 (`UPDATE a-1; UPDATE b+1`) 高争用下, ~330 次成功
-提交静默丢 1-3 个净单位 (单边转账丢弃)。判别: agg-SUM == row-SUM ==
-checkpoint+重开后同值 → 真持久丢失; 单行自增形状精确零丢失。复现器:
-`tests/test_concurrent_transfer_drift.rs` (`--ignored` 运行, 已知失败)。
-同期已修的两个相关根因: ① WAL 数据记录曾后于 Commit 标记 — auto-
-checkpoint 回放窗口吞掉已标记事务的数据 (已重排为数据先于标记);
-② `may_have_duplicate_keys` 检查-快照竞态致聚合瞬间 ×2/×3 双计
-(已加快照后复查)。剩余根因待查方向: 双语句水位线间隔内的提交应用序。
+3 写线程 × 双语句事务 (`UPDATE a-1; UPDATE b+1`) × 2 SUM 读线程高争用下,
+历史表现: ~330-400 次成功提交静默丢 1-5 个净单位, 且 **checkpoint+重开
+后仍丢失** (真持久损坏, 曾是发版阻断项)。round-9 通过三层探针实证
+(commit 时 append 后立即可见性、语句时基准值 vs store 最新值、
+append/flush/merge 全链路追踪) 定位出**三层叠加根因**, 全部修复:
+
+1. **flush 不可见窗口** (`store.rs::flush_buffer_locked`): 旧协议先把
+   write_buf 整体换出 → 写段文件 (磁盘 I/O) → 发布段, I/O 期间行在
+   "buf 已清空 + 段未发布" 的双盲区, 并发点查返回旧段值。探针证据:
+   `@@COMMIT-APPLY-INVISIBLE` 124 次/轮。新协议: 锁内 `snapshot()` →
+   锁外写文件 → 锁内 `drain_prefix(n)` + 段发布 + 计数更新原子完成;
+   点查 (`get`/`get_projected`/`get_projected_multi`) 在 write_buf 锁内
+   完成 [buf 检查 + 段列表快照], 行永远恰好在一个视图。
+2. **row_cache 投毒** (`row_cache.rs` + 读路径回填点): 读线程 cache miss
+   后无条件 `put` 回填, 与提交者 (write_lock 内 put 新值) 交错时把旧值
+   覆盖回去; 后续事务以毒值为 UPDATE 基准, 而语句水位线晚于冲突提交戳,
+   first-committer-wins **验证无法察觉** (这是漂移逃过 round-7 校验的
+   根本原因)。修复: 读路径回填全部改 `put_if_absent` (分片锁内原子),
+   提交者保持覆盖式 put。
+3. **合并集陈旧快照** (`store.rs::compact_once`/`force_compact_all`/
+   `compact_small_tail`): 在 flush_merge_lock **之外**快照段列表, 快照
+   与拿锁之间并发 flush 发布的新段 (含最新版本) 不在合并集; 合并输出
+   (旧数据) 被 push 到列表**尾部**, 点查 `.rev()` 首先命中旧值遮蔽新值,
+   后续合并的 rank 去重再把被遮蔽的新版本**永久丢弃** — 持久丢失的
+   直接来源 (探针版本链转储实锤: 新版本 ts 更高却在任何段中不存在)。
+   修复: 三个入口全部改为锁内快照; D2 合并同 key 胜者从纯 rank 改为
+   `(timestamp, rank)` (时间戳来自单调 write_lsn, 纵深防御)。
+
+**case 说明**: `tests/test_concurrent_transfer_drift.rs` — 8 秒高争用
+(3 写 + 2 读) 转账守恒, 含 CHECKPOINT+重开断言; 曾 `#[ignore]` 已知失败,
+round-9 修复后解禁并通过。`write_buf` 计数协议同步修复 (append/drain
+都在锁内更新, 杜绝计数与缓冲状态漂移)。
+
+**顺带发现的更早缺陷**: flush 旧协议的注释自己记录过 "row in neither
+view" 曾导致 `ORDER BY` 偶发 0 行 — 同根因, 一并消除。
