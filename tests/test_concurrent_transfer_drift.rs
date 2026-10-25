@@ -8,8 +8,9 @@
 //! - 单行形状 (ww7/`concurrent_txn_increments_no_lost_update`) 精确零丢失;
 //! - 同类 "SUM 瞬间 ×2/×3" 的读路径双计已由 round-8 的快照后复查修复
 //!   (may_have_duplicate_keys 竞态), 本残留是写路径单边丢失。
-//! 已修相关项 (本文件同期): WAL 数据记录先于 Commit 标记 (auto-checkpoint
-//! 回放窗口), M1/store 聚合去重复查。
+//! 已修相关项 (本文件同期):
+//! - WAL 数据记录先于 Commit 标记 (auto-checkpoint 回放窗口)
+//! - M1/store 聚合去重复查
 //!
 //! 运行: `cargo test --release --test test_concurrent_transfer_drift -- --ignored --nocapture`
 //! (默认 ignore: 已知失败, 发版前必须归零)。
