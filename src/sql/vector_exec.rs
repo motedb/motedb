@@ -893,8 +893,15 @@ pub fn try_vec_no_group_aggregate(
     // ⇒ key 唯一) 不再强制去重 — overlap_possible (UPDATE/DELETE 置位,
     // 重开 2+ 段保守置位, 全量合并清除) 才是跨段重复键的判据。省掉
     // keys 加载 + HashSet (~3ms/100K 行)。
-    let needs_dedup = store.may_have_duplicate_keys();
+    let mut needs_dedup = store.may_have_duplicate_keys();
     let mut seen_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // 🔒 post-snapshot recheck (round-8): the pre-check above races a
+    // concurrent note_overlap+append+auto-flush — the snapshot taken between
+    // contains overlapping segments while the flag was still false → SUM/
+    // COUNT double-counted every duplicated row (measured 3000→6000). The
+    // flag only turns false→true until a full merge, so re-checking after
+    // the snapshot closes the window.
+    needs_dedup |= store.may_have_duplicate_keys();
     // 🔑 M1 保守门: 任一段含墓碑 → decline。已提交 DELETE 的段状态一致
     // (本路径可正确处理), 但 事务回滚 的 undo 重插走 insert_row_to_table
     // 双写 (builder SST + 段), 段与 builder 可能发散 (ryw_delete 回滚后

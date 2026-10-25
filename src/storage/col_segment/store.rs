@@ -2641,6 +2641,16 @@ impl ColSegmentStore {
     /// appear only when an UPDATE was buffered and NOT yet flushed/compacted.
     /// Returns false for the common case (no pending UPDATEs), letting the scan
     /// path skip dedup entirely (the v0.5.0 performance fix).
+    /// may_have_duplicate_keys minus the write_buf lock (caller already
+    /// holds it — parking_lot Mutex is not reentrant). Caller holding the
+    /// buf means buf rows are already accounted for by the caller's decision.
+    fn may_have_duplicate_keys_nobuf(&self) -> bool {
+        self.segs().len() >= 2
+            && self
+                .overlap_possible
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn may_have_duplicate_keys(&self) -> bool {
         // The write buffer can hold a newer version of an already-segmented key
         // (covered by the buf_n check). On-disk cross-segment overlap happens
@@ -2678,9 +2688,12 @@ impl ColSegmentStore {
 
         // Determine dedup need BEFORE locking write_buf (may_have_duplicate_keys
         // also locks write_buf — parking_lot Mutex is not reentrant → deadlock).
-        let need_dedup = self.may_have_duplicate_keys();
+        let mut need_dedup = self.may_have_duplicate_keys();
         let buf = self.write_buf.lock();
         let segs = self.segs();
+        // 🔒 post-lock recheck (round-8): the pre-lock decision races a
+        // concurrent note_overlap+append+flush — see vector_exec M1 comment.
+        need_dedup |= self.may_have_duplicate_keys_nobuf();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
         } else {
@@ -2849,7 +2862,7 @@ impl ColSegmentStore {
         // 🔑 Flush buffered writes so they're visible to the segment scan.
         let _ = self.flush_buffer();
         let col_types = self.col_types.load();
-        let need_dedup = self.may_have_duplicate_keys();
+        let mut need_dedup = self.may_have_duplicate_keys();
         let segs = self.segments_snapshot();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
@@ -3161,7 +3174,7 @@ impl ColSegmentStore {
     ) -> MultiAggResult {
         use crate::sql::ast::BinaryOperator;
         let _ = self.flush_buffer();
-        let need_dedup = self.may_have_duplicate_keys();
+        let mut need_dedup = self.may_have_duplicate_keys();
         let segs = self.segments_snapshot();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())

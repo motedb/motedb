@@ -337,7 +337,50 @@ impl MoteDB {
             }
         }
 
-        // 3. Write WAL Commit record
+        // 3. Write PENDING UPDATE/DELETE data records BEFORE the Commit
+        //    marker (round-8): the old order (marker at step 3, pending
+        //    Update records down in step 6) let an auto-checkpoint WAL replay
+        //    run in between — the txn was marked committed while its UPDATE
+        //    records were still unwritten → replay silently skipped those
+        //    rows → one-sided transfer loss (~1 per 500 commits, durable
+        //    across checkpoint+reopen). Data-first, marker-last is the
+        //    standard WAL commit rule; the storage apply (step 6) stays
+        //    after the marker.
+        let mut pending_wal: std::collections::HashMap<PartitionId, Vec<WALRecord>> =
+            std::collections::HashMap::new();
+        for ((table_name, row_id), (old_row, new_row)) in &pending {
+            let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+            pending_wal
+                .entry(partition)
+                .or_default()
+                .push(WALRecord::Update {
+                    table_name: table_name.clone(),
+                    row_id: *row_id,
+                    partition,
+                    old_data: old_row.clone(),
+                    new_data: new_row.clone(),
+                    txn_id,
+                });
+        }
+        for ((table_name, row_id), old_row) in &pending_deletes {
+            let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+            pending_wal
+                .entry(partition)
+                .or_default()
+                .push(WALRecord::Delete {
+                    table_name: table_name.clone(),
+                    row_id: *row_id,
+                    partition,
+                    old_data: old_row.clone(),
+                    txn_id,
+                    timestamp: 0,
+                });
+        }
+        for (partition, records) in pending_wal {
+            self.wal.batch_append(partition, records)?;
+        }
+
+        // 4. Write WAL Commit record — AFTER all data records.
         self.wal.log_commit(0, txn_id, commit_ts)?;
 
         // 4. Flush all rows to LSM atomically via batch_put
@@ -433,26 +476,9 @@ impl MoteDB {
         // marker (the old in-place path logged txn_id=0 — uncommitted
         // transactional writes were replayed as committed).
         if !pending.is_empty() {
-            use std::collections::HashMap;
-            let mut by_partition: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
-            for ((table_name, row_id), (old_row, new_row)) in &pending {
-                let partition = (*row_id % self.num_partitions as u64) as PartitionId;
-                by_partition
-                    .entry(partition)
-                    .or_default()
-                    .push(WALRecord::Update {
-                        table_name: table_name.clone(),
-                        row_id: *row_id,
-                        partition,
-                        old_data: old_row.clone(),
-                        new_data: new_row.clone(),
-                        txn_id,
-                    });
-            }
-            for (partition, records) in by_partition {
-                self.wal.batch_append(partition, records)?;
-            }
-
+            // WAL records already written BEFORE the Commit marker (round-8
+            // reorder); only the storage apply + index/cache maintenance
+            // remains here.
             for ((table_name, row_id), (old_row, new_row)) in &pending {
                 // Storage: append the new version at the same composite key
                 // (newest-version-wins — same semantics as the autocommit
@@ -469,7 +495,9 @@ impl MoteDB {
                         .write_lsn
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     store.note_overlapping_write();
-                    let _ = store.append_rows(&[(key, ts, new_row.clone())]);
+                    if let Err(e) = store.append_rows(&[(key, ts, new_row.clone())]) {
+                        eprintln!("@@APPEND-FAIL table={table_name} row={row_id}: {e}");
+                    }
                 }
                 // Cache + index delta.
                 self.row_cache
@@ -489,25 +517,8 @@ impl MoteDB {
         // WAL Delete records with the REAL txn_id + secondary index removal.
         if !pending_deletes.is_empty() {
             use std::collections::HashMap;
-            let mut by_partition: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
-            for ((table_name, row_id), old_row) in &pending_deletes {
-                let partition = (*row_id % self.num_partitions as u64) as PartitionId;
-                by_partition
-                    .entry(partition)
-                    .or_default()
-                    .push(WALRecord::Delete {
-                        table_name: table_name.clone(),
-                        row_id: *row_id,
-                        partition,
-                        old_data: old_row.clone(),
-                        timestamp: 0,
-                        txn_id,
-                    });
-            }
-            for (partition, records) in by_partition {
-                self.wal.batch_append(partition, records)?;
-            }
-
+            // WAL Delete records already written BEFORE the Commit marker
+            // (round-8 reorder); storage apply only.
             for ((table_name, row_id), old_row) in &pending_deletes {
                 let tbl_schema = self.table_registry.get_table(table_name)?;
                 if let Some(store) = self.get_col_segment_store(table_name) {
