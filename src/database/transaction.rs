@@ -516,7 +516,6 @@ impl MoteDB {
         // 7. 🔒 M2 buffered pending DELETEs: tombstone in the store + proper
         // WAL Delete records with the REAL txn_id + secondary index removal.
         if !pending_deletes.is_empty() {
-            use std::collections::HashMap;
             // WAL Delete records already written BEFORE the Commit marker
             // (round-8 reorder); storage apply only.
             for ((table_name, row_id), old_row) in &pending_deletes {

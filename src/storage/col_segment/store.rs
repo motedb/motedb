@@ -2862,7 +2862,7 @@ impl ColSegmentStore {
         // 🔑 Flush buffered writes so they're visible to the segment scan.
         let _ = self.flush_buffer();
         let col_types = self.col_types.load();
-        let mut need_dedup = self.may_have_duplicate_keys();
+        let need_dedup = self.may_have_duplicate_keys();
         let segs = self.segments_snapshot();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
@@ -3174,7 +3174,7 @@ impl ColSegmentStore {
     ) -> MultiAggResult {
         use crate::sql::ast::BinaryOperator;
         let _ = self.flush_buffer();
-        let mut need_dedup = self.may_have_duplicate_keys();
+        let need_dedup = self.may_have_duplicate_keys();
         let segs = self.segments_snapshot();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())

@@ -67,6 +67,7 @@ fn concurrent_two_row_transfers_drift() {
             while !stop.load(Ordering::Relaxed) {
                 let _ = db.execute("SELECT SUM(bal) FROM acct");
             }
+            0u64
         }));
     }
     std::thread::sleep(Duration::from_secs(8));
