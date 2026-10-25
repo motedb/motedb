@@ -610,19 +610,99 @@ impl ColSegmentStore {
     /// segment (UPDATE new-version, DELETE tombstone, PK re-insert). Called
     /// by the crud layer's UPDATE/DELETE paths; makes cross-segment dedup
     /// precise instead of paying it on every multi-segment scan.
+    ///
+    /// ⚠️ Prefer the `_marked` append variants: this flag-set and a separate
+    /// append are two critical sections, and a concurrent full merge can
+    /// observe an empty buffer + clear the flag BETWEEN them — the
+    /// overlapping row then flushes with `overlap_possible == false` and
+    /// multi-segment scans double-count the key (round-10).
     pub fn note_overlapping_write(&self) {
         self.overlap_possible
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 🔒 Round-10: atomic [mark-overlap + append-rows]. The flag-set and the
+    /// buffer append share ONE write_buf critical section, so a concurrent
+    /// full merge either sees the row in the buffer (skips its flag clear) or
+    /// runs entirely before (flag survives the clear). See merge's
+    /// overlap_possible reset for the other half of the protocol.
+    pub fn append_rows_marked(&self, rows: &[(u64, u64, Vec<Value>)]) -> Result<()> {
+        if !rows.is_empty() {
+            self.groupby_cache.write().clear();
+            self.in_hash_cache.write().clear();
+        }
+        let mut buf = self.write_buf.lock();
+        self.overlap_possible
+            .store(true, std::sync::atomic::Ordering::Release);
+        for (key, ts, row) in rows {
+            buf.add_values(*key, *ts, false, row)?;
+        }
+        self.buffered_count
+            .store(buf.num_rows as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 🔒 Round-10: single-row `append_rows_marked` (no Vec<Value> clone).
+    pub fn append_row_ref_marked(&self, key: u64, ts: u64, row: &[Value]) -> Result<()> {
+        self.groupby_cache.write().clear();
+        self.in_hash_cache.write().clear();
+        let mut buf = self.write_buf.lock();
+        self.overlap_possible
+            .store(true, std::sync::atomic::Ordering::Release);
+        buf.add_values(key, ts, false, row)?;
+        self.buffered_count
+            .store(buf.num_rows as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 🔒 Round-10 txn-atomic apply: append a WHOLE transaction's mutations
+    /// for this table (rows + tombstones) in ONE write_buf critical section.
+    ///
+    /// The old per-row appends let a concurrent reader's flush drain BETWEEN
+    /// a multi-row transaction's rows — the segments briefly held HALF the
+    /// transaction (e.g. a transfer's `+1` flushed while its `-1` was still
+    /// buffered), and every segments-only reader (vectorized M1 aggregate,
+    /// text scans) could observe the torn state (`SUM(bal)` read 3001
+    /// mid-transfer). Ops order within the batch is preserved (per-key
+    /// newest-wins by last position, so inserts→updates→deletes keeps a
+    /// same-key tombstone on top). `mark_overlap` should be true whenever
+    /// the batch contains an UPDATE version or tombstone of an
+    /// already-segmented key.
+    pub fn append_txn_ops(
+        &self,
+        ops: &[(u64, u64, bool, Vec<Value>)],
+        mark_overlap: bool,
+    ) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.groupby_cache.write().clear();
+        self.in_hash_cache.write().clear();
+        let mut buf = self.write_buf.lock();
+        if mark_overlap {
+            self.overlap_possible
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        for (key, ts, deleted, row) in ops {
+            buf.add_values(*key, *ts, *deleted, row)?;
+        }
+        self.buffered_count
+            .store(buf.num_rows as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Append a tombstone (deletion marker) for a key. The tombstone suppresses
     /// the row in multi-segment scans (newest-version-wins with deleted=true).
     /// 🔥 Stability: auto-compacts when segments exceed threshold.
     pub fn append_tombstone(&self, key: u64, ts: u64) -> Result<()> {
-        // A tombstone always targets an existing (possibly segmented) key.
-        self.note_overlapping_write();
         let col_types = self.col_types.load();
         let mut buf = self.write_buf.lock();
+        // A tombstone always targets an existing (possibly segmented) key.
+        // 🔑 Set INSIDE the write_buf critical section (round-10): a separate
+        // unlocked flag-set let a concurrent full merge observe an empty
+        // buffer and clear the flag between the set and this append.
+        self.overlap_possible
+            .store(true, std::sync::atomic::Ordering::Release);
         // Write placeholder values for each column (keeps column_buffers in sync
         // with num_rows). The actual values are never read for deleted rows.
         let placeholder: Vec<Value> = col_types.iter().map(|_| Value::Null).collect();
@@ -2670,16 +2750,6 @@ impl ColSegmentStore {
     /// appear only when an UPDATE was buffered and NOT yet flushed/compacted.
     /// Returns false for the common case (no pending UPDATEs), letting the scan
     /// path skip dedup entirely (the v0.5.0 performance fix).
-    /// may_have_duplicate_keys minus the write_buf lock (caller already
-    /// holds it — parking_lot Mutex is not reentrant). Caller holding the
-    /// buf means buf rows are already accounted for by the caller's decision.
-    fn may_have_duplicate_keys_nobuf(&self) -> bool {
-        self.segs().len() >= 2
-            && self
-                .overlap_possible
-                .load(std::sync::atomic::Ordering::Acquire)
-    }
-
     pub fn may_have_duplicate_keys(&self) -> bool {
         // The write buffer can hold a newer version of an already-segmented key
         // (covered by the buf_n check). On-disk cross-segment overlap happens
@@ -2696,6 +2766,162 @@ impl ColSegmentStore {
                 .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// 🔒 Round-10 consistent aggregate view: [flush → lock write_buf →
+    /// snapshot segments → collect the latest buffered row per key].
+    ///
+    /// The aggregate fast paths (count_filtered / aggregate_filtered /
+    /// aggregate_multi_filtered) previously flushed and then scanned ONLY the
+    /// segment snapshot — rows committed between their own flush and the
+    /// snapshot sit in the write buffer and were silently INVISIBLE to
+    /// COUNT/SUM/AVG (a SELECT could miss already-committed rows). Buffered
+    /// rows are strictly newer than any segment version of the same key (a
+    /// flush drains the whole buffer), so callers fold them FIRST and put
+    /// their keys — including tombstones — into the dedup set to suppress
+    /// the segment versions.
+    ///
+    /// `cols` are the column positions the caller needs decoded (filter +
+    /// aggregate columns). Rows are decoded under the lock: after the entry
+    /// flush the buffer only holds rows appended since, which is small under
+    /// OLTP (bulk writers flush before querying anyway).
+    fn consistent_agg_view(
+        &self,
+        cols: &[usize],
+    ) -> (
+        Arc<Vec<Arc<Segment>>>,
+        Vec<(u64, bool, Vec<Value>)>,
+    ) {
+        let _ = self.flush_buffer();
+        let col_types = self.col_types.load();
+        let buf = self.write_buf.lock();
+        let segs = self.segs();
+        // Latest occurrence per key (rows are in append order, so the last
+        // index wins — same newest-wins rule as get()).
+        let mut latest: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::with_capacity(buf.num_rows);
+        for i in 0..buf.num_rows {
+            latest.insert(buf.keys[i], i);
+        }
+        let mut rows: Vec<(u64, bool, Vec<Value>)> = Vec::with_capacity(latest.len());
+        for (key, i) in latest {
+            let deleted = buf.deleted[i];
+            let vals: Vec<Value> = cols
+                .iter()
+                .map(|&c| {
+                    if c < buf.column_buffers.len() && c < col_types.len() {
+                        decode_buffered_value(&buf, c, i, &col_types[c])
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect();
+            rows.push((key, deleted, vals));
+        }
+        (segs, rows)
+    }
+
+
+    /// Value-level predicate for buffered rows in the aggregate fast paths
+    /// (round-10). Mirrors the segment-side typed comparisons: NULL filter
+    /// values never match (SQL three-valued logic), integers and floats
+    /// compare numerically across types, text compares as strings.
+    fn buf_value_matches(v: Option<&Value>, op: &crate::sql::ast::BinaryOperator, target: &Value) -> bool {
+        use crate::sql::ast::BinaryOperator as B;
+        let Some(v) = v else { return false };
+        if matches!(v, Value::Null) || matches!(target, Value::Null) {
+            return false;
+        }
+        // Numeric comparison across Integer/Float.
+        let num = |x: &Value| -> Option<f64> {
+            match x {
+                Value::Integer(i) => Some(*i as f64),
+                Value::Float(f) => Some(*f),
+                Value::Bool(b) => Some(*b as i64 as f64),
+                _ => None,
+            }
+        };
+        if let (Some(a), Some(b)) = (num(v), num(target)) {
+            return match op {
+                B::Eq => a == b,
+                B::Ne => a != b,
+                B::Lt => a < b,
+                B::Le => a <= b,
+                B::Gt => a > b,
+                B::Ge => a >= b,
+                _ => false,
+            };
+        }
+        match (v, target) {
+            (Value::Text(a), Value::Text(b)) => match op {
+                B::Eq => a.as_str() == b.as_str(),
+                B::Ne => a.as_str() != b.as_str(),
+                B::Lt => a.as_str() < b.as_str(),
+                B::Le => a.as_str() <= b.as_str(),
+                B::Gt => a.as_str() > b.as_str(),
+                B::Ge => a.as_str() >= b.as_str(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Fold one decoded aggregate Value into an AggregateResult (round-10
+    /// buffered-row path). Mirrors the segment-side typed folds: SUM overflow
+    /// promotes to the compensated float accumulator; NULL counts toward
+    /// null_count (COUNT(col) counts non-NULL only).
+    fn fold_value_into_agg(result: &mut AggregateResult, v: Option<&Value>) {
+        match v {
+            Some(Value::Integer(n)) => {
+                result.count += 1;
+                if result.has_float {
+                    result.float_sum.add(*n as f64);
+                } else if let Some(s) = result.int_sum.checked_add(*n) {
+                    result.int_sum = s;
+                } else {
+                    result.has_float = true;
+                    result.float_sum = crate::types::CompSum::from_value(result.int_sum as f64);
+                    result.float_sum.add(*n as f64);
+                }
+                if result.count == 1 {
+                    result.min_int = *n;
+                    result.max_int = *n;
+                } else {
+                    result.min_int = result.min_int.min(*n);
+                    result.max_int = result.max_int.max(*n);
+                }
+            }
+            Some(Value::Float(f)) => {
+                result.count += 1;
+                result.float_sum.add(*f);
+                result.has_float = true;
+                if result.count == 1 {
+                    result.min_float = *f;
+                    result.max_float = *f;
+                } else {
+                    result.min_float = result.min_float.min(*f);
+                    result.max_float = result.max_float.max(*f);
+                }
+            }
+            Some(Value::Bool(b)) => {
+                result.count += 1;
+                let n = *b as i64;
+                if result.count == 1 {
+                    result.min_int = n;
+                    result.max_int = n;
+                } else {
+                    result.min_int = result.min_int.min(n);
+                    result.max_int = result.max_int.max(n);
+                }
+            }
+            Some(Value::Null) | None => {
+                result.null_count += 1;
+            }
+            Some(_) => {
+                // Non-numeric non-NULL (text/blob/…) — counted by COUNT(col).
+                result.count += 1;
+            }
+        }
+    }
+
     /// Count rows matching a filter WITHOUT materializing Value objects.
     /// Optimized for COUNT(*) WHERE col = val / col > val / col < val.
     ///
@@ -2710,19 +2936,13 @@ impl ColSegmentStore {
         op: &crate::sql::ast::BinaryOperator,
         target: &Value,
     ) -> usize {
-        // 🔑 Flush buffered writes (INSERT/UPDATE/DELETE) so they're visible to
-        // the segment scan. Without this, count_filtered only sees persisted
-        // segments and misses buffered updates.
-        let _ = self.flush_buffer();
-
-        // Determine dedup need BEFORE locking write_buf (may_have_duplicate_keys
-        // also locks write_buf — parking_lot Mutex is not reentrant → deadlock).
-        let mut need_dedup = self.may_have_duplicate_keys();
-        let buf = self.write_buf.lock();
-        let segs = self.segs();
-        // 🔒 post-lock recheck (round-8): the pre-lock decision races a
-        // concurrent note_overlap+append+flush — see vector_exec M1 comment.
-        need_dedup |= self.may_have_duplicate_keys_nobuf();
+        // 🔒 Round-10 consistent view: [flush → lock buf → snapshot segs →
+        // collect latest buffered rows]. Previously the flush→snapshot gap
+        // made rows committed in between invisible to COUNT. Buffered rows
+        // are newer than any segment version of the same key → fold them
+        // first, and their keys (incl. tombstones) suppress segment versions.
+        let (segs, buf_rows) = self.consistent_agg_view(&[filter_col]);
+        let need_dedup = self.may_have_duplicate_keys() || !buf_rows.is_empty();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
         } else {
@@ -2761,6 +2981,18 @@ impl ColSegmentStore {
         let is_eq_filter = matches!(op, crate::sql::ast::BinaryOperator::Eq);
 
         let mut count = 0usize;
+        // 🔒 Round-10: fold buffered rows FIRST (newest per key). Their keys
+        // enter `seen` — including tombstones, which suppress the older live
+        // segment version of the same key.
+        for (key, deleted, vals) in &buf_rows {
+            seen.insert(*key);
+            if *deleted {
+                continue;
+            }
+            if Self::buf_value_matches(vals.first(), op, target) {
+                count += 1;
+            }
+        }
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
             // 🔑 Only load full keys when dedup is needed (multi-segment).
@@ -2869,7 +3101,6 @@ impl ColSegmentStore {
                 }
             }
         }
-        drop(buf);
         count
     }
 
@@ -2888,11 +3119,12 @@ impl ColSegmentStore {
         op: &crate::sql::ast::BinaryOperator,
         target: &Value,
     ) -> AggregateResult {
-        // 🔑 Flush buffered writes so they're visible to the segment scan.
-        let _ = self.flush_buffer();
+        // 🔒 Round-10 consistent view (see consistent_agg_view): buffered rows
+        // join the fold; the flush→snapshot gap no longer hides committed rows.
+        let view_cols: Vec<usize> = [filter_col.unwrap_or(0), agg_col].to_vec();
+        let (segs, buf_rows) = self.consistent_agg_view(&view_cols);
         let col_types = self.col_types.load();
-        let need_dedup = self.may_have_duplicate_keys();
-        let segs = self.segments_snapshot();
+        let need_dedup = self.may_have_duplicate_keys() || !buf_rows.is_empty();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
         } else {
@@ -2926,6 +3158,19 @@ impl ColSegmentStore {
         let is_eq_filter = matches!(op, crate::sql::ast::BinaryOperator::Eq);
 
         let mut result = AggregateResult::default();
+        // 🔒 Round-10: buffered rows fold FIRST; their keys (incl. tombstones)
+        // suppress the segment versions in the loop below.
+        for (key, deleted, vals) in &buf_rows {
+            seen.insert(*key);
+            if *deleted {
+                continue;
+            }
+            let passes = no_filter || Self::buf_value_matches(vals.first(), op, target);
+            if !passes {
+                continue;
+            }
+            Self::fold_value_into_agg(&mut result, vals.get(1));
+        }
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
             // 🔑 Only load full keys when dedup is needed (multi-segment).
@@ -3202,11 +3447,12 @@ impl ColSegmentStore {
         agg_cols: &[usize],
     ) -> MultiAggResult {
         use crate::sql::ast::BinaryOperator;
-        let _ = self.flush_buffer();
-        let mut need_dedup = self.may_have_duplicate_keys();
-        let segs = self.segments_snapshot();
-        // 🔒 post-snapshot recheck (round-8): see vector_exec M1 comment.
-        need_dedup |= self.may_have_duplicate_keys_nobuf();
+        // 🔒 Round-10 consistent view (see consistent_agg_view): buffered rows
+        // join the fold; the flush→snapshot gap no longer hides committed rows.
+        let mut view_cols: Vec<usize> = comparisons.iter().map(|(c, _, _)| *c).collect();
+        view_cols.extend_from_slice(agg_cols);
+        let (segs, buf_rows) = self.consistent_agg_view(&view_cols);
+        let need_dedup = self.may_have_duplicate_keys() || !buf_rows.is_empty();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
         } else {
@@ -3253,6 +3499,27 @@ impl ColSegmentStore {
                 .map(|_| AggregateResult::default())
                 .collect(),
         };
+
+        // 🔒 Round-10: buffered rows fold FIRST (newest per key; their keys —
+        // incl. tombstones — suppress segment versions below). vals layout:
+        // [comparison cols..., agg cols...].
+        for (key, deleted, vals) in &buf_rows {
+            seen.insert(*key);
+            if *deleted {
+                continue;
+            }
+            let passes = comparisons.iter().enumerate().all(|(ci, (_, op, target))| {
+                Self::buf_value_matches(vals.get(ci), op, target)
+            });
+            if !passes {
+                continue;
+            }
+            result.rows += 1;
+            for (ai, _) in agg_cols.iter().enumerate() {
+                let v = vals.get(comparisons.len() + ai);
+                Self::fold_value_into_agg(&mut result.per_col[ai], v);
+            }
+        }
 
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
@@ -4858,11 +5125,19 @@ impl ColSegmentStore {
 
         // A full merge produces one deduped segment — cross-segment overlap
         // is gone. Tail merges (keep_tombstones) keep the flag: base∩tail
-        // overlap may persist. Only clear while the buffer is empty (a
-        // buffered UPDATE would re-introduce overlap after its flush).
-        if !keep_tombstones && self.write_buf.lock().num_rows == 0 {
-            self.overlap_possible
-                .store(false, std::sync::atomic::Ordering::Release);
+        // overlap may persist. 🔒 Round-10: the empty-check and the flag
+        // clear share ONE write_buf critical section, and overlapping
+        // appends set the flag inside their own write_buf section
+        // (append_rows_marked / append_row_ref_marked / append_tombstone) —
+        // previously an unlocked note_overlapping_write could land between
+        // the check and the clear, and the flag was lost while the
+        // overlapping row flushed right after (scans double-counted it).
+        if !keep_tombstones {
+            let buf = self.write_buf.lock();
+            if buf.num_rows == 0 {
+                self.overlap_possible
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
         }
         // Record compaction in manifest FIRST (crash safety), then swap memory.
         self.manifest

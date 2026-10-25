@@ -170,3 +170,47 @@ round-9 修复后解禁并通过。`write_buf` 计数协议同步修复 (append/
 
 **顺带发现的更早缺陷**: flush 旧协议的注释自己记录过 "row in neither
 view" 曾导致 `ORDER BY` 偶发 0 行 — 同根因, 一并消除。
+
+## ✅ round-10: 并发可见性四连修 (2026-10-23)
+
+第 9 轮之后的新一轮并发审计, 四个独立缺陷 (各自的 case 见下):
+
+1. **事务 apply 撕裂读**: commit 的存储突变逐行 append (每行独立
+   write_buf 临界区), 不持 write_lock 的读者 flush 可在**两行之间**落盘
+   → 段里短暂存在**半个事务** — 向量化 M1 聚合观察到 `SUM = 3001`
+   (转账 +1 侧先落盘)。修复: `append_txn_ops` 把整个事务按表批量进
+   **单一临界区**; WAL 记录顺序同步改为 [删除 → 插入 → 更新]。
+2. **聚合快照漏 buf 行**: `count_filtered`/`aggregate_filtered`/
+   `aggregate_multi_filtered` 先 flush 再只扫段 — 两次调用之间提交的行
+   在 buffer 里, COUNT/SUM 看不见 (COUNT(*) 可回退)。修复:
+   `consistent_agg_view` 在 write_buf 锁内 [快照段 + 收集 buf 最新行],
+   buf 行 (必然新于段内同 key) 先折叠、其 key (含墓碑) 抑制段版本。
+3. **overlap 标志丢失**: 无锁 `note_overlapping_write` 与全量合并的
+   [空检查 + 清标志] 交错 → 重叠行 flush 后标志为 false → 多段扫描
+   跳过去重 → SUM/COUNT 双计。修复: `append_rows_marked`/
+   `append_row_ref_marked`/`append_tombstone` 把 [置标志 + 追加] 原子化,
+   合并清标志也入锁内。
+4. **事务内删除后重插同 PK**: 缓冲 DELETE 未提交时存储行 + pk_lookup
+   映射仍在, 重插被误报 `Duplicate primary key` (标准 SQL 合法)。
+   Integer PK 重插落**同一复合键** — WAL/batch 顺序必须 [墓碑 → 重插],
+   否则 newest-wins (buf rposition / merge max-ts / 重放顺序) 会吞掉
+   重插行。修复: 存储层查重对本事务 pending delete 放行 + 全链路顺序
+   统一。
+
+另加 row_cache **删除墓碑标记** (读者回填与 invalidate 竞争时不再复活
+已删行 — 窗口极窄难以稳定复现, 以确定性终态压力测试 + 标记机制双保险)。
+
+**case 说明**:
+- `tests/test_concurrent_agg_consistency.rs` — 转账负载下**每一次** SUM
+  观察精确守恒 (撕裂读/双计/漏行任一都会打破); 插入负载下 COUNT(*)/
+  SUM 单调不减 + 终态等于已提交数。
+- `tests/test_txn_delete_reinsert.rs` — 删除→重插 (含 链式
+  delete→insert→update、真重复仍拒绝、回滚恢复原值、CHECKPOINT+重开
+  持久性)。
+- `tests/test_row_cache_delete_ghost.rs` — 删除+重插风暴后终态逐 PK
+  点查必须全空 (缓存幽灵判定)。
+
+**已知边界 (记录在案)**: 向量化 M1 聚合入口仍是 [flush → 段快照] —
+事务原子化后它只会漏**整个**事务 (不再撕裂), 对守恒负载不可观测;
+纯插入负载的 COUNT/SUM 已路由到修复后的聚合路径。跨表多行事务的
+apply 以表为单位原子 (跨表撕裂窗口仍存在, 需要全局应用序才能消除)。

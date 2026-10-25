@@ -74,9 +74,22 @@ pub struct RowCache {
     /// 🚀 Replaced DashMap with RwLock<HashMap> (single lock, no sharding overhead on edge)
     access_patterns: Arc<RwLock<HashMap<String, AccessPattern>>>,
 
+    /// 🔒 Round-10 delete-tombstone markers: keys whose row a committer
+    /// DELETEd (invalidate). A reader that fetched the live row just before
+    /// the delete may still complete its `put_if_absent` refill AFTER the
+    /// invalidate — without the marker that refill would resurrect the
+    /// deleted row as a cache "ghost" served by later PK point reads. The
+    /// marker blocks the refill; any later real INSERT/UPDATE (`put`) clears
+    /// it. Bounded: on overflow the set is dropped wholesale (re-opens only
+    /// the microscopic refill race, never correctness of committed data).
+    tombstones: RwLock<std::collections::HashSet<CacheKey>>,
+
     /// 🚀 P2: Prefetch configuration
     prefetch_config: PrefetchConfig,
 }
+
+/// Soft cap on the tombstone marker set (~16MB of keys).
+const TOMBSTONE_MARKER_CAP: usize = 1 << 20;
 
 /// Cache statistics (snapshot of atomic counters)
 #[derive(Debug, Default, Clone)]
@@ -144,6 +157,7 @@ impl RowCache {
             prefetch_triggered: AtomicU64::new(0),
             prefetch_useful: AtomicU64::new(0),
             access_patterns: Arc::new(RwLock::new(HashMap::new())),
+            tombstones: RwLock::new(std::collections::HashSet::new()),
             prefetch_config,
         }
     }
@@ -299,10 +313,12 @@ impl RowCache {
     pub fn put(&self, table_name: String, row_id: RowId, row: Row) {
         self.put_arc(table_name, row_id, Arc::new(row));
     }
+    // (put delegates to put_arc, which clears the tombstone marker.)
 
     /// Put an Arc<Row> into cache (avoids clone when caller already has Arc)
     pub fn put_arc(&self, table_name: String, row_id: RowId, row_arc: Arc<Row>) {
         let key = (table_hash(&table_name), row_id);
+        self.clear_tombstone(&key);
         let mut cache = self.cache[self.shard_index(&key)].write();
         cache.put(key, row_arc);
     }
@@ -314,9 +330,15 @@ impl RowCache {
     /// would publish the stale value over the fresh one, and a later UPDATE
     /// would compute its base from it while first-committer-wins validation
     /// passes (the statement watermark postdates the conflicting commit).
-    /// Atomic per-entry via the shard write lock. Returns true if inserted.
+    /// 🔒 Round-10: also rejected for keys carrying a DELETE tombstone marker
+    /// — a refill racing a delete's invalidate would otherwise resurrect the
+    /// deleted row as a cache ghost. Atomic per-entry via the shard write
+    /// lock. Returns true if inserted.
     pub fn put_if_absent(&self, table_name: &str, row_id: RowId, row: Row) -> bool {
         let key = (table_hash(table_name), row_id);
+        if self.tombstones.read().contains(&key) {
+            return false;
+        }
         let mut cache = self.cache[self.shard_index(&key)].write();
         if cache.peek(&key).is_some() {
             return false;
@@ -325,10 +347,20 @@ impl RowCache {
         true
     }
 
+    /// Clear a key's tombstone marker (called by the committing put paths).
+    fn clear_tombstone(&self, key: &CacheKey) {
+        // Fast path: most tables never delete — skip the write lock when the
+        // marker set is empty.
+        if !self.tombstones.read().is_empty() {
+            self.tombstones.write().remove(key);
+        }
+    }
+
     /// Put a row into cache using &str table name (avoids String allocation).
     /// 🔑 PERF: hot INSERT path — saves a to_string() per insert.
     pub fn put_ref(&self, table_name: &str, row_id: RowId, row: Row) {
         let key = (table_hash(table_name), row_id);
+        self.clear_tombstone(&key);
         let mut cache = self.cache[self.shard_index(&key)].write();
         cache.put(key, Arc::new(row));
     }
@@ -339,9 +371,18 @@ impl RowCache {
         self.cache.iter().map(|c| c.read().len()).sum()
     }
 
-    /// Invalidate a single row
+    /// Invalidate a single row. 🔒 Round-10: also mark the key with a delete
+    /// tombstone so a racing read-path refill (put_if_absent) cannot
+    /// resurrect the row as a cache ghost.
     pub fn invalidate(&self, table_name: &str, row_id: RowId) {
         let key = (table_hash(table_name), row_id);
+        {
+            let mut tb = self.tombstones.write();
+            if tb.len() >= TOMBSTONE_MARKER_CAP {
+                tb.clear();
+            }
+            tb.insert(key);
+        }
         let mut cache = self.cache[self.shard_index(&key)].write();
         cache.pop(&key);
     }
@@ -364,6 +405,9 @@ impl RowCache {
 
         // Also clean up access_patterns for this table
         self.access_patterns.write().remove(table_name);
+        // And its tombstone markers (round-10).
+        let thash = table_hash(table_name);
+        self.tombstones.write().retain(|k| k.0 != thash);
     }
 
     /// Clear entire cache
@@ -371,6 +415,7 @@ impl RowCache {
         for shard in self.cache.iter() {
             shard.write().clear();
         }
+        self.tombstones.write().clear();
 
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);

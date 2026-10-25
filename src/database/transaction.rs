@@ -63,6 +63,39 @@ impl MoteDB {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     if let Some(pk_value) = row.get(pk_col.position) {
+                        // 🔑 Round-10 (delete→re-INSERT in one txn): a PK whose
+                        // row is deleted by a BUFFERED (pending) delete of THIS
+                        // transaction is logically free — the storage row and
+                        // the pk_lookup mapping still exist until commit, so
+                        // the checks below would reject a legal re-INSERT with
+                        // a bogus "Duplicate primary key".
+                        let deleted_in_txn = {
+                            let ctx = self.txn_coordinator.get_context(txn_id)?;
+                            let pd = ctx.pending_deletes.read();
+                            match pk_value {
+                                Value::Integer(i) => {
+                                    let rid = if *i >= 0 {
+                                        *i as RowId
+                                    } else {
+                                        0x8000_0000u64 | (*i as u64 & 0x7FFF_FFFF)
+                                    };
+                                    pd.contains_key(&(table_name.to_string(), rid))
+                                }
+                                _ => pd.iter().any(|((t, _), old)| {
+                                    t == table_name && old.get(pk_col.position) == Some(pk_value)
+                                }),
+                            }
+                        };
+                        if deleted_in_txn {
+                            // Re-INSERT after a buffered DELETE in the same txn:
+                            // legal (standard SQL). The storage row + pk_lookup
+                            // mapping still exist until commit — skip the
+                            // storage-level checks below. The write_set dup
+                            // check still applies. Commit apply orders the
+                            // tombstone BEFORE this insert (round-10) so every
+                            // newest-wins reader (buf rposition, merge max-ts,
+                            // WAL replay order) resolves to the live row.
+                        } else {
                         let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
                         let exists_in_cache = self
                             .pk_lookup
@@ -110,6 +143,7 @@ impl MoteDB {
                                 }
                             }
                         }
+                        } // end !deleted_in_txn
                     }
                 }
             }
@@ -311,14 +345,30 @@ impl MoteDB {
         //    If this fails, nothing is written to WAL — no orphaned records.
         let commit_ts = self.txn_coordinator.commit(txn_id)?;
 
-        // 2. Write all rows to WAL in ONE batch per partition — a single
-        // fsync for the whole transaction. The old per-row `log_insert` went
-        // through group_commit_append per record: an N-row COMMIT paid N
-        // fsync round-trips (50-row txn ≈ 40+ fsyncs ≈ 130ms of pure fsync
-        // latency on commodity SSDs).
+        // 2+3. Write ALL data records to WAL — ONE batch per partition, a
+        // single fsync for the whole transaction. 🔑 Record order (round-10):
+        // Deletes → Inserts → Updates, matching the storage apply order. For
+        // the only same-key co-presence (buffered DELETE + re-INSERT of the
+        // same Integer PK), replay appends in WAL order and newest-wins by
+        // last occurrence — the live re-inserted row must come AFTER its
+        // tombstone.
         {
             use std::collections::HashMap;
             let mut by_partition: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
+            for ((table_name, row_id), old_row) in &pending_deletes {
+                let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+                by_partition
+                    .entry(partition)
+                    .or_default()
+                    .push(WALRecord::Delete {
+                        table_name: table_name.clone(),
+                        row_id: *row_id,
+                        partition,
+                        old_data: old_row.clone(),
+                        txn_id,
+                        timestamp: 0,
+                    });
+            }
             for ((table_name, row_id), row_data) in &write_set {
                 let partition = (*row_id % self.num_partitions as u64) as PartitionId;
                 by_partition
@@ -332,55 +382,28 @@ impl MoteDB {
                         txn_id,
                     });
             }
+            for ((table_name, row_id), (old_row, new_row)) in &pending {
+                let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+                by_partition
+                    .entry(partition)
+                    .or_default()
+                    .push(WALRecord::Update {
+                        table_name: table_name.clone(),
+                        row_id: *row_id,
+                        partition,
+                        old_data: old_row.clone(),
+                        new_data: new_row.clone(),
+                        txn_id,
+                    });
+            }
             for (partition, records) in by_partition {
                 self.wal.batch_append(partition, records)?;
             }
         }
 
-        // 3. Write PENDING UPDATE/DELETE data records BEFORE the Commit
-        //    marker (round-8): the old order (marker at step 3, pending
-        //    Update records down in step 6) let an auto-checkpoint WAL replay
-        //    run in between — the txn was marked committed while its UPDATE
-        //    records were still unwritten → replay silently skipped those
-        //    rows → one-sided transfer loss (~1 per 500 commits, durable
-        //    across checkpoint+reopen). Data-first, marker-last is the
-        //    standard WAL commit rule; the storage apply (step 6) stays
-        //    after the marker.
-        let mut pending_wal: std::collections::HashMap<PartitionId, Vec<WALRecord>> =
-            std::collections::HashMap::new();
-        for ((table_name, row_id), (old_row, new_row)) in &pending {
-            let partition = (*row_id % self.num_partitions as u64) as PartitionId;
-            pending_wal
-                .entry(partition)
-                .or_default()
-                .push(WALRecord::Update {
-                    table_name: table_name.clone(),
-                    row_id: *row_id,
-                    partition,
-                    old_data: old_row.clone(),
-                    new_data: new_row.clone(),
-                    txn_id,
-                });
-        }
-        for ((table_name, row_id), old_row) in &pending_deletes {
-            let partition = (*row_id % self.num_partitions as u64) as PartitionId;
-            pending_wal
-                .entry(partition)
-                .or_default()
-                .push(WALRecord::Delete {
-                    table_name: table_name.clone(),
-                    row_id: *row_id,
-                    partition,
-                    old_data: old_row.clone(),
-                    txn_id,
-                    timestamp: 0,
-                });
-        }
-        for (partition, records) in pending_wal {
-            self.wal.batch_append(partition, records)?;
-        }
-
-        // 4. Write WAL Commit record — AFTER all data records.
+        // 4. Write WAL Commit record — AFTER all data records (round-8 rule:
+        // data-first, marker-last, so an interleaved auto-checkpoint replay
+        // never sees a marked-but-unwritten transaction).
         self.wal.log_commit(0, txn_id, commit_ts)?;
 
         // 4. Flush all rows to LSM atomically via batch_put
@@ -406,27 +429,82 @@ impl MoteDB {
         // INSERT (pre-BEGIN) already wrote ColSegmentStore. The transaction's
         // second INSERT data is in WAL only — it will be replayed on checkpoint.
         //
+        // 🔒 Round-10 txn-atomic storage apply: append ALL of this
+        // transaction's mutations per table in ONE write_buf critical section
+        // (write_set inserts + pending updates + pending deletes). The old
+        // per-row appends let a concurrent reader's flush drain BETWEEN a
+        // multi-row transaction's rows — segments briefly held HALF the
+        // transaction and segments-only readers (vectorized M1 aggregates,
+        // text scans) observed the torn state (SUM read 3001 mid-transfer).
+        {
+            use std::collections::HashMap;
+            // (table → ops); ops order: inserts → updates → deletes so a
+            // same-key tombstone lands on top (newest-wins by last position).
+            let mut by_table: HashMap<&str, Vec<(u64, u64, bool, Row)>> = HashMap::new();
+            let mut overlap_tables: HashMap<&str, bool> = HashMap::new();
+            let key_of = |table_name: &str, row_id: RowId| -> u64 {
+                let table_id =
+                    self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+                (table_id << 32) | (row_id & 0xFFFFFFFF)
+            };
+            // 🔑 Op order = deletes → inserts → updates, with ts allocated in
+            // the same order. The only same-key co-presence is a buffered
+            // DELETE followed by a re-INSERT of the same Integer PK (same
+            // composite key): the tombstone must precede the insert so every
+            // newest-wins reader (buf rposition, merge max-ts, WAL replay
+            // order) resolves to the LIVE re-inserted row.
+            for ((table_name, row_id), old_row) in &pending_deletes {
+                let ts = self
+                    .write_lsn
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                by_table
+                    .entry(table_name)
+                    .or_default()
+                    .push((key_of(table_name, *row_id), ts, true, old_row.clone()));
+                *overlap_tables.entry(table_name).or_insert(false) = true;
+            }
+            for ((table_name, row_id), row_data) in &write_set {
+                let ts = self
+                    .write_lsn
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                by_table
+                    .entry(table_name)
+                    .or_default()
+                    .push((key_of(table_name, *row_id), ts, false, row_data.clone()));
+            }
+            for ((table_name, row_id), (_old_row, new_row)) in &pending {
+                let ts = self
+                    .write_lsn
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                by_table
+                    .entry(table_name)
+                    .or_default()
+                    .push((key_of(table_name, *row_id), ts, false, new_row.clone()));
+                *overlap_tables.entry(table_name).or_insert(false) = true;
+            }
+            for (table_name, ops) in by_table {
+                if ops.is_empty() {
+                    continue;
+                }
+                let Ok(schema) = self.table_registry.get_table(table_name) else {
+                    continue;
+                };
+                let Ok(store) =
+                    self.get_or_create_col_segment_store(table_name, schema.col_types())
+                else {
+                    continue;
+                };
+                let mark = *overlap_tables.get(table_name).unwrap_or(&false);
+                if let Err(e) = store.append_txn_ops(&ops, mark) {
+                    eprintln!("@@APPEND-FAIL table={table_name} n_ops={}: {e}", ops.len());
+                }
+            }
+        }
+
         // Update caches so the data is visible to queries via row_cache.
         for ((table_name, row_id), row_data) in &write_set {
             self.row_cache
                 .put(table_name.to_string(), *row_id, row_data.clone());
-
-            // Also write ColSegmentStore for query visibility (no LSM backpressure).
-            // Clone the store Arc first to avoid holding DashMap read guard across
-            // append_rows (which takes write_buf lock — potential deadlock if
-            // another thread holds it). Use get_or_create so the first transactional
-            // INSERT on a table (no prior non-txn insert) still creates the store.
-            let tbl_schema2 = self.table_registry.get_table(table_name)?;
-            let col_types = tbl_schema2.col_types();
-            let store_clone = self
-                .get_or_create_col_segment_store(table_name, col_types)
-                .ok();
-            if let Some(store) = store_clone {
-                let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-                let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-                let ts = self.write_lsn.load(std::sync::atomic::Ordering::Relaxed);
-                let _ = store.append_rows(&[(key, ts, row_data.clone())]);
-            }
 
             // Timestamp index maintenance (query visibility before flush).
             self.index_row_timestamp(row_data, *row_id);
@@ -480,26 +558,9 @@ impl MoteDB {
             // reorder); only the storage apply + index/cache maintenance
             // remains here.
             for ((table_name, row_id), (old_row, new_row)) in &pending {
-                // Storage: append the new version at the same composite key
-                // (newest-version-wins — same semantics as the autocommit
-                // in-place path, minus the per-statement fsync).
+                // Storage append is done by the txn-atomic batch phase above
+                // (round-10). Cache + index delta only:
                 let tbl_schema = self.table_registry.get_table(table_name)?;
-                let col_types = tbl_schema.col_types();
-                let store = self
-                    .get_or_create_col_segment_store(table_name, col_types)
-                    .ok();
-                if let Some(store) = store {
-                    let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-                    let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-                    let ts = self
-                        .write_lsn
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    store.note_overlapping_write();
-                    if let Err(e) = store.append_rows(&[(key, ts, new_row.clone())]) {
-                        eprintln!("@@APPEND-FAIL table={table_name} row={row_id}: {e}");
-                    }
-                }
-                // Cache + index delta.
                 self.row_cache
                     .put(table_name.to_string(), *row_id, new_row.clone());
                 self.update_indexes_for_row(
@@ -517,18 +578,10 @@ impl MoteDB {
         // WAL Delete records with the REAL txn_id + secondary index removal.
         if !pending_deletes.is_empty() {
             // WAL Delete records already written BEFORE the Commit marker
-            // (round-8 reorder); storage apply only.
+            // (round-8 reorder); storage tombstones are applied by the
+            // txn-atomic batch phase above (round-10). Cache + index removal:
             for ((table_name, row_id), old_row) in &pending_deletes {
                 let tbl_schema = self.table_registry.get_table(table_name)?;
-                if let Some(store) = self.get_col_segment_store(table_name) {
-                    let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-                    let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-                    let ts = self
-                        .write_lsn
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    store.note_overlapping_write();
-                    let _ = store.append_tombstone(key, ts);
-                }
                 // Cache + index removal (reuse the update helper with the new
                 // row = all-NULL? No — a NULL row would try re-inserting into
                 // indexes. Use the delete-specific removal: point each index

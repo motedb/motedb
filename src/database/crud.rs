@@ -1452,9 +1452,6 @@ impl MoteDB {
             // 🔑 PERF: use append_row_ref (by reference) to avoid Vec<Value> clone.
             let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
             let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-            // UPDATE writes a new version of an already-segmented key →
-            // cross-segment overlap becomes possible (scan dedup flag).
-            store.note_overlapping_write();
 
             // 🔑 If the PK value changed, we need to:
             // 1. Tombstone the OLD composite_key (so WHERE old_pk finds nothing)
@@ -1469,11 +1466,14 @@ impl MoteDB {
                     .unwrap_or(false);
 
             if pk_changed {
-                // Tombstone the old composite_key.
+                // Tombstone the old composite_key (sets the overlap flag
+                // inside its critical section — round-10).
                 let old_key = (table_id << 32) | (row_id & 0xFFFFFFFF);
                 store.append_tombstone(old_key, timestamp)?;
 
                 // Insert at the new composite_key (derived from new PK value).
+                // 🔒 _marked variants (round-10): overlap flag + append atomic
+                // w.r.t. a concurrent full merge's flag reset.
                 if let Some(pk_name) = schema.primary_key() {
                     if let Some(pk_col) = schema.get_column(pk_name) {
                         if let Some(Value::Integer(new_pk)) = new_row.get(pk_col.position) {
@@ -1483,24 +1483,24 @@ impl MoteDB {
                                 0x8000_0000u64 | (*new_pk as u64 & 0x7FFF_FFFF)
                             };
                             let new_key = (table_id << 32) | (new_row_id & 0xFFFFFFFF);
-                            store.append_row_ref(new_key, timestamp, &new_row)?;
+                            store.append_row_ref_marked(new_key, timestamp, &new_row)?;
                         } else {
                             // Non-integer PK — fall back to old behavior.
                             let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-                            store.append_row_ref(key, timestamp, &new_row)?;
+                            store.append_row_ref_marked(key, timestamp, &new_row)?;
                         }
                     } else {
                         let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-                        store.append_row_ref(key, timestamp, &new_row)?;
+                        store.append_row_ref_marked(key, timestamp, &new_row)?;
                     }
                 } else {
                     let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-                    store.append_row_ref(key, timestamp, &new_row)?;
+                    store.append_row_ref_marked(key, timestamp, &new_row)?;
                 }
             } else {
                 // PK unchanged — write at the same composite_key as before.
                 let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-                store.append_row_ref(key, timestamp, &new_row)?;
+                store.append_row_ref_marked(key, timestamp, &new_row)?;
             }
             if store.buffered_bytes() >= 4 * 1024 * 1024 {
                 let _ = store.flush_buffer();
