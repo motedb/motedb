@@ -40,6 +40,108 @@ fn scalar_i64(db: &Database, sql: &str) -> i64 {
     }
 }
 
+/// 时间戳过滤列下的聚合可见性 (round-11)。
+///
+/// round-10 的 `consistent_agg_view` 引入的回归: `buf_value_matches` 未处理
+/// `Value::Timestamp`/`Value::Date` — 时间范围聚合 (本库核心形状
+/// `WHERE ts >= a AND ts <= b`) 的**缓冲行**静默不匹配谓词, 且其 key 已进入
+/// 去重集 (抑制段版本), 行从聚合中整体消失。
+///
+/// 🔑 断言设计: 单调性**抓不到**这类缺陷 (段内已可见的行永不回退, buf 内的
+/// 行从未可见 — 漏行表现为滞后而非回退)。正确的实时性断言:
+/// `c0 = committed 读取 → SELECT → 结果必须 ≥ c0` — 查询开始前已完成的
+/// 提交必须在结果中可见, 否则即漏行。
+#[test]
+fn timestamp_filtered_count_sees_all_committed_rows() {
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::create(dir.path().join("ts.mote")).unwrap());
+    db.execute("CREATE TABLE tt (id INT PRIMARY KEY, ts TIMESTAMP, val INT)")
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    // SeqCst: the reader's c0 load must not be reordered before its SELECT,
+    // and the writer's store must happen-after the INSERT's durable commit.
+    let committed = Arc::new(AtomicU64::new(0));
+    let bad = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut hs: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    {
+        let (db, stop, committed) = (
+            Arc::clone(&db),
+            Arc::clone(&stop),
+            Arc::clone(&committed),
+        );
+        hs.push(std::thread::spawn(move || {
+            let mut id = 0i64;
+            let base = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as i64;
+            while !stop.load(Ordering::Relaxed) {
+                id += 1;
+                let ts = base + id;
+                if db.execute(&format!("INSERT INTO tt VALUES ({id}, {ts}, 1)")).is_ok() {
+                    committed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }));
+    }
+    for q in [
+        "SELECT COUNT(*) FROM tt WHERE ts > 0",
+        "SELECT SUM(val) FROM tt WHERE ts > 0 AND ts < 9223372036854775807",
+        "SELECT COUNT(*) FROM tt",
+    ] {
+        let (db, stop, committed, bad, q) = (
+            Arc::clone(&db),
+            Arc::clone(&stop),
+            Arc::clone(&committed),
+            Arc::clone(&bad),
+            q.to_string(),
+        );
+        hs.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let c0 = committed.load(Ordering::SeqCst) as i64;
+                if let Ok(n) = db
+                    .execute(&q)
+                    .and_then(|r| r.materialize().map_err(|e| e.into()))
+                {
+                    if let (_, rows) = n.select_rows().unwrap() {
+                        match &rows[0][0] {
+                            V::Integer(v) => {
+                                if *v < c0 {
+                                    bad.lock().unwrap().push(format!(
+                                        "{q} saw {v} < {c0} committed (buffered rows invisible)"
+                                    ));
+                                }
+                            }
+                            V::Null => {}
+                            o => panic!("unexpected {o:?}"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    stop.store(true, Ordering::Relaxed);
+    for h in hs {
+        h.join().unwrap();
+    }
+    let total = committed.load(Ordering::SeqCst) as i64;
+    let cnt = scalar_i64(&db, "SELECT COUNT(*) FROM tt WHERE ts > 0");
+    let all = scalar_i64(&db, "SELECT COUNT(*) FROM tt");
+    assert_eq!(
+        (cnt, all),
+        (total, total),
+        "ts-filtered count must equal committed inserts (and unfiltered count)"
+    );
+    let b = bad.lock().unwrap();
+    assert!(
+        b.is_empty(),
+        "ts-filter aggregate visibility violations: {} issues, first: {:?}",
+        b.len(),
+        b.first()
+    );
+}
+
 /// 转账负载: 3 写线程双语句事务 + 2 读者, 每一次 SUM 观察都必须精确等于
 /// 初始总额 — 双计 (overlap 标志丢失) 或漏行 (buf 不可见) 都会打破。
 #[test]

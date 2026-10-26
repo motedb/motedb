@@ -2830,12 +2830,20 @@ impl ColSegmentStore {
         if matches!(v, Value::Null) || matches!(target, Value::Null) {
             return false;
         }
-        // Numeric comparison across Integer/Float.
+        // Numeric comparison across Integer/Float. 🔑 Timestamp compares as
+        // its micros and Date as its day-count (round-11): the segment side
+        // compares both as raw i64 — without this, buffered rows of a
+        // Timestamp filter column (the core `WHERE ts >= a AND ts <= b`
+        // shape) silently failed every predicate, and since their keys are
+        // pre-inserted into the dedup set, the rows vanished from the
+        // aggregate entirely (concurrent undercount).
         let num = |x: &Value| -> Option<f64> {
             match x {
                 Value::Integer(i) => Some(*i as f64),
                 Value::Float(f) => Some(*f),
                 Value::Bool(b) => Some(*b as i64 as f64),
+                Value::Timestamp(ts) => Some(ts.as_micros() as f64),
+                Value::Date(d) => Some(d.days() as i64 as f64),
                 _ => None,
             }
         };
@@ -2861,6 +2869,28 @@ impl ColSegmentStore {
                 _ => false,
             },
             _ => false,
+        }
+    }
+
+    /// i64 fold shared by the Integer/Timestamp/Date arms (checked SUM with
+    /// float promotion on overflow — same as the segment side).
+    fn fold_i64(result: &mut AggregateResult, n: i64) {
+        result.count += 1;
+        if result.has_float {
+            result.float_sum.add(n as f64);
+        } else if let Some(s) = result.int_sum.checked_add(n) {
+            result.int_sum = s;
+        } else {
+            result.has_float = true;
+            result.float_sum = crate::types::CompSum::from_value(result.int_sum as f64);
+            result.float_sum.add(n as f64);
+        }
+        if result.count == 1 {
+            result.min_int = n;
+            result.max_int = n;
+        } else {
+            result.min_int = result.min_int.min(n);
+            result.max_int = result.max_int.max(n);
         }
     }
 
@@ -2911,6 +2941,14 @@ impl ColSegmentStore {
                     result.min_int = result.min_int.min(n);
                     result.max_int = result.max_int.max(n);
                 }
+            }
+            // 🔑 Timestamp folds as micros, Date as days (round-11) — same
+            // raw-i64 semantics as the segment-side fixed-column folds.
+            Some(Value::Timestamp(ts)) => {
+                Self::fold_i64(result, ts.as_micros());
+            }
+            Some(Value::Date(d)) => {
+                Self::fold_i64(result, d.days() as i64);
             }
             Some(Value::Null) | None => {
                 result.null_count += 1;

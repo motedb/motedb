@@ -214,3 +214,29 @@ view" 曾导致 `ORDER BY` 偶发 0 行 — 同根因, 一并消除。
 事务原子化后它只会漏**整个**事务 (不再撕裂), 对守恒负载不可观测;
 纯插入负载的 COUNT/SUM 已路由到修复后的聚合路径。跨表多行事务的
 apply 以表为单位原子 (跨表撕裂窗口仍存在, 需要全局应用序才能消除)。
+
+## round-11: 审计无新缺陷 + 三处对等加固 (2026-10-26)
+
+对 round-9/10 新代码的复审轮。**结论: 未发现新的可观测缺陷** — 三个
+审计方向全部健全, 产出为对等性加固与回归锁定:
+
+1. **buf_value_matches 补 Timestamp/Date** (round-10 引入的缺口):
+   `Value::Timestamp`/`Value::Date` 此前落入 `_ => false`。审计发现该
+   缺口实际**不可观测** — 聚合入口的内部 flush 在快照前执行, 任何
+   「查询开始前已提交」的行必然先落段 (即 round-10 的 buf-fold 本身
+   也是纵深防御而非可观测修复; 真正可观测的修复是事务原子 apply)。
+   Timestamp 按微秒、Date 按天数纳入数值比较 (与段侧 i64 语义对等),
+   `fold_value_into_agg` 同步对等 — 保证未来若移除内部 flush 或窗口
+   变宽时语义一致。
+   🔑 附带的方法论教训: 单调性断言抓不到「漏已提交行」类缺陷 (段内
+   已可见的行永不回退, buf 内的行从未可见 — 漏行表现为滞后而非回退);
+   正确断言是 `c0 = committed 读取 → SELECT → 结果 ≥ c0`。
+   (test_concurrent_agg_consistency 的 ts 变体即此断言。)
+2. **事务 read-your-writes 全面验证为正确**: 聚合 (COUNT/SUM, 含
+   WHERE 过滤) 与 PK 点查对事务自己的 buffered INSERT/UPDATE/DELETE
+   全部立即可见, ROLLBACK 完全还原 — 探针测试原以为是缺陷的两处
+   「失败」均为测试自身的期望值算错。行为以
+   `tests/test_txn_read_your_writes.rs` 锁定。
+3. **drain_prefix 退化条目单测** (round-9 flush 协议): NULL 向量
+   (dim=0 → 2 字节)、空文本 (len=0 → 4 字节)、NULL 文本、交错形状的
+   前缀解析逐字节精确 — 一字节错位即静默串列 (数据损坏非报错)。

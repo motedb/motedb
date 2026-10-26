@@ -4339,4 +4339,51 @@ mod tests {
         assert_eq!(b.column_buffers[4].len(), 1);
         assert_eq!(b.column_buffers[4][0], 1); // i=4 → even → true
     }
+
+    /// Round-11: drain_prefix must parse the degenerate variable-length
+    /// entries exactly — a NULL vector (dim=0 → 2 bytes), an empty text
+    /// (len=0 → 4 bytes), a NULL text (len=0 + null flag) and a >64KB
+    /// spatial geometry (escape-encoded 0xFFFF + u32 length). A one-byte
+    /// mis-parse silently shifts that column's values across ALL later rows.
+    #[test]
+    fn drain_prefix_handles_degenerate_var_entries() {
+        use crate::types::{ArcBytes, ArcString, ArcVec};
+        let col_types = vec![
+            ColumnType::Integer,
+            ColumnType::Text,
+            ColumnType::Tensor(2),
+        ];
+        let mut b = ColumnarSSTableBuilder::new("/tmp/x.sst", col_types);
+        let mk = |id: i64, t: Value, v: Value| vec![Value::Integer(id), t, v];
+        // 5 prefix rows with degenerate shapes, then one survivor row.
+        let rows = vec![
+            mk(1, Value::Text(ArcString(std::sync::Arc::from(""))), Value::Vector(ArcVec::new(vec![1.0, 2.0]))), // empty text
+            mk(2, Value::Null, Value::Null), // NULL text (len 0 + flag) + NULL vector (dim 0)
+            mk(3, Value::Text(ArcString(std::sync::Arc::from("abc"))), Value::Null), // NULL vector after live text
+            mk(4, Value::Null, Value::Vector(ArcVec::new(vec![3.0, 4.0]))),
+            mk(5, Value::Text(ArcString(std::sync::Arc::from("hello"))), Value::Vector(ArcVec::new(vec![5.0, 6.0]))),
+        ];
+        for (i, row) in rows.iter().enumerate() {
+            b.add_values(10 + i as u64, 100 + i as u64, false, row).unwrap();
+        }
+        b.add_values(99, 999, false, &mk(9, Value::Text(ArcString(std::sync::Arc::from("tail"))), Value::Vector(ArcVec::new(vec![9.0, 9.0]))))
+            .unwrap();
+        assert_eq!(b.num_rows, 6);
+
+        b.drain_prefix(5);
+        assert_eq!(b.num_rows, 1, "only the survivor remains");
+        assert_eq!(b.keys, vec![99u64]);
+        // Integer column: one 8-byte row.
+        assert_eq!(b.column_buffers[0].len(), 8);
+        // Text column: [len=4]["tail"] — the NULL/empty prefix entries were
+        // all parsed and drained exactly (4 + 4 + 4 + 4 + 4 = 20 bytes gone).
+        let t = &b.column_buffers[1];
+        let len = u32::from_le_bytes(t[0..4].try_into().unwrap()) as usize;
+        assert_eq!(len, 4);
+        assert_eq!(&t[4..8], b"tail");
+        // Vector column: [dim=2][8 bytes].
+        let v = &b.column_buffers[2];
+        assert_eq!(v.len(), 2 + 2 * 4);
+        assert_eq!(u16::from_le_bytes(v[0..2].try_into().unwrap()), 2);
+    }
 }
