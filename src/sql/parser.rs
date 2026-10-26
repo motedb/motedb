@@ -2717,7 +2717,39 @@ impl Parser {
                     } else {
                         self.parse_expr_list()?
                     };
-                    self.expect(TokenType::RParen)?;
+                    // 🔑 Standard SQL SUBSTRING form (round-12):
+                    // SUBSTRING(expr FROM start [FOR len]) — the comma form
+                    // was already supported; the standard form only parsed
+                    // the first arg then failed on FROM with a confusing
+                    // "Expected RParen". Rewritten into the existing
+                    // FunctionCall("substr", [expr, start, len?]) shape.
+                    let (name, args) = if name.eq_ignore_ascii_case("substring")
+                        && matches!(self.current().token_type, TokenType::From)
+                        && args.len() == 1
+                    {
+                        self.advance(); // FROM
+                        let start = self.parse_expr(0)?;
+                        let len = if matches!(
+                            &self.current().token_type,
+                            TokenType::Identifier(w) if w.eq_ignore_ascii_case("FOR")
+                        ) {
+                            self.advance();
+                            Some(self.parse_expr(0)?)
+                        } else {
+                            None
+                        };
+                        self.expect(TokenType::RParen)?;
+                        let mut sargs = Vec::with_capacity(3);
+                        sargs.push(args.into_iter().next().unwrap());
+                        sargs.push(start);
+                        if let Some(l) = len {
+                            sargs.push(l);
+                        }
+                        ("substr".to_string(), sargs)
+                    } else {
+                        self.expect(TokenType::RParen)?;
+                        (name, args)
+                    };
 
                     // Special handling for POINT(x, y) constructor — auto-converts to 3D (z=0)
                     if name.to_uppercase() == "POINT" {

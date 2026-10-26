@@ -257,6 +257,22 @@ SELECT * FROM s WHERE t LIKE 'item_9$%%' ESCAPE '$';  -- 命中 "item_9%…"
 落在模式末尾时按字面转义符匹配 (宽松处理, SQLite 在此报错)。
 回归: `tests/test_like_escape.rs` (含 NOT LIKE 组合/语法错误/reopen+索引路径)。
 
+#### SUBSTRING 标准 FROM/FOR 形式 (2026-10-26+)
+
+```sql
+-- 标准 SQL 形式与逗号形式等价 (round-12 前标准形式解析失败):
+SELECT SUBSTRING('abcdef' FROM 2 FOR 3);  -- 'bcd'
+SELECT SUBSTRING('abcdef' FROM 2);        -- 'bcdef' (省略 FOR = 到结尾)
+SELECT SUBSTRING('abcdef', 2, 3);         -- 'bcd'   (逗号形式, 兼容不变)
+SELECT SUBSTR('abcdef', 2, 3);            -- 'bcd'   (别名)
+```
+
+语义: 位置 1 起算 (0 视为 1); 负位置从尾部倒数 (SQLite 兼容)。
+回归: `tests/test_bug_hunt_v102.rs::probe_string_functions`。
+
+NULL 分工 (自洽设计, 此处明确): `CONCAT(...)` 跳过 NULL 参数
+(PostgreSQL `concat` 语义); `||` 运算符传播 NULL (SQL 标准)。
+
 #### 相关子查询 — 外引用绑定 (2026-10-24 修复)
 
 ```sql
