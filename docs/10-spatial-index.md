@@ -8,24 +8,22 @@ A hybrid R-Tree (`SpatialHybridIndex`) providing millisecond-level range queries
 CREATE TABLE locations (
     id INT,
     name TEXT,
-    coords VECTOR(2), -- [lon, lat]
+    coords GEOMETRY, -- POINT3D 为别名; POINT(lon, lat) 字面量自动补 z=0
     category TEXT
 );
 ```
 
-> Vector length = 2, representing `x=longitude` and `y=latitude` respectively.
-
 ## Creating an Index
 
-```rust
-use motedb::{Database, types::BoundingBox};
-
-let db = Database::open("geo.mote")?;
-let bounds = BoundingBox::new(-180.0, -90.0, 180.0, 90.0);
-db.create_spatial_index("locations_coords", bounds)?;
+```sql
+-- SPATIAL 与 OCTREE 是同义词; 索引类型为 i-Octree
+CREATE SPATIAL INDEX locations_coords ON locations(coords);
 ```
 
-Recommended index naming: `<table>_<column>`, for easy correspondence with `db.spatial_search()`.
+> 建模说明 (2026-10 校准): 空间列用 `GEOMETRY` (向量列 `VECTOR(2)` 会被
+> OCTREE 索引拒绝 — "requires SPATIAL column")。早期文档的
+> `coords VECTOR(2)` + Rust `create_spatial_index()` API 已过时, 以本节
+> 为准。回归: `tests/test_bug_hunt_v104.rs::probe_spatial_within_bbox`。
 
 ## Write Example
 

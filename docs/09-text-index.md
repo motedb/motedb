@@ -43,6 +43,17 @@ for (row_id, score) in hits {
 
 ## Data Import and Refresh
 
+### MATCH 作为投影表达式 (2026-10-26+)
+
+```sql
+-- WHERE 里的 MATCH 走索引; SELECT 列表里的 MATCH 按行求值为布尔
+-- (空格分词 AND、显式 OR 并集、引号短语按原文匹配; 无索引也正确)。
+-- 此前投影位置的 MATCH 一律物化为 NULL (含关键词的行也是)。
+SELECT id, MATCH(content, 'database') AS m FROM art ORDER BY id;
+```
+
+回归: `tests/test_bug_hunt_v104.rs::probe_match_projection_bool`。
+
 - Standard `INSERT` / `batch_insert_map()` works; the full-text index listens for WAL updates and merges incrementally
 - For large-scale imports:
   1. `batch_insert_map()`

@@ -11648,9 +11648,34 @@ impl QueryExecutor {
             Expr::FunctionCall { name, args, .. } => {
                 Self::eval_function_positional(name, args, row, schema)
             }
-            Expr::Match { .. } => Err(MoteDBError::Query(
-                "MATCH must be evaluated by executor".into(),
-            )),
+            // 🔑 Row-local MATCH (round-13): the positional evaluator serves
+            // the col-segment scan projection — a projected
+            // `SELECT MATCH(col, q) AS m` previously errored here and the
+            // scan masked it to NULL for every row (even matching ones).
+            // Same OR-over-tokens semantics as the evaluator/executor
+            // fallbacks; a quoted phrase matches verbatim.
+            Expr::Match {
+                column,
+                query,
+                phrase,
+            } => {
+                // 🔑 Row-local MATCH (round-13): shared AND/OR/phrase semantics
+                // with the index path (see evaluator::match_local_match).
+                let bare = column.rsplit('.').next().unwrap_or(column);
+                let cell = schema
+                    .get_column_position(column)
+                    .or_else(|| schema.get_column_position(bare))
+                    .and_then(|p| row.get(p));
+                let text = match cell {
+                    Some(Value::Text(t)) => Some(t.as_str().to_string()),
+                    _ => None,
+                };
+                Ok(Value::Bool(crate::sql::evaluator::match_local_match(
+                    text.as_deref(),
+                    query,
+                    *phrase,
+                )))
+            }
             Expr::Case { whens, else_expr } => {
                 for (cond, result) in whens {
                     let cond_val = Self::eval_expr_on_row(cond, row, schema)?;
