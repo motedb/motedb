@@ -260,10 +260,17 @@ journal acked=[] 即 kill 落在 seed 完成后、首轮 ack 前)。
 确定性无-kill 形状 `wal_replay_overlapping_segment_dedup_flag` 当前通过
 (守卫 no-kill 路径)。
 
-待查方向: ① 重放路径 `get_table_id` 与段写路径的 table_id 是否可能不同
-(重开时注册表 id 分配 vs 写入时); ② 双 recover_from_disk 调用
-(构造器 + open 扫描) 的二次加载是否引入不同 manifest 视图;
-③ kill 窗口内 .writebuf.tmp 的采纳与 WAL 记录的键前缀一致性。
+待查方向 (round-16 取证更新, 假设①已排除):
+- ✅ **已排除 — table_id 前缀不一致**: 三份物理副本的复合键前缀完全一致
+  (0x1_0000000X), 插入路径 (make_composite_key) 与重放路径同源。
+- ✅ **已确认 — 重复源**: kill 前行已 flush 成段 (seg1), WAL 记录未截断
+  (无 checkpoint), 重开重放把**已在段的行再应用一遍** (seg2), 随后
+  sync_col_segment_to_sstables 的 force_compact 合并出 seg3。
+- 🔴 **主嫌疑 — 读取路径**: 输出 16 行的查询路径**没有触碰**
+  MergeCursor / scan_projected_filtered / scan_table_rows_streaming
+  (三者全部打点、全部静默) — 指向某条 legacy columnar_sstables 与
+  col-segment 的**并集读取路径未做跨源去重** (或单源双计)。
+  下一轮: 在 StreamingQueryResult 构造点全量打点, 定位发射路径。
 
 **发版决策**: 与 round-8 转账漂移同级别 (持久可见性破坏), v0.16.0
 发版前必须归零或明确降级声明。
