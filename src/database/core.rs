@@ -1619,6 +1619,18 @@ impl MoteDB {
                     }
                 }
             }
+            // 🔴 round-17: drop STALE legacy columnar entries for
+            // ColSegmentStore tables. The "ensure columnar SSTable exists"
+            // block below builds one from the WAL-redo LSM — for store-served
+            // tables that is a SECOND materialization of the same rows
+            // coexisting with the authoritative store. Readers consulting
+            // both sources emitted every row twice (kill-recovery
+            // double-visibility: 8 seed rows reopened as 16). The store is
+            // authoritative; sync_col_segment_to_sstables re-populates the
+            // legacy map on demand from the store's latest segment.
+            for entry in db.col_segment_stores.iter() {
+                db.columnar_sstables.remove(entry.key());
+            }
             // 🔑 Recover next_row_id from ColSegmentStore segments so that
             // post-reopen INSERTs don't reuse a row_id from a previous session.
             // Without this, the non-AUTO_INCREMENT row_id counter resets to 0/1
@@ -1897,6 +1909,16 @@ impl MoteDB {
                     );
                     continue;
                 };
+                // 🔴 round-17: replayed keys MAY already exist in segments
+                // recovered from disk (rows flushed pre-crash while their WAL
+                // records persisted). The plain append_row_ref does NOT set
+                // the overlap flag, and the conservative recover-time flag
+                // needs ≥2 pre-existing segments — with exactly one recovered
+                // segment the store ended up with 2 segments and
+                // overlap_possible=false, so scans skipped newest-wins dedup
+                // and emitted every replayed row a SECOND time (kill-recovery
+                // double-visibility: 8 seed rows reopened as 16).
+                store.note_overlapping_write();
                 for (key, op) in ops {
                     let ts = db
                         .write_lsn

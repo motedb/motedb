@@ -241,36 +241,28 @@ apply 以表为单位原子 (跨表撕裂窗口仍存在, 需要全局应用序�
    (dim=0 → 2 字节)、空文本 (len=0 → 4 字节)、NULL 文本、交错形状的
    前缀解析逐字节精确 — 一字节错位即静默串列 (数据损坏非报错)。
 
-## 🔴 round-15 已知开放问题: kill 后种子行双重可见 (2026-10-27, 发版阻断项)
+## ✅ round-15→17: kill 后种子行双重可见 (已归零, 2026-10-27)
 
-新崩溃形状 (事务内 [DELETE 同 PK → 重插 → 链式 UPDATE] × kill) 暴露:
-~50-75% 的 40 轮 soak 中, 重开后 8 行种子数据**可见两次** (16 行, 值 -1,
-journal acked=[] 即 kill 落在 seed 完成后、首轮 ack 前)。
+round-15 立案的崩溃恢复双重可见 (8 行种子数据 kill 后重开可见 16 行,
+~50-75% soak 复现) 于 round-17 根因归零。
 
-取证 (探针实测): recover 载入 N 段 + WAL 重放 M op, `overlap_possible`
-全程 true, 重放段与既有段键理应 newest-wins 去重 — 但重开后的扫描输出
-16 个**互异**复合键, 强烈指向两份副本位于不同的 table_id 键前缀下
-(段副本 vs 重放副本)。旧崩溃矩阵 7 形状 (含 INSERT 前缀/UPDATE-DELETE/
-事务原子性/时序/并发/upsert) 在 round-9/10 新协议上全部复验通过 —
-仅此新形状失败, 且失败需要 [autocommit seed + 语句前 flush + kill]
-的特定交叠 (自动 flush 线程 + 事务语句的 flush-before-read 均可触发)。
+**完整机制** (探针逐层实证): ① kill 时行已 flush 成段 (seg1) 而 WAL 记录
+未截断; ② 重开 recover_from_disk 只载入 1 段 — 保守 overlap 标志需要
+≥2 段才置位, 保持 false; ③ WAL 重放用**普通** append_row_ref 把同键行
+再应用一遍 (seg2) — 不置重叠标志; ④ 结果: 2 段 + overlap_possible=
+false → 扫描跳过 newest-wins 去重, 每个 replayed 行输出第二次。
 
-复现器: `tests/test_crash_injection.rs::test_kill9_delreins_recovers_exactly`
-(`#[ignore]` 已知失败, `MOTEDB_CRASH_ITERS=40` soak);
-确定性无-kill 形状 `wal_replay_overlapping_segment_dedup_flag` 当前通过
-(守卫 no-kill 路径)。
+**修复**: WAL 重放循环前置 `store.note_overlapping_write()` (重放的键
+可能与已恢复段重叠 — 恰是本场景)。一行修复, 480 次 kill soak 清零
+(此前 1-2 次即复现)。
 
-待查方向 (round-16 取证更新, 假设①已排除):
-- ✅ **已排除 — table_id 前缀不一致**: 三份物理副本的复合键前缀完全一致
-  (0x1_0000000X), 插入路径 (make_composite_key) 与重放路径同源。
-- ✅ **已确认 — 重复源**: kill 前行已 flush 成段 (seg1), WAL 记录未截断
-  (无 checkpoint), 重开重放把**已在段的行再应用一遍** (seg2), 随后
-  sync_col_segment_to_sstables 的 force_compact 合并出 seg3。
-- 🔴 **主嫌疑 — 读取路径**: 输出 16 行的查询路径**没有触碰**
-  MergeCursor / scan_projected_filtered / scan_table_rows_streaming
-  (三者全部打点、全部静默) — 指向某条 legacy columnar_sstables 与
-  col-segment 的**并集读取路径未做跨源去重** (或单源双计)。
-  下一轮: 在 StreamingQueryResult 构造点全量打点, 定位发射路径。
+**case**: `tests/test_crash_injection.rs::test_kill9_delreins_recovers_exactly`
+(已解禁; 每轮 [DELETE 同 PK→重插→链式 UPDATE]×kill, 按 journal 精确
+推演期望值, 含 ack 窗口容忍至多一个已提交未 ack 轮)。另
+`wal_replay_overlapping_segment_dedup_flag` 锁定无-kill 重放去重路径。
 
-**发版决策**: 与 round-8 转账漂移同级别 (持久可见性破坏), v0.16.0
-发版前必须归零或明确降级声明。
+**取证方法论沉淀**: 排除法逐路径打点 (MergeCursor / scan_projected_
+filtered / scan_table_rows_streaming / LSM 扫描 / Segment 解码 /
+build_column_segment 全部静默) → 定位到「2 段 + 标志 false」状态本身;
+教训: `cargo test/run` 不透传环境变量前缀 (必须 export), release 剥符号
+致 backtrace 无效 (debug 才可读)。

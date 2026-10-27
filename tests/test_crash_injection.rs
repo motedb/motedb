@@ -1012,7 +1012,6 @@ fn read_journal(path: &std::path::Path) -> Vec<i64> {
 /// A killed mid-txn round must contribute nothing (atomic apply); the WAL
 /// order [delete → insert] must leave the re-inserted row live.
 #[test]
-#[ignore = "KNOWN-FAIL (round-15 open; round-16 取证更新): kill during delreins workload — ~50-75% of 40-iter soaks reopen with the 8 seed rows VISIBLE TWICE (16 rows, values -1, acked=[]). round-16 hard evidence: ① all three physical copies share the IDENTICAL key prefix (0x1_0000000X — table_id 一致, 前缀假设排除); ② the duplication source is WAL replay re-applying rows ALREADY flushed to a segment pre-kill (seg id=1) — replay appends + flush → seg id=2, then sync force_compact → seg id=3; ③ the 16-row emitting path runs WITHOUT touching MergeCursor / scan_projected_filtered / scan_table_rows_streaming (all instrumented, all silent) — prime suspect: a legacy columnar_sstables ∪ col-segment union path without cross-source dedup. Hunt continues; see docs/05."]
 fn test_kill9_delreins_recovers_exactly() {
     let iterations: usize = std::env::var("MOTEDB_CRASH_ITERS")
         .ok()
@@ -1093,14 +1092,14 @@ fn test_kill9_delreins_recovers_exactly() {
             }
             m
         };
-        let last = acked.last().copied();
+        // At most ONE round can be committed-but-unacked (the kill lands in a
+        // single ack gap). With an empty journal that round may be round 0.
+        let last = acked.last().copied().unwrap_or(-1);
         let candidates: Vec<std::collections::HashMap<i64, i64>> = {
             let mut v = vec![expect_for(&acked)];
-            if let Some(l) = last {
-                let mut ext = acked.clone();
-                ext.push(l + 1);
-                v.push(expect_for(&ext));
-            }
+            let mut ext = acked.clone();
+            ext.push(last + 1);
+            v.push(expect_for(&ext));
             v
         };
         for r in &rows {
