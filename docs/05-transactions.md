@@ -240,3 +240,30 @@ apply 以表为单位原子 (跨表撕裂窗口仍存在, 需要全局应用序�
 3. **drain_prefix 退化条目单测** (round-9 flush 协议): NULL 向量
    (dim=0 → 2 字节)、空文本 (len=0 → 4 字节)、NULL 文本、交错形状的
    前缀解析逐字节精确 — 一字节错位即静默串列 (数据损坏非报错)。
+
+## 🔴 round-15 已知开放问题: kill 后种子行双重可见 (2026-10-27, 发版阻断项)
+
+新崩溃形状 (事务内 [DELETE 同 PK → 重插 → 链式 UPDATE] × kill) 暴露:
+~50-75% 的 40 轮 soak 中, 重开后 8 行种子数据**可见两次** (16 行, 值 -1,
+journal acked=[] 即 kill 落在 seed 完成后、首轮 ack 前)。
+
+取证 (探针实测): recover 载入 N 段 + WAL 重放 M op, `overlap_possible`
+全程 true, 重放段与既有段键理应 newest-wins 去重 — 但重开后的扫描输出
+16 个**互异**复合键, 强烈指向两份副本位于不同的 table_id 键前缀下
+(段副本 vs 重放副本)。旧崩溃矩阵 7 形状 (含 INSERT 前缀/UPDATE-DELETE/
+事务原子性/时序/并发/upsert) 在 round-9/10 新协议上全部复验通过 —
+仅此新形状失败, 且失败需要 [autocommit seed + 语句前 flush + kill]
+的特定交叠 (自动 flush 线程 + 事务语句的 flush-before-read 均可触发)。
+
+复现器: `tests/test_crash_injection.rs::test_kill9_delreins_recovers_exactly`
+(`#[ignore]` 已知失败, `MOTEDB_CRASH_ITERS=40` soak);
+确定性无-kill 形状 `wal_replay_overlapping_segment_dedup_flag` 当前通过
+(守卫 no-kill 路径)。
+
+待查方向: ① 重放路径 `get_table_id` 与段写路径的 table_id 是否可能不同
+(重开时注册表 id 分配 vs 写入时); ② 双 recover_from_disk 调用
+(构造器 + open 扫描) 的二次加载是否引入不同 manifest 视图;
+③ kill 窗口内 .writebuf.tmp 的采纳与 WAL 记录的键前缀一致性。
+
+**发版决策**: 与 round-8 转账漂移同级别 (持久可见性破坏), v0.16.0
+发版前必须归零或明确降级声明。

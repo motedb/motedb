@@ -134,6 +134,37 @@ fn crash_child_mode() {
                 journal.flush().unwrap();
             }
         }
+        // 🔴 round-15 delreins workload: per round a 3-statement txn
+        // [DELETE key k; re-INSERT key k (same PK, new value); UPDATE key
+        // (k+1)%8 (+1000)]. Exercises exactly what round-10 changed:
+        // - WAL record order [delete → insert → update] on recovery,
+        // - the tombstone-before-reinsert newest-wins contract,
+        // - the single-critical-section apply (a killed round is all-or-
+        //   nothing across its 3 statements).
+        "delreins" => {
+            db.execute("CREATE TABLE IF NOT EXISTS crash_dr (id INT PRIMARY KEY, val INT)")
+                .expect("create table");
+            for k in 0..8i64 {
+                db.execute(&format!("INSERT INTO crash_dr VALUES ({k}, -1)"))
+                    .expect("seed");
+            }
+            writeln!(journal, "S").unwrap();
+            journal.flush().unwrap();
+            for i in 0..iterations as i64 {
+                let k = i % 8;
+                let u = (k + 1) % 8;
+                db.execute("BEGIN").expect("begin");
+                db.execute(&format!("DELETE FROM crash_dr WHERE id = {k}"))
+                    .expect("delete");
+                db.execute(&format!("INSERT INTO crash_dr VALUES ({k}, {i})"))
+                    .expect("reinsert");
+                db.execute(&format!("UPDATE crash_dr SET val = val + 1000 WHERE id = {u}"))
+                    .expect("chained update");
+                db.execute("COMMIT").expect("commit");
+                writeln!(journal, "{i}").unwrap();
+                journal.flush().unwrap();
+            }
+        }
         // TimeSeries workload: monotonically increasing timestamps at a fixed
         // step. The parent verifies a contiguous timestamp prefix with exact
         // values (exercises the columnar_store.replay_row recovery path,
@@ -378,6 +409,7 @@ fn spawn_kill_child(
     delay_ms: u64,
     mode: &str,
 ) -> bool {
+    let dbg_stderr = std::env::var_os("MOTE_REPLAY_DEBUG").is_some();
     let mut child = Command::new(std::env::current_exe().expect("current exe"))
         .arg("crash_child_mode")
         .arg("--exact")
@@ -385,7 +417,7 @@ fn spawn_kill_child(
         .env("MOTEDB_CRASH_CHILD_JOURNAL", journal_path)
         .env("MOTEDB_CRASH_CHILD_MODE", mode)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if dbg_stderr { Stdio::inherit() } else { Stdio::null() })
         .spawn()
         .expect("spawn crash child");
     std::thread::sleep(Duration::from_millis(delay_ms));
@@ -969,4 +1001,169 @@ fn read_journal(path: &std::path::Path) -> Vec<i64> {
     // lines; a torn line means the ack never completed, so it makes no
     // durability promise.
     s.lines().filter_map(|l| l.parse::<i64>().ok()).collect()
+}
+
+// ── Parent: delete→re-INSERT round recovery (round-15) ────────────────────
+
+/// Kill during the delreins workload, reopen, and verify EXACT final values:
+/// for key j, val = (last acked round i with i%8==j, else the seed -1)
+///                + 1000 × (#acked rounds whose update target was j).
+/// A killed mid-txn round must contribute nothing (atomic apply); the WAL
+/// order [delete → insert] must leave the re-inserted row live.
+#[test]
+#[ignore = "KNOWN-FAIL (round-15, open): kill during delreins workload — ~50-75% of 40-iter soaks reopen with the 8 seed rows VISIBLE TWICE (16 rows, values -1, acked=[]). Probes show recover loaded N segments + WAL replay M ops with overlap=true throughout, yet the post-reopen scan emits 16 DISTINCT composite keys — strongly suggests the two copies live under DIFFERENT table_id key prefixes (segment copy vs replay copy). Root-cause hunt ongoing; see docs/05 round-15 section."]
+fn test_kill9_delreins_recovers_exactly() {
+    let iterations: usize = std::env::var("MOTEDB_CRASH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let mut rng_state: u64 = 0xDE1E_C0FE_0000_0001u64;
+    let next_delay_ms = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state % 200) + 10
+    };
+
+    let mut killed_runs = 0;
+    for iter in 0..iterations {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("crash.mote");
+        let journal_path = dir.path().join("acked.txt");
+        let delay = next_delay_ms(&mut rng_state);
+        if spawn_kill_child(&db_path, &journal_path, delay, "delreins") {
+            killed_runs += 1;
+        }
+
+        let seeded = read_journal_lines(&journal_path)
+            .iter()
+            .any(|l| l.trim() == "S");
+        let acked: Vec<i64> = read_journal_lines(&journal_path)
+            .iter()
+            .filter_map(|l| l.trim().parse::<i64>().ok())
+            .collect();
+
+        let db = match Database::open(&db_path) {
+            Ok(db) => db,
+            // Kill during DB initialization (before any acked write): an
+            // un-openable half-initialized directory loses nothing acked.
+            Err(e) if acked.is_empty() && !seeded => continue,
+            Err(e) => panic!("iter {iter}: reopen failed: {e}"),
+        };
+        let rows = match db.query("SELECT id, val FROM crash_dr") {
+            Ok(rs) => rs,
+            Err(e) if e.to_string().contains("not found") && acked.is_empty() => {
+                drop(db);
+                continue;
+            }
+            Err(e) => panic!("iter {iter}: query failed: {e}"),
+        };
+        drop(db);
+
+        if !seeded {
+            // Kill happened during seeding: any subset of the 8 seed rows
+            // (val -1) is legal — autocommit INSERTs acked individually.
+            assert!(
+                rows.len() <= 8
+                    && rows.iter().all(|r| matches!(r.get(1), Some(Value::Integer(-1)))),
+                "iter {iter}: pre-seed kill must leave only seed rows: {rows:?}"
+            );
+            continue;
+        }
+        // 8 rows after seeding + any number of delete/reinsert rounds.
+        assert_eq!(
+            rows.len(),
+            8,
+            "iter {iter}: delete+reinsert conserves row count (acked {:?}) rows={rows:?}",
+            acked
+        );
+
+        // Expected value per key from the acked rounds. 🔑 Ack window: the
+        // kill can land BETWEEN a round's COMMIT returning Ok and its journal
+        // line being written — one trailing COMMITTED-but-unacked round may
+        // legitimately exist. Accept expected(acked) OR expected(acked+next).
+        let expect_for = |rounds: &[i64]| -> std::collections::HashMap<i64, i64> {
+            let mut m: std::collections::HashMap<i64, i64> = (0..8).map(|j| (j, -1)).collect();
+            for &i in rounds {
+                let k = i % 8;
+                let u = (k + 1) % 8;
+                *m.get_mut(&k).unwrap() = i; // reinsert overwrites
+                *m.get_mut(&u).unwrap() += 1000; // chained update adds
+            }
+            m
+        };
+        let last = acked.last().copied();
+        let candidates: Vec<std::collections::HashMap<i64, i64>> = {
+            let mut v = vec![expect_for(&acked)];
+            if let Some(l) = last {
+                let mut ext = acked.clone();
+                ext.push(l + 1);
+                v.push(expect_for(&ext));
+            }
+            v
+        };
+        for r in &rows {
+            let (id, val) = match (r.first(), r.get(1)) {
+                (Some(Value::Integer(id)), Some(Value::Integer(v))) => (*id, *v),
+                o => panic!("iter {iter}: row shape {o:?}"),
+            };
+            assert!(
+                candidates.iter().any(|m| m[&id] == val),
+                "iter {iter}: key {id} val {val} matches neither candidate                  ({:?}) (acked {:?})",
+                candidates, acked
+            );
+        }
+    }
+    assert!(killed_runs > 0, "no run was actually killed — test did nothing");
+}
+
+/// 🔴 round-15 确定性复现 (无 kill): WAL 重放产生重叠段但 overlap 标志未置。
+/// 形状: 行已 flush 成段 (例如语句前 flush), WAL 未截断 (无 checkpoint),
+/// 重开 → 段恢复 (1 段 → 保守标志不置) + WAL 重放追加同键行成第 2 段
+/// → 扫描双行 (8 行表变 16)。
+#[test]
+fn wal_replay_overlapping_segment_dedup_flag() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("replay.mote");
+    {
+        let db = Database::create(&db_path).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        for i in 0..8i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {i})")).unwrap();
+        }
+        // 一次查询触发 prepare_for_query → buf flush 成段 (WAL 仍保留)。
+        let n: i64 = match db
+            .execute("SELECT COUNT(*) FROM t")
+            .unwrap()
+            .materialize()
+            .unwrap()
+            .select_rows()
+            .unwrap()
+            .1[0][0]
+            .clone()
+        {
+            Value::Integer(n) => n,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(n, 8, "pre-reopen count");
+        // 不 CHECKPOINT 直接 drop — WAL 里 8 条 INSERT 仍在。
+    }
+    let db = Database::open(&db_path).unwrap();
+    let rows = db
+        .execute("SELECT id, v FROM t")
+        .unwrap()
+        .materialize()
+        .unwrap()
+        .select_rows()
+        .unwrap()
+        .1
+        .to_vec();
+    assert_eq!(rows.len(), 8, "WAL replay of already-flushed rows must dedup: {rows:?}");
+    // 值也必须正确 (newest-wins)。
+    for r in &rows {
+        match (&r[0], &r[1]) {
+            (Value::Integer(i), Value::Integer(v)) => assert_eq!(i, v, "value intact"),
+            o => panic!("shape {o:?}"),
+        }
+    }
 }
