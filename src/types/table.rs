@@ -526,6 +526,12 @@ impl TableSchema {
                 }
                 (ColumnType::Float, crate::types::Value::Float(_)) => true,
                 (ColumnType::Float, crate::types::Value::Integer(_)) => true, // Allow integer to float conversion
+                // 🔖 Quoted numeric spellings coerce at insert time
+                // (coerce_row_to_schema) — includes the IEEE specials
+                // 'NaN'/'inf'/'Infinity', which have no SQL literal form.
+                (ColumnType::Float, crate::types::Value::Text(t)) => {
+                    t.as_str().trim().parse::<f64>().is_ok()
+                }
                 (ColumnType::Boolean, crate::types::Value::Bool(_)) => true,
                 (ColumnType::Text, crate::types::Value::Text(t)) => {
                     // 🔑 The columnar TEXT layout (u32 offsets on disk, u32

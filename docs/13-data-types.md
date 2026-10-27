@@ -24,6 +24,11 @@ pub enum Value {
 - SQL: `INT`, `FLOAT`, `BOOL`
 - Rust: `Value::Integer`, `Value::Float`, `Value::Bool`
 - Automatically supports comparison, range queries, and aggregation
+- 🔖 FLOAT 列接受引号数字拼写 (2026-10-27+)：`'3.5'` 以及 IEEE 特殊值
+  `'NaN'` / `'inf'` / `'Infinity'`（这些值没有 SQL 字面量形式，裸 `NaN`
+  会按列名解析）。与 DATE/VECTOR 接受各自字符串拼写的约定对齐；
+  不可解析文本仍报清晰的类型错误。回归:
+  `tests/test_bug_hunt_v105.rs::probe_nan_inf_roundtrip`。
 
 ### Text
 

@@ -929,8 +929,24 @@ impl MoteDB {
                 }
             }
             if matches!(ct, crate::types::ColumnType::Float) {
-                if let Some(crate::types::Value::Integer(v)) = row.get(i) {
-                    row[i] = crate::types::Value::Float(*v as f64);
+                match row.get(i) {
+                    Some(crate::types::Value::Integer(v)) => {
+                        row[i] = crate::types::Value::Float(*v as f64);
+                    }
+                    // 🔖 FLOAT columns accept quoted numeric spellings — Rust
+                    // f64 parsing covers '3.5' and the IEEE specials
+                    // ('NaN' / 'inf' / 'Infinity'), which otherwise have NO
+                    // literal form at all (round-14: even a bare NaN keyword
+                    // parses as a column). DATE/VECTOR/TIMESTAMP already
+                    // accept their string spellings; this closes the gap.
+                    // Unparseable text stays Text and fails validation with
+                    // the existing clear error (same pattern as Date).
+                    Some(crate::types::Value::Text(s)) => {
+                        if let Ok(f) = s.as_str().trim().parse::<f64>() {
+                            row[i] = crate::types::Value::Float(f);
+                        }
+                    }
+                    _ => {}
                 }
             }
             // 🔖 DATE columns accept string literals 'YYYY-MM-DD' (and
