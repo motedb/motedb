@@ -101,9 +101,10 @@ fn timestamp_filtered_count_sees_all_committed_rows() {
                 let c0 = committed.load(Ordering::SeqCst) as i64;
                 if let Ok(n) = db
                     .execute(&q)
-                    .and_then(|r| r.materialize().map_err(|e| e.into()))
+                    .and_then(|r| r.materialize())
                 {
-                    if let (_, rows) = n.select_rows().unwrap() {
+                    let (_, rows) = n.select_rows().unwrap();
+                    {
                         match &rows[0][0] {
                             V::Integer(v) => {
                                 if *v < c0 {
@@ -196,9 +197,10 @@ fn transfer_sums_exact_on_every_observation() {
                 // 升级错误也记录 (SUM 读出错误即是失败)。
                 if let Ok(n) = db
                     .execute(&q)
-                    .and_then(|r| r.materialize().map_err(|e| e.into()))
+                    .and_then(|r| r.materialize())
                 {
-                    if let (_, rows) = n.select_rows().unwrap() {
+                    let (_, rows) = n.select_rows().unwrap();
+                    {
                         if let V::Integer(v) = &rows[0][0] {
                             if *v != TOTAL {
                                 bad.lock()
@@ -263,9 +265,10 @@ fn count_monotone_under_concurrent_inserts() {
             while !stop.load(Ordering::Relaxed) {
                 if let Ok(n) = db
                     .execute(&q)
-                    .and_then(|r| r.materialize().map_err(|e| e.into()))
+                    .and_then(|r| r.materialize())
                 {
-                    if let (_, rows) = n.select_rows().unwrap() {
+                    let (_, rows) = n.select_rows().unwrap();
+                    {
                         if let V::Integer(v) = &rows[0][0] {
                             if *v < max_seen {
                                 bad.lock().unwrap().push(format!(

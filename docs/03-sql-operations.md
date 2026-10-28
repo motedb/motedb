@@ -204,6 +204,22 @@ let results = db.query("SELECT name, email FROM users")?;
 let results = db.query("SELECT * FROM users WHERE age > 25")?;
 ```
 
+### Column Aliases
+
+`AS` 可省略 —— 隐式别名与显式别名等价（round-20 修复：此前无 `AS` 的别名
+会报误导性的 `Multiple statements are not supported` 解析错误）：
+
+```sql
+SELECT name n FROM users;                  -- 列引用隐式别名
+SELECT score * 2 AS final FROM users;      -- 表达式显式别名
+SELECT dept d, COUNT(*) headcount
+  FROM users GROUP BY d HAVING headcount > 2;   -- 聚合隐式别名
+```
+
+别名可在 `ORDER BY` / `GROUP BY` / `HAVING` 中引用（如上 `GROUP BY d`、
+`HAVING headcount`）；`WHERE` 中引用别名会报 `ColumnNotFound`（与标准 SQL
+一致 —— `WHERE` 先于投影求值）。
+
 ### WHERE Conditions
 
 Supported operators:
@@ -218,6 +234,13 @@ Supported operators:
 | `OR` | Logical OR | `WHERE age < 20 OR age > 60` |
 | `IN` | Range matching | `WHERE id IN (1, 2, 3)` |
 | `LIKE` | Pattern matching | `WHERE name LIKE '%Alice%'` |
+
+> 🔴 **列名校验（round-20）**：单表 SELECT / UPDATE / DELETE 的 WHERE 中引用
+> 不存在的列会立即报 `ColumnNotFound`。此前过滤路径把求值错误静默当作
+> "不匹配" —— 拼错列名（`WHERE usr_id = 5`）返回 0 行且无任何错误提示，
+> 属于静默错误结果。JOIN 查询与相关子查询不受此校验影响（相关子查询引用
+> 外层列是合法的）。WHERE 中引用 SELECT 列表的别名同样报错（与标准 SQL
+> 一致：别名在 WHERE 之后绑定）。
 
 #### Examples
 

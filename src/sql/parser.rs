@@ -1039,6 +1039,15 @@ impl Parser {
                 // Check for AS alias
                 let alias = if self.match_token(TokenType::As) {
                     Some(self.parse_identifier()?)
+                } else if matches!(self.current().token_type, TokenType::Identifier(_)) {
+                    // 🔴 round-20: implicit alias — `SELECT v x`,
+                    // `SELECT COUNT(*) c`, `SELECT v + 1 total`. Every clause
+                    // boundary (FROM/WHERE/GROUP/.../UNION/OFFSET) is a real
+                    // keyword token and `ASOF`/`CROSS` never follow a select
+                    // item, so a bare Identifier here can only be an alias.
+                    // Before this, such queries died with the misleading
+                    // "Multiple statements are not supported" parse error.
+                    Some(self.parse_identifier()?)
                 } else {
                     None
                 };

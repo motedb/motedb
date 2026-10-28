@@ -1047,7 +1047,7 @@ fn test_kill9_delreins_recovers_exactly() {
             Ok(db) => db,
             // Kill during DB initialization (before any acked write): an
             // un-openable half-initialized directory loses nothing acked.
-            Err(e) if acked.is_empty() && !seeded => continue,
+            Err(_) if acked.is_empty() && !seeded => continue,
             Err(e) => panic!("iter {iter}: reopen failed: {e}"),
         };
         let rows = match db.query("SELECT id, val FROM crash_dr") {

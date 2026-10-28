@@ -89,6 +89,16 @@ def _text(content: str) -> dict:
     return {"content": [{"type": "text", "text": content}]}
 
 
+def _rows_payload(rows: list) -> str:
+    """Cap tool output at _MAX_ROWS and SAY so — a silently-truncated (or
+    unbounded multi-MB) result misleads the agent either way."""
+    if len(rows) > _MAX_ROWS:
+        return json.dumps(rows[:_MAX_ROWS], ensure_ascii=False, default=str) + (
+            f'\n_note: truncated to first {_MAX_ROWS} of {len(rows)} rows_'
+        )
+    return json.dumps(rows, ensure_ascii=False, default=str)
+
+
 def _call(db, name: str, args: dict) -> dict:
     if name == "list_tables":
         rows = db.execute("SHOW TABLES")
@@ -100,7 +110,7 @@ def _call(db, name: str, args: dict) -> dict:
     if name == "query":
         sql = args["sql"]
         rows = db.execute(sql, params=args.get("params"))
-        return _text(json.dumps(rows[:_MAX_ROWS], ensure_ascii=False, default=str))
+        return _text(_rows_payload(rows))
     if name == "vector_search":
         table = args["table"].replace('"', "")
         column = args["column"].replace('"', "")
@@ -111,11 +121,11 @@ def _call(db, name: str, args: dict) -> dict:
             f"SELECT {select} FROM {table} ORDER BY {column} <-> ? LIMIT {k}",
             params=[json.loads(vec)],
         )
-        return _text(json.dumps(rows, ensure_ascii=False, default=str))
+        return _text(_rows_payload(rows))
     if name == "episodes":
         table = args["table"].replace('"', "")
         rows = db.execute(f"SELECT * FROM EPISODES({table})")
-        return _text(json.dumps(rows[:_MAX_ROWS], ensure_ascii=False, default=str))
+        return _text(_rows_payload(rows))
     if name == "doctor":
         return _text(db.doctor())
     raise ValueError(f"unknown tool: {name}")

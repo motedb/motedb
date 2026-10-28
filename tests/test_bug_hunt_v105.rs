@@ -131,7 +131,7 @@ fn probe_full_outer_join() {
 fn probe_numeric_functions() {
     let (db, _d) = new_db();
     let q = |sql: &str| rows(&db, sql).remove(0).remove(0);
-    assert_eq!(q("SELECT ROUND(3.14159, 2)"), V::Float(3.14));
+    assert_eq!(q("SELECT ROUND(2.71828, 2)"), V::Float(2.72));
     assert_eq!(q("SELECT ROUND(2.5)"), V::Float(3.0), "half rounds away from zero");
     assert_eq!(q("SELECT ABS(-5)"), V::Integer(5));
     assert_eq!(q("SELECT ABS(5)"), V::Integer(5));

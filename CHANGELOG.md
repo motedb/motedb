@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- **🔴 修复(SQL 兼容性): SELECT 列表隐式别名** — 无 `AS` 的别名
+  (`SELECT v x`、`SELECT COUNT(*) c`、`SELECT v + 1 total`)曾全部死于误导性
+  `Multiple statements are not supported` 解析错误。MySQL/SQLite/Postgres
+  标准写法, ORM/分析查询高频。修复后别名可在 ORDER BY / GROUP BY / HAVING
+  中引用 (round-20, tests/test_bug_hunt_v110.rs)
+- **🔴 修复(静默错误结果): WHERE 未知列被静默吞掉** — 单表 SELECT/UPDATE/
+  DELETE 的 WHERE 引用不存在的列时, 逐行过滤路径把求值错误当作"不匹配":
+  `WHERE usr_id = 5` (拼错列名) 返回 0 行且无任何错误提示, UPDATE/DELETE
+  则静默 affected_rows: 0。现于语句入口做一次 schema 绑定校验, 立即报
+  `ColumnNotFound`。JOIN 查询与相关子查询(引用外层列)不受影响; WHERE 引用
+  SELECT 别名仍按标准报错 (round-20)
+- **clippy 门禁升级**: `cargo clippy --all-targets` 零警告(此前 lib-only,
+  测试代码 8 处历史遗留告警清零)
+
 - **🔑 向量索引旋钮 SQL 化 (§9)**: `CREATE VECTOR INDEX ... WITH (metric=,
   max_degree=, build_search_list=, search_list=)` — R 与构建束宽可调,
   构建束宽由硬编码阶梯(300/150/80)改为可覆盖。双形验证(100K×384 聚簇+

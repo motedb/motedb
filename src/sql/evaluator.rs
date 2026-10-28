@@ -3065,6 +3065,36 @@ fn dtw_multi(a: &[f32], b: &[f32], samples: usize, dim: usize) -> f32 {
     prev[m]
 }
 
+/// 🔑 Row-local MATCH semantics (round-13), shared by the evaluator and the
+/// executor's positional evaluator. Mirrors the index path: whitespace
+/// tokens AND together; a case-insensitive `OR` token splits alternatives
+/// (any alternative fully present matches); quoted phrases match verbatim;
+/// non-text cells never match.
+pub(crate) fn match_local_match(cell: Option<&str>, query: &str, phrase: bool) -> bool {
+    use crate::index::tokenizers::{Tokenizer as _, WhitespaceTokenizer};
+    let Some(hay) = cell else { return false };
+    if phrase {
+        return hay.contains(query);
+    }
+    let tok = WhitespaceTokenizer::default();
+    let q: Vec<String> = tok.tokenize(query).iter().map(|t| t.text.clone()).collect();
+    if q.is_empty() {
+        return false;
+    }
+    let hay_tokens: Vec<String> = tok.tokenize(hay).iter().map(|t| t.text.clone()).collect();
+    // Split alternatives on the OR operator, then AND within each.
+    let mut groups: Vec<Vec<String>> = vec![Vec::new()];
+    for t in q {
+        if t.eq_ignore_ascii_case("or") {
+            groups.push(Vec::new());
+        } else {
+            groups.last_mut().unwrap().push(t);
+        }
+    }
+    groups.iter().any(|g| {
+        !g.is_empty() && g.iter().all(|term| hay_tokens.contains(term))
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3630,33 +3660,4 @@ mod tests {
     }
 }
 
-/// 🔑 Row-local MATCH semantics (round-13), shared by the evaluator and the
-/// executor's positional evaluator. Mirrors the index path: whitespace
-/// tokens AND together; a case-insensitive `OR` token splits alternatives
-/// (any alternative fully present matches); quoted phrases match verbatim;
-/// non-text cells never match.
-pub(crate) fn match_local_match(cell: Option<&str>, query: &str, phrase: bool) -> bool {
-    use crate::index::tokenizers::{Tokenizer as _, WhitespaceTokenizer};
-    let Some(hay) = cell else { return false };
-    if phrase {
-        return hay.contains(query);
-    }
-    let tok = WhitespaceTokenizer::default();
-    let q: Vec<String> = tok.tokenize(query).iter().map(|t| t.text.clone()).collect();
-    if q.is_empty() {
-        return false;
-    }
-    let hay_tokens: Vec<String> = tok.tokenize(hay).iter().map(|t| t.text.clone()).collect();
-    // Split alternatives on the OR operator, then AND within each.
-    let mut groups: Vec<Vec<String>> = vec![Vec::new()];
-    for t in q {
-        if t.eq_ignore_ascii_case("or") {
-            groups.push(Vec::new());
-        } else {
-            groups.last_mut().unwrap().push(t);
-        }
-    }
-    groups.iter().any(|g| {
-        !g.is_empty() && g.iter().all(|term| hay_tokens.contains(term))
-    })
-}
+

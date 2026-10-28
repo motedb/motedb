@@ -4347,7 +4347,7 @@ mod tests {
     /// mis-parse silently shifts that column's values across ALL later rows.
     #[test]
     fn drain_prefix_handles_degenerate_var_entries() {
-        use crate::types::{ArcBytes, ArcString, ArcVec};
+        use crate::types::{ArcString, ArcVec};
         let col_types = vec![
             ColumnType::Integer,
             ColumnType::Text,
@@ -4356,9 +4356,9 @@ mod tests {
         let mut b = ColumnarSSTableBuilder::new("/tmp/x.sst", col_types);
         let mk = |id: i64, t: Value, v: Value| vec![Value::Integer(id), t, v];
         // 5 prefix rows with degenerate shapes, then one survivor row.
-        let rows = vec![
+        let rows = [
             mk(1, Value::Text(ArcString(std::sync::Arc::from(""))), Value::Vector(ArcVec::new(vec![1.0, 2.0]))), // empty text
-            mk(2, Value::Null, Value::Null), // NULL text (len 0 + flag) + NULL vector (dim 0)
+            mk(2, Value::Null, Value::Null), // NULL text (len 0 + flag) + NULL vector
             mk(3, Value::Text(ArcString(std::sync::Arc::from("abc"))), Value::Null), // NULL vector after live text
             mk(4, Value::Null, Value::Vector(ArcVec::new(vec![3.0, 4.0]))),
             mk(5, Value::Text(ArcString(std::sync::Arc::from("hello"))), Value::Vector(ArcVec::new(vec![5.0, 6.0]))),

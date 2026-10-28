@@ -5410,6 +5410,14 @@ impl QueryExecutor {
         } else {
             stmt
         };
+        // 🔴 round-20: unknown column in WHERE must ERROR, not silently
+        // filter to empty (per-row paths swallow eval errors by design).
+        if let (Some(wc), Some(TableRef::Table { name, .. })) = (&stmt.where_clause, &stmt.from) {
+            if !MATERIALIZED_CTES.with(|m| m.borrow().contains_key(name)) {
+                let schema = self.db.get_table_schema(name)?;
+                Self::validate_where_columns(wc, &schema)?;
+            }
+        }
         // 🔓 v2 CTE: a single-table FROM naming a materialized CTE must take
         // the generic materialized path — the columnar/optimizer fast paths
         // below resolve names against real storage only.
@@ -10691,6 +10699,104 @@ impl QueryExecutor {
     /// Per-row WHERE truthiness: prefer the pre-compiled predicate (pure
     /// positional compare), fall back to positional eval when the compiled
     /// form can't decide (eval → None) or was never compiled.
+    /// 🔴 round-20: upfront WHERE column binding for single-table
+    /// SELECT/UPDATE/DELETE.
+    ///
+    /// Per-row filter paths swallow evaluation errors BY DESIGN (an Err
+    /// becomes "no match" so dynamic fallbacks stay cheap), which turned
+    /// column typos into silent empty results: `WHERE usr_id = 5` returned
+    /// 0 rows with no error instead of ColumnNotFound. This walk pins the
+    /// schema binding once per statement, BEFORE any row evaluation.
+    ///
+    /// Resolution mirrors `eval_expr_on_row`'s Expr::Column arm exactly
+    /// (exact → stripped-prefix → bare-vs-qualified schema match), so
+    /// anything that would have evaluated keeps validating. It does NOT
+    /// descend into `Subquery`/`Exists` subtrees: correlated subqueries
+    /// legally reference OUTER-query columns absent from this schema.
+    /// Single-table statements only — JOIN merged schemas are built deep
+    /// inside the join executor and are exempt.
+    fn validate_where_columns(expr: &Expr, schema: &TableSchema) -> Result<()> {
+        match expr {
+            Expr::Column(name) => {
+                if Self::where_column_resolves(name, schema) {
+                    Ok(())
+                } else {
+                    Err(MoteDBError::ColumnNotFound(name.clone()))
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::validate_where_columns(left, schema)?;
+                Self::validate_where_columns(right, schema)
+            }
+            Expr::UnaryOp { expr, .. } => Self::validate_where_columns(expr, schema),
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    Self::validate_where_columns(a, schema)?;
+                }
+                Ok(())
+            }
+            Expr::In { expr, list, .. } => {
+                Self::validate_where_columns(expr, schema)?;
+                for e in list {
+                    Self::validate_where_columns(e, schema)?;
+                }
+                Ok(())
+            }
+            Expr::InHashset { expr, .. } => Self::validate_where_columns(expr, schema),
+            Expr::Between { expr, low, high, .. } => {
+                Self::validate_where_columns(expr, schema)?;
+                Self::validate_where_columns(low, schema)?;
+                Self::validate_where_columns(high, schema)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                Self::validate_where_columns(expr, schema)?;
+                Self::validate_where_columns(pattern, schema)
+            }
+            Expr::IsNull { expr, .. } => Self::validate_where_columns(expr, schema),
+            Expr::Case { whens, else_expr } => {
+                for (cond, result) in whens {
+                    Self::validate_where_columns(cond, schema)?;
+                    Self::validate_where_columns(result, schema)?;
+                }
+                if let Some(e) = else_expr {
+                    Self::validate_where_columns(e, schema)?;
+                }
+                Ok(())
+            }
+            // Column-by-name predicates (MATCH / KNN / spatial): the column
+            // must exist for the predicate to be evaluable at all.
+            Expr::Match { column, .. }
+            | Expr::KnnSearch { column, .. }
+            | Expr::KnnDistance { column, .. }
+            | Expr::StWithin3D { column, .. }
+            | Expr::StDistance3D { column, .. }
+            | Expr::StKnn3D { column, .. }
+            | Expr::StRadius3D { column, .. } => {
+                if Self::where_column_resolves(column, schema) {
+                    Ok(())
+                } else {
+                    Err(MoteDBError::ColumnNotFound(column.clone()))
+                }
+            }
+            // Literals / parameters resolve trivially; subqueries and window
+            // functions are out of scope for WHERE binding.
+            _ => Ok(()),
+        }
+    }
+
+    /// The exact three-step column resolution `eval_expr_on_row` performs.
+    fn where_column_resolves(name: &str, schema: &TableSchema) -> bool {
+        if schema.get_column_position(name).is_some() {
+            return true;
+        }
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        schema.get_column_position(bare).is_some()
+            || schema
+                .columns
+                .iter()
+                .any(|c| c.name.rsplit('.').next().unwrap_or(&c.name) == bare)
+    }
+
     fn compiled_or_eval_row(
         compiled: Option<&CompiledWhere>,
         fallback_expr: &Expr,
@@ -11995,6 +12101,16 @@ impl QueryExecutor {
         } else {
             stmt
         };
+        // 🔴 round-20: unknown column in WHERE must ERROR, not silently
+        // filter to empty (per-row paths swallow eval errors by design).
+        // (CTE-named FROM exempt: resolves to a materialized CTE, not the
+        // table registry.)
+        if let (Some(wc), Some(TableRef::Table { name, .. })) = (&stmt.where_clause, &stmt.from) {
+            if !MATERIALIZED_CTES.with(|m| m.borrow().contains_key(name)) {
+                let schema = self.db.get_table_schema(name)?;
+                Self::validate_where_columns(wc, &schema)?;
+            }
+        }
 
         // 🔑 Pre-resolve non-correlated subqueries in the WHERE clause before
         // any routing. execute_select_internal is called for subqueries (via
@@ -19580,6 +19696,11 @@ impl QueryExecutor {
         // Subquery node in the WHERE clause and returns NULL for every row
         // (UPDATE matches nothing). materialize_subqueries converts
         // IN (SELECT...) → INHashset for O(1) per-row lookup.
+        // 🔴 round-20: bind WHERE columns upfront — a typo'd column in
+        // UPDATE ... WHERE silently matched nothing (affected_rows: 0).
+        if let Some(ref wc) = stmt.where_clause {
+            Self::validate_where_columns(wc, &schema)?;
+        }
         let resolved_where = if let Some(ref wc) = stmt.where_clause {
             if Self::expr_contains_subquery(wc) {
                 Some(self.materialize_subqueries(wc)?)
@@ -19816,6 +19937,11 @@ impl QueryExecutor {
             stmt
         };
         let schema = self.db.get_table_schema(&stmt.table)?;
+        // 🔴 round-20: bind WHERE columns upfront — a typo'd column in
+        // DELETE ... WHERE silently deleted nothing (affected_rows: 0).
+        if let Some(ref wc) = stmt.where_clause {
+            Self::validate_where_columns(wc, &schema)?;
+        }
 
         // 🔑 TimeSeries DELETE: the ColumnarStore is append-only; the general
         // delete path wrote tombstones into a store the TS read path never
