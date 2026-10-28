@@ -257,6 +257,19 @@ SELECT * FROM s WHERE t LIKE 'item_9$%%' ESCAPE '$';  -- 命中 "item_9%…"
 落在模式末尾时按字面转义符匹配 (宽松处理, SQLite 在此报错)。
 回归: `tests/test_like_escape.rs` (含 NOT LIKE 组合/语法错误/reopen+索引路径)。
 
+#### CROSS JOIN 与逗号连接 (2026-10-28+)
+
+```sql
+-- 笛卡尔积: 两种标准写法等价 (round-19 前均不支持 — CROSS 报
+-- "Expected On", 逗号报 "Multiple statements")
+SELECT COUNT(*) FROM a CROSS JOIN b;
+SELECT a.x, b.y FROM a, b WHERE a.x = 1;   -- 隐式交叉积 + WHERE 过滤
+```
+
+回归: `tests/test_bug_hunt_v108.rs::probe_cross_join`。
+⚠️ 已知缺口: 列级 `UNIQUE` 约束语法 (`k INT UNIQUE`) 尚不支持
+(解析报错), 唯一性请用 PRIMARY KEY 或应用层校验。
+
 #### SUBSTRING 标准 FROM/FOR 形式 (2026-10-26+)
 
 ```sql

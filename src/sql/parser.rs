@@ -1124,6 +1124,27 @@ impl Parser {
 
         // Parse JOINs (can chain multiple JOINs)
         while self.is_join_keyword() {
+            // 🔖 CROSS JOIN (round-19): cartesian product — no ON clause.
+            // Equivalent to INNER JOIN ... ON TRUE. Standard SQL; previously
+            // rejected with a confusing "Expected On".
+            if matches!(
+                &self.current().token_type,
+                TokenType::Identifier(w) if w.eq_ignore_ascii_case("CROSS")
+            ) && matches!(
+                self.peek_token_type(),
+                TokenType::Join
+            ) {
+                self.advance(); // CROSS
+                self.advance(); // JOIN
+                let right = self.parse_single_table()?;
+                left = TableRef::Join {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    join_type: JoinType::Inner,
+                    on_condition: Expr::Literal(Value::Bool(true)),
+                };
+                continue;
+            }
             let join_type = self.parse_join_type()?;
             let right = self.parse_single_table()?;
 
@@ -1136,6 +1157,20 @@ impl Parser {
                 right: Box::new(right),
                 join_type,
                 on_condition,
+            };
+        }
+
+        // 🔖 Comma join (round-19): `FROM a, b` — implicit cartesian product,
+        // the classic SQL spelling. Previously rejected as "Multiple
+        // statements". Mapped to CROSS JOIN (ON TRUE) unless a WHERE filters
+        // it later (which the optimizer handles as a normal join predicate).
+        while self.match_token(TokenType::Comma) {
+            let right = self.parse_single_table()?;
+            left = TableRef::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: JoinType::Inner,
+                on_condition: Expr::Literal(Value::Bool(true)),
             };
         }
 
@@ -1197,7 +1232,9 @@ impl Parser {
         // as a join, not as fr{alias:"ASOF"} + Inner join (silently 0 rows).
         let alias = if self.match_token(TokenType::As) {
             Some(self.parse_identifier()?)
-        } else if matches!(self.current().token_type, TokenType::Identifier(ref w) if !w.eq_ignore_ascii_case("ASOF"))
+        } else if matches!(self.current().token_type, TokenType::Identifier(ref w)
+            if !(w.eq_ignore_ascii_case("ASOF")
+                || w.eq_ignore_ascii_case("CROSS") && matches!(*self.peek_token_type(), TokenType::Join)))
         {
             // Allow implicit alias (without AS keyword)
             Some(self.parse_identifier()?)
@@ -1211,6 +1248,11 @@ impl Parser {
     /// Check if current token is a JOIN keyword
     fn is_join_keyword(&self) -> bool {
         if matches!(self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("ASOF"))
+        {
+            return true;
+        }
+        // 🔖 CROSS (round-19): not a keyword token — arrives as Identifier.
+        if matches!(self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("CROSS"))
         {
             return true;
         }
@@ -3808,3 +3850,4 @@ mod tests {
         }
     }
 }
+
