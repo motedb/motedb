@@ -1,5 +1,13 @@
 # Vector Index
 
+
+## 维度校验 (2026-10-28+)
+
+`ORDER BY emb <-> '...'` / KNN 的查询点维度与列声明维度不一致时返回明确错误
+(`Vector dimension mismatch: query has N dims, column 'emb' declares M`) —
+此前无索引时静默返回 0 行或任意序 (错误被排序回退吞掉)。回归:
+`tests/test_bug_hunt_v107.rs::probe_vector_query_dim_mismatch`。
+
 An approximate nearest neighbor index based on a FreshDiskANN + LSM hybrid architecture, suitable for RAG, recommendation systems, semantic search, and similar scenarios.
 
 ## Core Capabilities

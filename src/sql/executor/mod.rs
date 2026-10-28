@@ -5705,7 +5705,19 @@ impl QueryExecutor {
                     Ok(QueryResult::Select { columns, rows }) => {
                         return Ok(StreamingQueryResult::SelectReady { columns, rows });
                     }
-                    _ => return self.materialize_as_streaming(stmt),
+                    // 🔴 round-18: an Err here is a REAL query fault (e.g.
+                    // dim-mismatched query vector) — the old `_` arm swallowed
+                    // it into materialize_as_streaming, whose sorter skips
+                    // expression keys → silently wrong row order.
+                    Err(e) => return Err(e),
+                    Ok(QueryResult::Modification { affected_rows }) => {
+                        return Ok(StreamingQueryResult::Modification { affected_rows });
+                    }
+                    Ok(QueryResult::Definition { message }) => {
+                        return Ok(StreamingQueryResult::Definition { message });
+                    }
+                    #[allow(unreachable_patterns)]
+                    Ok(_) => return self.materialize_as_streaming(stmt),
                 }
             }
         }
@@ -23854,6 +23866,16 @@ impl QueryExecutor {
         let schema = self.db.get_table_schema(table)?;
         let col_pos = schema.get_column_position(col).unwrap_or(0);
         let qdim = query.len();
+        // 🔴 round-18: same upfront dim validation as the indexed plan path —
+        // mismatched segments are SKIPPED below, which silently returned 0
+        // rows for a dim-mismatched query vector.
+        if let Some(crate::types::ColumnType::Tensor(d)) = schema.col_types().get(col_pos) {
+            if qdim != *d {
+                return Err(MoteDBError::InvalidArgument(format!(
+                    "Vector dimension mismatch: query has {qdim} dims, column '{col}' declares {d}"
+                )));
+            }
+        }
 
         if std::env::var_os("MOTE_TRACE_KNN").is_some() {
             let nsegs = self
@@ -24623,6 +24645,25 @@ impl QueryExecutor {
             plan.column,
             plan.k
         );
+        // 🔴 round-18: a dim-mismatched query vector previously slipped
+        // through to the scan paths, which SKIP mismatched segments — the
+        // query silently returned 0 rows (a wrong answer with no diagnostic).
+        // Reject upfront against the column's declared dimension.
+        if let Ok(schema) = self.db.get_table_schema(&plan.table) {
+            if let Some(crate::types::ColumnType::Tensor(d)) = schema
+                .get_column_position(&plan.column)
+                .and_then(|p| schema.col_types().get(p))
+            {
+                if plan.query_vector.len() != *d {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Vector dimension mismatch: query has {} dims, column '{}' declares {}",
+                        plan.query_vector.len(),
+                        plan.column,
+                        d
+                    )));
+                }
+            }
+        }
 
         // Resolve index name via registry (supports custom index names)
         let index_name = self
