@@ -198,6 +198,10 @@ impl ExprEvaluator {
     fn value_to_micros(val: &Value) -> Option<i64> {
         match val {
             Value::Timestamp(ts) => Some(ts.as_micros()),
+            // 🔴 round-21: DATE values carry no time-of-day — midnight UTC of
+            // that day. YEAR/MONTH/DAY on a DATE column used to fall through
+            // to None → TypeError, which projection paths masked to NULL.
+            Value::Date(d) => Some(d.days() as i64 * 86_400_000_000),
             Value::Integer(i) => Some(*i),
             _ => None,
         }
@@ -2229,40 +2233,42 @@ impl ExprEvaluator {
             }
 
             "date_diff" | "datediff" => {
-                // DATE_DIFF(timestamp1, timestamp2) - difference in seconds
+                // DATE_DIFF(a, b) — signed difference in SECONDS (a − b).
+                // 🔴 round-21: accepts DATE (midnight) and ISO text literals
+                // in addition to TIMESTAMP/INTEGER micros — previously a
+                // DATE column argument TypeError'd, which projection paths
+                // masked to NULL.
                 if args.len() != 2 {
                     return Err(MoteDBError::InvalidArgument(
                         "DATE_DIFF() takes 2 arguments (timestamp1, timestamp2)".to_string(),
                     ));
                 }
-                let ts1 = match self.eval(&args[0], row)? {
-                    Value::Timestamp(ts) => ts,
-                    Value::Integer(i) => crate::types::Timestamp::from_micros(i),
-                    _ => {
-                        return Err(MoteDBError::TypeError(
-                            "DATE_DIFF() first argument must be timestamp".to_string(),
-                        ))
+                let to_micros = |v: Value| -> Result<i64> {
+                    match &v {
+                        Value::Timestamp(_) | Value::Date(_) | Value::Integer(_) => Self::value_to_micros(&v)
+                            .ok_or_else(|| MoteDBError::TypeError(
+                                "DATE_DIFF() argument must be a timestamp or date".to_string(),
+                            )),
+                        Value::Text(s) => crate::types::Timestamp::parse_iso(s)
+                            .map(|t| t.as_micros())
+                            .ok_or_else(|| MoteDBError::TypeError(format!(
+                                "DATE_DIFF() cannot parse date literal '{s}'"
+                            ))),
+                        _ => Err(MoteDBError::TypeError(
+                            "DATE_DIFF() argument must be a timestamp or date".to_string(),
+                        )),
                     }
                 };
-                let ts2 = match self.eval(&args[1], row)? {
-                    Value::Timestamp(ts) => ts,
-                    Value::Integer(i) => crate::types::Timestamp::from_micros(i),
-                    _ => {
-                        return Err(MoteDBError::TypeError(
-                            "DATE_DIFF() second argument must be timestamp".to_string(),
-                        ))
-                    }
-                };
-
-                let diff_micros =
-                    ts1.as_micros()
-                        .checked_sub(ts2.as_micros())
-                        .ok_or_else(|| {
-                            MoteDBError::InvalidArgument(
-                                "DATE_DIFF() timestamp difference overflow".to_string(),
-                            )
-                        })?;
-                let diff_seconds = diff_micros / 1_000_000;
+                let m1 = to_micros(self.eval(&args[0], row)?)?;
+                let m2 = to_micros(self.eval(&args[1], row)?)?;
+                let diff_seconds = m1
+                    .checked_sub(m2)
+                    .ok_or_else(|| {
+                        MoteDBError::InvalidArgument(
+                            "DATE_DIFF() timestamp difference overflow".to_string(),
+                        )
+                    })?
+                    / 1_000_000;
                 Ok(Value::Integer(diff_seconds))
             }
 
@@ -2399,11 +2405,26 @@ impl ExprEvaluator {
                         ))),
                     },
                     "TEXT" | "VARCHAR" | "STRING" => {
+                        // 🔴 round-21: the old catch-all was `format!("{:?}")`
+                        // — CAST(date AS TEXT) leaked Rust Debug output like
+                        // "Date(Date { days: 19753 })". Each type now renders
+                        // in its SQL textual form.
                         let text = match val {
                             Value::Text(s) => s.as_str().to_string(),
                             Value::Integer(i) => i.to_string(),
                             Value::Float(f) => f.to_string(),
                             Value::Bool(b) => b.to_string(),
+                            Value::Date(d) => d.to_iso(),
+                            Value::Timestamp(ts) => ts.to_iso(),
+                            // SQLite semantics: blob bytes interpreted as
+                            // (possibly lossy) UTF-8 text.
+                            Value::Blob(b) => String::from_utf8_lossy(b.as_slice()).into_owned(),
+                            Value::Vector(v) => {
+                                // SQL literal form: [1, 2, 3]
+                                let parts: Vec<String> =
+                                    v.0.iter().map(|x| format!("{x}")).collect();
+                                format!("[{}]", parts.join(", "))
+                            }
                             Value::Null => return Ok(Value::Null),
                             _ => format!("{:?}", val),
                         };

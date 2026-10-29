@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **🔴 修复(静默错误结果): 日期函数对 DATE 列返回 NULL** — `YEAR/MONTH/
+  DAY_OF_MONTH` 只认 TIMESTAMP 值, DATE 列经 value_to_micros 落空 →
+  TypeError 被投影路径吞成 NULL; `DATEDIFF` 对 DATE 参数同样 TypeError。
+  修复: value_to_micros 接受 Date (当日零点 µs), DATEDIFF 额外接受 ISO
+  字符串字面量 (round-21)
+- **🔴 修复(内部泄漏): CAST(x AS TEXT) 输出 Rust Debug 串** —
+  `CAST(date AS TEXT)` 返回 `Date(Date { days: 19753 })`。现按 SQL 文本
+  形态渲染: DATE→`YYYY-MM-DD`, TIMESTAMP→`YYYY-MM-DD HH:MM:SS[.ffffff]`
+  (新增 `Timestamp::to_iso`), BLOB→UTF-8 解释, VECTOR→`[1, 2, 3]`
+  (round-21)
+- **🔴 修复(精度丢失): ISO 时间戳小数秒被丢弃** — `parse_iso` 用
+  `split('.').next()` 只取整秒, `'…12:00:00.5'` 的 .5 消失;
+  row_converter 的手写副本 `parse_datetime` (schema-order INSERT 路径)
+  同病。修复 parse_iso 解析到 µs, 副本直接委托 (单一实现, 不再漂移)
+  (round-21)
+- **语义钉住**: `CONCAT` 忽略 NULL 操作数 (PG/SQLite≥3.44 风格), `||`
+  按标准传播 NULL; `DATEDIFF(a,b)` = a−b 秒数; docs/13 日期函数表
+
 - **🔴 修复(SQL 兼容性): SELECT 列表隐式别名** — 无 `AS` 的别名
   (`SELECT v x`、`SELECT COUNT(*) c`、`SELECT v + 1 total`)曾全部死于误导性
   `Multiple statements are not supported` 解析错误。MySQL/SQLite/Postgres

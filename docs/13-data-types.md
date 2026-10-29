@@ -74,6 +74,18 @@ let value = Value::Timestamp(ts);
 
 - Stored internally as microseconds; supports range queries and sorting
 
+#### 日期/时间函数（round-21 修复与语义钉住）
+
+| 函数 | 行为 |
+|------|------|
+| `YEAR/MONTH/DAY_OF_MONTH(x)` | 接受 **TIMESTAMP 和 DATE** 列（round-21 前对 DATE 静默返回 NULL） |
+| `HOUR/MINUTE/SECOND(ts)` | TIMESTAMP 列；pre-epoch 用 rem_euclid 保证 0-23 正确 |
+| `DATEDIFF(a, b)` | a−b 的**秒**数差（引擎约定；非 MySQL 的天数）。接受 TIMESTAMP/DATE/INTEGER(µs)/ISO 字符串字面量 |
+| `CAST(x AS TEXT)` | DATE → `YYYY-MM-DD`；TIMESTAMP → `YYYY-MM-DD HH:MM:SS[.ffffff]`；BLOB → 按 UTF-8 解释；VECTOR → `[1, 2, 3]`（round-21 前泄漏 Rust Debug 串如 `Date { days: 19753 }`） |
+| `CONCAT(a, b, …)` | **忽略** NULL 操作数（PostgreSQL / SQLite≥3.44 语义）；`||` 运算符按 SQL 标准传播 NULL |
+
+- ISO 字符串解析（INSERT / 字面量）保留**小数秒**到微秒精度：`'2024-06-01 12:00:00.5'`（round-21 前 schema-order INSERT 路径丢弃小数部分）
+
 ## Row vs SqlRow
 
 | Type | Definition | Purpose |

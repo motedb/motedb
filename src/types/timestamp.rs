@@ -78,6 +78,26 @@ impl Timestamp {
     /// and integer microseconds. Returns None if the string doesn't match.
     /// Used for comparing TIMESTAMP columns against text literals in WHERE
     /// clauses (e.g. `WHERE ts > '2024-01-01'`).
+    /// Render as `YYYY-MM-DD HH:MM:SS[.ffffff]` — the inverse of
+    /// [`Timestamp::parse_iso`] (fractional part only when non-zero).
+    /// div_euclid/rem_euclid keep pre-epoch (negative) times correct.
+    /// 🔴 round-21: existed as the CAST(x AS TEXT) escape hatch before this
+    /// — that path fell back to Rust's `{:?}` Debug output.
+    pub fn to_iso(&self) -> String {
+        let day = self.micros.div_euclid(86_400_000_000);
+        let rest = self.micros.rem_euclid(86_400_000_000);
+        let date = super::Date::from_days(day as i32).to_iso();
+        let h = rest / 3_600_000_000;
+        let m = (rest % 3_600_000_000) / 60_000_000;
+        let s = (rest % 60_000_000) / 1_000_000;
+        let us = rest % 1_000_000;
+        if us == 0 {
+            format!("{date} {h:02}:{m:02}:{s:02}")
+        } else {
+            format!("{date} {h:02}:{m:02}:{s:02}.{us:06}")
+        }
+    }
+
     pub fn parse_iso(s: &str) -> Option<Timestamp> {
         // Try parsing as integer microseconds first (numeric timestamp).
         if let Ok(micros) = s.parse::<i64>() {
@@ -100,25 +120,40 @@ impl Timestamp {
         if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
             return None;
         }
-        // Parse time: HH:MM:SS (seconds optional)
-        let (hour, min, sec) = if let Some(tp) = time_part {
+        // Parse time: HH:MM:SS[.ffffff] (seconds optional)
+        let (hour, min, sec, frac_micros) = if let Some(tp) = time_part {
             let tparts: Vec<&str> = tp.split(':').collect();
             let h: u32 = tparts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
             let m: u32 = tparts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let s: u32 = tparts
-                .get(2)
-                .and_then(|s| s.split('.').next().and_then(|n| n.parse().ok()))
-                .unwrap_or(0);
-            (h, m, s)
+            // 🔴 round-21: the seconds field may carry fractional digits
+            // ("23:59:59.5"). The old `split('.').next()` dropped the
+            // fraction entirely — .999999 parsed as whole seconds.
+            let (s, frac_micros) = match tparts.get(2) {
+                Some(tok) => {
+                    let sec: u32 = tok.split('.').next().and_then(|n| n.parse().ok())?;
+                    let frac = tok
+                        .split_once('.')
+                        .and_then(|(_, f)| {
+                            let f = &f[..f.len().min(6)]; // µs precision
+                            let digits = f.parse::<u32>().ok()?;
+                            Some(digits as i64 * 10_i64.pow(6 - f.len() as u32))
+                        })
+                        .unwrap_or(0);
+                    (sec, frac)
+                }
+                None => (0, 0),
+            };
+            (h, m, s, frac_micros)
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0)
         };
         // Convert to Unix epoch microseconds using Howard Hinnant's algorithm.
         let days = days_from_civil(year, month, day)?;
         let micros = days as i64 * 86_400_000_000
             + hour as i64 * 3_600_000_000
             + min as i64 * 60_000_000
-            + sec as i64 * 1_000_000;
+            + sec as i64 * 1_000_000
+            + frac_micros;
         Some(Timestamp::from_micros(micros))
     }
 }
