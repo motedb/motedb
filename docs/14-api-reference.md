@@ -95,6 +95,16 @@ pub fn open<P: AsRef<Path>>(path: P) -> Result<Self>
 let db = Database::open("myapp.mote")?;
 ```
 
+> 🔴 **进程内共享句柄（round-25 钉住）**：同一进程内对同一路径的第二次
+> `open()` **不报错**，而是附着到已存在的引擎实例（共享句柄注册表 —
+> flock 按 open-file-description 计数，进程内重开本会误报"already
+> open"）。两个句柄等价于**同一条连接**：
+> - 句柄 A `BEGIN` 后，句柄 B 的普通查询运行在 A 的活跃事务内（能看到
+>   其未提交写入 — read-your-writes 连接语义，非脏读）；
+> - 句柄间无隔离，需要隔离请用事务边界或单句柄。
+> **跨进程**由 `.lock` 文件 flock 互斥：第二个进程 open 报
+> "Database is already open by another process"。
+
 ### flush
 
 Flush all data to disk.

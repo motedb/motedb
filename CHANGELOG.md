@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- **语义钉住 (round-25, 连续第二个零缺陷轮 — 并发/维护前沿)**: 同进程
+  二次 open 附着同一引擎 (共享句柄注册表, docs/14) — 句柄间为同一连接
+  语义 (BEGIN 后其他句柄读运行在活跃事务内), 跨进程由 flock 互斥
+  (裸 flock 实测有效); 并发同行 UPDATE 无撕裂写; 4 写者+2 读者并发
+  终态逐表精确; VACUUM 后数据完整且重开稳定; 1000 值 IN/NOT IN 精确;
+  BLOB ORDER BY 字典序确定性; MySQL 的 UPDATE/DELETE ... ORDER BY/
+  LIMIT 语法干净拒绝。tests/test_bug_hunt_v115.rs 7 项。
+
 - **语义钉住 (round-24, 零缺陷轮)**: 除零对整型/浮点除数一律
   DivisionByZero 错误 (PostgreSQL 语义, 非 SQLite NULL / IEEE inf);
   空间谓词边界精确 (radius ≤ 含等距点, 盒面含边界点) 且 octree 索引
