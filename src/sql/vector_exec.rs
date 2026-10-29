@@ -265,9 +265,14 @@ impl VecPred {
                 let Expr::Column(c) = expr.as_ref() else {
                     return None;
                 };
-                let pos = resolve_col_alias(c, schema, alias)?;
-                let lv = literal_of(low)?;
-                let hv = literal_of(high)?;
+                // 🔴 round-22: bounds must go through col_lit's type-aware
+                // pre-parse. A TIMESTAMP column with TEXT bounds
+                // (`at BETWEEN '…' AND '…'`) compared I64-vs-Text and never
+                // matched — a silent empty result while the equivalent
+                // `>= AND <=` form worked (it pre-parsed via col_lit).
+                let (pos, lv) = Self::col_lit(expr, low, schema, alias)?;
+                let (_, hv) = Self::col_lit(expr, high, schema, alias)?;
+                let _ = c;
                 Some(VecPred::And(
                     Box::new(VecPred::Leaf(VecPredLeaf::Cmp {
                         col: pos,

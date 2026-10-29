@@ -2857,12 +2857,16 @@ impl QueryExecutor {
                 }
             }
             Statement::ShowTables => {
+                // 🔴 round-22: used to wrap into Definition { "Tables shown" }
+                // — the actual table rows were DISCARDED on the streaming
+                // path (db.query returned [] and execute() surfaced only the
+                // message). Mirror ShowIndexes: Select rows flow through.
                 let result = self.execute_show_tables()?;
-                StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Tables shown".to_string(),
-                    },
+                match result {
+                    QueryResult::Select { columns, rows } => {
+                        StreamingQueryResult::SelectReady { columns, rows }
+                    }
+                    _ => unreachable!("execute_show_tables always yields Select"),
                 }
             }
             Statement::ShowIndexes { table } => {
@@ -2875,12 +2879,15 @@ impl QueryExecutor {
                 }
             }
             Statement::DescribeTable(table_name) => {
+                // 🔴 round-22: same row-discard bug as ShowTables above —
+                // DESCRIBE built a Select with schema rows, then the
+                // streaming path threw them away for a Definition message.
                 let result = self.execute_describe_table(table_name.clone())?;
-                StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Table described".to_string(),
-                    },
+                match result {
+                    QueryResult::Select { columns, rows } => {
+                        StreamingQueryResult::SelectReady { columns, rows }
+                    }
+                    _ => unreachable!("execute_describe_table always yields Select"),
                 }
             }
             Statement::AlterTable(a) => {
@@ -4400,7 +4407,11 @@ impl QueryExecutor {
                     Output(usize),
                     Full(usize),
                 }
-                let plan: Vec<(KeyRef, bool)> = ob
+                // 🔴 round-22: nulls_first was DROPPED here — ORDER BY on a
+                // non-projected column ignored explicit NULLS FIRST/LAST
+                // (bare order_by_cmp is NULLs-first-always). Carry the flag
+                // and apply the same rank logic as apply_order_by.
+                let plan: Vec<(KeyRef, bool, Option<bool>)> = ob
                     .iter()
                     .map(|oe| {
                         let k = match &oe.expr {
@@ -4423,11 +4434,11 @@ impl QueryExecutor {
                             }
                             _ => KeyRef::Full(usize::MAX),
                         };
-                        (k, oe.asc)
+                        (k, oe.asc, oe.nulls_first)
                     })
                     .collect();
                 idx.sort_by(|&a, &b| {
-                    for &(ref k, asc) in &plan {
+                    for &(ref k, asc, nulls_first) in &plan {
                         let av = match k {
                             KeyRef::Output(p) => {
                                 out_rows[a].get(*p).cloned().unwrap_or(Value::Null)
@@ -4440,6 +4451,25 @@ impl QueryExecutor {
                             }
                             KeyRef::Full(p) => full_rows[b].get(*p).cloned().unwrap_or(Value::Null),
                         };
+                        let nulls_first_effective = nulls_first.unwrap_or(asc);
+                        let rank = |v: &Value| -> i8 {
+                            if matches!(v, Value::Null) {
+                                if nulls_first_effective {
+                                    0
+                                } else {
+                                    2
+                                }
+                            } else {
+                                1
+                            }
+                        };
+                        let (ra, rb) = (rank(&av), rank(&bv));
+                        if ra != rb {
+                            return ra.cmp(&rb);
+                        }
+                        if matches!(av, Value::Null) {
+                            continue; // both NULL → next key
+                        }
                         let cmp = order_by_cmp(&av, &bv);
                         if cmp != std::cmp::Ordering::Equal {
                             return if asc { cmp } else { cmp.reverse() };
@@ -13513,6 +13543,34 @@ impl QueryExecutor {
                                     return Ok(proj_row[idx].clone());
                                 }
                             }
+                            // 🔴 round-22: expression key matching a SELECT-list
+                            // expression must read the GROUPED projected value.
+                            // On grouped output the full_row zip below pairs
+                            // group output[i] with INPUT row[i] — evaluating
+                            // against it produced misaligned keys and silently
+                            // mis-sorted groups (GROUP BY v/10 ORDER BY v/10
+                            // came out [1,2,0]). Expr has no PartialEq; the
+                            // Debug string is a faithful structural proxy.
+                            let ob_key = format!("{:?}", order.expr);
+                            if let Some(idx) = stmt.columns.iter().position(|sc| {
+                                matches!(sc, SelectColumn::Expr(e, _) if format!("{:?}", e) == ob_key)
+                            }) {
+                                if idx < proj_row.len() {
+                                    return Ok(proj_row[idx].clone());
+                                }
+                            }
+                            // Grouped result + still-unresolved expression key:
+                            // full_row is an arbitrary member row — a key
+                            // computed there is wrong by construction. Standard
+                            // SQL rejects ordering by non-grouped expressions;
+                            // error instead of silently mis-sorting.
+                            if stmt.group_by.is_some() {
+                                return Err(MoteDBError::InvalidArgument(format!(
+                                    "ORDER BY expression {:?} is not in the GROUP BY \
+                                     or SELECT list of the grouped result",
+                                    order.expr
+                                )));
+                            }
                             // Otherwise, evaluate expression against original row
                             self.evaluator.eval(&order.expr, full_row)
                         })
@@ -13523,13 +13581,38 @@ impl QueryExecutor {
                 .collect::<Result<Vec<_>>>()?;
 
             // Sort
+            // 🔴 round-22: this comparator used bare partial_cmp — explicit
+            // NULLS FIRST/LAST was silently ignored (ORDER BY v ASC NULLS
+            // LAST still put NULLs first) and NaN ordering diverged from
+            // apply_order_by. Mirror its rank logic: NULL placement is
+            // independent of ASC/DESC (dialect default: NULLs first on ASC,
+            // last on DESC), values compare via order_by_cmp (NaN-aware).
             rows_with_keys.sort_by(|a, b| {
                 for (i, order) in order_by.iter().enumerate() {
-                    let cmp = a.0[i]
-                        .partial_cmp(&b.0[i])
-                        .unwrap_or(std::cmp::Ordering::Equal);
-                    if cmp != std::cmp::Ordering::Equal {
-                        return if order.asc { cmp } else { cmp.reverse() };
+                    let va = &a.0[i];
+                    let vb = &b.0[i];
+                    let nulls_first_effective = order.nulls_first.unwrap_or(order.asc);
+                    let rank = |v: &Value| -> i8 {
+                        if matches!(v, Value::Null) {
+                            if nulls_first_effective {
+                                0
+                            } else {
+                                2
+                            }
+                        } else {
+                            1
+                        }
+                    };
+                    let (ra, rb) = (rank(va), rank(vb));
+                    if ra != rb {
+                        return ra.cmp(&rb);
+                    }
+                    if matches!(va, Value::Null) {
+                        continue; // both NULL → next key
+                    }
+                    let value_cmp = order_by_cmp(va, vb);
+                    if value_cmp != std::cmp::Ordering::Equal {
+                        return if order.asc { value_cmp } else { value_cmp.reverse() };
                     }
                 }
                 std::cmp::Ordering::Equal
@@ -17581,14 +17664,23 @@ impl QueryExecutor {
             //    (extra_order_aggs were appended per group, in the order the
             //    non-selected ORDER BY aggregates were encountered).
             let mut extra_cursor = 0usize; // index into extra_order_aggs
-            let order_specs: Vec<(usize, bool)> = order_by
+            // 🔴 round-22: ORDER BY clauses that resolve to NONE of the shapes
+            // below (e.g. a bare expression `ORDER BY v / 10`) used to be
+            // silently DROPPED from the sort plan — grouped queries returned
+            // arbitrary (HashMap) group order with no error. Now: an
+            // expression key matching a SELECT-list expression sorts by that
+            // output column; anything unresolvable declines the whole fast
+            // path to the materialized path (which evaluates expression keys
+            // against group member rows).
+            let mut declined = false;
+            let order_specs: Vec<(usize, bool, Option<bool>)> = order_by
                 .iter()
                 .filter_map(|ob| {
                     if let Expr::Column(ref col_name) = ob.expr {
                         return column_names
                             .iter()
                             .position(|c| c == col_name)
-                            .map(|idx| (idx, ob.asc));
+                            .map(|idx| (idx, ob.asc, ob.nulls_first));
                     }
                     if let Expr::FunctionCall { name, args, .. } = &ob.expr {
                         let arg_str = args
@@ -17602,7 +17694,7 @@ impl QueryExecutor {
                         let ob_name = format!("{}({})", name.to_uppercase(), arg_str);
                         // In SELECT list?
                         if let Some(idx) = column_names.iter().position(|c| c == &ob_name) {
-                            return Some((idx, ob.asc));
+                            return Some((idx, ob.asc, ob.nulls_first));
                         }
                         // Not in SELECT — use the next extra slot (they were
                         // collected in ORDER BY clause order for non-selected
@@ -17610,17 +17702,54 @@ impl QueryExecutor {
                         if extra_cursor < extra_order_aggs.len() {
                             let idx = extra_order_offset + extra_cursor;
                             extra_cursor += 1;
-                            return Some((idx, ob.asc));
+                            return Some((idx, ob.asc, ob.nulls_first));
                         }
                     }
+                    // Expression key structurally equal to a SELECT-list
+                    // expression (e.g. GROUP BY v/10 ORDER BY v/10 where the
+                    // same expression is projected) → sort by that output.
+                    // Expr has no PartialEq; Debug output is a faithful
+                    // structural proxy (same tokens → same tree → same
+                    // string; different trees never collide in practice
+                    // because every variant embeds its full structure).
+                    let ob_key = format!("{:?}", ob.expr);
+                    if let Some(idx) = stmt.columns.iter().position(|sc| {
+                        matches!(sc, SelectColumn::Expr(e, _) if format!("{:?}", e) == ob_key)
+                    }) {
+                        return Some((idx, ob.asc, ob.nulls_first));
+                    }
+                    declined = true;
                     None
                 })
                 .collect();
+            if declined {
+                return Ok(None);
+            }
 
             result_rows.sort_by(|a, b| {
-                for &(idx, asc) in &order_specs {
-                    // NULL ordering: NULLs sort last in ASC, first in DESC
-                    // (matches apply_order_by, the non-GROUP-BY ORDER BY path).
+                for &(idx, asc, nulls_first) in &order_specs {
+                    // NULL placement (round-22): explicit NULLS FIRST/LAST,
+                    // else the dialect default — NULLs first on ASC, last on
+                    // DESC (what compare_with_nulls yields unreversed).
+                    let nulls_first_effective = nulls_first.unwrap_or(asc);
+                    let rank = |v: &Value| -> i8 {
+                        if matches!(v, Value::Null) {
+                            if nulls_first_effective {
+                                0
+                            } else {
+                                2
+                            }
+                        } else {
+                            1
+                        }
+                    };
+                    let (ra, rb) = (rank(&a[idx]), rank(&b[idx]));
+                    if ra != rb {
+                        return ra.cmp(&rb);
+                    }
+                    if matches!(a[idx], Value::Null) {
+                        continue; // both NULL → next key
+                    }
                     let cmp = compare_with_nulls(&a[idx], &b[idx]);
                     let cmp = if asc { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
@@ -17999,7 +18128,14 @@ impl QueryExecutor {
 
         // Apply ORDER BY
         if let Some(ref order_by) = stmt.order_by {
-            let order_specs: Vec<(usize, bool)> = order_by
+            // 🔴 round-22: expression keys (ORDER BY v / 10 with GROUP BY
+            // v / 10) used to hit `_ => return None` — silently dropped,
+            // groups came out in HashMap order. Match the expression
+            // structurally (Debug string proxy — Expr has no PartialEq)
+            // against the SELECT list; unresolvable keys decline the fast
+            // path instead of mis-sorting.
+            let mut order_declined = false;
+            let order_specs: Vec<(usize, bool, Option<bool>)> = order_by
                 .iter()
                 .filter_map(|ob| {
                     // 🔑 ORDER BY can reference a bare column (e.g. ORDER BY cat)
@@ -18021,17 +18157,50 @@ impl QueryExecutor {
                                 .join(", ");
                             format!("{}({})", name.to_uppercase(), arg_str)
                         }
-                        _ => return None,
+                        _ => String::new(),
                     };
-                    let idx = column_names.iter().position(|c| c == &ob_name)?;
-                    Some((idx, ob.asc))
+                    if !ob_name.is_empty() {
+                        let idx = column_names.iter().position(|c| c == &ob_name)?;
+                        return Some((idx, ob.asc, ob.nulls_first));
+                    }
+                    // Expression key matching a projected expression → its output.
+                    let ob_key = format!("{:?}", ob.expr);
+                    if let Some(idx) = stmt.columns.iter().position(|sc| {
+                        matches!(sc, SelectColumn::Expr(e, _) if format!("{:?}", e) == ob_key)
+                    }) {
+                        return Some((idx, ob.asc, ob.nulls_first));
+                    }
+                    order_declined = true;
+                    None
                 })
                 .collect();
+            if order_declined {
+                return Ok(None);
+            }
 
             result_rows.sort_by(|a, b| {
-                for &(idx, asc) in &order_specs {
-                    // NULL ordering: NULLs sort last in ASC, first in DESC
-                    // (matches apply_order_by, the non-GROUP-BY ORDER BY path).
+                for &(idx, asc, nulls_first) in &order_specs {
+                    // NULL placement (round-22): explicit NULLS FIRST/LAST,
+                    // else dialect default (NULLs first on ASC).
+                    let nulls_first_effective = nulls_first.unwrap_or(asc);
+                    let rank = |v: &Value| -> i8 {
+                        if matches!(v, Value::Null) {
+                            if nulls_first_effective {
+                                0
+                            } else {
+                                2
+                            }
+                        } else {
+                            1
+                        }
+                    };
+                    let (ra, rb) = (rank(&a[idx]), rank(&b[idx]));
+                    if ra != rb {
+                        return ra.cmp(&rb);
+                    }
+                    if matches!(a[idx], Value::Null) {
+                        continue; // both NULL → next key
+                    }
                     let cmp = compare_with_nulls(&a[idx], &b[idx]);
                     let cmp = if asc { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {

@@ -1747,25 +1747,29 @@ impl QueryExecutor {
                     Col(usize),
                     Expr(Expr),
                 }
-                let sort_plan: Vec<(SortKey, bool)> = ob
+                // 🔴 round-22: nulls_first was dropped here — explicit
+                // NULLS FIRST/LAST on this (primary) scan sort path was
+                // silently ignored. Carry it into the plan and comparator.
+                let sort_plan: Vec<(SortKey, bool, Option<bool>)> = ob
                     .iter()
                     .map(|oe| {
+                        let nf = oe.nulls_first;
                         match &oe.expr {
                             crate::sql::ast::Expr::Column(cn) => {
                                 let b = cn.rsplit('.').next().unwrap_or(cn);
                                 // 1. Direct schema column.
                                 if let Some(p) = schema.get_column_position(b) {
-                                    return (SortKey::Col(p), oe.asc);
+                                    return (SortKey::Col(p), oe.asc, nf);
                                 }
                                 // 2. SELECT alias of a plain column.
                                 if let Some(&p) = alias_to_col.get(b) {
-                                    return (SortKey::Col(p), oe.asc);
+                                    return (SortKey::Col(p), oe.asc, nf);
                                 }
                                 // 3. SELECT alias of a computed expression —
                                 //    evaluate that expression as the sort key.
                                 match alias_to_expr.get(b) {
-                                    Some(e) => (SortKey::Expr(e.clone()), oe.asc),
-                                    None => (SortKey::Expr(oe.expr.clone()), oe.asc),
+                                    Some(e) => (SortKey::Expr(e.clone()), oe.asc, nf),
+                                    None => (SortKey::Expr(oe.expr.clone()), oe.asc, nf),
                                 }
                             }
                             // ORDER BY column position (1-based, references
@@ -1774,12 +1778,12 @@ impl QueryExecutor {
                             crate::sql::ast::Expr::Literal(Value::Integer(n)) => {
                                 let pos_1based = *n as usize;
                                 if pos_1based == 0 || pos_1based > out_positions.len() {
-                                    (SortKey::Expr(oe.expr.clone()), oe.asc)
+                                    (SortKey::Expr(oe.expr.clone()), oe.asc, nf)
                                 } else {
-                                    (SortKey::Col(out_positions[pos_1based - 1]), oe.asc)
+                                    (SortKey::Col(out_positions[pos_1based - 1]), oe.asc, nf)
                                 }
                             }
-                            _ => (SortKey::Expr(oe.expr.clone()), oe.asc),
+                            _ => (SortKey::Expr(oe.expr.clone()), oe.asc, nf),
                         }
                     })
                     .collect();
@@ -1797,7 +1801,7 @@ impl QueryExecutor {
                         }
                         let keys: Vec<Value> = sort_plan
                             .iter()
-                            .map(|(sk, _)| match sk {
+                            .map(|(sk, _, _)| match sk {
                                 SortKey::Col(p) => full.get(*p).cloned().unwrap_or(Value::Null),
                                 SortKey::Expr(e) => {
                                     Self::eval_expr_on_row(e, &full, schema).unwrap_or(Value::Null)
@@ -1810,9 +1814,31 @@ impl QueryExecutor {
                 let mut keyed = keyed;
                 let cmp_fn = |(ka, _): &(Vec<Value>, Vec<Value>),
                               (kb, _): &(Vec<Value>, Vec<Value>)| {
-                    for (i, (_, asc)) in sort_plan.iter().enumerate() {
+                    for (i, (_, asc, nulls_first)) in sort_plan.iter().enumerate() {
                         let av = &ka[i];
                         let bv = &kb[i];
+                        // NULL placement independent of ASC/DESC (mirror
+                        // apply_order_by): explicit flag, else dialect
+                        // default NULLs-first-ASC / NULLs-last-DESC.
+                        let nulls_first_effective = nulls_first.unwrap_or(*asc);
+                        let rank = |v: &Value| -> i8 {
+                            if matches!(v, Value::Null) {
+                                if nulls_first_effective {
+                                    0
+                                } else {
+                                    2
+                                }
+                            } else {
+                                1
+                            }
+                        };
+                        let (ra, rb) = (rank(av), rank(bv));
+                        if ra != rb {
+                            return ra.cmp(&rb);
+                        }
+                        if matches!(av, Value::Null) {
+                            continue; // both NULL → next key
+                        }
                         let cmp = order_by_cmp(av, bv);
                         if cmp != std::cmp::Ordering::Equal {
                             return if *asc { cmp } else { cmp.reverse() };

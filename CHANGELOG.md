@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **🔴 修复(结果丢失): SHOW TABLES / DESCRIBE 丢弃结果行** — 流式分发把
+  execute_show_tables/describe_table 构建的 Select 硬包成 Definition
+  {"Tables shown"}，行数据全丢（db.query 返回 []，MCP list_tables 空）。
+  test_sql_ddl_features 里的 TODO 注释早已承认此缺口 (round-22)
+- **🔴 修复(静默错序): NULLS FIRST/LAST 被静默忽略** — 四条排序路径
+  (scan.rs 扫描级排序 / mod.rs 全行置换排序 / 物化 comparator /
+  两个 GROUP BY 快路径) 中三条丢掉了 nulls_first 标志，"ORDER BY v ASC
+  NULLS LAST" 照样 NULL 在前。全路径统一 rank 语义 (NULL 定位与
+  ASC/DESC 独立)，物化 comparator 同时改用 order_by_cmp (NaN 一致)
+  (round-22)
+- **🔴 修复(静默错序): GROUP BY 表达式 + ORDER BY 同表达式乱序** —
+  两个 GROUP BY 快路径把非列/非聚合 ORDER BY 键静默丢弃 (输出 HashMap
+  任意序)；物化路径的 full_row zip 把分组输出与输入行错位配对，表达式
+  键在错误行上求值。修复: 表达式键匹配 SELECT 列表读分组投影值;
+  GROUP BY 下不可解析的 ORDER BY 表达式明确报错 (标准 SQL 行为)
+  (round-22)
+- **🔴 修复(静默空结果): TIMESTAMP 列 BETWEEN 文本字面量恒空** —
+  vector_exec 谓词编译器对简单比较 (>=/<=) 做了 Timestamp-vs-Text
+  预解析，BETWEEN 分支漏掉——I64 批比较 vs Text 恒 false。等价的
+  `>= AND <=` 形式却正常。BETWEEN 边界现走同一 col_lit 预解析 (round-22)
+- **语义钉住**: LIKE 大小写敏感 (PG 风格, 与 = 一致); 表名大小写敏感/
+  列名不敏感 (存储键精确匹配, 折叠属 0.16 破坏性变更范畴); DDL 非事务
+  (CREATE 留存/行回滚, DROP 在事务内被拒)
+
 - **🔴 修复(静默错误结果): 日期函数对 DATE 列返回 NULL** — `YEAR/MONTH/
   DAY_OF_MONTH` 只认 TIMESTAMP 值, DATE 列经 value_to_micros 落空 →
   TypeError 被投影路径吞成 NULL; `DATEDIFF` 对 DATE 参数同样 TypeError。

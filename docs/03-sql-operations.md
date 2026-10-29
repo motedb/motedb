@@ -235,6 +235,20 @@ Supported operators:
 | `IN` | Range matching | `WHERE id IN (1, 2, 3)` |
 | `LIKE` | Pattern matching | `WHERE name LIKE '%Alice%'` |
 
+> 🔴 **round-22 修复与语义钉住**：
+> * `LIKE` 与 `=` 一致为**大小写敏感**（PostgreSQL 语义；SQLite/MySQL 会在
+>   LIKE 中折叠 ASCII 大小写，MoteDB 不会）。
+> * 表名**大小写敏感**（存储键精确匹配），列名大小写不敏感——引用时请使
+>   用建表时的表名拼写。
+> * `SHOW TABLES` / `DESCRIBE` 此前在流式路径上把结果行丢弃、只返回
+>   "Tables shown" 消息——现已返回真实行。
+> * `ORDER BY ... NULLS FIRST/LAST` 此前在多条排序路径上被静默忽略——
+>   现已全路径生效（默认：ASC 时 NULL 最前，DESC 时 NULL 最后）。
+> * `ts BETWEEN '字面量' AND '字面量'` 此前恒为空（向量化谓词未做
+>   Timestamp-vs-Text 预解析）——现已与 `>= AND <=` 形式一致。
+> * DDL 非事务：事务内 `CREATE TABLE` 在 ROLLBACK 后表保留（其事务内
+>   插入的行正确回滚）；事务内 `DROP TABLE` 被拒绝执行。
+
 > 🔴 **列名校验（round-20）**：单表 SELECT / UPDATE / DELETE 的 WHERE 中引用
 > 不存在的列会立即报 `ColumnNotFound`。此前过滤路径把求值错误静默当作
 > "不匹配" —— 拼错列名（`WHERE usr_id = 5`）返回 0 行且无任何错误提示，
