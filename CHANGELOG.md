@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- **语义钉住 (round-24, 零缺陷轮)**: 除零对整型/浮点除数一律
+  DivisionByZero 错误 (PostgreSQL 语义, 非 SQLite NULL / IEEE inf);
+  空间谓词边界精确 (radius ≤ 含等距点, 盒面含边界点) 且 octree 索引
+  在 UPDATE 移动点/建索引后 INSERT 下与无索引路径完全一致;
+  TIME_BUCKET 对齐桶边界 (整点自映, 桶内下取整); ROUND(x, -n) 负数位
+  (half-away-from-zero); `||` 连接数值强制转文本 (1||2="12");
+  UPDATE SET = 标量子查询读**更新前**快照; INSERT ... SELECT 支持。
+  已知不对称 (文档化): WHERE 中除零静默 0 行 vs SELECT 投影报错 —
+  过滤回退路径吞错, v0.16 候选。tests/test_bug_hunt_v114.rs 6 项。
+
 - **🔴🔴 修复(数据损坏): 向量列在 UPDATE+DELETE+合并后读成 65535 维全零向量** —
   列段合并的墓碑/ALTER 占位给 VECTOR 列写裸 [0xFFFF]，而逐行
   [dim:u16][payload] 编码里 0xFFFF 是合法非空维度（无载荷跟随）——

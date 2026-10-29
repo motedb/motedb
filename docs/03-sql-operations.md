@@ -249,6 +249,13 @@ Supported operators:
 > * DDL 非事务：事务内 `CREATE TABLE` 在 ROLLBACK 后表保留（其事务内
 >   插入的行正确回滚）；事务内 `DROP TABLE` 被拒绝执行。
 
+> 🔴 **除零语义（round-24 钉住）**：`x / 0` 对整数**与浮点**除数一律报
+> `DivisionByZero` 错误（PostgreSQL 语义；PG 对 `1.0/0.0` 同样报错。
+> SQLite 返回 NULL、IEEE 给 ±inf —— MoteDB 均不采用）。`%` 同理。
+> ⚠️ 已知不对称（限制）：该错误出现在 **SELECT 投影**时立即报错，但出现在
+> **WHERE 过滤**里时被过滤回退路径吞掉、静默返回 0 行 —— 修复需重构过滤
+> 错误传播（见 round-20 WHERE 校证的同类权衡），v0.16 候选。
+
 > 🔴 **列名校验（round-20）**：单表 SELECT / UPDATE / DELETE 的 WHERE 中引用
 > 不存在的列会立即报 `ColumnNotFound`。此前过滤路径把求值错误静默当作
 > "不匹配" —— 拼错列名（`WHERE usr_id = 5`）返回 0 行且无任何错误提示，
