@@ -11,7 +11,6 @@ use crate::index::btree_generic::{GenericBTree, GenericBTreeConfig};
 use crate::index::text_dictionary::ChunkedDictionary;
 use crate::index::text_types::{
     BM25Config, DocId, FieldNormTable, Position, PostingList, PostingListFormat, TermId, Tokenizer,
-    WhitespaceTokenizer,
 };
 use crate::{Result, StorageError};
 use lru::LruCache;
@@ -353,7 +352,10 @@ impl TextFTSIndex {
     pub fn new(storage_path: PathBuf) -> Result<Self> {
         Self::with_config(
             storage_path,
-            Arc::new(WhitespaceTokenizer::default()),
+            // 🔴 round-23: AutoTokenizer (CJK → Jieba, else whitespace) —
+            // the hardcoded WhitespaceTokenizer indexed a Chinese sentence
+            // as ONE token, so keyword MATCH queries silently found nothing.
+            Arc::new(crate::index::tokenizers::AutoTokenizer),
             true, // enable positions for phrase query support
             32,
         )

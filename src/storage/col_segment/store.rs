@@ -165,13 +165,18 @@ fn encode_column_raw(
         }
         // No default — width-correct NULL placeholder so the raw buffer
         // matches the column's declared encoding.
+        // 🔴 round-23: var-length columns (VECTOR/SPATIAL) use [0x0000]
+        // (dim/len 0 = NULL) — the old bare [0xFFFF] parsed as a VALID
+        // non-null dim=65535 with no payload, misaligning every later row
+        // in the column for sequential walkers (post-merge vector reads
+        // came back as 65535-dim zero vectors).
         match col_types.get(ci) {
             Some(ColumnType::Integer) | Some(ColumnType::Float) | Some(ColumnType::Timestamp) => {
                 buf.extend_from_slice(&[0u8; 8]);
             }
             Some(ColumnType::Boolean) => buf.push(0u8),
             Some(ColumnType::Text | ColumnType::Blob) => buf.extend_from_slice(&0u32.to_le_bytes()),
-            _ => buf.extend_from_slice(&0xFFFFu16.to_le_bytes()),
+            _ => buf.extend_from_slice(&0u16.to_le_bytes()),
         }
         row_nulls.push(true);
         row_bytes.push(buf);
@@ -5105,6 +5110,10 @@ impl ColSegmentStore {
                     // Tiered merge keeps the tombstone: width-correct NULL
                     // placeholders (values are never read, but the builder's
                     // column buffers must stay in sync with num_rows).
+                    // 🔴 round-23: var-length columns use [0x0000] (dim/len
+                    // 0 = NULL) — the old bare [0xFFFF] parsed as a VALID
+                    // non-null dim=65535 with no payload and misaligned
+                    // every later row of the column for sequential walkers.
                     for ct in col_types.iter().take(ncols) {
                         match ct {
                             ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp => {
@@ -5112,7 +5121,7 @@ impl ColSegmentStore {
                             }
                             ColumnType::Boolean => row_bytes.push(vec![0u8]),
                             ColumnType::Text => row_bytes.push(0u32.to_le_bytes().to_vec()),
-                            _ => row_bytes.push(0xFFFFu16.to_le_bytes().to_vec()),
+                            _ => row_bytes.push(0u16.to_le_bytes().to_vec()),
                         }
                         row_nulls.push(true);
                     }

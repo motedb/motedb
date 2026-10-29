@@ -3092,12 +3092,16 @@ fn dtw_multi(a: &[f32], b: &[f32], samples: usize, dim: usize) -> f32 {
 /// (any alternative fully present matches); quoted phrases match verbatim;
 /// non-text cells never match.
 pub(crate) fn match_local_match(cell: Option<&str>, query: &str, phrase: bool) -> bool {
-    use crate::index::tokenizers::{Tokenizer as _, WhitespaceTokenizer};
+    use crate::index::tokenizers::Tokenizer as _;
     let Some(hay) = cell else { return false };
     if phrase {
         return hay.contains(query);
     }
-    let tok = WhitespaceTokenizer::default();
+    // 🔴 round-23: the SAME AutoTokenizer policy the FTS index uses
+    // (CJK → Jieba, else whitespace). The old hardcoded WhitespaceTokenizer
+    // made a Chinese sentence one token — MATCH('训练') never matched
+    // '深度学习模型训练', on both the indexed and row-local paths.
+    let tok = crate::index::tokenizers::AutoTokenizer;
     let q: Vec<String> = tok.tokenize(query).iter().map(|t| t.text.clone()).collect();
     if q.is_empty() {
         return false;

@@ -418,6 +418,32 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_number(&mut self) -> Result<TokenType> {
+        // 🔴 round-23: hex literals (0x1F → 31). The old path read the '0'
+        // and stopped at 'x'; the parser then saw identifier `x1F`, and
+        // with implicit SELECT aliases (round-20) `SELECT 0x1F` silently
+        // evaluated to 0 instead of erroring.
+        if self.current_char() == '0'
+            && matches!(self.bytes.get(self.position + 1), Some(b'x') | Some(b'X'))
+        {
+            self.advance(); // consume '0'
+            self.advance(); // consume 'x'
+            let mut hex = String::with_capacity(8);
+            while !self.is_eof() && self.current_char().is_ascii_hexdigit() {
+                hex.push(self.current_char());
+                self.advance();
+            }
+            if hex.is_empty() {
+                return Err(MoteDBError::ParseError(
+                    "Invalid hex literal: missing digits after 0x".into(),
+                ));
+            }
+            return i64::from_str_radix(&hex, 16)
+                .map(TokenType::PureInteger)
+                .map_err(|_| {
+                    MoteDBError::ParseError(format!("Hex literal out of range: 0x{hex}"))
+                });
+        }
+
         let mut value = String::with_capacity(16);
 
         while !self.is_eof() && (self.current_char().is_numeric() || self.current_char() == '.') {

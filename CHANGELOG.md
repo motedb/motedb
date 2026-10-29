@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- **🔴🔴 修复(数据损坏): 向量列在 UPDATE+DELETE+合并后读成 65535 维全零向量** —
+  列段合并的墓碑/ALTER 占位给 VECTOR 列写裸 [0xFFFF]，而逐行
+  [dim:u16][payload] 编码里 0xFFFF 是合法非空维度（无载荷跟随）——
+  顺序走读者到此错位，同列后续所有行雪崩（实测 17/68 行损坏，维度
+  65535 全零）。占位改为 [0x0000] (dim 0 = NULL)。损坏仅在内存合并
+  视图（重开干净），但 KNN/扫描在长运行会话中静默返回错误距离
+  (round-23, tests/test_bug_hunt_v113.rs::vector_knn_consistent_under_mutation)
+- **🔴 修复(静默空结果): 中文 MATCH 恒不命中** — FTS 索引与逐行 MATCH
+  都硬编码空白分词器，无空格中文句成一个整 token。新增 AutoTokenizer
+  (CJK→Jieba 精确, 其余→空白) 作为两路径统一默认；含 jieba feature 时
+  `MATCH(body) AGAINST('训练')` 正常命中 (round-23)
+- **🔴 修复(静默错值): 0x 十六进制字面量** — 词法器不认 0x1F：读 '0' 停在
+  'x'，round-20 隐式别名把 x1F 吃成列别名，`SELECT 0x1F` 静默返回 0。
+  词法器现支持 0x/0X 十六进制 → i64 (round-23)
+- **验证钉住**: 向量 KNN 与暴力扫描在 UPDATE/DELETE/INSERT/checkpoint/
+  重开全阶段逐 id 一致；64KB±1 BLOB 边界字节级往返；query_by_column/
+  range 与 SQL 一致（含 UPDATE 后）；CASE 简单形式/裸布尔 WHERE/NULL
+  算术传播/GROUP_CONCAT/unicode LENGTH=字符数；`1_000` = 1+隐式别名
+  （标准 SQL）
+
 - **🔴 修复(结果丢失): SHOW TABLES / DESCRIBE 丢弃结果行** — 流式分发把
   execute_show_tables/describe_table 构建的 Select 硬包成 Definition
   {"Tables shown"}，行数据全丢（db.query 返回 []，MCP list_tables 空）。

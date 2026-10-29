@@ -54,6 +54,21 @@ SELECT id, MATCH(content, 'database') AS m FROM art ORDER BY id;
 
 回归: `tests/test_bug_hunt_v104.rs::probe_match_projection_bool`。
 
+### 中文 MATCH / AutoTokenizer（round-23）
+
+默认分词策略为 **AutoTokenizer**：含 CJK 字符的文本走 Jieba 精确分词
+（需 `tokenizer-jieba` feature，默认开启），其余走空白分词。FTS 索引
+（`CREATE TEXT INDEX`）与无索引的逐行 MATCH 共用同一策略。
+
+```sql
+-- round-23 前：无空格的中文句在两条路径上都是一个整 token，
+-- MATCH(body) AGAINST('训练') 匹配 '深度学习模型训练' 恒为空。
+INSERT INTO docs VALUES (2, '深度学习模型训练流程');
+SELECT id FROM docs WHERE MATCH(body) AGAINST('训练');  -- → 2
+```
+
+回归: `tests/test_bug_hunt_v113.rs::chinese_match_search`。
+
 - Standard `INSERT` / `batch_insert_map()` works; the full-text index listens for WAL updates and merges incrementally
 - For large-scale imports:
   1. `batch_insert_map()`

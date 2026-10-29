@@ -64,6 +64,51 @@ pub use crate::index::text_types::{Position, Token, Tokenizer};
 pub use crate::index::text_types::{NgramTokenizer, WhitespaceTokenizer};
 
 //=============================================================================
+// 🔴 round-23: 自动分词策略 — FTS 索引与 row-local MATCH 的统一默认
+//=============================================================================
+
+/// Default tokenizer policy: CJK-bearing text tokenizes with Jieba
+/// (Precise) when the `tokenizer-jieba` feature is enabled; everything else
+/// goes to the whitespace tokenizer.
+///
+/// Before round-23 both the FTS index (`TextFTSIndex::new`) and the
+/// row-local MATCH hardcoded `WhitespaceTokenizer` — a Chinese sentence
+/// with no spaces became ONE token, so `MATCH(col) AGAINST('训练')` never
+/// matched `深度学习模型训练` (silently empty on BOTH paths). One policy
+/// object keeps the indexed and non-indexed paths in agreement.
+pub struct AutoTokenizer;
+
+impl Default for AutoTokenizer {
+    fn default() -> Self {
+        AutoTokenizer
+    }
+}
+
+fn text_has_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        let u = c as u32;
+        (0x4E00..=0x9FFF).contains(&u) // CJK Unified Ideographs
+            || (0x3400..=0x4DBF).contains(&u) // Extension A
+            || (0xF900..=0xFAFF).contains(&u) // Compatibility Ideographs
+    })
+}
+
+impl Tokenizer for AutoTokenizer {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        #[cfg(feature = "tokenizer-jieba")]
+        if text_has_cjk(text) {
+            use jieba_plugin::JiebaTokenizer;
+            return JiebaTokenizer::default().tokenize(text);
+        }
+        WhitespaceTokenizer::default().tokenize(text)
+    }
+
+    fn name(&self) -> &str {
+        "auto"
+    }
+}
+
+//=============================================================================
 // 🔌 Plugin: Jieba 中文分词器（可选）
 //=============================================================================
 
