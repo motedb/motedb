@@ -8,7 +8,7 @@ A hybrid R-Tree (`SpatialHybridIndex`) providing millisecond-level range queries
 CREATE TABLE locations (
     id INT,
     name TEXT,
-    coords GEOMETRY, -- POINT3D 为别名; POINT(lon, lat) 字面量自动补 z=0
+    coords GEOMETRY, -- POINT3D alias; POINT(lon, lat) literals get z=0
     category TEXT
 );
 ```
@@ -16,14 +16,15 @@ CREATE TABLE locations (
 ## Creating an Index
 
 ```sql
--- SPATIAL 与 OCTREE 是同义词; 索引类型为 i-Octree
+-- SPATIAL and OCTREE are synonyms; the index type is i-Octree
 CREATE SPATIAL INDEX locations_coords ON locations(coords);
 ```
 
-> 建模说明 (2026-10 校准): 空间列用 `GEOMETRY` (向量列 `VECTOR(2)` 会被
-> OCTREE 索引拒绝 — "requires SPATIAL column")。早期文档的
-> `coords VECTOR(2)` + Rust `create_spatial_index()` API 已过时, 以本节
-> 为准。回归: `tests/test_bug_hunt_v104.rs::probe_spatial_within_bbox`。
+> Model spatial columns as `GEOMETRY` (a `VECTOR(2)` column is rejected
+> by the OCTREE index with "requires SPATIAL column"). Older docs showing
+> `coords VECTOR(2)` + a Rust `create_spatial_index()` API are
+> outdated — this section is authoritative. Regression:
+> `tests/test_bug_hunt_v104.rs::probe_spatial_within_bbox`.
 
 ## Write Example
 

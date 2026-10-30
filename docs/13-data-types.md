@@ -24,11 +24,12 @@ pub enum Value {
 - SQL: `INT`, `FLOAT`, `BOOL`
 - Rust: `Value::Integer`, `Value::Float`, `Value::Bool`
 - Automatically supports comparison, range queries, and aggregation
-- 🔖 FLOAT 列接受引号数字拼写 (2026-10-27+)：`'3.5'` 以及 IEEE 特殊值
-  `'NaN'` / `'inf'` / `'Infinity'`（这些值没有 SQL 字面量形式，裸 `NaN`
-  会按列名解析）。与 DATE/VECTOR 接受各自字符串拼写的约定对齐；
-  不可解析文本仍报清晰的类型错误。回归:
-  `tests/test_bug_hunt_v105.rs::probe_nan_inf_roundtrip`。
+- FLOAT columns accept quoted numeric spellings: `'3.5'` and the IEEE
+  specials `'NaN'` / `'inf'` / `'Infinity'` (these have no bare SQL
+  literal form — a bare `NaN` parses as a column name). Mirrors the
+  convention where DATE/VECTOR columns accept their string spellings;
+  unparseable text still fails with a clear type error. Regression:
+  `tests/test_bug_hunt_v105.rs::probe_nan_inf_roundtrip`.
 
 ### Text
 
@@ -74,17 +75,18 @@ let value = Value::Timestamp(ts);
 
 - Stored internally as microseconds; supports range queries and sorting
 
-#### 日期/时间函数（round-21 修复与语义钉住）
+#### Date/time functions
 
-| 函数 | 行为 |
+| Function | Behavior |
 |------|------|
-| `YEAR/MONTH/DAY_OF_MONTH(x)` | 接受 **TIMESTAMP 和 DATE** 列（round-21 前对 DATE 静默返回 NULL） |
-| `HOUR/MINUTE/SECOND(ts)` | TIMESTAMP 列；pre-epoch 用 rem_euclid 保证 0-23 正确 |
-| `DATEDIFF(a, b)` | a−b 的**秒**数差（引擎约定；非 MySQL 的天数）。接受 TIMESTAMP/DATE/INTEGER(µs)/ISO 字符串字面量 |
-| `CAST(x AS TEXT)` | DATE → `YYYY-MM-DD`；TIMESTAMP → `YYYY-MM-DD HH:MM:SS[.ffffff]`；BLOB → 按 UTF-8 解释；VECTOR → `[1, 2, 3]`（round-21 前泄漏 Rust Debug 串如 `Date { days: 19753 }`） |
-| `CONCAT(a, b, …)` | **忽略** NULL 操作数（PostgreSQL / SQLite≥3.44 语义）；`||` 运算符按 SQL 标准传播 NULL |
+| `YEAR/MONTH/DAY_OF_MONTH(x)` | Accept **both TIMESTAMP and DATE** columns |
+| `HOUR/MINUTE/SECOND(ts)` | TIMESTAMP columns; pre-epoch times use `rem_euclid` so hours stay 0-23 |
+| `DATEDIFF(a, b)` | Signed difference **a − b in seconds** (engine convention; not MySQL's days). Accepts TIMESTAMP / DATE / INTEGER(µs) / ISO string literals |
+| `CAST(x AS TEXT)` | DATE → `YYYY-MM-DD`; TIMESTAMP → `YYYY-MM-DD HH:MM:SS[.ffffff]`; BLOB → interpreted as UTF-8; VECTOR → `[1, 2, 3]` |
+| `CONCAT(a, b, ...)` | **Skips** NULL operands (PostgreSQL / SQLite≥3.44 semantics); the `\|\|` operator propagates NULL per the SQL standard |
 
-- ISO 字符串解析（INSERT / 字面量）保留**小数秒**到微秒精度：`'2024-06-01 12:00:00.5'`（round-21 前 schema-order INSERT 路径丢弃小数部分）
+- ISO string parsing (INSERT / literals) preserves **fractional seconds**
+  to microsecond precision: `'2024-06-01 12:00:00.5'`.
 
 ## Row vs SqlRow
 
@@ -141,15 +143,14 @@ Binary large object — raw bytes for sensor payloads, serialized messages
 ```sql
 CREATE TABLE frames (id INTEGER PRIMARY KEY, ts TIMESTAMP, payload BLOB);
 INSERT INTO frames VALUES (1, 1700000000000000, X'00fffe0a0b');
-SELECT COUNT(*) FROM frames WHERE payload = X'00fffe0a0b';  -- 字节等值
+SELECT COUNT(*) FROM frames WHERE payload = X'00fffe0a0b';  -- byte equality
 ```
 
-- Python: `params=[..., b"\x00\xff"]` / 取回为 `bytes`;`bytearray` 亦可
-- `LENGTH(blob)` 返回**字节数**(SQLite 语义)
-- 上限 16 MiB/值(防止误将整文件写入行缓冲)
-- 已知 v0.13 缺口 **已清零**(2026-10-22): BLOB 列上的标量函数与谓词
-  (`WHERE LENGTH(payload) > 2`、`IS NOT NULL`)在 segment 合并扫描路径
-  被解码成 NULL 而静默丢行 —— 根因是 MergeCursor 缺 Blob tag 臂 + Text
-  无条件 UTF-8 校验(该游标同时驱动 compaction 重写,不修则压实会把
-  BLOB 永久写成 NULL),及 row_format 部分解码缺 Blob 臂;均已修复并有
-  回归测试(tests/test_blob_where.rs,含 compaction 存活性)。不可索引
+- Python: `params=[..., b"\x00\xff"]`; retrieved as `bytes` (`bytearray`
+  also accepted on input)
+- `LENGTH(blob)` returns the **byte count** (SQLite semantics)
+- 16 MiB per value cap (prevents accidentally buffering whole files)
+- BLOB predicates and scalar functions work on every scan path, including
+  segment-merge rewrites (`WHERE LENGTH(payload) > 2`, `IS NOT NULL`)
+  — regression: `tests/test_blob_where.rs` (incl. compaction survival).
+

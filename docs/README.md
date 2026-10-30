@@ -122,7 +122,7 @@ db.commit_transaction(tx_id)?;
 
 ## 📝 Version Information
 
-Documentation version: v0.1.0
+Documentation version: v0.16.0
 Last updated: 2026-01-11
 
 ---

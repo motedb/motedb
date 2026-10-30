@@ -2,41 +2,42 @@
 
 Complete API documentation for MoteDB.
 
-## 1.0 API 冻结清单 (2026-10)
+## 1.0 API Freeze List
 
-自 1.0 起,以下表面进入 semver 冻结(政策见根目录 [VERSIONING.md](../VERSIONING.md));
-清单外的一切视为内部实现,不承诺兼容。
+The following surfaces enter semver freeze at 1.0 (policy: root
+[VERSIONING.md](../VERSIONING.md)); everything outside the list is an
+internal implementation detail with no compatibility promise.
 
-**Rust crate `motedb`** — 冻结面(全部为当前公开项,不做收窄):
+**Rust crate `motedb`** — frozen surface (all current public items, no
+narrowing):
 
-- 入口类型:`motedb::Database`(本文件全部方法)、`motedb::MoteDB`、
-  `motedb::QueryResult / StreamingQueryResult / ForEachResult / StreamingControl`
-- 配置:`motedb::DBConfig / AutoCheckpointConfig / DurabilityLevel / LSMConfig / WALConfig`
-- 类型系统:`motedb::types::{Value, ColumnType, ColumnDef, TableSchema, IndexType,
-  Timestamp, Date, Text, Blob(=ArcBytes), Vector(=ArcVec), Geometry, TTLDuration, TableType}`
-- 错误:`motedb::{Result, MoteDBError(=StorageError)}` — `StorageError` 与 `Value`
-  均为 `#[non_exhaustive]`:新变体可在 minor 加入,下游 match 必须带 `_` 臂
-  (绑定层把未知变体映射为各自 null 表示,旧包不因新引擎损坏)
-- 生态互操作:`EXPORT/IMPORT PARQUET`、`EXPORT LEROBOT`(feature `parquet`)、
-  `motedb::tokenizers` 插件系统
-- 明确**不在**冻结面:`motedb::ffi`(C ABI,实验性,见 lib.rs 顶部声明)、
-  `motedb::storage / index / sql / database / catalog` 等模块的内部结构 —
-  它们公开仅为 crate 组织所需,1.x 内可能调整;请只通过上面的入口使用
+- Entry types: `motedb::Database` (all methods in this file),
+  `motedb::MoteDB`, `motedb::QueryResult / StreamingQueryResult /
+  ForEachResult / StreamingControl`
+- Config: `motedb::DBConfig / AutoCheckpointConfig / DurabilityLevel /
+  LSMConfig / WALConfig`
+- Types: `motedb::types::{Value, ColumnType, ColumnDef, TableSchema,
+  IndexType, Timestamp, Date, Text, Blob(=ArcBytes), Vector(=ArcVec),
+  Geometry, TTLDuration, TableType}`
+- Errors: `motedb::{Result, MoteDBError(=StorageError)}` — both
+  `StorageError` and `Value` are `#[non_exhaustive]`: new variants may be
+  added in a minor release, downstream `match`es must carry a `_` arm
+  (bindings map unknown variants to their null representation)
+- Ecosystem interop: `EXPORT/IMPORT PARQUET`, `EXPORT LEROBOT`
+  (feature `parquet`), the `motedb::tokenizers` plugin system
+- Explicitly **not** frozen: `motedb::ffi` (experimental C ABI, see the
+  lib.rs header) and the internal structures of `motedb::storage / index /
+  sql / database / catalog` — public only for crate organization; they may
+  change within 1.x. Use only the entry points above.
 
-冻结基线:`docs/api/`(cargo-public-api 清单;新增允许,删除/改签名只在 2.0)。
+Freeze baseline: `docs/api/` (cargo-public-api listing; additions allowed,
+removals/signature changes only in 2.0).
 
-**Python 包 `motedb`(21 方法)**:`motedb.Database(path, preset, create,
-durability, periodic_ms)` + `execute / executemany / query / fetch_arrays /
-insert_arrays / begin / commit / rollback / checkpoint / close / backup_to /
-export_to / import_mcap / doctor / vacuum / hybrid_search /
-set_vector_cache_budget / vector_cache_budget_bytes / open_snapshot**。
-参数化查询 `?` 占位、
-durability 关键字、容器文件自动只读 — 均为冻结行为。
-
-**Node 包 `motedb`(11 成员)**:`new Database(path)` / `Database.open_readonly /
-open_snapshot`(静态)/ 实例 `execute → ExecResult / query / checkpoint /
-backup_to / export_snapshot / close / doctor`。Date 值 ↔ `'YYYY-MM-DD'` 字符串、
-BLOB ↔ base64、float 参数不被截断 — 冻结行为。
+**Node package `motedb` (11 members)**: `new Database(path)` /
+`Database.open_readonly / open_snapshot` (static) / instance `execute ->
+ExecResult / query / checkpoint / backup_to / export_snapshot / close /
+doctor`. Frozen behaviors: Date values ↔ `'YYYY-MM-DD'` strings, BLOB ↔
+base64, float parameters are never truncated.
 
 ## Database Struct
 
@@ -95,17 +96,21 @@ pub fn open<P: AsRef<Path>>(path: P) -> Result<Self>
 let db = Database::open("myapp.mote")?;
 ```
 
-> 🔴 **进程内共享句柄（round-25 钉住）**：同一进程内对同一路径的第二次
-> `open()` **不报错**，而是附着到已存在的引擎实例（共享句柄注册表 —
-> flock 按 open-file-description 计数，进程内重开本会误报"already
-> open"）。两个句柄等价于**同一条连接**：
-> - 句柄 A `BEGIN` 后，句柄 B 的普通查询运行在 A 的活跃事务内（能看到
->   其未提交写入 — read-your-writes 连接语义，非脏读）；
-> - 句柄间无隔离，需要隔离请用事务边界或单句柄。
-> **跨进程**由 `.lock` 文件 flock 互斥：第二个进程 open 报
-> "Database is already open by another process"。
+> **In-process shared handles**: a second `open()` on the same path in
+> the same process does not error — it attaches to the existing engine
+> instance (shared-handle registry; flock is per open-file-description,
+> so an in-process reopen would otherwise misreport "already open"). Two
+> handles behave as **one connection**:
+> - after handle A runs `BEGIN`, plain queries on handle B execute inside
+>   A's active transaction (they see its uncommitted writes —
+>   read-your-writes connection semantics, not a dirty read);
+> - there is no isolation between handles; use transaction boundaries or
+>   a single handle when you need isolation.
+> **Cross-process** opens are mutually excluded by an flock on the
+> `.lock` file: the second process's open fails with "Database is
+> already open by another process".
 
-### flush
+### flush### flush
 
 Flush all data to disk.
 

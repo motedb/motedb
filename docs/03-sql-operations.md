@@ -206,19 +206,19 @@ let results = db.query("SELECT * FROM users WHERE age > 25")?;
 
 ### Column Aliases
 
-`AS` 可省略 —— 隐式别名与显式别名等价（round-20 修复：此前无 `AS` 的别名
-会报误导性的 `Multiple statements are not supported` 解析错误）：
+`AS` is optional — implicit aliases are equivalent to explicit ones:
 
 ```sql
-SELECT name n FROM users;                  -- 列引用隐式别名
-SELECT score * 2 AS final FROM users;      -- 表达式显式别名
+SELECT name n FROM users;                  -- implicit column alias
+SELECT score * 2 AS final FROM users;      -- explicit expression alias
 SELECT dept d, COUNT(*) headcount
-  FROM users GROUP BY d HAVING headcount > 2;   -- 聚合隐式别名
+  FROM users GROUP BY d HAVING headcount > 2;   -- aggregate alias
 ```
 
-别名可在 `ORDER BY` / `GROUP BY` / `HAVING` 中引用（如上 `GROUP BY d`、
-`HAVING headcount`）；`WHERE` 中引用别名会报 `ColumnNotFound`（与标准 SQL
-一致 —— `WHERE` 先于投影求值）。
+Aliases can be referenced in `ORDER BY` / `GROUP BY` / `HAVING` (as with
+`GROUP BY d` and `HAVING headcount` above). Referencing an alias in
+`WHERE` raises `ColumnNotFound` — standard SQL semantics (WHERE is
+evaluated before the projection).
 
 ### WHERE Conditions
 
@@ -235,33 +235,25 @@ Supported operators:
 | `IN` | Range matching | `WHERE id IN (1, 2, 3)` |
 | `LIKE` | Pattern matching | `WHERE name LIKE '%Alice%'` |
 
-> 🔴 **round-22 修复与语义钉住**：
-> * `LIKE` 与 `=` 一致为**大小写敏感**（PostgreSQL 语义；SQLite/MySQL 会在
->   LIKE 中折叠 ASCII 大小写，MoteDB 不会）。
-> * 表名**大小写敏感**（存储键精确匹配），列名大小写不敏感——引用时请使
->   用建表时的表名拼写。
-> * `SHOW TABLES` / `DESCRIBE` 此前在流式路径上把结果行丢弃、只返回
->   "Tables shown" 消息——现已返回真实行。
-> * `ORDER BY ... NULLS FIRST/LAST` 此前在多条排序路径上被静默忽略——
->   现已全路径生效（默认：ASC 时 NULL 最前，DESC 时 NULL 最后）。
-> * `ts BETWEEN '字面量' AND '字面量'` 此前恒为空（向量化谓词未做
->   Timestamp-vs-Text 预解析）——现已与 `>= AND <=` 形式一致。
-> * DDL 非事务：事务内 `CREATE TABLE` 在 ROLLBACK 后表保留（其事务内
->   插入的行正确回滚）；事务内 `DROP TABLE` 被拒绝执行。
-
-> 🔴 **除零语义（round-24 钉住）**：`x / 0` 对整数**与浮点**除数一律报
-> `DivisionByZero` 错误（PostgreSQL 语义；PG 对 `1.0/0.0` 同样报错。
-> SQLite 返回 NULL、IEEE 给 ±inf —— MoteDB 均不采用）。`%` 同理。
-> ⚠️ 已知不对称（限制）：该错误出现在 **SELECT 投影**时立即报错，但出现在
-> **WHERE 过滤**里时被过滤回退路径吞掉、静默返回 0 行 —— 修复需重构过滤
-> 错误传播（见 round-20 WHERE 校证的同类权衡），v0.16 候选。
-
-> 🔴 **列名校验（round-20）**：单表 SELECT / UPDATE / DELETE 的 WHERE 中引用
-> 不存在的列会立即报 `ColumnNotFound`。此前过滤路径把求值错误静默当作
-> "不匹配" —— 拼错列名（`WHERE usr_id = 5`）返回 0 行且无任何错误提示，
-> 属于静默错误结果。JOIN 查询与相关子查询不受此校验影响（相关子查询引用
-> 外层列是合法的）。WHERE 中引用 SELECT 列表的别名同样报错（与标准 SQL
-> 一致：别名在 WHERE 之后绑定）。
+> **Semantics notes**:
+> * `LIKE` is **case-sensitive**, same as `=` (PostgreSQL semantics;
+>   SQLite/MySQL fold ASCII case in LIKE — MoteDB does not).
+> * Table names are **case-sensitive** (exact storage keys); column names
+>   are case-insensitive. Quote table names exactly as created.
+> * `ORDER BY ... NULLS FIRST/LAST` is honored on every sort path
+>   (default: NULLs first on ASC, last on DESC).
+> * Division by zero raises `DivisionByZero` for integer **and** float
+>   divisors (PostgreSQL semantics — not SQLite's NULL, not IEEE ±inf).
+>   `%` behaves the same. Known asymmetry: the error surfaces from
+>   SELECT projections, but inside a WHERE filter it is currently
+>   swallowed as "no match" (0 rows) — on the roadmap.
+> * Unknown columns in a single-table WHERE raise `ColumnNotFound`
+>   immediately. JOINs and correlated subqueries (outer references) are
+>   unaffected; referencing a SELECT alias in WHERE also errors (aliases
+>   bind after WHERE, as in standard SQL).
+> * DDL is non-transactional: `CREATE TABLE` inside a rolled-back
+>   transaction survives (its transactional inserts are rolled back
+>   correctly); `DROP TABLE` inside a transaction is rejected.
 
 #### Examples
 
@@ -286,370 +278,64 @@ let results = db.query("
 ")?;
 ```
 
-#### LIKE … ESCAPE — 字面匹配 % / _ / 转义符 (2026-10-24+)
+#### LIKE ... ESCAPE — literal % / _ / escape char
 
 ```sql
--- '$' 后的字符按字面匹配: 只命中文本恰为 "100% sure" 的行
+-- The character after '$' matches literally: only "100% sure" hits
 SELECT * FROM s WHERE t LIKE '100$% sure' ESCAPE '$';
--- 双写转义符 = 字面转义符: 命中 "a$b"
+-- Doubled escape char = literal escape char: matches "a$b"
 SELECT * FROM s WHERE t LIKE 'a$$b' ESCAPE '$';
--- ⚠️ LIKE 是全串匹配 — 字面前缀过滤需尾随未转义通配:
-SELECT * FROM s WHERE t LIKE 'item_9$%%' ESCAPE '$';  -- 命中 "item_9%…"
+-- LIKE matches the WHOLE string — a literal-prefix filter needs a
+-- trailing unescaped wildcard:
+SELECT * FROM s WHERE t LIKE 'item_9$%%' ESCAPE '$';  -- matches "item_9%..."
 ```
 
-规则: ESCAPE 取单字符字面量 (多字符/非字面量报解析错误); 转义符悬空
-落在模式末尾时按字面转义符匹配 (宽松处理, SQLite 在此报错)。
-回归: `tests/test_like_escape.rs` (含 NOT LIKE 组合/语法错误/reopen+索引路径)。
+Rules: `ESCAPE` takes a single-character literal (multi-char or
+non-literal is a parse error); a dangling escape at the very end of the
+pattern matches a literal escape char (lenient — SQLite errors here).
+Regressions: `tests/test_like_escape.rs`.
 
-#### CROSS JOIN 与逗号连接 (2026-10-28+)
+#### CROSS JOIN and comma joins
 
 ```sql
--- 笛卡尔积: 两种标准写法等价 (round-19 前均不支持 — CROSS 报
--- "Expected On", 逗号报 "Multiple statements")
+-- Cartesian product: both standard spellings are equivalent
 SELECT COUNT(*) FROM a CROSS JOIN b;
-SELECT a.x, b.y FROM a, b WHERE a.x = 1;   -- 隐式交叉积 + WHERE 过滤
+SELECT a.x, b.y FROM a, b WHERE a.x = 1;   -- implicit cross join + WHERE
 ```
 
-回归: `tests/test_bug_hunt_v108.rs::probe_cross_join`。
-⚠️ 已知缺口: 列级 `UNIQUE` 约束语法 (`k INT UNIQUE`) 尚不支持
-(解析报错), 唯一性请用 PRIMARY KEY 或应用层校验。
+Regressions: `tests/test_bug_hunt_v108.rs::probe_cross_join`.
+Known gap: column-level `UNIQUE` (`k INT UNIQUE`) is not supported yet —
+use PRIMARY KEY or application-side checks for uniqueness.
 
-#### SUBSTRING 标准 FROM/FOR 形式 (2026-10-26+)
+#### SUBSTRING — standard FROM/FOR form
 
 ```sql
--- 标准 SQL 形式与逗号形式等价 (round-12 前标准形式解析失败):
-SELECT SUBSTRING('abcdef' FROM 2 FOR 3);  -- 'bcd'
-SELECT SUBSTRING('abcdef' FROM 2);        -- 'bcdef' (省略 FOR = 到结尾)
-SELECT SUBSTRING('abcdef', 2, 3);         -- 'bcd'   (逗号形式, 兼容不变)
-SELECT SUBSTR('abcdef', 2, 3);            -- 'bcd'   (别名)
+SELECT SUBSTRING('abcdef' FROM 2);        -- 'bcdef' (FOR omitted = to end)
+SELECT SUBSTRING('abcdef', 2, 3);         -- 'bcd'   (comma form)
+SELECT SUBSTR('abcdef', 2, 3);            -- 'bcd'   (alias)
 ```
 
-语义: 位置 1 起算 (0 视为 1); 负位置从尾部倒数 (SQLite 兼容)。
-回归: `tests/test_bug_hunt_v102.rs::probe_string_functions`。
+Semantics: positions are 1-based (0 is treated as 1); negative positions
+count from the end (SQLite-compatible).
+Regressions: `tests/test_bug_hunt_v102.rs::probe_string_functions`.
 
-NULL 分工 (自洽设计, 此处明确): `CONCAT(...)` 跳过 NULL 参数
-(PostgreSQL `concat` 语义); `||` 运算符传播 NULL (SQL 标准)。
+NULL handling: `CONCAT(...)` skips NULL arguments (PostgreSQL `concat`
+semantics); the `||` operator propagates NULL (SQL standard).
 
-#### 相关子查询 — 外引用绑定 (2026-10-24 修复)
+#### Correlated subqueries — outer-reference binding
 
 ```sql
--- 相关 EXISTS: 内表 b 的行按外行 a.k 逐行判断 — 只返回在 b 中有同 k 值的 a 行
+-- Correlated EXISTS: rows of inner table b are judged per outer row of a
 SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k);
--- 相关标量子查询 (SELECT 列表或 WHERE): 每外行执行一次
+-- Correlated scalar subquery (projection or WHERE): runs per outer row
 SELECT id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a;
 ```
 
-规则: 表限定列按前缀区分内外 — 前缀等于子查询 FROM 表/别名的列是
-内引用, 其余前缀 (可在外层解析) 是外引用按外行逐行绑定; 无限定名列
-取**最内层**作用域 (`b.k = k` 中 k 即 b.k)。
-历史 bug (已修, 回归 `tests/test_correlated_subquery.rs`): 内外表裸列
-同名时两侧都被绑到外行 → `b.k = a.k` 恒真 → EXISTS 匹配全部行、
-标量计数恒为内表行数; 以及 WHERE 快路径 eager 执行未绑定相关子查询。
-
-### ORDER BY
-
-```rust
-// Ascending order
-let results = db.query("SELECT * FROM users ORDER BY age ASC")?;
-
-// Descending order
-let results = db.query("SELECT * FROM users ORDER BY salary DESC")?;
-
-// Multi-column sort
-let results = db.query("
-    SELECT * FROM users
-    ORDER BY age DESC, name ASC
-")?;
-```
-
-### LIMIT and OFFSET
-
-```rust
-// Limit the number of returned rows
-let results = db.query("SELECT * FROM users LIMIT 10")?;
-
-// Paginated query
-let results = db.query("SELECT * FROM users LIMIT 10 OFFSET 20")?;
-
-// Combined usage
-let results = db.query("
-    SELECT * FROM users
-    WHERE age > 18
-    ORDER BY created_at DESC
-    LIMIT 50
-")?;
-```
-
-## Aggregate Functions
-
-### Supported Aggregate Functions
-
-| Function | Description | Example |
-|-----|-----|-----|
-| `COUNT(*)` | Count rows | `SELECT COUNT(*) FROM users` |
-| `SUM(col)` | Sum values | `SELECT SUM(salary) FROM users` |
-| `AVG(col)` | Average value | `SELECT AVG(age) FROM users` |
-| `MIN(col)` | Minimum value | `SELECT MIN(age) FROM users` |
-| `MAX(col)` | Maximum value | `SELECT MAX(salary) FROM users` |
-
-### Examples
-
-```rust
-// Total count
-let result = db.query("SELECT COUNT(*) as total FROM users")?;
-
-// Average value
-let result = db.query("SELECT AVG(age) as avg_age FROM users")?;
-
-// Multiple aggregates
-let result = db.query("
-    SELECT
-        COUNT(*) as total,
-        AVG(age) as avg_age,
-        MIN(age) as min_age,
-        MAX(age) as max_age,
-        SUM(salary) as total_salary
-    FROM users
-")?;
-```
-
-### GROUP BY
-
-```rust
-// Group by a single column
-let result = db.query("
-    SELECT category, COUNT(*) as count
-    FROM products
-    GROUP BY category
-")?;
-
-// Group by multiple columns
-let result = db.query("
-    SELECT category, is_active, AVG(price) as avg_price
-    FROM products
-    GROUP BY category, is_active
-")?;
-
-// With HAVING filter
-let result = db.query("
-    SELECT category, COUNT(*) as count
-    FROM products
-    GROUP BY category
-    HAVING count > 10
-")?;
-```
-
-## JOIN Queries
-
-### INNER JOIN
-
-```rust
-let result = db.query("
-    SELECT users.name, orders.order_id, orders.amount
-    FROM users
-    INNER JOIN orders ON users.id = orders.user_id
-")?;
-```
-
-### LEFT JOIN
-
-```rust
-let result = db.query("
-    SELECT users.name, orders.order_id
-    FROM users
-    LEFT JOIN orders ON users.id = orders.user_id
-")?;
-```
-
-### Multi-Table JOIN
-
-```rust
-let result = db.query("
-    SELECT
-        users.name,
-        orders.order_id,
-        products.product_name
-    FROM users
-    INNER JOIN orders ON users.id = orders.user_id
-    INNER JOIN products ON orders.product_id = products.id
-    WHERE users.is_active = TRUE
-")?;
-```
-
-## Subqueries
-
-### WHERE Subquery
-
-```rust
-let result = db.query("
-    SELECT * FROM users
-    WHERE age > (SELECT AVG(age) FROM users)
-")?;
-
-// IN subquery
-let result = db.query("
-    SELECT * FROM products
-    WHERE category_id IN (
-        SELECT id FROM categories WHERE is_active = TRUE
-    )
-")?;
-```
-
-### FROM Subquery
-
-```rust
-let result = db.query("
-    SELECT avg_age, COUNT(*) as count
-    FROM (
-        SELECT age, AVG(salary) as avg_age
-        FROM users
-        GROUP BY age
-    ) subquery
-    WHERE avg_age > 50000
-    GROUP BY avg_age
-")?;
-```
-
-## Index Operations
-
-### Creating Indexes
-
-```rust
-// Column index
-db.execute("CREATE INDEX users_email ON users(email)")?;
-
-// Vector index
-db.execute("CREATE VECTOR INDEX docs_embedding ON documents(embedding)")?;
-
-// Full-text index
-db.execute("CREATE TEXT INDEX articles_content ON articles(content)")?;
-
-// Spatial index
-db.execute("CREATE SPATIAL INDEX locations_coords ON locations(coords)")?;
-```
-
-### Dropping Indexes
-
-```rust
-db.execute("DROP INDEX users_email ON users")?;
-```
-
-### Viewing Indexes
-
-```rust
-let result = db.query("SHOW INDEXES FROM users")?;
-```
-
-## Special Operations
-
-### Vector Search
-
-```rust
-// Using the <-> operator (L2 distance)
-let result = db.query("
-    SELECT * FROM documents
-    ORDER BY embedding <-> [0.1, 0.2, ..., 0.5]
-    LIMIT 10
-")?;
-
-// Using the <#> operator (inner product)
-let result = db.query("
-    SELECT * FROM documents
-    ORDER BY embedding <#> [0.1, 0.2, ..., 0.5]
-    LIMIT 10
-")?;
-
-// Using the <=> operator (cosine distance)
-let result = db.query("
-    SELECT * FROM documents
-    ORDER BY embedding <=> [0.1, 0.2, ..., 0.5]
-    LIMIT 10
-")?;
-```
-
-### Full-Text Search
-
-```rust
-// MATCH function
-let result = db.query("
-    SELECT * FROM articles
-    WHERE MATCH(content, 'rust database')
-")?;
-
-// With BM25 score
-let result = db.query("
-    SELECT *, BM25_SCORE(content, 'rust database') as score
-    FROM articles
-    WHERE MATCH(content, 'rust database')
-    ORDER BY score DESC
-    LIMIT 20
-")?;
-```
-
-### Spatial Queries
-
-```rust
-// ST_WITHIN function
-let result = db.query("
-    SELECT * FROM locations
-    WHERE ST_WITHIN(coords, 116.0, 39.0, 117.0, 40.0)
-")?;
-
-// ST_DISTANCE function
-let result = db.query("
-    SELECT *, ST_DISTANCE(coords, 116.4, 39.9) as distance
-    FROM locations
-    ORDER BY distance ASC
-    LIMIT 10
-")?;
-```
-
-## Parsing Query Results
-
-```rust
-let results = db.query("SELECT * FROM users WHERE age > 25")?;
-
-// Get column information
-println!("Columns: {:?}", results.columns);
-
-// Iterate over rows
-for row_map in results.rows_as_maps() {
-    // Get field values
-    if let Some(name) = row_map.get("name") {
-        println!("Name: {:?}", name);
-    }
-
-    if let Some(age) = row_map.get("age") {
-        if let motedb::Value::Integer(age_val) = age {
-            println!("Age: {}", age_val);
-        }
-    }
-}
-
-// Get row count
-println!("Total rows: {}", results.row_count());
-```
-
-## Best Practices
-
-1. **Use parameterized queries** (prevent SQL injection)
-2. **Create appropriate indexes** (improve query performance)
-3. **Use LIMIT** (restrict the amount of returned data)
-4. **Avoid SELECT *** (explicitly specify the columns you need)
-5. **Use transactions** (ensure data consistency)
-
-## Limits
-
-- **Expression nesting**: at most 64 levels of nested parentheses / unary
-  operators / vector literals `[...]` / `CASE` expressions. Deeper input
-  returns a syntax error (`Expression nesting too deep`) instead of
-  overflowing the stack — any realistic SQL stays far below the limit.
-
-## Next Steps
-
-- [Batch Operations](./04-batch-operations.md) - High-performance batch inserts
-- [Index System](./06-indexes-overview.md) - Deep dive into indexes
-- [API Reference](./14-api-reference.md) - Complete API documentation
+Binding rule: table-qualified columns resolve by prefix — a prefix equal
+to the subquery's own FROM table/alias is an inner reference; any other
+prefix (resolvable in the outer scope) binds to the outer row, per row.
+Unqualified columns take the **innermost** scope (in `b.k = k`, `k` is
+`b.k`). Regression: `tests/test_correlated_subquery.rs`.
 
 ---
 
@@ -657,18 +343,19 @@ println!("Total rows: {}", results.row_count());
 **Next**: [Batch Operations](./04-batch-operations.md)
 
 
-## 参数化 LIMIT / OFFSET（0.12 新增）
+## Parameterized LIMIT / OFFSET
 
 ```rust,ignore
 db.execute_prepared("SELECT id FROM t ORDER BY id LIMIT ? OFFSET ?",
                     vec![Value::Integer(10), Value::Integer(20)])?;
 ```
 
-Python: `db.query("SELECT ... LIMIT ? OFFSET ?", params=[10, 20])`。
+Python: `db.query("SELECT ... LIMIT ? OFFSET ?", params=[10, 20])`.
 
-限制：UNION/EXCEPT/INTERSECT 结果集不支持参数化 LIMIT/OFFSET（普通
-SELECT 全支持）；参数必须是非负整数。
+Limits: set-operation results (UNION/EXCEPT/INTERSECT) do not support
+parameterized LIMIT/OFFSET (plain SELECTs fully do); parameters must be
+non-negative integers.
 
-## Python 混合检索 / Arrow（0.12 新增）
+## Python Hybrid Retrieval / Arrow
 
-见 [17-hybrid-arrow.md](17-hybrid-arrow.md)。
+See [17-hybrid-arrow.md](17-hybrid-arrow.md).

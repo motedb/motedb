@@ -1,152 +1,74 @@
 # Changelog
 
-## [Unreleased]
+## [0.16.0] — 2026-10-30
 
-- **🔴 修复(MCP): describe 工具返回的是 DESCRIBE 输出表头而非 schema** —
-  `cols, _ = fetch_arrays(...)` 保留了输出列名 (["Field","Type",
-  "Nullable","Position"], 对任何表都一样) 丢弃了真实行。改用行 API
-  返回逐列记录。新增 bindings/python/e2e/test_mcp_stdio.py — MCP stdio
-  端到端往返 (initialize/list_tables/query 截断/vector_search 精确
-  top-3/describe/只读门), 6/6 全绿; round-20/22 的修复首次端到端验证
-  (round-28)
+> 28 轮系统性猎虫与验证后的正确性版本。**42 个缺陷修复**（含 1 个数据
+> 损坏级、多个"静默错误结果"类），SQL 兼容性大幅提升（隐式别名、复合
+> 主键验证、中文全文检索、时间戳算术），四层 API（Rust/Node/Go/Python）
+> 与 MCP 全部在当前引擎上端到端验证。全面性能 A/B 对照确认无回归
+> （ORDER BY 快 ~28%，查询内存省 18%，其余持平）。
 
-- **门禁补洞 + 绑定层首次全面验证 (round-27)**:
-  * clippy 门禁此前只查默认 feature 集 — 最小集 (node 构建:
-    no-jieba/no-rayon/no-jemalloc) 积累 5 处 cfg 死代码/风格警告,
-    全部修复 (text_has_cjk 门控、segs_disjoint cfg_attr、
-    SerialParBridge allow、VecAcc::merge cfg、needless_return)。
-    两个 feature 集现均零警告
-  * Node 插件自 0.15.2 后首次重建 (含 26 轮引擎改动):
-    smoke_ci + smoke_snapshot 双绿 (node v22, darwin-arm64)
-  * Go 绑定首次运行: ffi 静态库重建, 6/6 测试全过
-    (CRUD+类型/重开持久化/episode+ASOF 对齐/备份/快照导出导入/
-    时序统一+容器只读)
+### 静默错误结果类（最关键）
 
-- **🔴 修复(静默空结果): TIMESTAMP ± INTEGER(µs) 算术** — 两套求值器
-  (SqlRow evaluator 与 positional 副本) 都缺 (Timestamp, Integer) 分支:
-  TypeError/Null 被 WHERE 过滤路径吞掉, `WHERE at + 60000000 > x`
-  静默返回空。现按引擎 µs 约定正确计算 (checked_add/sub 防溢出),
-  投影与 WHERE 一致 (round-26)
-- **验证钉住 (round-26)**: CREATE TABLE 列 DEFAULT 值在 INSERT 省列时
-  填充 (INT/TEXT/FLOAT), 显式 NULL 覆盖默认; NOT NULL 约束在 INSERT
-  与 UPDATE 双路径强制; **复合 PRIMARY KEY (a, b)** — 重复拒绝、双键
-  点查、ON CONFLICT 复合键 upsert、重开后唯一性仍然强制;
-  LIMIT ?/OFFSET ? 绑定参数; 标识符上限 4096 (1000 字符合法);
-  TRUE/FALSE 字面量 + TRUE=1 强转; = NULL 永不匹配; JOIN ON 带 OR
-  条件精确。tests/test_bug_hunt_v116.rs 8 项。
+- **🔴🔴 数据损坏**: 向量列在 UPDATE+DELETE+段合并后读成 65535 维全零
+  向量 — 列段合并的墓碑/ALTER 占位写裸 [0xFFFF]，逐行 [dim:u16] 编码里
+  是合法非空维度且无载荷 → 顺序走读者错位、同列后续全雪崩。占位改
+  [0x0000] (dim 0 = NULL)。回归: KNN 与暴力扫描全阶段逐 id 一致
+- WHERE 未知列被静默吞掉 — 单表 SELECT/UPDATE/DELETE 拼错列名返回
+  0 行/affected_rows: 0 无提示；语句入口 schema 绑定校验立即报
+  ColumnNotFound
+- SHOW TABLES / DESCRIBE 流式分发丢弃结果行（db.query 返回 []、
+  MCP list_tables 空）——行数据流经完整路径
+- 日期函数对 DATE 列返回 NULL（YEAR/MONTH/DAY_OF_MONTH/DATEDIFF）
+- CAST(x AS TEXT) 泄漏 Rust Debug 串（`Date { days: 19753 }`）——
+  现按 SQL 文本形态渲染（新增 Timestamp::to_iso）
+- ISO 时间戳小数秒被丢弃（'…12:00:00.5' 的 .5 消失，schema-order
+  INSERT 路径）——解析到 µs，双实现去重
+- 中文 MATCH 恒不命中 — FTS 索引与逐行 MATCH 都硬编码空白分词器；
+  新增 AutoTokenizer（CJK→Jieba，其余→空白）两路径统一
+- TIMESTAMP ± INTEGER(µs) 算术 TypeError 被吞 → WHERE 静默空
+- TIMESTAMP 列 BETWEEN 文本字面量恒空（vector_exec 预解析缺口，
+  `>= AND <=` 却正常）——同一 col_lit 预解析
+- GROUP BY 表达式 + ORDER BY 同表达式乱序（快路径丢键 + full_row
+  zip 错位配对）——表达式键读分组投影值，不可解析则明确报错
+- NULLS FIRST/LAST 被四条排序路径中的三条静默忽略——全路径统一
+- 0x 十六进制字面量静默返回 0（词法器缺十六进制 + 隐式别名吞噬）
+- MCP describe 工具返回 DESCRIBE 表头而非 schema（行被丢弃）
 
-- **语义钉住 (round-25, 连续第二个零缺陷轮 — 并发/维护前沿)**: 同进程
-  二次 open 附着同一引擎 (共享句柄注册表, docs/14) — 句柄间为同一连接
-  语义 (BEGIN 后其他句柄读运行在活跃事务内), 跨进程由 flock 互斥
-  (裸 flock 实测有效); 并发同行 UPDATE 无撕裂写; 4 写者+2 读者并发
-  终态逐表精确; VACUUM 后数据完整且重开稳定; 1000 值 IN/NOT IN 精确;
-  BLOB ORDER BY 字典序确定性; MySQL 的 UPDATE/DELETE ... ORDER BY/
-  LIMIT 语法干净拒绝。tests/test_bug_hunt_v115.rs 7 项。
+### SQL 兼容性
 
-- **语义钉住 (round-24, 零缺陷轮)**: 除零对整型/浮点除数一律
-  DivisionByZero 错误 (PostgreSQL 语义, 非 SQLite NULL / IEEE inf);
-  空间谓词边界精确 (radius ≤ 含等距点, 盒面含边界点) 且 octree 索引
-  在 UPDATE 移动点/建索引后 INSERT 下与无索引路径完全一致;
-  TIME_BUCKET 对齐桶边界 (整点自映, 桶内下取整); ROUND(x, -n) 负数位
-  (half-away-from-zero); `||` 连接数值强制转文本 (1||2="12");
-  UPDATE SET = 标量子查询读**更新前**快照; INSERT ... SELECT 支持。
-  已知不对称 (文档化): WHERE 中除零静默 0 行 vs SELECT 投影报错 —
-  过滤回退路径吞错, v0.16 候选。tests/test_bug_hunt_v114.rs 6 项。
+- **SELECT 列表隐式别名**（`SELECT v x`、`SELECT COUNT(*) c`）——此前
+  全部死于误导性解析错误；别名可在 ORDER BY/GROUP BY/HAVING 引用
+- 验证钉住: 复合 PRIMARY KEY（重复拒绝/双键点查/复合 upsert/重开强制）、
+  列 DEFAULT 值、NOT NULL 双路径强制、LIMIT ?/OFFSET ? 绑定参数
 
-- **🔴🔴 修复(数据损坏): 向量列在 UPDATE+DELETE+合并后读成 65535 维全零向量** —
-  列段合并的墓碑/ALTER 占位给 VECTOR 列写裸 [0xFFFF]，而逐行
-  [dim:u16][payload] 编码里 0xFFFF 是合法非空维度（无载荷跟随）——
-  顺序走读者到此错位，同列后续所有行雪崩（实测 17/68 行损坏，维度
-  65535 全零）。占位改为 [0x0000] (dim 0 = NULL)。损坏仅在内存合并
-  视图（重开干净），但 KNN/扫描在长运行会话中静默返回错误距离
-  (round-23, tests/test_bug_hunt_v113.rs::vector_knn_consistent_under_mutation)
-- **🔴 修复(静默空结果): 中文 MATCH 恒不命中** — FTS 索引与逐行 MATCH
-  都硬编码空白分词器，无空格中文句成一个整 token。新增 AutoTokenizer
-  (CJK→Jieba 精确, 其余→空白) 作为两路径统一默认；含 jieba feature 时
-  `MATCH(body) AGAINST('训练')` 正常命中 (round-23)
-- **🔴 修复(静默错值): 0x 十六进制字面量** — 词法器不认 0x1F：读 '0' 停在
-  'x'，round-20 隐式别名把 x1F 吃成列别名，`SELECT 0x1F` 静默返回 0。
-  词法器现支持 0x/0X 十六进制 → i64 (round-23)
-- **验证钉住**: 向量 KNN 与暴力扫描在 UPDATE/DELETE/INSERT/checkpoint/
-  重开全阶段逐 id 一致；64KB±1 BLOB 边界字节级往返；query_by_column/
-  range 与 SQL 一致（含 UPDATE 后）；CASE 简单形式/裸布尔 WHERE/NULL
-  算术传播/GROUP_CONCAT/unicode LENGTH=字符数；`1_000` = 1+隐式别名
-  （标准 SQL）
+### 语义钉住（文档化，防止引擎间歧义）
 
-- **🔴 修复(结果丢失): SHOW TABLES / DESCRIBE 丢弃结果行** — 流式分发把
-  execute_show_tables/describe_table 构建的 Select 硬包成 Definition
-  {"Tables shown"}，行数据全丢（db.query 返回 []，MCP list_tables 空）。
-  test_sql_ddl_features 里的 TODO 注释早已承认此缺口 (round-22)
-- **🔴 修复(静默错序): NULLS FIRST/LAST 被静默忽略** — 四条排序路径
-  (scan.rs 扫描级排序 / mod.rs 全行置换排序 / 物化 comparator /
-  两个 GROUP BY 快路径) 中三条丢掉了 nulls_first 标志，"ORDER BY v ASC
-  NULLS LAST" 照样 NULL 在前。全路径统一 rank 语义 (NULL 定位与
-  ASC/DESC 独立)，物化 comparator 同时改用 order_by_cmp (NaN 一致)
-  (round-22)
-- **🔴 修复(静默错序): GROUP BY 表达式 + ORDER BY 同表达式乱序** —
-  两个 GROUP BY 快路径把非列/非聚合 ORDER BY 键静默丢弃 (输出 HashMap
-  任意序)；物化路径的 full_row zip 把分组输出与输入行错位配对，表达式
-  键在错误行上求值。修复: 表达式键匹配 SELECT 列表读分组投影值;
-  GROUP BY 下不可解析的 ORDER BY 表达式明确报错 (标准 SQL 行为)
-  (round-22)
-- **🔴 修复(静默空结果): TIMESTAMP 列 BETWEEN 文本字面量恒空** —
-  vector_exec 谓词编译器对简单比较 (>=/<=) 做了 Timestamp-vs-Text
-  预解析，BETWEEN 分支漏掉——I64 批比较 vs Text 恒 false。等价的
-  `>= AND <=` 形式却正常。BETWEEN 边界现走同一 col_lit 预解析 (round-22)
-- **语义钉住**: LIKE 大小写敏感 (PG 风格, 与 = 一致); 表名大小写敏感/
-  列名不敏感 (存储键精确匹配, 折叠属 0.16 破坏性变更范畴); DDL 非事务
-  (CREATE 留存/行回滚, DROP 在事务内被拒)
+- 除零: 整型/浮点除数一律 DivisionByZero（PostgreSQL 语义）
+- LIKE 与 = 一致大小写敏感；表名大小写敏感/列名不敏感
+- CONCAT 忽略 NULL（PG 风格），|| 按标准传播 NULL；DATEDIFF = a−b 秒
+- 同进程二次 open() 附着同一引擎（共享句柄注册表，docs/14）；跨进程
+  flock 互斥
+- DDL 非事务（CREATE 留存+行回滚，事务内 DROP 被拒）
+- 圆整 ROUND(x,-n) half-away；DATE 函数表（docs/13）；已知限制:
+  WHERE 中除零静默 0 行（v0.16+ 候选修复）
 
-- **🔴 修复(静默错误结果): 日期函数对 DATE 列返回 NULL** — `YEAR/MONTH/
-  DAY_OF_MONTH` 只认 TIMESTAMP 值, DATE 列经 value_to_micros 落空 →
-  TypeError 被投影路径吞成 NULL; `DATEDIFF` 对 DATE 参数同样 TypeError。
-  修复: value_to_micros 接受 Date (当日零点 µs), DATEDIFF 额外接受 ISO
-  字符串字面量 (round-21)
-- **🔴 修复(内部泄漏): CAST(x AS TEXT) 输出 Rust Debug 串** —
-  `CAST(date AS TEXT)` 返回 `Date(Date { days: 19753 })`。现按 SQL 文本
-  形态渲染: DATE→`YYYY-MM-DD`, TIMESTAMP→`YYYY-MM-DD HH:MM:SS[.ffffff]`
-  (新增 `Timestamp::to_iso`), BLOB→UTF-8 解释, VECTOR→`[1, 2, 3]`
-  (round-21)
-- **🔴 修复(精度丢失): ISO 时间戳小数秒被丢弃** — `parse_iso` 用
-  `split('.').next()` 只取整秒, `'…12:00:00.5'` 的 .5 消失;
-  row_converter 的手写副本 `parse_datetime` (schema-order INSERT 路径)
-  同病。修复 parse_iso 解析到 µs, 副本直接委托 (单一实现, 不再漂移)
-  (round-21)
-- **语义钉住**: `CONCAT` 忽略 NULL 操作数 (PG/SQLite≥3.44 风格), `||`
-  按标准传播 NULL; `DATEDIFF(a,b)` = a−b 秒数; docs/13 日期函数表
+### 质量与验证
 
-- **🔴 修复(SQL 兼容性): SELECT 列表隐式别名** — 无 `AS` 的别名
-  (`SELECT v x`、`SELECT COUNT(*) c`、`SELECT v + 1 total`)曾全部死于误导性
-  `Multiple statements are not supported` 解析错误。MySQL/SQLite/Postgres
-  标准写法, ORM/分析查询高频。修复后别名可在 ORDER BY / GROUP BY / HAVING
-  中引用 (round-20, tests/test_bug_hunt_v110.rs)
-- **🔴 修复(静默错误结果): WHERE 未知列被静默吞掉** — 单表 SELECT/UPDATE/
-  DELETE 的 WHERE 引用不存在的列时, 逐行过滤路径把求值错误当作"不匹配":
-  `WHERE usr_id = 5` (拼错列名) 返回 0 行且无任何错误提示, UPDATE/DELETE
-  则静默 affected_rows: 0。现于语句入口做一次 schema 绑定校验, 立即报
-  `ColumnNotFound`。JOIN 查询与相关子查询(引用外层列)不受影响; WHERE 引用
-  SELECT 别名仍按标准报错 (round-20)
-- **clippy 门禁升级**: `cargo clippy --all-targets` 零警告(此前 lib-only,
-  测试代码 8 处历史遗留告警清零)
+- clippy 双 feature 集零警告（默认集 + node 最小集——后者此前从未
+  被门禁覆盖）
+- 绑定层全面验证: Node smoke 双绿、Go 6/6 首跑、Python 13/13、
+  MCP stdio e2e 6/6（round-20/22 修复的端到端确认）
+- 性能 A/B（round-19 基线 vs 0.16.0，同机背靠背）: 无回归；ORDER BY
+  快 ~28%，查询后 RSS 省 18%，其余持平
+- 新增回归: test_bug_hunt_v110~v116（57 项）、MCP e2e
 
-- **🔑 向量索引旋钮 SQL 化 (§9)**: `CREATE VECTOR INDEX ... WITH (metric=,
-  max_degree=, build_search_list=, search_list=)` — R 与构建束宽可调,
-  构建束宽由硬编码阶梯(300/150/80)改为可覆盖。双形验证(100K×384 聚簇+
-  均匀, 自查询+加噪查询, recall@10 全 1.0000): R32/bef40 聚簇 2.4×(80.5→
-  33.7s)、均匀 1.7×(277→163s); R16 均匀 2.6×。docs/08 调优表。默认值未动
-  (真实嵌入语料验证后再评估大 N 自适应默认)
-- **修复(正确性)**: `ORDER BY emb <-> '[1,2,3]'`(带引号的方括号串)曾静默
-  落入"排序器跳过表达式键"路径返回任意顺序 — KNN 快路径现接受该拼写
-  (仓库自身示例曾用此形式); 三拼写(裸向量/带引号/参数)回归测试
-- **修复(死代码复活)**: CREATE INDEX 的 WITH 子句从未可达 — WITH 是
-  关键字 token, 旧匹配查 Identifier 永不命中; metric 值也要求字符串字面量
-  而非标识符(带引号 'l2'/'cosine')
+### 此前积累（0.15.2 后、猎虫前）
 
-- **perf(vector-index build)**: 构建期钉住精确 f32 向量快照(arc-swap 无锁
-  读)——robust_prune 逐对取向量从"两次共享锁+每次 1.5KB 反量化分配"变为
-  等待无关的 Arc 克隆,且 prune 判距不再携带 SQ8 量化误差;mutation 自动
-  失效。聚簇 220K/均匀 100K 实测持平(瓶颈在构建参数而非此处,见设计文档
-  性能优化轮结论),召回套件全绿
+- 向量索引旋钮 SQL 化: CREATE VECTOR INDEX ... WITH (metric=, max_degree=,
+  build_search_list=, search_list=)；构建期精确 f32 快照
+- ORDER BY emb <-> '带引号向量' 三拼写回归；CREATE INDEX WITH 子句
+  死代码复活
 
 ## [0.15.2] — 2026-10-22
 

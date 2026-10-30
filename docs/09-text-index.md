@@ -43,31 +43,35 @@ for (row_id, score) in hits {
 
 ## Data Import and Refresh
 
-### MATCH 作为投影表达式 (2026-10-26+)
+### MATCH as a projection expression
 
 ```sql
--- WHERE 里的 MATCH 走索引; SELECT 列表里的 MATCH 按行求值为布尔
--- (空格分词 AND、显式 OR 并集、引号短语按原文匹配; 无索引也正确)。
--- 此前投影位置的 MATCH 一律物化为 NULL (含关键词的行也是)。
+-- WHERE-side MATCH uses the index; a MATCH in the SELECT list is
+-- evaluated per row as a boolean (whitespace-token AND, explicit OR
+-- union, quoted phrases match verbatim; works without an index too).
 SELECT id, MATCH(content, 'database') AS m FROM art ORDER BY id;
 ```
 
-回归: `tests/test_bug_hunt_v104.rs::probe_match_projection_bool`。
+Regression: `tests/test_bug_hunt_v104.rs::probe_match_projection_bool`.
 
-### 中文 MATCH / AutoTokenizer（round-23）
+### CJK MATCH / AutoTokenizer
 
-默认分词策略为 **AutoTokenizer**：含 CJK 字符的文本走 Jieba 精确分词
-（需 `tokenizer-jieba` feature，默认开启），其余走空白分词。FTS 索引
-（`CREATE TEXT INDEX`）与无索引的逐行 MATCH 共用同一策略。
+The default tokenizer policy is **AutoTokenizer**: text containing CJK
+characters tokenizes with Jieba (Precise mode; requires the
+`tokenizer-jieba` feature, on by default), everything else uses the
+whitespace tokenizer. The FTS index (`CREATE TEXT INDEX`) and the
+row-local MATCH share this policy.
 
 ```sql
--- round-23 前：无空格的中文句在两条路径上都是一个整 token，
--- MATCH(body) AGAINST('训练') 匹配 '深度学习模型训练' 恒为空。
+-- A space-free Chinese sentence used to tokenize as ONE token, so
+-- MATCH(body) AGAINST('训练') never matched '深度学习模型训练'.
 INSERT INTO docs VALUES (2, '深度学习模型训练流程');
-SELECT id FROM docs WHERE MATCH(body) AGAINST('训练');  -- → 2
+SELECT id FROM docs WHERE MATCH(body) AGAINST('训练');  -- -> 2
 ```
 
-回归: `tests/test_bug_hunt_v113.rs::chinese_match_search`。
+Regression: `tests/test_bug_hunt_v113.rs::chinese_match_search`.
+
+## Data Import and Refresh
 
 - Standard `INSERT` / `batch_insert_map()` works; the full-text index listens for WAL updates and merges incrementally
 - For large-scale imports:
