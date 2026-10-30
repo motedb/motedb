@@ -104,9 +104,13 @@ def _call(db, name: str, args: dict) -> dict:
         rows = db.execute("SHOW TABLES")
         return _text(json.dumps(rows, ensure_ascii=False, default=str))
     if name == "describe":
+        # 🔴 round-28: this used `cols, _ = fetch_arrays(...)` — it kept the
+        # OUTPUT HEADER names (["Field","Type","Nullable","Position"], the
+        # same for every table) and discarded the actual schema rows. The
+        # row API returns real per-column records.
         table = args["table"].replace('"', "")
-        cols, _ = db.fetch_arrays(f"DESCRIBE {table}")
-        return _text(json.dumps(list(cols), ensure_ascii=False))
+        rows = db.execute(f"DESCRIBE {table}")
+        return _text(_rows_payload(rows))
     if name == "query":
         sql = args["sql"]
         rows = db.execute(sql, params=args.get("params"))

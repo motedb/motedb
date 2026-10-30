@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- **🔴 修复(MCP): describe 工具返回的是 DESCRIBE 输出表头而非 schema** —
+  `cols, _ = fetch_arrays(...)` 保留了输出列名 (["Field","Type",
+  "Nullable","Position"], 对任何表都一样) 丢弃了真实行。改用行 API
+  返回逐列记录。新增 bindings/python/e2e/test_mcp_stdio.py — MCP stdio
+  端到端往返 (initialize/list_tables/query 截断/vector_search 精确
+  top-3/describe/只读门), 6/6 全绿; round-20/22 的修复首次端到端验证
+  (round-28)
+
 - **门禁补洞 + 绑定层首次全面验证 (round-27)**:
   * clippy 门禁此前只查默认 feature 集 — 最小集 (node 构建:
     no-jieba/no-rayon/no-jemalloc) 积累 5 处 cfg 死代码/风格警告,
