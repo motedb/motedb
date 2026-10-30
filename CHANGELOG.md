@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- **🔴 修复(静默空结果): TIMESTAMP ± INTEGER(µs) 算术** — 两套求值器
+  (SqlRow evaluator 与 positional 副本) 都缺 (Timestamp, Integer) 分支:
+  TypeError/Null 被 WHERE 过滤路径吞掉, `WHERE at + 60000000 > x`
+  静默返回空。现按引擎 µs 约定正确计算 (checked_add/sub 防溢出),
+  投影与 WHERE 一致 (round-26)
+- **验证钉住 (round-26)**: CREATE TABLE 列 DEFAULT 值在 INSERT 省列时
+  填充 (INT/TEXT/FLOAT), 显式 NULL 覆盖默认; NOT NULL 约束在 INSERT
+  与 UPDATE 双路径强制; **复合 PRIMARY KEY (a, b)** — 重复拒绝、双键
+  点查、ON CONFLICT 复合键 upsert、重开后唯一性仍然强制;
+  LIMIT ?/OFFSET ? 绑定参数; 标识符上限 4096 (1000 字符合法);
+  TRUE/FALSE 字面量 + TRUE=1 强转; = NULL 永不匹配; JOIN ON 带 OR
+  条件精确。tests/test_bug_hunt_v116.rs 8 项。
+
 - **语义钉住 (round-25, 连续第二个零缺陷轮 — 并发/维护前沿)**: 同进程
   二次 open 附着同一引擎 (共享句柄注册表, docs/14) — 句柄间为同一连接
   语义 (BEGIN 后其他句柄读运行在活跃事务内), 跨进程由 flock 互斥

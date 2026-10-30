@@ -2482,6 +2482,18 @@ impl ExprEvaluator {
 
     fn add_values(&self, left: Value, right: Value) -> Result<Value> {
         match (left, right) {
+            // 🔴 round-26: TIMESTAMP ± INTEGER(µs) — the engine's documented
+            // convention (INTEGER = micros since epoch). The missing arms
+            // TypeError'd, which WHERE filter paths swallowed as "no match"
+            // — `WHERE at + 60000000 > x` silently returned empty.
+            (Value::Timestamp(t), Value::Integer(us)) => match t.as_micros().checked_add(us) {
+                Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+            },
+            (Value::Integer(us), Value::Timestamp(t)) => match t.as_micros().checked_add(us) {
+                Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+            },
             (Value::Integer(l), Value::Integer(r)) => match l.checked_add(r) {
                 Some(n) => Ok(Value::Integer(n)),
                 None => Ok(Value::Float(l as f64 + r as f64)),
@@ -2499,6 +2511,11 @@ impl ExprEvaluator {
             (Value::Integer(l), Value::Integer(r)) => match l.checked_sub(r) {
                 Some(n) => Ok(Value::Integer(n)),
                 None => Ok(Value::Float(l as f64 - r as f64)),
+            },
+            // 🔴 round-26: TIMESTAMP - INTEGER(µs) — see add_values.
+            (Value::Timestamp(t), Value::Integer(us)) => match t.as_micros().checked_sub(us) {
+                Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                None => Err(MoteDBError::TypeError("timestamp subtraction overflow".into())),
             },
             (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
             (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 - r)),

@@ -9606,6 +9606,17 @@ impl QueryExecutor {
 
     fn positional_add(l: &Value, r: &Value) -> Result<Value> {
         match (l, r) {
+            // 🔴 round-26: TIMESTAMP ± INTEGER(µs) — mirrored from the
+            // SqlRow evaluator; the catch-all Null made
+            // `WHERE at + 60000000 > x` silently match nothing.
+            (Value::Timestamp(t), Value::Integer(us)) => match t.as_micros().checked_add(*us) {
+                Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+            },
+            (Value::Integer(us), Value::Timestamp(t)) => match t.as_micros().checked_add(*us) {
+                Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+            },
             (Value::Integer(a), Value::Integer(b)) => match a.checked_add(*b) {
                 Some(v) => Ok(Value::Integer(v)),
                 None => Ok(Value::Float(*a as f64 + *b as f64)),
@@ -9618,6 +9629,11 @@ impl QueryExecutor {
     }
     fn positional_sub(l: &Value, r: &Value) -> Result<Value> {
         match (l, r) {
+            // 🔴 round-26: TIMESTAMP - INTEGER(µs) — see positional_add.
+            (Value::Timestamp(t), Value::Integer(us)) => match t.as_micros().checked_sub(*us) {
+                Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                None => Err(MoteDBError::TypeError("timestamp subtraction overflow".into())),
+            },
             (Value::Integer(a), Value::Integer(b)) => match a.checked_sub(*b) {
                 Some(v) => Ok(Value::Integer(v)),
                 None => Ok(Value::Float(*a as f64 - *b as f64)),
