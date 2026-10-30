@@ -46,7 +46,11 @@ impl<T> SerialParIter<T> for [T] {
     }
 }
 
+// Serial shim for par_bridge when rayon is compiled out. All call sites
+// are themselves rayon-gated, so the shim is dead code in minimal builds —
+// kept for the next non-rayon caller rather than deleted.
 #[cfg(not(feature = "rayon"))]
+#[allow(dead_code)]
 trait SerialParBridge: Iterator + Sized {
     fn par_bridge(self) -> Self {
         self

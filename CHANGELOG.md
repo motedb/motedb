@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **门禁补洞 + 绑定层首次全面验证 (round-27)**:
+  * clippy 门禁此前只查默认 feature 集 — 最小集 (node 构建:
+    no-jieba/no-rayon/no-jemalloc) 积累 5 处 cfg 死代码/风格警告,
+    全部修复 (text_has_cjk 门控、segs_disjoint cfg_attr、
+    SerialParBridge allow、VecAcc::merge cfg、needless_return)。
+    两个 feature 集现均零警告
+  * Node 插件自 0.15.2 后首次重建 (含 26 轮引擎改动):
+    smoke_ci + smoke_snapshot 双绿 (node v22, darwin-arm64)
+  * Go 绑定首次运行: ffi 静态库重建, 6/6 测试全过
+    (CRUD+类型/重开持久化/episode+ASOF 对齐/备份/快照导出导入/
+    时序统一+容器只读)
+
 - **🔴 修复(静默空结果): TIMESTAMP ± INTEGER(µs) 算术** — 两套求值器
   (SqlRow evaluator 与 positional 副本) 都缺 (Timestamp, Integer) 分支:
   TypeError/Null 被 WHERE 过滤路径吞掉, `WHERE at + 60000000 > x`

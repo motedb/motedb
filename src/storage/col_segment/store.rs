@@ -4129,7 +4129,7 @@ impl ColSegmentStore {
         #[cfg(not(feature = "rayon"))]
         {
             let _ = (order_col, desc, is_float);
-            return None;
+            None
         }
         #[cfg(feature = "rayon")]
         {

@@ -24324,6 +24324,7 @@ impl QueryExecutor {
             // 落进与旧段重叠的区间 → 判据失败 → 走顺序 newest-wins)。首键 =
             // row_map.key(0) (fence 边界精确), 尾键 = last_key_hint, 均 O(1)。
             // 重开时保守置位的 overlap_possible 不再误伤纯插入段阵。
+            #[cfg_attr(not(feature = "rayon"), allow(unused_variables))]
             let segs_disjoint: bool = {
                 let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(segs.len());
                 let mut ok = true;

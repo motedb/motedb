@@ -505,6 +505,7 @@ impl VecAcc {
     /// 合并另一个累加器（M5 并行 morsel 的 partial→merge）。
     /// min/max 用引擎级全序 (colbatch_order_cmp) 合并 — 与 fold 的类型化
     /// 比较在数值列上等价。
+    #[cfg(feature = "rayon")]
     fn merge(&mut self, o: &VecAcc) {
         use crate::storage::colbatch::colbatch_order_cmp;
         self.count += o.count;

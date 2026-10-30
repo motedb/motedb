@@ -84,6 +84,7 @@ impl Default for AutoTokenizer {
     }
 }
 
+#[cfg(feature = "tokenizer-jieba")]
 fn text_has_cjk(s: &str) -> bool {
     s.chars().any(|c| {
         let u = c as u32;
