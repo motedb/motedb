@@ -34,6 +34,20 @@ ignore = [
     # (RUSTSEC-2026-0173). Build-time only (proc-macro), never in the runtime
     # artifact. Removed when the tokenizer-jieba feature is off.
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 via optional jieba-rs; build-time only" },
+
+    # zstd-safe/zstd-sys 7.x — RUSTSEC-2026-0391/0398/0403/0410 (patched in
+    # zstd-safe 8.2.0). Our DIRECT zstd dependency is bumped to the 0.14 line
+    # (zstd-safe 8.2.0) — all runtime data compression (columnar segments,
+    # parquet) uses the fixed version. The residual 7.3.0 in the graph is
+    # pulled ONLY by jieba-rs -> include-flate (compile-time embedding of the
+    # tokenizer dictionary; upstream pins zstd 0.13). include-flate uses the
+    # simple buffer API — none of the vulnerable code paths (stream contexts,
+    # Seekable::decompress, WASM shim) are reachable from it. Unblocks when
+    # include-flate/jieba-rs moves to zstd 0.14.
+    { id = "RUSTSEC-2026-0391", reason = "zstd-safe 7.3.0 via jieba-rs/include-flate only (dictionary embed, buffer API; direct dep on 8.2.0)" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.3.0 via jieba-rs/include-flate only; Seekable API not used by include-flate" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7.3.0 via jieba-rs/include-flate only; streaming legacy frames not used" },
+    { id = "RUSTSEC-2026-0410", reason = "zstd-sys 2.0.16 via jieba-rs/include-flate only; WASM shim not applicable (native builds)" },
 ]
 
 [licenses]

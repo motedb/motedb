@@ -47,7 +47,7 @@ memmap2 = "0.9"
 
 # Compression (used by: LSM engine, sstable, memtable, txn)
 snap = "1.1"  # Snappy compression (fast, moderate ratio)
-zstd = "0.13" # Zstandard compression (better ratio, fast decompression)
+zstd = "0.14" # Zstandard compression (better ratio, fast decompression)
 
 # CRC32 for data integrity (used by: manifest, checksum, WAL)
 crc32fast = "1.4"
