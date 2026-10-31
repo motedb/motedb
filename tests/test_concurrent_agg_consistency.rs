@@ -64,11 +64,7 @@ fn timestamp_filtered_count_sees_all_committed_rows() {
     let bad = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut hs: Vec<std::thread::JoinHandle<()>> = Vec::new();
     {
-        let (db, stop, committed) = (
-            Arc::clone(&db),
-            Arc::clone(&stop),
-            Arc::clone(&committed),
-        );
+        let (db, stop, committed) = (Arc::clone(&db), Arc::clone(&stop), Arc::clone(&committed));
         hs.push(std::thread::spawn(move || {
             let mut id = 0i64;
             let base = std::time::SystemTime::now()
@@ -78,7 +74,10 @@ fn timestamp_filtered_count_sees_all_committed_rows() {
             while !stop.load(Ordering::Relaxed) {
                 id += 1;
                 let ts = base + id;
-                if db.execute(&format!("INSERT INTO tt VALUES ({id}, {ts}, 1)")).is_ok() {
+                if db
+                    .execute(&format!("INSERT INTO tt VALUES ({id}, {ts}, 1)"))
+                    .is_ok()
+                {
                     committed.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -99,10 +98,7 @@ fn timestamp_filtered_count_sees_all_committed_rows() {
         hs.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let c0 = committed.load(Ordering::SeqCst) as i64;
-                if let Ok(n) = db
-                    .execute(&q)
-                    .and_then(|r| r.materialize())
-                {
+                if let Ok(n) = db.execute(&q).and_then(|r| r.materialize()) {
                     let (_, rows) = n.select_rows().unwrap();
                     {
                         match &rows[0][0] {
@@ -184,8 +180,10 @@ fn transfer_sums_exact_on_every_observation() {
             }
         }));
     }
-    for q in ["SELECT SUM(bal) FROM acct", "SELECT SUM(bal) FROM acct WHERE id > 0 AND id <= 30"]
-    {
+    for q in [
+        "SELECT SUM(bal) FROM acct",
+        "SELECT SUM(bal) FROM acct WHERE id > 0 AND id <= 30",
+    ] {
         let (db, stop, bad, q) = (
             Arc::clone(&db),
             Arc::clone(&stop),
@@ -195,10 +193,7 @@ fn transfer_sums_exact_on_every_observation() {
         hs.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 // 升级错误也记录 (SUM 读出错误即是失败)。
-                if let Ok(n) = db
-                    .execute(&q)
-                    .and_then(|r| r.materialize())
-                {
+                if let Ok(n) = db.execute(&q).and_then(|r| r.materialize()) {
                     let (_, rows) = n.select_rows().unwrap();
                     {
                         if let V::Integer(v) = &rows[0][0] {
@@ -233,7 +228,8 @@ fn transfer_sums_exact_on_every_observation() {
 fn count_monotone_under_concurrent_inserts() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path().join("ins.mote")).unwrap());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let inserted = Arc::new(AtomicU64::new(0));
     let bad = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -244,7 +240,10 @@ fn count_monotone_under_concurrent_inserts() {
             let mut id = 0i64;
             while !stop.load(Ordering::Relaxed) {
                 id += 1;
-                if db.execute(&format!("INSERT INTO t VALUES ({id}, 1)")).is_ok() {
+                if db
+                    .execute(&format!("INSERT INTO t VALUES ({id}, 1)"))
+                    .is_ok()
+                {
                     inserted.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -263,10 +262,7 @@ fn count_monotone_under_concurrent_inserts() {
         hs.push(std::thread::spawn(move || {
             let mut max_seen: i64 = 0;
             while !stop.load(Ordering::Relaxed) {
-                if let Ok(n) = db
-                    .execute(&q)
-                    .and_then(|r| r.materialize())
-                {
+                if let Ok(n) = db.execute(&q).and_then(|r| r.materialize()) {
                     let (_, rows) = n.select_rows().unwrap();
                     {
                         if let V::Integer(v) = &rows[0][0] {
@@ -285,7 +281,10 @@ fn count_monotone_under_concurrent_inserts() {
     // SUM(val) 读者: SUM 必须等于同批可见的 COUNT (val 恒 1) — 漏行/双计都会
     // 打破 "SUM == 某个单调不减的值"。这里只做弱断言: SUM 也单调不减。
     // 两种形状: 无 WHERE (aggregate 路径) 与 AND 谓词 (向量化 M1 路径)。
-    for q in ["SELECT SUM(val) FROM t", "SELECT SUM(val) FROM t WHERE id > 0"] {
+    for q in [
+        "SELECT SUM(val) FROM t",
+        "SELECT SUM(val) FROM t WHERE id > 0",
+    ] {
         let (db, stop, bad, q) = (
             Arc::clone(&db),
             Arc::clone(&stop),

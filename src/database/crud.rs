@@ -625,7 +625,9 @@ impl MoteDB {
                 // 🔒 put_if_absent (round-9): a read fill must never overwrite
                 // a committer's fresh entry (cache poisoning → stale UPDATE
                 // bases that first-committer-wins cannot detect).
-                let _ = self.row_cache.put_if_absent(table_name, row_id, row.clone());
+                let _ = self
+                    .row_cache
+                    .put_if_absent(table_name, row_id, row.clone());
                 return Ok(Some(row));
             }
             // Not in any segment — key doesn't exist (store is authoritative).
@@ -648,7 +650,9 @@ impl MoteDB {
         if let Some(col_sst) = self.columnar_sstables.get(table_name) {
             let key = self.make_composite_key(table_name, row_id);
             if let Some(row) = col_sst.get_row(key, schema.col_types()) {
-                let _ = self.row_cache.put_if_absent(table_name, row_id, row.clone());
+                let _ = self
+                    .row_cache
+                    .put_if_absent(table_name, row_id, row.clone());
                 return Ok(Some(row));
             }
             return Ok(None);
@@ -683,7 +687,9 @@ impl MoteDB {
                 StorageError::Serialization(format!("Failed to deserialize row {}: {}", row_id, e))
             })?;
 
-            let _ = self.row_cache.put_if_absent(table_name, row_id, row.clone());
+            let _ = self
+                .row_cache
+                .put_if_absent(table_name, row_id, row.clone());
 
             if let Some((next_row_id, count, stride)) =
                 self.row_cache.check_prefetch(table_name, row_id)

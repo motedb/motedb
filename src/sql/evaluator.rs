@@ -2245,15 +2245,20 @@ impl ExprEvaluator {
                 }
                 let to_micros = |v: Value| -> Result<i64> {
                     match &v {
-                        Value::Timestamp(_) | Value::Date(_) | Value::Integer(_) => Self::value_to_micros(&v)
-                            .ok_or_else(|| MoteDBError::TypeError(
-                                "DATE_DIFF() argument must be a timestamp or date".to_string(),
-                            )),
+                        Value::Timestamp(_) | Value::Date(_) | Value::Integer(_) => {
+                            Self::value_to_micros(&v).ok_or_else(|| {
+                                MoteDBError::TypeError(
+                                    "DATE_DIFF() argument must be a timestamp or date".to_string(),
+                                )
+                            })
+                        }
                         Value::Text(s) => crate::types::Timestamp::parse_iso(s)
                             .map(|t| t.as_micros())
-                            .ok_or_else(|| MoteDBError::TypeError(format!(
-                                "DATE_DIFF() cannot parse date literal '{s}'"
-                            ))),
+                            .ok_or_else(|| {
+                                MoteDBError::TypeError(format!(
+                                    "DATE_DIFF() cannot parse date literal '{s}'"
+                                ))
+                            }),
                         _ => Err(MoteDBError::TypeError(
                             "DATE_DIFF() argument must be a timestamp or date".to_string(),
                         )),
@@ -2261,14 +2266,11 @@ impl ExprEvaluator {
                 };
                 let m1 = to_micros(self.eval(&args[0], row)?)?;
                 let m2 = to_micros(self.eval(&args[1], row)?)?;
-                let diff_seconds = m1
-                    .checked_sub(m2)
-                    .ok_or_else(|| {
-                        MoteDBError::InvalidArgument(
-                            "DATE_DIFF() timestamp difference overflow".to_string(),
-                        )
-                    })?
-                    / 1_000_000;
+                let diff_seconds = m1.checked_sub(m2).ok_or_else(|| {
+                    MoteDBError::InvalidArgument(
+                        "DATE_DIFF() timestamp difference overflow".to_string(),
+                    )
+                })? / 1_000_000;
                 Ok(Value::Integer(diff_seconds))
             }
 
@@ -2515,7 +2517,9 @@ impl ExprEvaluator {
             // 🔴 round-26: TIMESTAMP - INTEGER(µs) — see add_values.
             (Value::Timestamp(t), Value::Integer(us)) => match t.as_micros().checked_sub(us) {
                 Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
-                None => Err(MoteDBError::TypeError("timestamp subtraction overflow".into())),
+                None => Err(MoteDBError::TypeError(
+                    "timestamp subtraction overflow".into(),
+                )),
             },
             (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
             (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 - r)),
@@ -3133,9 +3137,9 @@ pub(crate) fn match_local_match(cell: Option<&str>, query: &str, phrase: bool) -
             groups.last_mut().unwrap().push(t);
         }
     }
-    groups.iter().any(|g| {
-        !g.is_empty() && g.iter().all(|term| hay_tokens.contains(term))
-    })
+    groups
+        .iter()
+        .any(|g| !g.is_empty() && g.iter().all(|term| hay_tokens.contains(term)))
 }
 #[cfg(test)]
 mod tests {
@@ -3701,5 +3705,3 @@ mod tests {
         assert_eq!(result, Value::Integer(0), "i64::MIN % -1 should be 0");
     }
 }
-
-

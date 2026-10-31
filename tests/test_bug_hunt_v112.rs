@@ -35,7 +35,8 @@ fn ints(rows: &[Vec<Value>]) -> Vec<i64> {
 }
 
 fn setup(db: &Database) {
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, g TEXT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, g TEXT, v INT)")
+        .unwrap();
     let rows: [(i64, &str, i64); 8] = [
         (0, "a", 5),
         (1, "a", 15),
@@ -49,7 +50,11 @@ fn setup(db: &Database) {
     for (id, g, v) in rows {
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?, ?)",
-            vec![Value::Integer(id), Value::Text(ArcString::from(g)), Value::Integer(v)],
+            vec![
+                Value::Integer(id),
+                Value::Text(ArcString::from(g)),
+                Value::Integer(v),
+            ],
         )
         .unwrap();
     }
@@ -65,7 +70,10 @@ fn group_by_expression_buckets() {
     setup(&db);
 
     // Group by v/10: buckets 0 (5,3,7,7), 1 (15,13), 2 (25,21)
-    let r = sel(&db, "SELECT v / 10, COUNT(*) FROM t GROUP BY v / 10 ORDER BY v / 10");
+    let r = sel(
+        &db,
+        "SELECT v / 10, COUNT(*) FROM t GROUP BY v / 10 ORDER BY v / 10",
+    );
     assert_eq!(r.len(), 3, "three buckets: {r:?}");
     assert_eq!(r[0][0], Value::Integer(0));
     assert_eq!(r[0][1], Value::Integer(4));
@@ -75,8 +83,14 @@ fn group_by_expression_buckets() {
     assert_eq!(r[2][1], Value::Integer(2));
 
     // Expression grouping must agree with grouping by the projected alias
-    let r2 = sel(&db, "SELECT v / 10 bucket, COUNT(*) c FROM t GROUP BY bucket ORDER BY bucket");
-    let r1 = sel(&db, "SELECT v / 10, COUNT(*) FROM t GROUP BY v / 10 ORDER BY 1");
+    let r2 = sel(
+        &db,
+        "SELECT v / 10 bucket, COUNT(*) c FROM t GROUP BY bucket ORDER BY bucket",
+    );
+    let r1 = sel(
+        &db,
+        "SELECT v / 10, COUNT(*) FROM t GROUP BY v / 10 ORDER BY 1",
+    );
     for (a, b) in r1.iter().zip(r2.iter()) {
         assert_eq!(a[0], b[0]);
         assert_eq!(a[1], b[1]);
@@ -120,11 +134,23 @@ fn distinct_aggregates() {
     assert_eq!(r[0][1], Value::Integer(96));
 
     // DISTINCT aggregate + GROUP BY
-    let r = sel(&db, "SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g ORDER BY g");
+    let r = sel(
+        &db,
+        "SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g ORDER BY g",
+    );
     // a: {5,15,25} = 3 distinct; b: {3,13} = 2; c: {7,21} = 2 (7 dup)
-    assert_eq!(r[0], vec![Value::Text(ArcString::from("a")), Value::Integer(3)]);
-    assert_eq!(r[1], vec![Value::Text(ArcString::from("b")), Value::Integer(2)]);
-    assert_eq!(r[2], vec![Value::Text(ArcString::from("c")), Value::Integer(2)]);
+    assert_eq!(
+        r[0],
+        vec![Value::Text(ArcString::from("a")), Value::Integer(3)]
+    );
+    assert_eq!(
+        r[1],
+        vec![Value::Text(ArcString::from("b")), Value::Integer(2)]
+    );
+    assert_eq!(
+        r[2],
+        vec![Value::Text(ArcString::from("c")), Value::Integer(2)]
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -134,9 +160,14 @@ fn distinct_aggregates() {
 #[test]
 fn nulls_first_last_explicit() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE n (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE n (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for (id, v) in [(0, 3), (1, 1), (2, 0), (3, 2)] {
-        let val = if v == 0 { Value::Null } else { Value::Integer(v * 10) };
+        let val = if v == 0 {
+            Value::Null
+        } else {
+            Value::Integer(v * 10)
+        };
         db.execute_prepared("INSERT INTO n VALUES (?, ?)", vec![Value::Integer(id), val])
             .unwrap();
     }
@@ -197,7 +228,8 @@ fn identifier_case_insensitivity() {
 #[test]
 fn string_equality_vs_like_case_sensitivity() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE cs (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE cs (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     for (i, s) in ["Apple", "apple", "APPLE", "banana"].iter().enumerate() {
         db.execute_prepared(
             "INSERT INTO cs VALUES (?, ?)",
@@ -215,7 +247,11 @@ fn string_equality_vs_like_case_sensitivity() {
     let r = ints(&sel(&db, "SELECT id FROM cs WHERE s LIKE 'apple'"));
     assert_eq!(r, vec![1], "LIKE is case-sensitive");
     let r = ints(&sel(&db, "SELECT id FROM cs WHERE s LIKE 'A%'"));
-    assert_eq!(r, vec![0, 2], "LIKE 'A%' matches Apple and APPLE (capital A)");
+    assert_eq!(
+        r,
+        vec![0, 2],
+        "LIKE 'A%' matches Apple and APPLE (capital A)"
+    );
     let r = ints(&sel(&db, "SELECT id FROM cs WHERE s LIKE 'appl%'"));
     assert_eq!(r, vec![1], "LIKE 'appl%' matches only lowercase 'apple'");
     // Wildcards stay case-sensitive too: only APPLE contains capital P
@@ -230,11 +266,13 @@ fn string_equality_vs_like_case_sensitivity() {
 #[test]
 fn ddl_inside_transaction_rollback() {
     let (db, dir) = new_db();
-    db.execute("CREATE TABLE base (id INT PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE base (id INT PRIMARY KEY)")
+        .unwrap();
     db.execute("INSERT INTO base VALUES (1)").unwrap();
 
     let tx = db.begin_transaction().unwrap();
-    db.execute("CREATE TABLE rolled (id INT PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE rolled (id INT PRIMARY KEY)")
+        .unwrap();
     db.execute("INSERT INTO rolled VALUES (99)").unwrap();
     db.execute("INSERT INTO base VALUES (2)").unwrap();
     db.rollback_transaction(tx).unwrap();
@@ -256,7 +294,10 @@ fn ddl_inside_transaction_rollback() {
             assert_eq!(n, 0, "table survives but its txn-inserted row must not");
             let tables = db.query("SHOW TABLES").unwrap();
             assert!(
-                tables.iter().flatten().any(|v| matches!(v, Value::Text(s) if s.as_str() == "rolled")),
+                tables
+                    .iter()
+                    .flatten()
+                    .any(|v| matches!(v, Value::Text(s) if s.as_str() == "rolled")),
                 "surviving table is listed in SHOW TABLES",
             );
         }
@@ -264,7 +305,10 @@ fn ddl_inside_transaction_rollback() {
             // Transactional DDL: table is gone entirely
             let tables = db.query("SHOW TABLES").unwrap();
             assert!(
-                !tables.iter().flatten().any(|v| matches!(v, Value::Text(s) if s.as_str() == "rolled")),
+                !tables
+                    .iter()
+                    .flatten()
+                    .any(|v| matches!(v, Value::Text(s) if s.as_str() == "rolled")),
                 "rolled-back table must not appear in SHOW TABLES",
             );
         }
@@ -279,11 +323,15 @@ fn ddl_inside_transaction_rollback() {
     // rolled's reopen state matches its pre-reopen state
     match db2.query("SELECT COUNT(*) FROM rolled") {
         Ok(rows) => {
-            let n = match &rows[0][0] { Value::Integer(n) => *n, o => panic!("{o:?}") };
+            let n = match &rows[0][0] {
+                Value::Integer(n) => *n,
+                o => panic!("{o:?}"),
+            };
             assert_eq!(n, 0);
         }
         Err(e) => assert!(
-            matches!(e, motedb::MoteDBError::TableNotFound(_)) || format!("{e:?}").contains("not found"),
+            matches!(e, motedb::MoteDBError::TableNotFound(_))
+                || format!("{e:?}").contains("not found"),
             "reopen: rolled cleanly absent, got {e:?}",
         ),
     }
@@ -296,7 +344,8 @@ fn ddl_inside_transaction_rollback() {
 #[test]
 fn auto_increment_after_explicit_and_delete() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE ai (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE ai (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO ai (v) VALUES (10)").unwrap();
     db.execute("INSERT INTO ai (v) VALUES (20)").unwrap();
     // Explicit id far above the counter
@@ -309,7 +358,10 @@ fn auto_increment_after_explicit_and_delete() {
     assert_eq!(ids[0], 1);
     assert_eq!(ids[1], 2);
     assert_eq!(ids[2], 100);
-    assert!(ids[3] > 100, "counter advanced past explicit id 100: {ids:?}");
+    assert!(
+        ids[3] > 100,
+        "counter advanced past explicit id 100: {ids:?}"
+    );
 
     // Delete the max row — counter must NOT regress
     db.execute("DELETE FROM ai WHERE id > 99").unwrap();
@@ -318,7 +370,10 @@ fn auto_increment_after_explicit_and_delete() {
     let last = *ids.last().unwrap();
     let prev = ids[ids.len() - 2];
     assert!(last > prev, "counter never regresses after delete: {ids:?}");
-    assert!(last > 100, "counter stays past 100 after deleting the max row: {ids:?}");
+    assert!(
+        last > 100,
+        "counter stays past 100 after deleting the max row: {ids:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -328,7 +383,8 @@ fn auto_increment_after_explicit_and_delete() {
 #[test]
 fn between_on_timestamps() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE ts (id INT PRIMARY KEY, at TIMESTAMP)").unwrap();
+    db.execute("CREATE TABLE ts (id INT PRIMARY KEY, at TIMESTAMP)")
+        .unwrap();
     let base = 1_700_000_000i64; // seconds
     for i in 0..5 {
         db.execute_prepared(
@@ -348,14 +404,22 @@ fn between_on_timestamps() {
         &db,
         "SELECT id FROM ts WHERE at BETWEEN '2023-11-14 22:20:00' AND '2023-11-14 23:00:00'",
     ));
-    assert_eq!(r, Vec::<i64>::new(), "window between two stored rows is empty");
+    assert_eq!(
+        r,
+        Vec::<i64>::new(),
+        "window between two stored rows is empty"
+    );
 
     // Inclusive both ends: subquery bounds spanning all rows
     let r2 = ints(&sel(
         &db,
         "SELECT id FROM ts WHERE at BETWEEN (SELECT at FROM ts WHERE id = 0) AND (SELECT at FROM ts WHERE id = 4)",
     ));
-    assert_eq!(r2, vec![0, 1, 2, 3, 4], "BETWEEN bounds via subquery are inclusive");
+    assert_eq!(
+        r2,
+        vec![0, 1, 2, 3, 4],
+        "BETWEEN bounds via subquery are inclusive"
+    );
 
     // A one-row window around id 1's exact value
     let r3 = ints(&sel(

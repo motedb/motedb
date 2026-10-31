@@ -2957,7 +2957,11 @@ impl ColumnarSSTableBuilder {
             keys: self.keys.clone(),
             timestamps: self.timestamps.clone(),
             deleted: self.deleted.clone(),
-            column_buffers: self.column_buffers.iter().map(|b| b.as_slice().to_vec()).collect(),
+            column_buffers: self
+                .column_buffers
+                .iter()
+                .map(|b| b.as_slice().to_vec())
+                .collect(),
             null_flags: self.null_flags.to_vec(),
             finished: false,
             compact_storage: self.compact_storage,
@@ -4296,7 +4300,8 @@ mod tests {
             })
             .collect();
         for (i, row) in rows.iter().enumerate() {
-            b.add_values(100 + i as u64, 1000 + i as u64, false, row).unwrap();
+            b.add_values(100 + i as u64, 1000 + i as u64, false, row)
+                .unwrap();
         }
         // Concurrent append AFTER the snapshot point (rows the flush must NOT
         // touch — they stay live in the buffer).
@@ -4348,26 +4353,44 @@ mod tests {
     #[test]
     fn drain_prefix_handles_degenerate_var_entries() {
         use crate::types::{ArcString, ArcVec};
-        let col_types = vec![
-            ColumnType::Integer,
-            ColumnType::Text,
-            ColumnType::Tensor(2),
-        ];
+        let col_types = vec![ColumnType::Integer, ColumnType::Text, ColumnType::Tensor(2)];
         let mut b = ColumnarSSTableBuilder::new("/tmp/x.sst", col_types);
         let mk = |id: i64, t: Value, v: Value| vec![Value::Integer(id), t, v];
         // 5 prefix rows with degenerate shapes, then one survivor row.
         let rows = [
-            mk(1, Value::Text(ArcString(std::sync::Arc::from(""))), Value::Vector(ArcVec::new(vec![1.0, 2.0]))), // empty text
+            mk(
+                1,
+                Value::Text(ArcString(std::sync::Arc::from(""))),
+                Value::Vector(ArcVec::new(vec![1.0, 2.0])),
+            ), // empty text
             mk(2, Value::Null, Value::Null), // NULL text (len 0 + flag) + NULL vector
-            mk(3, Value::Text(ArcString(std::sync::Arc::from("abc"))), Value::Null), // NULL vector after live text
+            mk(
+                3,
+                Value::Text(ArcString(std::sync::Arc::from("abc"))),
+                Value::Null,
+            ), // NULL vector after live text
             mk(4, Value::Null, Value::Vector(ArcVec::new(vec![3.0, 4.0]))),
-            mk(5, Value::Text(ArcString(std::sync::Arc::from("hello"))), Value::Vector(ArcVec::new(vec![5.0, 6.0]))),
+            mk(
+                5,
+                Value::Text(ArcString(std::sync::Arc::from("hello"))),
+                Value::Vector(ArcVec::new(vec![5.0, 6.0])),
+            ),
         ];
         for (i, row) in rows.iter().enumerate() {
-            b.add_values(10 + i as u64, 100 + i as u64, false, row).unwrap();
+            b.add_values(10 + i as u64, 100 + i as u64, false, row)
+                .unwrap();
         }
-        b.add_values(99, 999, false, &mk(9, Value::Text(ArcString(std::sync::Arc::from("tail"))), Value::Vector(ArcVec::new(vec![9.0, 9.0]))))
-            .unwrap();
+        b.add_values(
+            99,
+            999,
+            false,
+            &mk(
+                9,
+                Value::Text(ArcString(std::sync::Arc::from("tail"))),
+                Value::Vector(ArcVec::new(vec![9.0, 9.0])),
+            ),
+        )
+        .unwrap();
         assert_eq!(b.num_rows, 6);
 
         b.drain_prefix(5);

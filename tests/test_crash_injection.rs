@@ -158,8 +158,10 @@ fn crash_child_mode() {
                     .expect("delete");
                 db.execute(&format!("INSERT INTO crash_dr VALUES ({k}, {i})"))
                     .expect("reinsert");
-                db.execute(&format!("UPDATE crash_dr SET val = val + 1000 WHERE id = {u}"))
-                    .expect("chained update");
+                db.execute(&format!(
+                    "UPDATE crash_dr SET val = val + 1000 WHERE id = {u}"
+                ))
+                .expect("chained update");
                 db.execute("COMMIT").expect("commit");
                 writeln!(journal, "{i}").unwrap();
                 journal.flush().unwrap();
@@ -409,8 +411,8 @@ fn spawn_kill_child(
     delay_ms: u64,
     mode: &str,
 ) -> bool {
-    let dbg_stderr =
-        std::env::var_os("MOTE_REPLAY_DEBUG").is_some() || std::env::var_os("MOTE_KEY_DEBUG").is_some();
+    let dbg_stderr = std::env::var_os("MOTE_REPLAY_DEBUG").is_some()
+        || std::env::var_os("MOTE_KEY_DEBUG").is_some();
     let mut child = Command::new(std::env::current_exe().expect("current exe"))
         .arg("crash_child_mode")
         .arg("--exact")
@@ -418,7 +420,11 @@ fn spawn_kill_child(
         .env("MOTEDB_CRASH_CHILD_JOURNAL", journal_path)
         .env("MOTEDB_CRASH_CHILD_MODE", mode)
         .stdout(Stdio::null())
-        .stderr(if dbg_stderr { Stdio::inherit() } else { Stdio::null() })
+        .stderr(if dbg_stderr {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .expect("spawn crash child");
     std::thread::sleep(Duration::from_millis(delay_ms));
@@ -1065,7 +1071,9 @@ fn test_kill9_delreins_recovers_exactly() {
             // (val -1) is legal — autocommit INSERTs acked individually.
             assert!(
                 rows.len() <= 8
-                    && rows.iter().all(|r| matches!(r.get(1), Some(Value::Integer(-1)))),
+                    && rows
+                        .iter()
+                        .all(|r| matches!(r.get(1), Some(Value::Integer(-1)))),
                 "iter {iter}: pre-seed kill must leave only seed rows: {rows:?}"
             );
             continue;
@@ -1114,7 +1122,10 @@ fn test_kill9_delreins_recovers_exactly() {
             );
         }
     }
-    assert!(killed_runs > 0, "no run was actually killed — test did nothing");
+    assert!(
+        killed_runs > 0,
+        "no run was actually killed — test did nothing"
+    );
 }
 
 /// 🔴 round-15 确定性复现 (无 kill): WAL 重放产生重叠段但 overlap 标志未置。
@@ -1127,9 +1138,11 @@ fn wal_replay_overlapping_segment_dedup_flag() {
     let db_path = dir.path().join("replay.mote");
     {
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
         for i in 0..8i64 {
-            db.execute(&format!("INSERT INTO t VALUES ({i}, {i})")).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .unwrap();
         }
         // 一次查询触发 prepare_for_query → buf flush 成段 (WAL 仍保留)。
         let n: i64 = match db
@@ -1158,7 +1171,11 @@ fn wal_replay_overlapping_segment_dedup_flag() {
         .unwrap()
         .1
         .to_vec();
-    assert_eq!(rows.len(), 8, "WAL replay of already-flushed rows must dedup: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        8,
+        "WAL replay of already-flushed rows must dedup: {rows:?}"
+    );
     // 值也必须正确 (newest-wins)。
     for r in &rows {
         match (&r[0], &r[1]) {

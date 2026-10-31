@@ -70,28 +70,43 @@ fn probe_intersect_except_and_order() {
     let e = sorted(ints(&db, "SELECT v FROM a EXCEPT SELECT v FROM b"));
     assert_eq!(e, vec![1, 2], "EXCEPT");
     let o = ints(&db, "SELECT v FROM a UNION SELECT v FROM b ORDER BY v DESC");
-    assert_eq!(o, vec![5, 4, 3, 2, 1], "ORDER BY applies to the whole union");
+    assert_eq!(
+        o,
+        vec![5, 4, 3, 2, 1],
+        "ORDER BY applies to the whole union"
+    );
 }
 
 /// LEFT JOIN: 未匹配右表 → 右列 NULL; WHERE 右列 IS NULL 找未匹配行。
 #[test]
 fn probe_left_join_null_semantics() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE l (id INT PRIMARY KEY, k INT)").unwrap();
-    db.execute("CREATE TABLE r (id INT PRIMARY KEY, k INT, w TEXT)").unwrap();
+    db.execute("CREATE TABLE l (id INT PRIMARY KEY, k INT)")
+        .unwrap();
+    db.execute("CREATE TABLE r (id INT PRIMARY KEY, k INT, w TEXT)")
+        .unwrap();
     db.execute("INSERT INTO l VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO l VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO r VALUES (100, 10, 'ten')").unwrap();
-    let r = rows(&db, "SELECT l.id, r.id, r.w FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.id");
+    let r = rows(
+        &db,
+        "SELECT l.id, r.id, r.w FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.id",
+    );
     assert_eq!(r.len(), 2);
-    assert_eq!(r[0], vec![V::Integer(1), V::Integer(100), V::text("ten".into())]);
+    assert_eq!(
+        r[0],
+        vec![V::Integer(1), V::Integer(100), V::text("ten".into())]
+    );
     assert_eq!(
         r[1],
         vec![V::Integer(2), V::Null, V::Null],
         "unmatched right side is NULL-extended"
     );
     // IS NULL 找未匹配左行 (反连接)。
-    let un = ints(&db, "SELECT l.id FROM l LEFT JOIN r ON l.k = r.k WHERE r.id IS NULL");
+    let un = ints(
+        &db,
+        "SELECT l.id FROM l LEFT JOIN r ON l.k = r.k WHERE r.id IS NULL",
+    );
     assert_eq!(un, vec![2], "anti-join via IS NULL");
 }
 
@@ -111,14 +126,16 @@ fn probe_full_outer_join() {
             let rs = mat.select_rows().unwrap().1.to_vec();
             let mut got: Vec<(Option<i64>, Option<i64>, Option<String>)> = rs
                 .iter()
-                .map(|r| {
-                    (opt_int(&r[0]), opt_int(&r[1]), opt_text(&r[2]))
-                })
+                .map(|r| (opt_int(&r[0]), opt_int(&r[1]), opt_text(&r[2])))
                 .collect();
             // 排序键: l.k (right-only 行为 NULL → -1 最前)。
             got.sort_by_key(|(lk, _, _)| lk.unwrap_or(-1));
             assert_eq!(got.len(), 3, "both sides kept: {got:?}");
-            assert_eq!(got[0], (None, Some(3), Some("three".into())), "right-only (l.k NULL)");
+            assert_eq!(
+                got[0],
+                (None, Some(3), Some("three".into())),
+                "right-only (l.k NULL)"
+            );
             assert_eq!(got[1], (Some(1), None, None), "left-only (r.* NULL)");
             assert_eq!(got[2], (Some(2), Some(2), Some("two".into())), "matched");
         }
@@ -132,7 +149,11 @@ fn probe_numeric_functions() {
     let (db, _d) = new_db();
     let q = |sql: &str| rows(&db, sql).remove(0).remove(0);
     assert_eq!(q("SELECT ROUND(2.71828, 2)"), V::Float(2.72));
-    assert_eq!(q("SELECT ROUND(2.5)"), V::Float(3.0), "half rounds away from zero");
+    assert_eq!(
+        q("SELECT ROUND(2.5)"),
+        V::Float(3.0),
+        "half rounds away from zero"
+    );
     assert_eq!(q("SELECT ABS(-5)"), V::Integer(5));
     assert_eq!(q("SELECT ABS(5)"), V::Integer(5));
     // MOD 与 % 运算符一致。
@@ -163,8 +184,16 @@ fn probe_cast_semantics() {
     let (db, _d) = new_db();
     let q = |sql: &str| rows(&db, sql).remove(0).remove(0);
     assert_eq!(q("SELECT CAST('123' AS INT)"), V::Integer(123));
-    assert_eq!(q("SELECT CAST(1.9 AS INT)"), V::Integer(1), "truncation toward zero");
-    assert_eq!(q("SELECT CAST(-1.9 AS INT)"), V::Integer(-1), "truncation toward zero (negative)");
+    assert_eq!(
+        q("SELECT CAST(1.9 AS INT)"),
+        V::Integer(1),
+        "truncation toward zero"
+    );
+    assert_eq!(
+        q("SELECT CAST(-1.9 AS INT)"),
+        V::Integer(-1),
+        "truncation toward zero (negative)"
+    );
     assert_eq!(q("SELECT CAST(42 AS TEXT)"), V::text("42".into()));
     assert_eq!(q("SELECT CAST('3.5' AS FLOAT)"), V::Float(3.5));
     // 不可解析字符串: 报错或 0/NULL — 自洽即可 (不 panic)。
@@ -175,12 +204,17 @@ fn probe_cast_semantics() {
 #[test]
 fn probe_auto_increment_after_explicit() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES (1)").unwrap();
     db.execute("INSERT INTO t (id, v) VALUES (100, 2)").unwrap();
     db.execute("INSERT INTO t (v) VALUES (3)").unwrap();
     let ids = ints(&db, "SELECT id FROM t ORDER BY id");
-    assert_eq!(ids, vec![1, 100, 101], "auto continues past the explicit value: {ids:?}");
+    assert_eq!(
+        ids,
+        vec![1, 100, 101],
+        "auto continues past the explicit value: {ids:?}"
+    );
     // 失败插入 (重复) 不烧掉自增值? 允许烧掉 (MySQL 兼容) — 只要不产生重复。
     let dup = db.execute("INSERT INTO t (id, v) VALUES (1, 9)");
     assert!(dup.is_err(), "explicit duplicate id rejected");
@@ -196,7 +230,8 @@ fn probe_auto_increment_after_explicit() {
 #[test]
 fn probe_nan_inf_roundtrip() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, f FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, f FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'NaN')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'Infinity')").unwrap();
     db.execute("INSERT INTO t VALUES (3, '-Infinity')").unwrap();
@@ -245,9 +280,12 @@ fn probe_join_non_equi_condition() {
 #[test]
 fn probe_three_table_join_chain() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, bid INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, cid INT)").unwrap();
-    db.execute("CREATE TABLE c (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, bid INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, cid INT)")
+        .unwrap();
+    db.execute("CREATE TABLE c (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO b VALUES (10, 100)").unwrap();
     db.execute("INSERT INTO c VALUES (100, 'deep')").unwrap();

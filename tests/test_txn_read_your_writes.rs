@@ -25,9 +25,11 @@ fn scalar(db: &Database, sql: &str) -> i64 {
 fn aggregate_sees_own_txn_writes() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path().join("ryw.mote")).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, 1)")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 1)"))
+            .unwrap();
     }
 
     // 1. 事务内 INSERT → COUNT/SUM 必须立刻可见。
@@ -47,7 +49,10 @@ fn aggregate_sees_own_txn_writes() {
     let c2f = scalar(&db, "SELECT COUNT(*) FROM t WHERE v = 1");
     db.execute("COMMIT").unwrap();
     assert_eq!(c2, 10, "COUNT must see own buffered DELETEs (got {c2})");
-    assert_eq!(c2f, 10, "filtered COUNT must see own buffered DELETEs (got {c2f})");
+    assert_eq!(
+        c2f, 10,
+        "filtered COUNT must see own buffered DELETEs (got {c2f})"
+    );
 
     // 3. 事务内 UPDATE → WHERE 过滤的 COUNT 必须反映新值。
     //    (此刻表内容: id 3..12 共 10 行 v=1; UPDATE id>8 → id 9..12 四行
@@ -57,7 +62,10 @@ fn aggregate_sees_own_txn_writes() {
     let c3 = scalar(&db, "SELECT COUNT(*) FROM t WHERE v = 1");
     let s3 = scalar(&db, "SELECT SUM(v) FROM t");
     db.execute("COMMIT").unwrap();
-    assert_eq!(c3, 6, "filtered COUNT must see own buffered UPDATEs (got {c3})");
+    assert_eq!(
+        c3, 6,
+        "filtered COUNT must see own buffered UPDATEs (got {c3})"
+    );
     assert_eq!(s3, 6, "SUM must see own buffered UPDATEs (got {s3})");
 
     // 4. ROLLBACK 后聚合必须回到原值。
@@ -76,9 +84,11 @@ fn aggregate_sees_own_txn_writes() {
 fn pk_select_sees_own_txn_delete_and_update() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path().join("p.mote")).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=5 {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, {i}00)")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {i}00)"))
+            .unwrap();
     }
     db.execute("BEGIN").unwrap();
     db.execute("DELETE FROM t WHERE id = 3").unwrap();
@@ -91,9 +101,21 @@ fn pk_select_sees_own_txn_delete_and_update() {
     let r1b = rows_of(&db, "SELECT v FROM t WHERE id = 3");
     let r3b = rows_of(&db, "SELECT v FROM t WHERE id = 10");
     assert!(r1.is_empty(), "deleted-in-txn row via PK select: {r1:?}");
-    assert_eq!(r2, vec![vec![V::Integer(999)]], "updated-in-txn value via PK select");
-    assert_eq!(r3, vec![vec![V::Integer(7)]], "inserted-in-txn row via PK select");
-    assert_eq!(r1b, vec![vec![V::Integer(300)]], "rollback restores deleted row");
+    assert_eq!(
+        r2,
+        vec![vec![V::Integer(999)]],
+        "updated-in-txn value via PK select"
+    );
+    assert_eq!(
+        r3,
+        vec![vec![V::Integer(7)]],
+        "inserted-in-txn row via PK select"
+    );
+    assert_eq!(
+        r1b,
+        vec![vec![V::Integer(300)]],
+        "rollback restores deleted row"
+    );
     assert!(r3b.is_empty(), "rollback removes inserted row");
 }
 

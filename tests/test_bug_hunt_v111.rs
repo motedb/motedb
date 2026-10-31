@@ -44,7 +44,8 @@ fn ints(rows: &[Vec<Value>]) -> Vec<i64> {
 #[test]
 fn index_consistency_under_mutation() {
     let (db, dir) = new_db();
-    db.execute("CREATE TABLE items (id INT PRIMARY KEY, cat TEXT, val INT)").unwrap();
+    db.execute("CREATE TABLE items (id INT PRIMARY KEY, cat TEXT, val INT)")
+        .unwrap();
 
     let cats = ["a", "b", "c", "d"];
     let mut oracle: BTreeMap<i64, (Option<String>, Option<i64>)> = BTreeMap::new();
@@ -66,44 +67,51 @@ fn index_consistency_under_mutation() {
     db.execute("CREATE INDEX cat_idx ON items(cat)").unwrap();
     db.execute("CREATE INDEX val_idx ON items(val)").unwrap();
 
-    let check = |db: &Database, oracle: &BTreeMap<i64, (Option<String>, Option<i64>)>, phase: &str| {
-        // Per-cat equality through cat_idx
-        let mut cats_present: Vec<Option<&str>> =
-            oracle.values().map(|(c, _)| c.as_deref()).collect();
-        cats_present.sort_unstable();
-        cats_present.dedup();
-        for cat in cats_present {
-            let expected: Vec<i64> = oracle
-                .iter()
-                .filter(|(_, (c, _))| c.as_deref() == cat)
-                .map(|(id, _)| *id)
-                .collect();
-            let got = match cat {
-                Some(c) => ints(&sel(
+    let check =
+        |db: &Database, oracle: &BTreeMap<i64, (Option<String>, Option<i64>)>, phase: &str| {
+            // Per-cat equality through cat_idx
+            let mut cats_present: Vec<Option<&str>> =
+                oracle.values().map(|(c, _)| c.as_deref()).collect();
+            cats_present.sort_unstable();
+            cats_present.dedup();
+            for cat in cats_present {
+                let expected: Vec<i64> = oracle
+                    .iter()
+                    .filter(|(_, (c, _))| c.as_deref() == cat)
+                    .map(|(id, _)| *id)
+                    .collect();
+                let got = match cat {
+                    Some(c) => ints(&sel(
+                        db,
+                        &format!("SELECT id FROM items WHERE cat = '{}' ORDER BY id", c),
+                    )),
+                    None => ints(&sel(
+                        db,
+                        "SELECT id FROM items WHERE cat IS NULL ORDER BY id",
+                    )),
+                };
+                assert_eq!(got, expected, "{phase}: cat={cat:?} equality drifted");
+            }
+            // Range query through val_idx, several windows
+            for (lo, hi) in [(0, 25), (25, 60), (60, 101)] {
+                let expected: Vec<i64> = oracle
+                    .iter()
+                    .filter(|(_, (_, v))| matches!(v, Some(x) if *x >= lo && *x < hi))
+                    .map(|(id, _)| *id)
+                    .collect();
+                let got = ints(&sel(
                     db,
-                    &format!("SELECT id FROM items WHERE cat = '{}' ORDER BY id", c),
-                )),
-                None => ints(&sel(db, "SELECT id FROM items WHERE cat IS NULL ORDER BY id")),
-            };
-            assert_eq!(got, expected, "{phase}: cat={cat:?} equality drifted");
-        }
-        // Range query through val_idx, several windows
-        for (lo, hi) in [(0, 25), (25, 60), (60, 101)] {
-            let expected: Vec<i64> = oracle
-                .iter()
-                .filter(|(_, (_, v))| matches!(v, Some(x) if *x >= lo && *x < hi))
-                .map(|(id, _)| *id)
-                .collect();
-            let got = ints(&sel(
-                db,
-                &format!("SELECT id FROM items WHERE val >= {} AND val < {} ORDER BY id", lo, hi),
-            ));
-            assert_eq!(got, expected, "{phase}: val range [{lo},{hi}) drifted");
-        }
-        // COUNT matches the mirror exactly
-        let count = ints(&sel(db, "SELECT COUNT(*) FROM items"))[0];
-        assert_eq!(count, oracle.len() as i64, "{phase}: COUNT drifted");
-    };
+                    &format!(
+                        "SELECT id FROM items WHERE val >= {} AND val < {} ORDER BY id",
+                        lo, hi
+                    ),
+                ));
+                assert_eq!(got, expected, "{phase}: val range [{lo},{hi}) drifted");
+            }
+            // COUNT matches the mirror exactly
+            let count = ints(&sel(db, "SELECT COUNT(*) FROM items"))[0];
+            assert_eq!(count, oracle.len() as i64, "{phase}: COUNT drifted");
+        };
 
     check(&db, &oracle, "initial");
 
@@ -126,7 +134,8 @@ fn index_consistency_under_mutation() {
 
     // P2: DELETE 10 rows
     for i in (1..60).step_by(6) {
-        db.execute(&format!("DELETE FROM items WHERE id = {i}")).unwrap();
+        db.execute(&format!("DELETE FROM items WHERE id = {i}"))
+            .unwrap();
         oracle.remove(&i);
     }
     check(&db, &oracle, "after P2 delete");
@@ -171,7 +180,8 @@ fn index_consistency_under_mutation() {
 
     // P5: NULL out cat on some rows — NULL keys in the index
     for id in [3, 7, 11, 1005] {
-        db.execute(&format!("UPDATE items SET cat = NULL WHERE id = {id}")).unwrap();
+        db.execute(&format!("UPDATE items SET cat = NULL WHERE id = {id}"))
+            .unwrap();
         let val = oracle.get(&id).map(|(_, v)| *v).unwrap_or(None);
         oracle.insert(id, (None, val));
     }
@@ -191,7 +201,8 @@ fn index_consistency_under_mutation() {
 #[test]
 fn date_function_edges() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE ev (id INT PRIMARY KEY, d DATE, ts TIMESTAMP)").unwrap();
+    db.execute("CREATE TABLE ev (id INT PRIMARY KEY, d DATE, ts TIMESTAMP)")
+        .unwrap();
     for (i, (d, ts)) in [
         ("2024-01-31", "2024-01-31 10:20:30"),
         ("2024-02-29", "2024-02-29 23:59:59"),
@@ -214,15 +225,36 @@ fn date_function_edges() {
     let one = |sql: &str| -> Value { sel(&db, sql).pop().unwrap()[0].clone() };
 
     // Field extraction on DATE
-    assert_eq!(one("SELECT YEAR(d) FROM ev WHERE id = 0"), Value::Integer(2024));
-    assert_eq!(one("SELECT MONTH(d) FROM ev WHERE id = 0"), Value::Integer(1));
-    assert_eq!(one("SELECT DAY_OF_MONTH(d) FROM ev WHERE id = 0"), Value::Integer(31));
+    assert_eq!(
+        one("SELECT YEAR(d) FROM ev WHERE id = 0"),
+        Value::Integer(2024)
+    );
+    assert_eq!(
+        one("SELECT MONTH(d) FROM ev WHERE id = 0"),
+        Value::Integer(1)
+    );
+    assert_eq!(
+        one("SELECT DAY_OF_MONTH(d) FROM ev WHERE id = 0"),
+        Value::Integer(31)
+    );
     // Leap day
-    assert_eq!(one("SELECT DAY_OF_MONTH(d) FROM ev WHERE id = 1"), Value::Integer(29));
+    assert_eq!(
+        one("SELECT DAY_OF_MONTH(d) FROM ev WHERE id = 1"),
+        Value::Integer(29)
+    );
     // Field extraction on TIMESTAMP
-    assert_eq!(one("SELECT HOUR(ts) FROM ev WHERE id = 0"), Value::Integer(10));
-    assert_eq!(one("SELECT MINUTE(ts) FROM ev WHERE id = 0"), Value::Integer(20));
-    assert_eq!(one("SELECT SECOND(ts) FROM ev WHERE id = 0"), Value::Integer(30));
+    assert_eq!(
+        one("SELECT HOUR(ts) FROM ev WHERE id = 0"),
+        Value::Integer(10)
+    );
+    assert_eq!(
+        one("SELECT MINUTE(ts) FROM ev WHERE id = 0"),
+        Value::Integer(20)
+    );
+    assert_eq!(
+        one("SELECT SECOND(ts) FROM ev WHERE id = 0"),
+        Value::Integer(30)
+    );
 
     // DATEDIFF: signed difference in SECONDS (engine convention, now
     // documented). Same-day = 0; Jan 31 vs Dec 1 of the prior year = 61
@@ -234,7 +266,10 @@ fn date_function_edges() {
     };
     assert_eq!(diff, 0);
     match one("SELECT DATEDIFF('2024-01-31', '2023-12-01')") {
-        Value::Integer(n) => assert!(n == 5_270_400 || n == -5_270_400, "DATEDIFF ±61 days in seconds, got {n}"),
+        Value::Integer(n) => assert!(
+            n == 5_270_400 || n == -5_270_400,
+            "DATEDIFF ±61 days in seconds, got {n}"
+        ),
         o => panic!("DATEDIFF literal args expected int, got {o:?}"),
     }
     // DATE columns accepted directly: Feb 29 2024 − Jan 31 2024 = 29 days
@@ -242,16 +277,29 @@ fn date_function_edges() {
         Value::Integer(n) => assert_eq!(n, 0),
         o => panic!("DATEDIFF on DATE columns, got {o:?}"),
     }
-    let cross = sel(&db, "SELECT DATEDIFF((SELECT d FROM ev WHERE id = 1), (SELECT d FROM ev WHERE id = 0))");
+    let cross = sel(
+        &db,
+        "SELECT DATEDIFF((SELECT d FROM ev WHERE id = 1), (SELECT d FROM ev WHERE id = 0))",
+    );
     match cross[0][0].clone() {
-        Value::Integer(n) => assert!(n == 29 * 86_400 || n == -29 * 86_400, "Feb29−Jan31 = ±29 days in seconds, got {n}"),
+        Value::Integer(n) => assert!(
+            n == 29 * 86_400 || n == -29 * 86_400,
+            "Feb29−Jan31 = ±29 days in seconds, got {n}"
+        ),
         o => panic!("DATEDIFF cross-row DATE, got {o:?}"),
     }
 
     // Ordering + range on DATE (string literal coercion)
     let ordered = ints(&sel(&db, "SELECT id FROM ev ORDER BY d"));
-    assert_eq!(ordered, vec![2, 0, 1], "chronological: Dec 2023, Jan 31, Feb 29");
-    let in_2024 = ints(&sel(&db, "SELECT id FROM ev WHERE d >= '2024-01-01' ORDER BY id"));
+    assert_eq!(
+        ordered,
+        vec![2, 0, 1],
+        "chronological: Dec 2023, Jan 31, Feb 29"
+    );
+    let in_2024 = ints(&sel(
+        &db,
+        "SELECT id FROM ev WHERE d >= '2024-01-01' ORDER BY id",
+    ));
     assert_eq!(in_2024, vec![0, 1]);
 
     // DATE round-trip: stored value survives a read
@@ -263,14 +311,18 @@ fn date_function_edges() {
 
     // 🔴 round-21 regressions: CAST-to-TEXT used to leak Rust Debug output
     // ("Date(Date { days: 19753 })"); YEAR/MONTH/DAY on DATE returned NULL.
-    assert_eq!(one("SELECT CAST(d AS TEXT) FROM ev WHERE id = 0"), Value::Text(ArcString::from("2024-01-31")));
+    assert_eq!(
+        one("SELECT CAST(d AS TEXT) FROM ev WHERE id = 0"),
+        Value::Text(ArcString::from("2024-01-31"))
+    );
     assert_eq!(
         one("SELECT CAST(ts AS TEXT) FROM ev WHERE id = 0"),
         Value::Text(ArcString::from("2024-01-31 10:20:30")),
     );
     // Fractional seconds survive parse → render round-trip (parse_iso used
     // to drop the ".5" entirely).
-    db.execute("INSERT INTO ev VALUES (9, '2024-06-01', '2024-06-01 12:00:00.5')").unwrap();
+    db.execute("INSERT INTO ev VALUES (9, '2024-06-01', '2024-06-01 12:00:00.5')")
+        .unwrap();
     assert_eq!(
         one("SELECT CAST(ts AS TEXT) FROM ev WHERE id = 9"),
         Value::Text(ArcString::from("2024-06-01 12:00:00.500000")),
@@ -279,7 +331,11 @@ fn date_function_edges() {
         Value::Timestamp(t) => t.as_micros(),
         o => panic!("expected timestamp, got {o:?}"),
     };
-    assert_eq!(us % 1_000_000, 500_000, "fractional seconds stored, not truncated");
+    assert_eq!(
+        us % 1_000_000,
+        500_000,
+        "fractional seconds stored, not truncated"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -289,8 +345,10 @@ fn date_function_edges() {
 #[test]
 fn string_function_edges() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE s (id INT PRIMARY KEY, t TEXT)").unwrap();
-    db.execute("INSERT INTO s VALUES (1, 'hello world')").unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, t TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 'hello world')")
+        .unwrap();
 
     let one = |sql: &str| -> Value { sel(&db, sql).pop().unwrap()[0].clone() };
 
@@ -307,7 +365,10 @@ fn string_function_edges() {
         Value::Text(ArcString::from("hello world")),
         "no-op replace leaves text intact",
     );
-    assert_eq!(one("SELECT REVERSE(t) FROM s"), Value::Text(ArcString::from("dlrow olleh")));
+    assert_eq!(
+        one("SELECT REVERSE(t) FROM s"),
+        Value::Text(ArcString::from("dlrow olleh"))
+    );
     assert_eq!(
         one("SELECT REPEAT('ab', 3) FROM s"),
         Value::Text(ArcString::from("ababab")),
@@ -331,13 +392,22 @@ fn string_function_edges() {
     let c = one("SELECT CONCAT('a', 'b', 'c') FROM s");
     assert_eq!(c, Value::Text(ArcString::from("abc")));
     let c = one("SELECT t || NULL FROM s");
-    assert!(matches!(c, Value::Null), "|| with NULL → NULL (standard), got {c:?}");
+    assert!(
+        matches!(c, Value::Null),
+        "|| with NULL → NULL (standard), got {c:?}"
+    );
     let c = one("SELECT 'a' || 'b' FROM s");
     assert_eq!(c, Value::Text(ArcString::from("ab")));
 
     // STR_LEFT / STR_RIGHT bounds
-    assert_eq!(one("SELECT STR_LEFT(t, 5) FROM s"), Value::Text(ArcString::from("hello")));
-    assert_eq!(one("SELECT STR_RIGHT(t, 5) FROM s"), Value::Text(ArcString::from("world")));
+    assert_eq!(
+        one("SELECT STR_LEFT(t, 5) FROM s"),
+        Value::Text(ArcString::from("hello"))
+    );
+    assert_eq!(
+        one("SELECT STR_RIGHT(t, 5) FROM s"),
+        Value::Text(ArcString::from("world"))
+    );
     assert_eq!(
         one("SELECT STR_LEFT(t, 99) FROM s"),
         Value::Text(ArcString::from("hello world")),
@@ -352,21 +422,29 @@ fn string_function_edges() {
 #[test]
 fn alter_add_column_metadata_and_writes() {
     let (db, dir) = new_db();
-    db.execute("CREATE TABLE al (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE al (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO al VALUES (1, 10)").unwrap();
 
     db.execute("ALTER TABLE al ADD COLUMN note TEXT").unwrap();
 
     // New column visible in SELECT * with NULL fill
-    let row = sel(&db, "SELECT id, v, note FROM al WHERE id = 1").pop().unwrap();
+    let row = sel(&db, "SELECT id, v, note FROM al WHERE id = 1")
+        .pop()
+        .unwrap();
     assert_eq!(row[0], Value::Integer(1));
     assert_eq!(row[1], Value::Integer(10));
     assert!(matches!(row[2], Value::Null), "fresh column reads NULL");
 
     // Write through the new column (both update + insert shapes)
-    db.execute("UPDATE al SET note = 'first' WHERE id = 1").unwrap();
-    db.execute("INSERT INTO al VALUES (2, 20, 'second')").unwrap();
-    let notes: Vec<Value> = sel(&db, "SELECT note FROM al ORDER BY id").into_iter().map(|r| r[0].clone()).collect();
+    db.execute("UPDATE al SET note = 'first' WHERE id = 1")
+        .unwrap();
+    db.execute("INSERT INTO al VALUES (2, 20, 'second')")
+        .unwrap();
+    let notes: Vec<Value> = sel(&db, "SELECT note FROM al ORDER BY id")
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect();
     assert_eq!(notes[0], Value::Text(ArcString::from("first")));
     assert_eq!(notes[1], Value::Text(ArcString::from("second")));
 
@@ -378,7 +456,10 @@ fn alter_add_column_metadata_and_writes() {
     let path = dir.path().join("t.mote");
     drop(db);
     let db2 = Database::open(path).unwrap();
-    let notes: Vec<Value> = sel(&db2, "SELECT note FROM al ORDER BY id").into_iter().map(|r| r[0].clone()).collect();
+    let notes: Vec<Value> = sel(&db2, "SELECT note FROM al ORDER BY id")
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect();
     assert_eq!(notes.len(), 2);
     assert_eq!(notes[1], Value::Text(ArcString::from("second")));
 }
@@ -390,11 +471,16 @@ fn alter_add_column_metadata_and_writes() {
 #[test]
 fn window_frame_rows_between() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE w (id INT PRIMARY KEY, g INT, v INT)").unwrap();
+    db.execute("CREATE TABLE w (id INT PRIMARY KEY, g INT, v INT)")
+        .unwrap();
     for i in 0..6 {
         db.execute_prepared(
             "INSERT INTO w VALUES (?, ?, ?)",
-            vec![Value::Integer(i), Value::Integer(i / 3), Value::Integer(i + 1)],
+            vec![
+                Value::Integer(i),
+                Value::Integer(i / 3),
+                Value::Integer(i + 1),
+            ],
         )
         .unwrap();
     }
@@ -415,11 +501,12 @@ fn window_frame_rows_between() {
     assert_eq!(sums, vec![3, 5, 3, 9, 11, 6], "current+next sums");
 
     // LAG with explicit default
-    let lags = ints(&sel(
-        &db,
-        "SELECT LAG(v, 1, 0) OVER (ORDER BY id) FROM w",
-    ));
-    assert_eq!(lags, vec![0, 1, 2, 3, 4, 5], "LAG default fills the first row");
+    let lags = ints(&sel(&db, "SELECT LAG(v, 1, 0) OVER (ORDER BY id) FROM w"));
+    assert_eq!(
+        lags,
+        vec![0, 1, 2, 3, 4, 5],
+        "LAG default fills the first row"
+    );
 
     // LEAD without default → NULL at the tail
     let leads = sel(&db, "SELECT LEAD(v, 1) OVER (ORDER BY id) FROM w");
@@ -439,7 +526,8 @@ fn window_frame_rows_between() {
 #[test]
 fn left_right_function_keyword_collision() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE s (id INT PRIMARY KEY, t TEXT)").unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, t TEXT)")
+        .unwrap();
     db.execute("INSERT INTO s VALUES (1, 'hello')").unwrap();
 
     // Docs expose STR_LEFT/STR_RIGHT; MySQL/SQLite spellings LEFT()/RIGHT()
@@ -452,7 +540,10 @@ fn left_right_function_keyword_collision() {
             }
             Err(e) => {
                 let msg = format!("{e:?}");
-                assert!(msg.contains("Parse"), "{sql}: expected parse error, got {msg}");
+                assert!(
+                    msg.contains("Parse"),
+                    "{sql}: expected parse error, got {msg}"
+                );
             }
         }
     }

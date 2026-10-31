@@ -53,16 +53,21 @@ fn probe_count_distinct() {
 #[test]
 fn probe_order_by_null_consistency() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, x INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, x INT)")
+        .unwrap();
     for (id, x) in [(1, 5), (2, 3), (3, 6), (4, 3), (5, 9)] {
-        db.execute(&format!("INSERT INTO t VALUES ({id}, {x})")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({id}, {x})"))
+            .unwrap();
     }
     db.execute("INSERT INTO t VALUES (6, NULL)").unwrap();
     let asc = ints(&db, "SELECT id FROM t ORDER BY x ASC, id ASC");
     let desc = ints(&db, "SELECT id FROM t ORDER BY x DESC, id DESC");
     let mut rev = desc.clone();
     rev.reverse();
-    assert_eq!(asc, rev, "ASC and DESC must be exact mirrors (ties by id too)");
+    assert_eq!(
+        asc, rev,
+        "ASC and DESC must be exact mirrors (ties by id too)"
+    );
 }
 
 /// GROUP BY: NULL 自成一组。
@@ -75,9 +80,13 @@ fn probe_group_by_null_group() {
             Some(s) => format!("'{s}'"),
             None => "NULL".into(),
         };
-        db.execute(&format!("INSERT INTO t VALUES ({gsql}, {v})")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({gsql}, {v})"))
+            .unwrap();
     }
-    let r = rows(&db, "SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g ORDER BY g");
+    let r = rows(
+        &db,
+        "SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g ORDER BY g",
+    );
     assert_eq!(r.len(), 2, "NULL forms its own group: {r:?}");
 }
 
@@ -139,7 +148,11 @@ fn probe_string_functions() {
         V::Text(s) => assert_eq!(s.as_str(), "a"),
         o => panic!("concat skips NULLs (PG semantics): {o:?}"),
     }
-    assert_eq!(scalar(&db, "SELECT 'a' || NULL"), V::Null, "|| propagates NULL");
+    assert_eq!(
+        scalar(&db, "SELECT 'a' || NULL"),
+        V::Null,
+        "|| propagates NULL"
+    );
 }
 
 /// SUM 溢出提升为浮点 (不回绕为负数)。
@@ -147,8 +160,10 @@ fn probe_string_functions() {
 fn probe_sum_overflow_promotes() {
     let (db, _d) = new_db();
     db.execute("CREATE TABLE t (v BIGINT)").unwrap();
-    db.execute("INSERT INTO t VALUES (9223372036854775807)").unwrap();
-    db.execute("INSERT INTO t VALUES (9223372036854775807)").unwrap();
+    db.execute("INSERT INTO t VALUES (9223372036854775807)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (9223372036854775807)")
+        .unwrap();
     match scalar(&db, "SELECT SUM(v) FROM t") {
         V::Float(f) => assert!(f > 1.8e19, "overflow promotes to float: {f}"),
         V::Integer(i) => panic!("wrapped instead of promoting: {i}"),
@@ -187,8 +202,15 @@ fn probe_case_null_condition() {
     let (db, _d) = new_db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
     db.execute("INSERT INTO t VALUES (NULL)").unwrap();
-    let r = rows(&db, "SELECT CASE WHEN v > 0 THEN 'pos' ELSE 'other' END FROM t");
-    assert_eq!(r[0][0], V::Text(motedb::types::ArcString(std::sync::Arc::from("other"))), "NULL condition falls to ELSE");
+    let r = rows(
+        &db,
+        "SELECT CASE WHEN v > 0 THEN 'pos' ELSE 'other' END FROM t",
+    );
+    assert_eq!(
+        r[0][0],
+        V::Text(motedb::types::ArcString(std::sync::Arc::from("other"))),
+        "NULL condition falls to ELSE"
+    );
     let r2 = rows(&db, "SELECT CASE WHEN v > 0 THEN 'pos' END FROM t");
     assert_eq!(r2[0][0], V::Null, "no ELSE → NULL");
 }
@@ -197,7 +219,8 @@ fn probe_case_null_condition() {
 #[test]
 fn probe_upsert_excluded() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT, total INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT, total INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 100)").unwrap();
     db.execute(
         "INSERT INTO t VALUES (1, 5, 0) ON CONFLICT (id) DO UPDATE SET n = excluded.n, total = total + excluded.n",
@@ -212,29 +235,54 @@ fn probe_upsert_excluded() {
 #[test]
 fn probe_knn_after_vector_update() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE vec (id INT PRIMARY KEY, emb VECTOR(2))").unwrap();
-    db.execute("INSERT INTO vec VALUES (1, '[0.0, 0.0]')").unwrap();
-    db.execute("INSERT INTO vec VALUES (2, '[5.0, 5.0]')").unwrap();
-    db.execute("INSERT INTO vec VALUES (3, '[10.0, 10.0]')").unwrap();
-    let near = ints(&db, "SELECT id FROM vec ORDER BY emb <-> '[1.0, 1.0]' LIMIT 2");
+    db.execute("CREATE TABLE vec (id INT PRIMARY KEY, emb VECTOR(2))")
+        .unwrap();
+    db.execute("INSERT INTO vec VALUES (1, '[0.0, 0.0]')")
+        .unwrap();
+    db.execute("INSERT INTO vec VALUES (2, '[5.0, 5.0]')")
+        .unwrap();
+    db.execute("INSERT INTO vec VALUES (3, '[10.0, 10.0]')")
+        .unwrap();
+    let near = ints(
+        &db,
+        "SELECT id FROM vec ORDER BY emb <-> '[1.0, 1.0]' LIMIT 2",
+    );
     assert_eq!(near, vec![1, 2], "initial nearest");
     // 把 1 号向量移到远处, 2 号变最近。
-    db.execute("UPDATE vec SET emb = '[20.0, 20.0]' WHERE id = 1").unwrap();
-    let near2 = ints(&db, "SELECT id FROM vec ORDER BY emb <-> '[1.0, 1.0]' LIMIT 2");
-    assert_eq!(near2, vec![2, 3], "KNN after vector UPDATE (index delta): {near2:?}");
+    db.execute("UPDATE vec SET emb = '[20.0, 20.0]' WHERE id = 1")
+        .unwrap();
+    let near2 = ints(
+        &db,
+        "SELECT id FROM vec ORDER BY emb <-> '[1.0, 1.0]' LIMIT 2",
+    );
+    assert_eq!(
+        near2,
+        vec![2, 3],
+        "KNN after vector UPDATE (index delta): {near2:?}"
+    );
 }
 
 /// 向量删除后 KNN 不得返回已删 id。
 #[test]
 fn probe_knn_after_vector_delete() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE vec (id INT PRIMARY KEY, emb VECTOR(2))").unwrap();
-    db.execute("INSERT INTO vec VALUES (1, '[0.0, 0.0]')").unwrap();
-    db.execute("INSERT INTO vec VALUES (2, '[1.0, 1.0]')").unwrap();
-    db.execute("INSERT INTO vec VALUES (3, '[2.0, 2.0]')").unwrap();
+    db.execute("CREATE TABLE vec (id INT PRIMARY KEY, emb VECTOR(2))")
+        .unwrap();
+    db.execute("INSERT INTO vec VALUES (1, '[0.0, 0.0]')")
+        .unwrap();
+    db.execute("INSERT INTO vec VALUES (2, '[1.0, 1.0]')")
+        .unwrap();
+    db.execute("INSERT INTO vec VALUES (3, '[2.0, 2.0]')")
+        .unwrap();
     db.execute("DELETE FROM vec WHERE id = 1").unwrap();
-    let near = ints(&db, "SELECT id FROM vec ORDER BY emb <-> '[0.5, 0.5]' LIMIT 5");
-    assert!(!near.contains(&1), "deleted id must not appear in KNN: {near:?}");
+    let near = ints(
+        &db,
+        "SELECT id FROM vec ORDER BY emb <-> '[0.5, 0.5]' LIMIT 5",
+    );
+    assert!(
+        !near.contains(&1),
+        "deleted id must not appear in KNN: {near:?}"
+    );
     assert_eq!(near.len(), 2);
 }
 
@@ -242,7 +290,8 @@ fn probe_knn_after_vector_delete() {
 #[test]
 fn probe_ddl_inside_transaction() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     let r = (|| -> motedb::Result<()> {
         db.execute("BEGIN")?;
         db.execute("INSERT INTO t VALUES (1, 'a')")?;
@@ -267,7 +316,8 @@ fn probe_ddl_inside_transaction() {
 #[test]
 fn probe_update_swap_columns() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 20)").unwrap();
     db.execute("UPDATE t SET a = b, b = a").unwrap();
     let r = rows(&db, "SELECT a, b FROM t");

@@ -2791,10 +2791,7 @@ impl ColSegmentStore {
     fn consistent_agg_view(
         &self,
         cols: &[usize],
-    ) -> (
-        Arc<Vec<Arc<Segment>>>,
-        Vec<(u64, bool, Vec<Value>)>,
-    ) {
+    ) -> (Arc<Vec<Arc<Segment>>>, Vec<(u64, bool, Vec<Value>)>) {
         let _ = self.flush_buffer();
         let col_types = self.col_types.load();
         let buf = self.write_buf.lock();
@@ -2824,12 +2821,15 @@ impl ColSegmentStore {
         (segs, rows)
     }
 
-
     /// Value-level predicate for buffered rows in the aggregate fast paths
     /// (round-10). Mirrors the segment-side typed comparisons: NULL filter
     /// values never match (SQL three-valued logic), integers and floats
     /// compare numerically across types, text compares as strings.
-    fn buf_value_matches(v: Option<&Value>, op: &crate::sql::ast::BinaryOperator, target: &Value) -> bool {
+    fn buf_value_matches(
+        v: Option<&Value>,
+        op: &crate::sql::ast::BinaryOperator,
+        target: &Value,
+    ) -> bool {
         use crate::sql::ast::BinaryOperator as B;
         let Some(v) = v else { return false };
         if matches!(v, Value::Null) || matches!(target, Value::Null) {
@@ -3551,9 +3551,10 @@ impl ColSegmentStore {
             if *deleted {
                 continue;
             }
-            let passes = comparisons.iter().enumerate().all(|(ci, (_, op, target))| {
-                Self::buf_value_matches(vals.get(ci), op, target)
-            });
+            let passes = comparisons
+                .iter()
+                .enumerate()
+                .all(|(ci, (_, op, target))| Self::buf_value_matches(vals.get(ci), op, target));
             if !passes {
                 continue;
             }

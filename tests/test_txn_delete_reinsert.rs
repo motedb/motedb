@@ -32,7 +32,8 @@ fn scalar(db: &Database, sql: &str) -> i64 {
 fn delete_then_reinsert_same_pk_in_txn() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path().join("t.mote")).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=3 {
         db.execute(&format!("INSERT INTO t VALUES ({i}, {i}00)"))
             .unwrap();
@@ -44,8 +45,16 @@ fn delete_then_reinsert_same_pk_in_txn() {
     db.execute("INSERT INTO t VALUES (2, 999)").unwrap();
     db.execute("COMMIT").unwrap();
 
-    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM t"), 3, "row count conserved");
-    assert_eq!(scalar(&db, "SELECT v FROM t WHERE id = 2"), 999, "re-inserted row is live with the NEW value");
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM t"),
+        3,
+        "row count conserved"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT v FROM t WHERE id = 2"),
+        999,
+        "re-inserted row is live with the NEW value"
+    );
     assert_eq!(scalar(&db, "SELECT SUM(v) FROM t"), 100 + 999 + 300);
 
     // 持久性: checkpoint + 重开后重插行仍存活 (WAL 顺序: 墓碑先于重插)。
@@ -64,7 +73,8 @@ fn delete_then_reinsert_same_pk_in_txn() {
 fn delete_then_reinsert_then_update_in_txn() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path().join("t.mote")).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (7, 1)").unwrap();
 
     db.execute("BEGIN").unwrap();
@@ -73,7 +83,11 @@ fn delete_then_reinsert_then_update_in_txn() {
     db.execute("UPDATE t SET v = 3 WHERE id = 7").unwrap();
     db.execute("COMMIT").unwrap();
 
-    assert_eq!(scalar(&db, "SELECT v FROM t WHERE id = 7"), 3, "chained delete→insert→update");
+    assert_eq!(
+        scalar(&db, "SELECT v FROM t WHERE id = 7"),
+        3,
+        "chained delete→insert→update"
+    );
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM t"), 1);
 }
 
@@ -81,27 +95,37 @@ fn delete_then_reinsert_then_update_in_txn() {
 fn reinsert_still_rejects_real_duplicates() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path().join("t.mote")).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
 
     // 不删除就重插 → 仍然必须报重复。
     db.execute("BEGIN").unwrap();
-    let err = db.execute("INSERT INTO t VALUES (1, 11)").err().expect("must fail");
+    let err = db
+        .execute("INSERT INTO t VALUES (1, 11)")
+        .err()
+        .expect("must fail");
     assert!(
         err.to_string().contains("Duplicate primary key"),
         "real duplicate must still fail: {err}"
     );
     // 删除 id=1 后重插 id=2 (别人没删) → 仍必须报重复。
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
-    let err2 = db.execute("INSERT INTO t VALUES (2, 21)").err().expect("must fail");
+    let err2 = db
+        .execute("INSERT INTO t VALUES (2, 21)")
+        .err()
+        .expect("must fail");
     assert!(
         err2.to_string().contains("Duplicate primary key"),
         "undeleted PK must still fail: {err2}"
     );
     // 被删的 id=1 重插 → OK; 同一事务内再插一次 id=1 → write_set 查重拦截。
     db.execute("INSERT INTO t VALUES (1, 12)").unwrap();
-    let err3 = db.execute("INSERT INTO t VALUES (1, 13)").err().expect("must fail");
+    let err3 = db
+        .execute("INSERT INTO t VALUES (1, 13)")
+        .err()
+        .expect("must fail");
     assert!(
         err3.to_string().contains("Duplicate primary key"),
         "write_set dup check must still fire: {err3}"
@@ -115,7 +139,8 @@ fn reinsert_still_rejects_real_duplicates() {
 fn rollback_of_delete_reinsert_restores_original() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path().join("t.mote")).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (5, 55)").unwrap();
 
     db.execute("BEGIN").unwrap();
@@ -123,7 +148,11 @@ fn rollback_of_delete_reinsert_restores_original() {
     db.execute("INSERT INTO t VALUES (5, 56)").unwrap();
     db.execute("ROLLBACK").unwrap();
 
-    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM t"), 1, "rollback conserves the row");
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM t"),
+        1,
+        "rollback conserves the row"
+    );
     assert_eq!(
         scalar(&db, "SELECT v FROM t WHERE id = 5"),
         55,

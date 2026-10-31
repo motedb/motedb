@@ -34,15 +34,20 @@ fn ints(db: &Database, sql: &str) -> Vec<i64> {
 #[test]
 fn probe_delete_with_subquery() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=5 {
-        db.execute(&format!("INSERT INTO a VALUES ({i}, {i}00)")).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({i}, {i}00)"))
+            .unwrap();
     }
     for i in 3..=5 {
-        db.execute(&format!("INSERT INTO b VALUES ({i}, 0)")).unwrap();
+        db.execute(&format!("INSERT INTO b VALUES ({i}, 0)"))
+            .unwrap();
     }
-    db.execute("DELETE FROM a WHERE id IN (SELECT id FROM b)").unwrap();
+    db.execute("DELETE FROM a WHERE id IN (SELECT id FROM b)")
+        .unwrap();
     let r = ints(&db, "SELECT id FROM a ORDER BY id");
     assert_eq!(r, vec![1, 2], "delete via IN-subquery");
 }
@@ -51,7 +56,8 @@ fn probe_delete_with_subquery() {
 #[test]
 fn probe_upsert_do_update_where() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     let r = db.execute(
         "INSERT INTO t VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE t.n < 5",
@@ -79,8 +85,10 @@ fn probe_upsert_do_update_where() {
 #[test]
 fn probe_vector_query_dim_mismatch() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE v (id INT PRIMARY KEY, emb VECTOR(2))").unwrap();
-    db.execute("INSERT INTO v VALUES (1, '[0.0, 0.0]')").unwrap();
+    db.execute("CREATE TABLE v (id INT PRIMARY KEY, emb VECTOR(2))")
+        .unwrap();
+    db.execute("INSERT INTO v VALUES (1, '[0.0, 0.0]')")
+        .unwrap();
     let bad = db.execute("SELECT id FROM v ORDER BY emb <-> '[1.0, 2.0, 3.0]' LIMIT 1");
     assert!(bad.is_err(), "dim-mismatched query point must error");
     let _ = db.execute("SELECT id FROM v ORDER BY emb <-> '[1.0]' LIMIT 1");
@@ -93,11 +101,19 @@ fn probe_vector_query_dim_mismatch() {
 fn probe_timestamp_vs_string_comparison() {
     let (db, _d) = new_db();
     db.execute("CREATE TABLE m (ts TIMESTAMP, v INT)").unwrap();
-    db.execute("INSERT INTO m VALUES ('2024-06-15T10:00:00', 1)").unwrap();
-    db.execute("INSERT INTO m VALUES ('2024-06-15T12:00:00', 2)").unwrap();
-    let n = ints(&db, "SELECT COUNT(*) FROM m WHERE ts >= '2024-06-15T11:00:00'");
+    db.execute("INSERT INTO m VALUES ('2024-06-15T10:00:00', 1)")
+        .unwrap();
+    db.execute("INSERT INTO m VALUES ('2024-06-15T12:00:00', 2)")
+        .unwrap();
+    let n = ints(
+        &db,
+        "SELECT COUNT(*) FROM m WHERE ts >= '2024-06-15T11:00:00'",
+    );
     assert_eq!(n, vec![1], "string bound filters by time");
-    let n2 = ints(&db, "SELECT COUNT(*) FROM m WHERE ts < '2024-06-15T11:00:00'");
+    let n2 = ints(
+        &db,
+        "SELECT COUNT(*) FROM m WHERE ts < '2024-06-15T11:00:00'",
+    );
     assert_eq!(n2, vec![1], "other side");
 }
 
@@ -105,13 +121,18 @@ fn probe_timestamp_vs_string_comparison() {
 #[test]
 fn probe_order_group_by_expression() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for (i, v) in [(1, 10), (2, 20), (3, 10), (4, 20)] {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, {v})")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {v})"))
+            .unwrap();
     }
     let r = ints(&db, "SELECT id FROM t ORDER BY v DESC, id ASC");
     assert_eq!(r, vec![2, 4, 1, 3], "multi-key order");
-    let g = rows(&db, "SELECT v / 10 AS bucket, COUNT(*) FROM t GROUP BY v / 10 ORDER BY bucket");
+    let g = rows(
+        &db,
+        "SELECT v / 10 AS bucket, COUNT(*) FROM t GROUP BY v / 10 ORDER BY bucket",
+    );
     assert_eq!(g.len(), 2, "GROUP BY expression buckets");
     // 表达式排序: -v 升序 = v 降序 (-20 < -10 → v=20 的行先出)。
     let r2 = ints(&db, "SELECT id FROM t ORDER BY -v, id");
@@ -146,12 +167,14 @@ fn probe_alter_add_column_and_reopen() {
     let db_path = dir.path().join("a.mote");
     {
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.execute("ALTER TABLE t ADD COLUMN b TEXT").unwrap();
         let r = rows(&db, "SELECT id, a, b FROM t");
         assert_eq!(r[0][2], V::Null, "old row: new column NULL");
-        db.execute("INSERT INTO t (id, a, b) VALUES (2, 20, 'x')").unwrap();
+        db.execute("INSERT INTO t (id, a, b) VALUES (2, 20, 'x')")
+            .unwrap();
         // 旧行 UPDATE 新列。
         db.execute("UPDATE t SET b = 'y' WHERE id = 1").unwrap();
         let r2 = rows(&db, "SELECT b FROM t ORDER BY id");
@@ -162,7 +185,11 @@ fn probe_alter_add_column_and_reopen() {
     let db = Database::open(&db_path).unwrap();
     let r3 = rows(&db, "SELECT id, a, b FROM t ORDER BY id");
     assert_eq!(r3.len(), 2);
-    assert_eq!(r3[0][2], V::text("y".into()), "reopen: altered values persist");
+    assert_eq!(
+        r3[0][2],
+        V::text("y".into()),
+        "reopen: altered values persist"
+    );
     assert_eq!(r3[1][2], V::text("x".into()));
     let n = ints(&db, "SELECT COUNT(*) FROM t WHERE b IS NULL");
     assert_eq!(n, vec![0]);
@@ -173,8 +200,10 @@ fn probe_alter_add_column_and_reopen() {
 fn probe_nested_subqueries_three_deep() {
     let (db, _d) = new_db();
     db.execute("CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, aid INT)").unwrap();
-    db.execute("CREATE TABLE c (id INT PRIMARY KEY, bid INT, v INT)").unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, aid INT)")
+        .unwrap();
+    db.execute("CREATE TABLE c (id INT PRIMARY KEY, bid INT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1)").unwrap();
     db.execute("INSERT INTO b VALUES (10, 1)").unwrap();
     db.execute("INSERT INTO c VALUES (100, 10, 42)").unwrap();
@@ -190,7 +219,8 @@ fn probe_nested_subqueries_three_deep() {
 #[test]
 fn probe_cross_type_comparison_safety() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     let _ = db.execute("SELECT * FROM t WHERE v = 'abc'");
     let _ = db.execute("SELECT * FROM t WHERE v = '10'");
@@ -203,9 +233,11 @@ fn probe_cross_type_comparison_safety() {
 #[test]
 fn probe_update_affected_rows() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for (i, v) in [(1, 1), (2, 2), (3, 3)] {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, {v})")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {v})"))
+            .unwrap();
     }
     let r = db
         .execute("UPDATE t SET v = 99 WHERE v > 1")

@@ -1139,10 +1139,8 @@ impl Parser {
             if matches!(
                 &self.current().token_type,
                 TokenType::Identifier(w) if w.eq_ignore_ascii_case("CROSS")
-            ) && matches!(
-                self.peek_token_type(),
-                TokenType::Join
-            ) {
+            ) && matches!(self.peek_token_type(), TokenType::Join)
+            {
                 self.advance(); // CROSS
                 self.advance(); // JOIN
                 let right = self.parse_single_table()?;
@@ -3859,4 +3857,3 @@ mod tests {
         }
     }
 }
-

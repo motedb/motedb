@@ -39,9 +39,11 @@ fn sorted(mut v: Vec<i64>) -> Vec<i64> {
 #[test]
 fn probe_cte_basic() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, g TEXT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, g TEXT, v INT)")
+        .unwrap();
     for (i, g, v) in [(1, "a", 10), (2, "a", 20), (3, "b", 30), (4, "b", 40)] {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, '{g}', {v})")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, '{g}', {v})"))
+            .unwrap();
     }
     let r = sorted(ints(
         &db,
@@ -63,8 +65,10 @@ fn probe_cte_basic() {
 #[test]
 fn probe_cte_join_and_subquery() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, k INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, k INT, w TEXT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, k INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, k INT, w TEXT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO b VALUES (100, 10, 'ten')").unwrap();
     let r = rows(
@@ -73,7 +77,10 @@ fn probe_cte_join_and_subquery() {
     );
     assert_eq!(r.len(), 1, "CTE used in JOIN");
     assert_eq!(r[0], vec![V::Integer(1), V::text("ten".into())]);
-    let n = ints(&db, "WITH ca AS (SELECT k FROM a) SELECT COUNT(*) FROM b WHERE k IN (SELECT k FROM ca)");
+    let n = ints(
+        &db,
+        "WITH ca AS (SELECT k FROM a) SELECT COUNT(*) FROM b WHERE k IN (SELECT k FROM ca)",
+    );
     assert_eq!(n, vec![1], "CTE in IN-subquery");
 }
 
@@ -105,7 +112,8 @@ fn probe_episode_table() {
     for i in 0..4i64 {
         // 同 session, 连续 1s 间隔 → 一个 episode; i=3 与 i=2 隔 10s → 新 episode。
         let t = base + i * 1_000_000 + if i == 3 { 9_000_000 } else { 0 };
-        db.execute(&format!("INSERT INTO teleop VALUES ('s1', {t}, {}.0)", i)).unwrap();
+        db.execute(&format!("INSERT INTO teleop VALUES ('s1', {t}, {}.0)", i))
+            .unwrap();
     }
     let n = ints(&db, "SELECT COUNT(*) FROM teleop");
     assert_eq!(n, vec![4], "all rows queryable");
@@ -118,19 +126,33 @@ fn probe_vector_index_persistence() {
     let db_path = dir.path().join("v.mote");
     {
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE vec (id INT PRIMARY KEY, emb VECTOR(2))").unwrap();
-        db.execute("INSERT INTO vec VALUES (1, '[0.0, 0.0]')").unwrap();
-        db.execute("INSERT INTO vec VALUES (2, '[5.0, 5.0]')").unwrap();
-        db.execute("INSERT INTO vec VALUES (3, '[10.0, 10.0]')").unwrap();
-        db.execute("CREATE VECTOR INDEX vec_emb ON vec(emb)").unwrap();
-        let near = ints(&db, "SELECT id FROM vec ORDER BY emb <-> '[1.0, 1.0]' LIMIT 2");
+        db.execute("CREATE TABLE vec (id INT PRIMARY KEY, emb VECTOR(2))")
+            .unwrap();
+        db.execute("INSERT INTO vec VALUES (1, '[0.0, 0.0]')")
+            .unwrap();
+        db.execute("INSERT INTO vec VALUES (2, '[5.0, 5.0]')")
+            .unwrap();
+        db.execute("INSERT INTO vec VALUES (3, '[10.0, 10.0]')")
+            .unwrap();
+        db.execute("CREATE VECTOR INDEX vec_emb ON vec(emb)")
+            .unwrap();
+        let near = ints(
+            &db,
+            "SELECT id FROM vec ORDER BY emb <-> '[1.0, 1.0]' LIMIT 2",
+        );
         assert_eq!(near, vec![1, 2], "pre-checkpoint KNN");
         db.execute("CHECKPOINT").unwrap();
     }
     let db = Database::open(&db_path).unwrap();
-    let near2 = ints(&db, "SELECT id FROM vec ORDER BY emb <-> '[1.0, 1.0]' LIMIT 2");
+    let near2 = ints(
+        &db,
+        "SELECT id FROM vec ORDER BY emb <-> '[1.0, 1.0]' LIMIT 2",
+    );
     assert_eq!(near2, vec![1, 2], "KNN after checkpoint+reopen");
-    let near3 = ints(&db, "SELECT id FROM vec ORDER BY emb <-> '[9.0, 9.0]' LIMIT 1");
+    let near3 = ints(
+        &db,
+        "SELECT id FROM vec ORDER BY emb <-> '[9.0, 9.0]' LIMIT 1",
+    );
     assert_eq!(near3, vec![3], "far query point");
 }
 
@@ -138,7 +160,8 @@ fn probe_vector_index_persistence() {
 #[test]
 fn probe_large_batch_insert() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     let vals: Vec<String> = (1..=500).map(|i| format!("({i}, {i})")).collect();
     db.execute(&format!("INSERT INTO t VALUES {}", vals.join(",")))
         .unwrap();
@@ -155,12 +178,15 @@ fn probe_large_batch_insert() {
 #[test]
 fn probe_update_set_subquery() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for (i, v) in [(1, 10), (2, 20), (3, 30)] {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, {v})")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {v})"))
+            .unwrap();
     }
     // v = 全表平均 (20) → 全部变 20。
-    db.execute("UPDATE t SET v = (SELECT AVG(v) FROM t)").unwrap();
+    db.execute("UPDATE t SET v = (SELECT AVG(v) FROM t)")
+        .unwrap();
     let r = rows(&db, "SELECT v FROM t ORDER BY id");
     for row in &r {
         assert_eq!(row[0], V::Integer(20), "SET scalar subquery: {:?}", row);
@@ -171,7 +197,8 @@ fn probe_update_set_subquery() {
 #[test]
 fn probe_string_quote_escape() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'it''s')").unwrap();
     let r = rows(&db, "SELECT s FROM t");
     assert_eq!(r[0][0], V::text("it's".into()), "doubled-quote escape");
@@ -184,7 +211,8 @@ fn probe_string_quote_escape() {
 #[test]
 fn probe_bool_column_semantics() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, flag BOOL)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, flag BOOL)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, TRUE)").unwrap();
     db.execute("INSERT INTO t VALUES (2, FALSE)").unwrap();
     db.execute("INSERT INTO t VALUES (3, NULL)").unwrap();

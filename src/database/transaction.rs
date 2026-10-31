@@ -96,53 +96,53 @@ impl MoteDB {
                             // newest-wins reader (buf rposition, merge max-ts,
                             // WAL replay order) resolves to the live row.
                         } else {
-                        let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
-                        let exists_in_cache = self
-                            .pk_lookup
-                            .get(table_name)
-                            .map(|lookup| lookup.get_pk(&pk_key).is_some())
-                            .unwrap_or(false);
-                        if exists_in_cache {
-                            return Err(StorageError::InvalidData(format!(
-                                "Duplicate primary key {:?} for table '{}'",
-                                pk_value, table_name
-                            )));
-                        }
-                        // 🔑 Integer PK 的 row_id 恒等于 PK 值 —— 直接点查比
-                        // query_by_column 更准：后者在无列索引时直接报错，
-                        // 而 ColSegmentStore 表默认不建列索引，`if let Ok`
-                        // 把错误吞掉后这条检查从未生效（冷缓存重开 + 事务
-                        // INSERT 已存在主键被放行，COMMIT 后静默顶掉原行）。
-                        if let crate::types::Value::Integer(pk_int) = pk_value {
-                            let rid = if *pk_int >= 0 {
-                                *pk_int as RowId
-                            } else {
-                                0x8000_0000u64 | (*pk_int as u64 & 0x7FFF_FFFF)
-                            };
-                            if self.get_table_row(table_name, rid)?.is_some() {
+                            let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
+                            let exists_in_cache = self
+                                .pk_lookup
+                                .get(table_name)
+                                .map(|lookup| lookup.get_pk(&pk_key).is_some())
+                                .unwrap_or(false);
+                            if exists_in_cache {
                                 return Err(StorageError::InvalidData(format!(
                                     "Duplicate primary key {:?} for table '{}'",
                                     pk_value, table_name
                                 )));
                             }
-                        }
-                        if let Ok(found) = self.query_by_column(table_name, pk_name, pk_value) {
-                            if !found.is_empty() {
-                                let mut has_live = false;
-                                for &rid in &found {
-                                    if self.get_table_row(table_name, rid)?.is_some() {
-                                        has_live = true;
-                                        break;
-                                    }
-                                }
-                                if has_live {
+                            // 🔑 Integer PK 的 row_id 恒等于 PK 值 —— 直接点查比
+                            // query_by_column 更准：后者在无列索引时直接报错，
+                            // 而 ColSegmentStore 表默认不建列索引，`if let Ok`
+                            // 把错误吞掉后这条检查从未生效（冷缓存重开 + 事务
+                            // INSERT 已存在主键被放行，COMMIT 后静默顶掉原行）。
+                            if let crate::types::Value::Integer(pk_int) = pk_value {
+                                let rid = if *pk_int >= 0 {
+                                    *pk_int as RowId
+                                } else {
+                                    0x8000_0000u64 | (*pk_int as u64 & 0x7FFF_FFFF)
+                                };
+                                if self.get_table_row(table_name, rid)?.is_some() {
                                     return Err(StorageError::InvalidData(format!(
                                         "Duplicate primary key {:?} for table '{}'",
                                         pk_value, table_name
                                     )));
                                 }
                             }
-                        }
+                            if let Ok(found) = self.query_by_column(table_name, pk_name, pk_value) {
+                                if !found.is_empty() {
+                                    let mut has_live = false;
+                                    for &rid in &found {
+                                        if self.get_table_row(table_name, rid)?.is_some() {
+                                            has_live = true;
+                                            break;
+                                        }
+                                    }
+                                    if has_live {
+                                        return Err(StorageError::InvalidData(format!(
+                                            "Duplicate primary key {:?} for table '{}'",
+                                            pk_value, table_name
+                                        )));
+                                    }
+                                }
+                            }
                         } // end !deleted_in_txn
                     }
                 }
@@ -443,8 +443,7 @@ impl MoteDB {
             let mut by_table: HashMap<&str, Vec<(u64, u64, bool, Row)>> = HashMap::new();
             let mut overlap_tables: HashMap<&str, bool> = HashMap::new();
             let key_of = |table_name: &str, row_id: RowId| -> u64 {
-                let table_id =
-                    self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+                let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
                 (table_id << 32) | (row_id & 0xFFFFFFFF)
             };
             // 🔑 Op order = deletes → inserts → updates, with ts allocated in
@@ -457,29 +456,35 @@ impl MoteDB {
                 let ts = self
                     .write_lsn
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                by_table
-                    .entry(table_name)
-                    .or_default()
-                    .push((key_of(table_name, *row_id), ts, true, old_row.clone()));
+                by_table.entry(table_name).or_default().push((
+                    key_of(table_name, *row_id),
+                    ts,
+                    true,
+                    old_row.clone(),
+                ));
                 *overlap_tables.entry(table_name).or_insert(false) = true;
             }
             for ((table_name, row_id), row_data) in &write_set {
                 let ts = self
                     .write_lsn
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                by_table
-                    .entry(table_name)
-                    .or_default()
-                    .push((key_of(table_name, *row_id), ts, false, row_data.clone()));
+                by_table.entry(table_name).or_default().push((
+                    key_of(table_name, *row_id),
+                    ts,
+                    false,
+                    row_data.clone(),
+                ));
             }
             for ((table_name, row_id), (_old_row, new_row)) in &pending {
                 let ts = self
                     .write_lsn
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                by_table
-                    .entry(table_name)
-                    .or_default()
-                    .push((key_of(table_name, *row_id), ts, false, new_row.clone()));
+                by_table.entry(table_name).or_default().push((
+                    key_of(table_name, *row_id),
+                    ts,
+                    false,
+                    new_row.clone(),
+                ));
                 *overlap_tables.entry(table_name).or_insert(false) = true;
             }
             for (table_name, ops) in by_table {

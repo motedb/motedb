@@ -10,8 +10,8 @@
 //! * ORDER BY on BLOB column determinism
 //! * UPDATE ... ORDER BY / LIMIT (MySQL syntax) — clean error, no panic
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use motedb::types::{ArcBytes, Value};
 use motedb::Database;
@@ -42,7 +42,8 @@ fn ints(rows: &[Vec<Value>]) -> Vec<i64> {
 #[test]
 fn concurrent_same_row_update_exactly_one_wins() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE c (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE c (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO c VALUES (1, 0)").unwrap();
 
     let db = Arc::new(db);
@@ -86,7 +87,10 @@ fn concurrent_same_row_update_exactly_one_wins() {
     let final_v = ints(&sel(&db, "SELECT v FROM c WHERE id = 1"))[0];
     // The invariant: no torn write, value is a valid tag of one of the writers.
     let writer = final_v / 1_000_000;
-    assert!(writer == 0 || writer == 1, "final value {final_v} is a valid writer tag");
+    assert!(
+        writer == 0 || writer == 1,
+        "final value {final_v} is a valid writer tag"
+    );
     // And the value strictly increased from 0.
     assert!(final_v >= 0);
     // Each reported win actually applied: the winner count is ≤ total rounds.
@@ -102,7 +106,8 @@ fn concurrent_same_row_update_exactly_one_wins() {
 #[test]
 fn dirty_read_isolation() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE iso (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE iso (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO iso VALUES (1, 10)").unwrap();
 
     let tx = db.begin_transaction().unwrap();
@@ -114,7 +119,11 @@ fn dirty_read_isolation() {
     // transaction — they see its own writes. That is read-your-writes,
     // not a dirty read. The cross-handle probe below checks isolation.
     let rows = ints(&sel(&db, "SELECT id FROM iso ORDER BY id"));
-    assert_eq!(rows, vec![1, 2], "same-handle query sees its own txn (connection semantics)");
+    assert_eq!(
+        rows,
+        vec![1, 2],
+        "same-handle query sees its own txn (connection semantics)"
+    );
     let v = ints(&sel(&db, "SELECT v FROM iso WHERE id = 1"))[0];
     assert_eq!(v, 99, "same-handle query sees its own txn update");
 
@@ -143,7 +152,8 @@ fn dirty_read_isolation() {
 fn concurrent_writers_readers_exact_final_state() {
     let (db, _d) = new_db();
     for t in 0..4 {
-        db.execute(&format!("CREATE TABLE w{t} (id INT PRIMARY KEY, v INT)")).unwrap();
+        db.execute(&format!("CREATE TABLE w{t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
     }
     let db = Arc::new(db);
     let mut handles = Vec::new();
@@ -217,10 +227,12 @@ fn concurrent_writers_readers_exact_final_state() {
 #[test]
 fn vacuum_after_churn_keeps_data() {
     let (db, dir) = new_db();
-    db.execute("CREATE TABLE v (id INT PRIMARY KEY, keep INT)").unwrap();
+    db.execute("CREATE TABLE v (id INT PRIMARY KEY, keep INT)")
+        .unwrap();
     for i in 0..500i64 {
         let keep = if i % 5 == 0 { 1 } else { 0 };
-        db.execute(&format!("INSERT INTO v VALUES ({i}, {keep})")).unwrap();
+        db.execute(&format!("INSERT INTO v VALUES ({i}, {keep})"))
+            .unwrap();
     }
     // Delete every non-keep row in one pass (churn comes from the volume).
     db.execute("DELETE FROM v WHERE keep = 0").unwrap();
@@ -247,16 +259,23 @@ fn thousand_value_in_list() {
     let (db, _d) = new_db();
     db.execute("CREATE TABLE big (id INT PRIMARY KEY)").unwrap();
     for i in 0..2000i64 {
-        db.execute(&format!("INSERT INTO big VALUES ({i})")).unwrap();
+        db.execute(&format!("INSERT INTO big VALUES ({i})"))
+            .unwrap();
     }
     // ids 0, 3, 6, ... 2997 — but table only has 0..1999: matches = 0..=1998 step 3
     let wanted: Vec<String> = (0..1000).map(|k| (k * 3).to_string()).collect();
-    let sql = format!("SELECT COUNT(*) FROM big WHERE id IN ({})", wanted.join(","));
+    let sql = format!(
+        "SELECT COUNT(*) FROM big WHERE id IN ({})",
+        wanted.join(",")
+    );
     let n = ints(&sel(&db, &sql))[0];
     assert_eq!(n, 667, "ids 0..2997 step 3 ∩ [0,2000) = ceil(1999/3) = 667");
 
     // NOT IN excludes exactly those
-    let sql = format!("SELECT COUNT(*) FROM big WHERE id NOT IN ({})", wanted.join(","));
+    let sql = format!(
+        "SELECT COUNT(*) FROM big WHERE id NOT IN ({})",
+        wanted.join(",")
+    );
     let n = ints(&sel(&db, &sql))[0];
     assert_eq!(n, 2000 - 667, "NOT IN complement");
 }
@@ -268,7 +287,8 @@ fn thousand_value_in_list() {
 #[test]
 fn order_by_blob_deterministic() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, data BLOB)").unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, data BLOB)")
+        .unwrap();
     for (i, len) in [3usize, 1, 2, 5, 4].iter().enumerate() {
         let bytes: Vec<u8> = (0..*len as u8).collect();
         db.execute_prepared(
@@ -291,7 +311,8 @@ fn order_by_blob_deterministic() {
 #[test]
 fn update_order_by_limit_is_clean_error() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE u (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO u VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO u VALUES (2, 20)").unwrap();
 

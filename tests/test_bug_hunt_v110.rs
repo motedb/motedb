@@ -36,12 +36,21 @@ fn ints(rows: &[Vec<Value>]) -> Vec<i64> {
 }
 
 fn setup(db: &Database) {
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, s TEXT)")
+        .unwrap();
     for i in 0..10 {
-        let v = if i % 4 == 0 { Value::Null } else { Value::Integer(i * 10) };
+        let v = if i % 4 == 0 {
+            Value::Null
+        } else {
+            Value::Integer(i * 10)
+        };
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?, ?)",
-            vec![Value::Integer(i), v, Value::Text(ArcString::from(format!("s{i}")))],
+            vec![
+                Value::Integer(i),
+                v,
+                Value::Text(ArcString::from(format!("s{i}"))),
+            ],
         )
         .unwrap();
     }
@@ -64,7 +73,10 @@ fn implicit_select_alias_without_as() {
     assert_eq!(rows[0][0], Value::Integer(0));
 
     // Aggregate with implicit alias, used by HAVING/ORDER BY
-    let rows = sel(&db, "SELECT v grp, COUNT(*) c FROM t GROUP BY v ORDER BY c DESC, grp ASC");
+    let rows = sel(
+        &db,
+        "SELECT v grp, COUNT(*) c FROM t GROUP BY v ORDER BY c DESC, grp ASC",
+    );
     let first = &rows[0];
     let c = match &first[1] {
         Value::Integer(n) => *n,
@@ -146,7 +158,10 @@ fn where_alias_reference_errors_like_standard_sql() {
     let err = db
         .query("SELECT v AS x FROM t WHERE x > 2")
         .expect_err("alias not visible in WHERE");
-    assert!(matches!(err, motedb::MoteDBError::ColumnNotFound(_)), "{err:?}");
+    assert!(
+        matches!(err, motedb::MoteDBError::ColumnNotFound(_)),
+        "{err:?}"
+    );
 }
 
 /// The validator must not break subqueries: IN-subqueries and correlated
@@ -156,13 +171,20 @@ fn where_subquery_and_correlated_exists_unaffected() {
     let (db, _d) = new_db();
     setup(&db);
     assert_eq!(
-        ints(&sel(&db, "SELECT id FROM t WHERE v IN (SELECT v FROM t WHERE v < 30)")),
+        ints(&sel(
+            &db,
+            "SELECT id FROM t WHERE v IN (SELECT v FROM t WHERE v < 30)"
+        )),
         vec![1, 2],
     );
     // Correlated: subquery's WHERE references the OUTER table t. NULL-v
     // rows (ids 0, 4, 8) never match (NULL = x is never TRUE) → 7 rows.
     assert_eq!(
-        sel(&db, "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.v = t.v)").len(),
+        sel(
+            &db,
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.v = t.v)"
+        )
+        .len(),
         7,
     );
 }
@@ -207,18 +229,32 @@ fn order_by_null_placement_consistent_across_shapes() {
     setup(&db);
 
     let plain_asc = ints(&sel(&db, "SELECT id FROM t ORDER BY v ASC, id ASC"));
-    assert_eq!(plain_asc, vec![0, 4, 8, 1, 2, 3, 5, 6, 7, 9], "ASC puts NULL first");
+    assert_eq!(
+        plain_asc,
+        vec![0, 4, 8, 1, 2, 3, 5, 6, 7, 9],
+        "ASC puts NULL first"
+    );
 
     let plain_desc = ints(&sel(&db, "SELECT id FROM t ORDER BY v DESC, id DESC"));
-    assert_eq!(plain_desc, vec![9, 7, 6, 5, 3, 2, 1, 8, 4, 0], "DESC puts NULL last");
+    assert_eq!(
+        plain_desc,
+        vec![9, 7, 6, 5, 3, 2, 1, 8, 4, 0],
+        "DESC puts NULL last"
+    );
 
     // DISTINCT over v: NULL collapses to one row and still sorts first ASC
     let d = sel(&db, "SELECT DISTINCT v FROM t ORDER BY v ASC");
-    assert!(matches!(d[0][0], Value::Null), "DISTINCT+ORDER BY: NULL first");
+    assert!(
+        matches!(d[0][0], Value::Null),
+        "DISTINCT+ORDER BY: NULL first"
+    );
 
     // GROUP BY + ORDER BY on the group key
     let g = sel(&db, "SELECT v, COUNT(*) c FROM t GROUP BY v ORDER BY v ASC");
-    assert!(matches!(g[0][0], Value::Null), "GROUP BY+ORDER BY: NULL first");
+    assert!(
+        matches!(g[0][0], Value::Null),
+        "GROUP BY+ORDER BY: NULL first"
+    );
 
     // UNION + ORDER BY (the merged path)
     let u = sel(
@@ -242,7 +278,13 @@ fn scalar_functions_propagate_null() {
     setup(&db);
 
     // v is NULL at id=0: NULL in → NULL out for every string function.
-    for f in ["LENGTH(v)", "UPPER(v)", "LOWER(v)", "TRIM(v)", "SUBSTRING(v, 1, 2)"] {
+    for f in [
+        "LENGTH(v)",
+        "UPPER(v)",
+        "LOWER(v)",
+        "TRIM(v)",
+        "SUBSTRING(v, 1, 2)",
+    ] {
         let sql = format!("SELECT {f} FROM t WHERE id = 0");
         let rows = sel(&db, &sql);
         assert_eq!(rows.len(), 1, "{f}: one row");
@@ -253,19 +295,32 @@ fn scalar_functions_propagate_null() {
 #[test]
 fn substring_out_of_range_and_edges() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE w (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE w (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     db.execute("INSERT INTO w VALUES (1, 'abcdef')").unwrap();
 
     let one = |sql: &str| -> Value { sel(&db, sql).pop().unwrap()[0].clone() };
 
     // start beyond length → empty string (not NULL, not error)
-    assert_eq!(one("SELECT SUBSTRING(s, 10, 2) FROM w"), Value::Text(ArcString::from("")));
+    assert_eq!(
+        one("SELECT SUBSTRING(s, 10, 2) FROM w"),
+        Value::Text(ArcString::from(""))
+    );
     // length runs past the end → clamp
-    assert_eq!(one("SELECT SUBSTRING(s, 4, 99) FROM w"), Value::Text(ArcString::from("def")));
+    assert_eq!(
+        one("SELECT SUBSTRING(s, 4, 99) FROM w"),
+        Value::Text(ArcString::from("def"))
+    );
     // zero length → empty
-    assert_eq!(one("SELECT SUBSTRING(s, 2, 0) FROM w"), Value::Text(ArcString::from("")));
+    assert_eq!(
+        one("SELECT SUBSTRING(s, 2, 0) FROM w"),
+        Value::Text(ArcString::from(""))
+    );
     // two-arg form to the end
-    assert_eq!(one("SELECT SUBSTRING(s, 4) FROM w"), Value::Text(ArcString::from("def")));
+    assert_eq!(
+        one("SELECT SUBSTRING(s, 4) FROM w"),
+        Value::Text(ArcString::from("def"))
+    );
     // SQL-standard FROM/FOR spelling parses (round-12 fix) and agrees
     assert_eq!(
         one("SELECT SUBSTRING(s FROM 2 FOR 3) FROM w"),
@@ -280,7 +335,8 @@ fn substring_out_of_range_and_edges() {
 #[test]
 fn like_escape_edges() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE lk (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE lk (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     for (i, s) in ["100%", "a_b", "z_y", "x!y"].iter().enumerate() {
         db.execute_prepared(
             "INSERT INTO lk VALUES (?, ?)",
@@ -304,7 +360,11 @@ fn like_escape_edges() {
 
     // pattern that is only the escape char → matches a literal '!'
     let hits = sel(&db, "SELECT id FROM lk WHERE s LIKE '!' ESCAPE '!'");
-    assert_eq!(ints(&hits), Vec::<i64>::new(), "'!' alone must not match 'x!y' (2 chars)");
+    assert_eq!(
+        ints(&hits),
+        Vec::<i64>::new(),
+        "'!' alone must not match 'x!y' (2 chars)"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -314,7 +374,8 @@ fn like_escape_edges() {
 #[test]
 fn update_multi_set_uses_old_values() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE u (a INT PRIMARY KEY, b INT)").unwrap();
+    db.execute("CREATE TABLE u (a INT PRIMARY KEY, b INT)")
+        .unwrap();
     db.execute("INSERT INTO u VALUES (10, 100)").unwrap();
 
     // SQL standard: every SET expression sees the OLD row. b must get 10,
@@ -329,7 +390,11 @@ fn update_multi_set_uses_old_values() {
     db.execute("UPDATE u SET a = b, b = a").unwrap();
     let row = sel(&db, "SELECT a, b FROM u").pop().unwrap();
     assert_eq!(row[0], Value::Integer(10), "a = b (old b = 10)");
-    assert_eq!(row[1], Value::Integer(11), "b = a (old a = 11) — both read OLD values");
+    assert_eq!(
+        row[1],
+        Value::Integer(11),
+        "b = a (old a = 11) — both read OLD values"
+    );
 }
 
 #[test]
@@ -393,7 +458,8 @@ fn not_in_with_null_yields_no_rows() {
 #[test]
 fn parquet_date_roundtrip_and_missing_column_nulls() {
     let (db, d) = new_db();
-    db.execute("CREATE TABLE src (id INT PRIMARY KEY, d DATE, label TEXT)").unwrap();
+    db.execute("CREATE TABLE src (id INT PRIMARY KEY, d DATE, label TEXT)")
+        .unwrap();
     db.execute_prepared(
         "INSERT INTO src VALUES (?, ?, ?)",
         vec![
@@ -410,11 +476,14 @@ fn parquet_date_roundtrip_and_missing_column_nulls() {
     .unwrap();
 
     let path = d.path().join("dates.parquet");
-    db.execute(&format!("EXPORT TABLE src TO '{}'", path.display())).unwrap();
+    db.execute(&format!("EXPORT TABLE src TO '{}'", path.display()))
+        .unwrap();
 
     // Same-shape table: values survive, NULLs survive
-    db.execute("CREATE TABLE dst (id INT PRIMARY KEY, d DATE, label TEXT)").unwrap();
-    db.execute(&format!("IMPORT PARQUET '{}' INTO dst", path.display())).unwrap();
+    db.execute("CREATE TABLE dst (id INT PRIMARY KEY, d DATE, label TEXT)")
+        .unwrap();
+    db.execute(&format!("IMPORT PARQUET '{}' INTO dst", path.display()))
+        .unwrap();
 
     let rows = sel(&db, "SELECT id, d, label FROM dst ORDER BY id");
     assert_eq!(rows[0][1], Value::Date(Date::from_days(20000)));
@@ -423,10 +492,15 @@ fn parquet_date_roundtrip_and_missing_column_nulls() {
     assert!(matches!(rows[1][2], Value::Null));
 
     // Target table with an EXTRA column not present in the file → NULL
-    db.execute("CREATE TABLE wide (id INT PRIMARY KEY, d DATE, label TEXT, extra INT)").unwrap();
-    db.execute(&format!("IMPORT PARQUET '{}' INTO wide", path.display())).unwrap();
+    db.execute("CREATE TABLE wide (id INT PRIMARY KEY, d DATE, label TEXT, extra INT)")
+        .unwrap();
+    db.execute(&format!("IMPORT PARQUET '{}' INTO wide", path.display()))
+        .unwrap();
     let rows = sel(&db, "SELECT extra FROM wide ORDER BY id");
     for r in &rows {
-        assert!(matches!(r[0], Value::Null), "missing file column fills NULL");
+        assert!(
+            matches!(r[0], Value::Null),
+            "missing file column fills NULL"
+        );
     }
 }

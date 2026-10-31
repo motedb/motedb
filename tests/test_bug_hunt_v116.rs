@@ -43,22 +43,30 @@ fn create_table_default_values_fill_on_omitted_column() {
 
     // INSERT naming only id — defaults must fill the rest.
     db.execute("INSERT INTO d (id) VALUES (1)").unwrap();
-    let row = sel(&db, "SELECT v, s, f FROM d WHERE id = 1").pop().unwrap();
+    let row = sel(&db, "SELECT v, s, f FROM d WHERE id = 1")
+        .pop()
+        .unwrap();
     assert_eq!(row[0], Value::Integer(7), "INT DEFAULT fills");
-    assert_eq!(row[1], Value::Text(ArcString::from("hi")), "TEXT DEFAULT fills");
+    assert_eq!(
+        row[1],
+        Value::Text(ArcString::from("hi")),
+        "TEXT DEFAULT fills"
+    );
     match &row[2] {
         Value::Float(f) => assert!((f - 1.5).abs() < 1e-9, "FLOAT DEFAULT fills: {f}"),
         o => panic!("FLOAT DEFAULT: {o:?}"),
     }
 
     // Explicit values override defaults.
-    db.execute("INSERT INTO d (id, v, s, f) VALUES (2, 99, 'x', 9.0)").unwrap();
+    db.execute("INSERT INTO d (id, v, s, f) VALUES (2, 99, 'x', 9.0)")
+        .unwrap();
     let row = sel(&db, "SELECT v, s FROM d WHERE id = 2").pop().unwrap();
     assert_eq!(row[0], Value::Integer(99));
     assert_eq!(row[1], Value::Text(ArcString::from("x")));
 
     // Bare NULL still writes NULL (DEFAULT only fills OMITTED columns).
-    db.execute("INSERT INTO d (id, v) VALUES (3, NULL)").unwrap();
+    db.execute("INSERT INTO d (id, v) VALUES (3, NULL)")
+        .unwrap();
     let row = sel(&db, "SELECT v FROM d WHERE id = 3").pop().unwrap();
     assert!(matches!(row[0], Value::Null), "explicit NULL beats DEFAULT");
 
@@ -73,7 +81,8 @@ fn create_table_default_values_fill_on_omitted_column() {
 #[test]
 fn not_null_constraint_enforced() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE n (id INT PRIMARY KEY, v INT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE n (id INT PRIMARY KEY, v INT NOT NULL)")
+        .unwrap();
     db.execute("INSERT INTO n VALUES (1, 10)").unwrap();
 
     // INSERT NULL violates.
@@ -135,7 +144,8 @@ fn composite_primary_key_semantics() {
     assert_eq!(n, 3, "upsert did not add a row");
 
     // DELETE by composite key; reopen keeps exactly the rest.
-    db.execute("DELETE FROM cp WHERE a = 2 AND b = 'x'").unwrap();
+    db.execute("DELETE FROM cp WHERE a = 2 AND b = 'x'")
+        .unwrap();
     let path = dir.path().join("t.mote");
     drop(db);
     let db2 = Database::open(path).unwrap();
@@ -158,8 +168,11 @@ fn limit_offset_bound_parameters() {
         db.execute(&format!("INSERT INTO l VALUES ({i})")).unwrap();
     }
 
-    db.execute_prepared("SELECT id FROM l ORDER BY id LIMIT ?", vec![Value::Integer(3)])
-        .unwrap();
+    db.execute_prepared(
+        "SELECT id FROM l ORDER BY id LIMIT ?",
+        vec![Value::Integer(3)],
+    )
+    .unwrap();
     let rows = match db
         .execute_prepared(
             "SELECT id FROM l ORDER BY id LIMIT ? OFFSET ?",
@@ -172,7 +185,13 @@ fn limit_offset_bound_parameters() {
         motedb::QueryResult::Select { rows, .. } => rows,
         o => panic!("{o:?}"),
     };
-    let got: Vec<i64> = rows.iter().map(|r| match &r[0] { Value::Integer(i) => *i, o => panic!("{o:?}") }).collect();
+    let got: Vec<i64> = rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(i) => *i,
+            o => panic!("{o:?}"),
+        })
+        .collect();
     assert_eq!(got, vec![5, 6, 7], "LIMIT ? OFFSET ? binds correctly");
 
     // LIMIT 0 via param
@@ -199,7 +218,8 @@ fn identifier_length_limit_is_clean() {
 
     // A 64-char identifier is fine (typical limit).
     let ok_name = "a".repeat(64);
-    db.execute(&format!("CREATE TABLE {ok_name} (id INT PRIMARY KEY)")).unwrap();
+    db.execute(&format!("CREATE TABLE {ok_name} (id INT PRIMARY KEY)"))
+        .unwrap();
 
     // A grossly long identifier (engine limit: 4096) is a clean error.
     let huge_name = "b".repeat(5000);
@@ -208,7 +228,10 @@ fn identifier_length_limit_is_clean() {
         Ok(_) => panic!("1000-char identifier must be rejected"),
         Err(e) => {
             let m = format!("{e:?}");
-            assert!(m.contains("long") || m.contains("Identifier") || m.contains("Parse"), "{m}");
+            assert!(
+                m.contains("long") || m.contains("Identifier") || m.contains("Parse"),
+                "{m}"
+            );
         }
     }
 }
@@ -220,7 +243,8 @@ fn identifier_length_limit_is_clean() {
 #[test]
 fn true_false_null_literals() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, flag BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, flag BOOLEAN)")
+        .unwrap();
     db.execute("INSERT INTO b VALUES (1, TRUE)").unwrap();
     db.execute("INSERT INTO b VALUES (2, FALSE)").unwrap();
     db.execute("INSERT INTO b VALUES (3, NULL)").unwrap();
@@ -237,7 +261,11 @@ fn true_false_null_literals() {
     assert_eq!(ids, vec![1], "TRUE = 1 coercion in WHERE");
     // NULL literal comparison never matches.
     let ids = ints(&sel(&db, "SELECT id FROM b WHERE flag = NULL"));
-    assert_eq!(ids, Vec::<i64>::new(), "= NULL never matches (IS NULL required)");
+    assert_eq!(
+        ids,
+        Vec::<i64>::new(),
+        "= NULL never matches (IS NULL required)"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -247,25 +275,35 @@ fn true_false_null_literals() {
 #[test]
 fn timestamp_arithmetic_in_where() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE ts (id INT PRIMARY KEY, at TIMESTAMP)").unwrap();
+    db.execute("CREATE TABLE ts (id INT PRIMARY KEY, at TIMESTAMP)")
+        .unwrap();
     let base = 1_700_000_000i64;
     for i in 0..5 {
         db.execute_prepared(
             "INSERT INTO ts VALUES (?, ?)",
-            vec![Value::Integer(i), Value::Timestamp(Timestamp::from_secs(base + i * 60))],
+            vec![
+                Value::Integer(i),
+                Value::Timestamp(Timestamp::from_secs(base + i * 60)),
+            ],
         )
         .unwrap();
     }
     // at + 60s > boundary: ids where ts+60 > base+180 → ts > base+120 → ids 3,4
     let ids = ints(&sel(
         &db,
-        &format!("SELECT id FROM ts WHERE at + 60000000 > {}", (base + 180) * 1_000_000),
+        &format!(
+            "SELECT id FROM ts WHERE at + 60000000 > {}",
+            (base + 180) * 1_000_000
+        ),
     ));
     assert_eq!(ids, vec![3, 4], "ts + µs arithmetic in WHERE");
     // at - 60s: ids where ts-60 >= base → ids 1..4
     let ids = ints(&sel(
         &db,
-        &format!("SELECT id FROM ts WHERE at - 60000000 >= {}", base * 1_000_000),
+        &format!(
+            "SELECT id FROM ts WHERE at - 60000000 >= {}",
+            base * 1_000_000
+        ),
     ));
     assert_eq!(ids, vec![1, 2, 3, 4], "ts - µs arithmetic in WHERE");
 }
@@ -277,11 +315,15 @@ fn timestamp_arithmetic_in_where() {
 #[test]
 fn join_with_or_in_on_condition() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, x INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, y INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, x INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, y INT)")
+        .unwrap();
     for i in 0..3 {
-        db.execute(&format!("INSERT INTO a VALUES ({i}, {i})")).unwrap();
-        db.execute(&format!("INSERT INTO b VALUES ({i}, {})", i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({i}, {i})"))
+            .unwrap();
+        db.execute(&format!("INSERT INTO b VALUES ({i}, {})", i * 10))
+            .unwrap();
     }
     // ON a.x = b.y OR b.id = 2: a0 matches b0 (x=0=y0) AND b2 → 2 rows;
     // a1, a2 match only b2 → 1 row each. Total 4.
@@ -290,8 +332,16 @@ fn join_with_or_in_on_condition() {
         "SELECT a.id, b.id FROM a JOIN b ON a.x = b.y OR b.id = 2 ORDER BY a.id, b.id",
     );
     assert_eq!(rows.len(), 4, "OR in ON: a0 matches b0+b2, a1/a2 match b2");
-    assert_eq!(rows[0], vec![Value::Integer(0), Value::Integer(0)], "a0-b0 via x=y");
-    assert_eq!(rows[1], vec![Value::Integer(0), Value::Integer(2)], "a0-b2 via OR");
+    assert_eq!(
+        rows[0],
+        vec![Value::Integer(0), Value::Integer(0)],
+        "a0-b0 via x=y"
+    );
+    assert_eq!(
+        rows[1],
+        vec![Value::Integer(0), Value::Integer(2)],
+        "a0-b2 via OR"
+    );
     assert_eq!(rows[2], vec![Value::Integer(1), Value::Integer(2)]);
     assert_eq!(rows[3], vec![Value::Integer(2), Value::Integer(2)]);
 }

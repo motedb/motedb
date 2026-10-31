@@ -67,7 +67,10 @@ fn probe_min_max_ignore_null() {
     db.execute("CREATE TABLE n (v INT)").unwrap();
     db.execute("INSERT INTO n VALUES (NULL)").unwrap();
     db.execute("INSERT INTO n VALUES (NULL)").unwrap();
-    let r2 = rows(&db, "SELECT MIN(v), MAX(v), SUM(v), COUNT(v), COUNT(*) FROM n");
+    let r2 = rows(
+        &db,
+        "SELECT MIN(v), MAX(v), SUM(v), COUNT(v), COUNT(*) FROM n",
+    );
     assert_eq!(
         r2[0],
         vec![V::Null, V::Null, V::Null, V::Integer(0), V::Integer(2)]
@@ -78,7 +81,8 @@ fn probe_min_max_ignore_null() {
 #[test]
 fn probe_scalar_subquery_in_select_list() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE d (id INT PRIMARY KEY, n INT)").unwrap();
+    db.execute("CREATE TABLE d (id INT PRIMARY KEY, n INT)")
+        .unwrap();
     db.execute("INSERT INTO d VALUES (1, 100)").unwrap();
     db.execute("INSERT INTO d VALUES (2, 200)").unwrap();
     let r = ints(
@@ -97,9 +101,15 @@ fn probe_exists_semantics() {
     db.execute("INSERT INTO a VALUES (1)").unwrap();
     db.execute("INSERT INTO a VALUES (2)").unwrap();
     db.execute("INSERT INTO b VALUES (1)").unwrap();
-    let has = ints(&db, "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)");
+    let has = ints(
+        &db,
+        "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)",
+    );
     assert_eq!(has, vec![1], "EXISTS correlated");
-    let none = ints(&db, "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)");
+    let none = ints(
+        &db,
+        "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)",
+    );
     assert_eq!(none, vec![2], "NOT EXISTS");
 }
 
@@ -107,7 +117,8 @@ fn probe_exists_semantics() {
 #[test]
 fn probe_self_join_independence() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE e (id INT PRIMARY KEY, boss INT)").unwrap();
+    db.execute("CREATE TABLE e (id INT PRIMARY KEY, boss INT)")
+        .unwrap();
     db.execute("INSERT INTO e VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO e VALUES (2, 1)").unwrap();
     db.execute("INSERT INTO e VALUES (3, 1)").unwrap();
@@ -115,18 +126,28 @@ fn probe_self_join_independence() {
         &db,
         "SELECT w.id FROM e w JOIN e b ON w.boss = b.id ORDER BY w.id",
     );
-    assert_eq!(r, vec![2, 3], "self-join resolves both aliases independently");
+    assert_eq!(
+        r,
+        vec![2, 3],
+        "self-join resolves both aliases independently"
+    );
 }
 
 /// 向量: k 超过行数返回全部; 维度不匹配的插入被拒绝 (不静默截断)。
 #[test]
 fn probe_vector_k_and_dim_boundaries() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE v (id INT PRIMARY KEY, emb VECTOR(2))").unwrap();
-    db.execute("INSERT INTO v VALUES (1, '[0.0, 0.0]')").unwrap();
-    db.execute("INSERT INTO v VALUES (2, '[3.0, 4.0]')").unwrap();
+    db.execute("CREATE TABLE v (id INT PRIMARY KEY, emb VECTOR(2))")
+        .unwrap();
+    db.execute("INSERT INTO v VALUES (1, '[0.0, 0.0]')")
+        .unwrap();
+    db.execute("INSERT INTO v VALUES (2, '[3.0, 4.0]')")
+        .unwrap();
     // k > 行数 → 返回全部 (不 panic)。
-    let all = ints(&db, "SELECT id FROM v ORDER BY emb <-> '[0.0, 0.0]' LIMIT 10");
+    let all = ints(
+        &db,
+        "SELECT id FROM v ORDER BY emb <-> '[0.0, 0.0]' LIMIT 10",
+    );
     assert_eq!(all, vec![1, 2]);
     // 维度不匹配的向量必须被拒绝或报错 — 不许静默接受。
     let bad = db.execute("INSERT INTO v VALUES (3, '[1.0, 2.0, 3.0]')");
@@ -141,22 +162,37 @@ fn probe_vector_k_and_dim_boundaries() {
 #[test]
 fn probe_vector_operator_variants() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE v (id INT PRIMARY KEY, emb VECTOR(2))").unwrap();
-    db.execute("INSERT INTO v VALUES (1, '[1.0, 0.0]')").unwrap();
-    db.execute("INSERT INTO v VALUES (2, '[0.0, 1.0]')").unwrap();
-    let l2 = ints(&db, "SELECT id FROM v ORDER BY emb <-> '[0.9, 0.1]' LIMIT 1");
-    let cos = ints(&db, "SELECT id FROM v ORDER BY emb <=> '[0.9, 0.1]' LIMIT 1");
+    db.execute("CREATE TABLE v (id INT PRIMARY KEY, emb VECTOR(2))")
+        .unwrap();
+    db.execute("INSERT INTO v VALUES (1, '[1.0, 0.0]')")
+        .unwrap();
+    db.execute("INSERT INTO v VALUES (2, '[0.0, 1.0]')")
+        .unwrap();
+    let l2 = ints(
+        &db,
+        "SELECT id FROM v ORDER BY emb <-> '[0.9, 0.1]' LIMIT 1",
+    );
+    let cos = ints(
+        &db,
+        "SELECT id FROM v ORDER BY emb <=> '[0.9, 0.1]' LIMIT 1",
+    );
     assert_eq!(l2, vec![1], "L2 nearest");
-    assert_eq!(cos, vec![1], "cosine nearest (same winner for near-axis query)");
+    assert_eq!(
+        cos,
+        vec![1],
+        "cosine nearest (same winner for near-axis query)"
+    );
 }
 
 /// 嵌套聚合引用: WHERE 里用标量聚合子查询。
 #[test]
 fn probe_aggregate_subquery_in_where() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for (i, v) in [(1, 10), (2, 20), (3, 30)] {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, {v})")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {v})"))
+            .unwrap();
     }
     let r = ints(
         &db,
@@ -176,9 +212,15 @@ fn probe_in_subquery() {
     db.execute("INSERT INTO a VALUES (3)").unwrap();
     db.execute("INSERT INTO b VALUES (2)").unwrap();
     db.execute("INSERT INTO b VALUES (3)").unwrap();
-    let r = ints(&db, "SELECT id FROM a WHERE id IN (SELECT x FROM b) ORDER BY id");
+    let r = ints(
+        &db,
+        "SELECT id FROM a WHERE id IN (SELECT x FROM b) ORDER BY id",
+    );
     assert_eq!(r, vec![2, 3]);
-    let r2 = ints(&db, "SELECT id FROM a WHERE id NOT IN (SELECT x FROM b) ORDER BY id");
+    let r2 = ints(
+        &db,
+        "SELECT id FROM a WHERE id NOT IN (SELECT x FROM b) ORDER BY id",
+    );
     assert_eq!(r2, vec![1]);
 }
 
@@ -186,9 +228,11 @@ fn probe_in_subquery() {
 #[test]
 fn probe_text_ordering_consistency() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     for (i, s) in [(1, "apple"), (2, "Banana"), (3, "apple"), (4, "cherry")] {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, '{s}')")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({i}, '{s}')"))
+            .unwrap();
     }
     let asc = rows(&db, "SELECT s FROM t ORDER BY s ASC, id ASC");
     let desc = rows(&db, "SELECT s FROM t ORDER BY s DESC, id DESC");

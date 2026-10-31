@@ -34,10 +34,14 @@ fn ints(db: &Database, sql: &str) -> Vec<i64> {
 #[test]
 fn probe_prepare_execute_params() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=3i64 {
-        db.execute_prepared("INSERT INTO t VALUES (?, ?)", vec![V::Integer(i), V::Integer(i * 100)])
-            .unwrap_or_else(|e| panic!("prepared insert {i}: {e}"));
+        db.execute_prepared(
+            "INSERT INTO t VALUES (?, ?)",
+            vec![V::Integer(i), V::Integer(i * 100)],
+        )
+        .unwrap_or_else(|e| panic!("prepared insert {i}: {e}"));
     }
     let n = ints(&db, "SELECT COUNT(*) FROM t");
     assert_eq!(n, vec![3], "3 parameterized inserts");
@@ -58,13 +62,23 @@ fn probe_prepare_execute_params() {
 #[test]
 fn probe_fts_after_text_update() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE art (id INT PRIMARY KEY, content TEXT)").unwrap();
-    db.execute("INSERT INTO art VALUES (1, 'alpha beta')").unwrap();
-    db.execute("CREATE TEXT INDEX art_content ON art(content)").unwrap();
-    assert_eq!(ints(&db, "SELECT id FROM art WHERE MATCH(content, 'alpha')"), vec![1]);
-    db.execute("UPDATE art SET content = 'gamma delta' WHERE id = 1").unwrap();
+    db.execute("CREATE TABLE art (id INT PRIMARY KEY, content TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO art VALUES (1, 'alpha beta')")
+        .unwrap();
+    db.execute("CREATE TEXT INDEX art_content ON art(content)")
+        .unwrap();
+    assert_eq!(
+        ints(&db, "SELECT id FROM art WHERE MATCH(content, 'alpha')"),
+        vec![1]
+    );
+    db.execute("UPDATE art SET content = 'gamma delta' WHERE id = 1")
+        .unwrap();
     let old = ints(&db, "SELECT id FROM art WHERE MATCH(content, 'alpha')");
-    assert!(old.is_empty(), "old term no longer matches after UPDATE: {old:?}");
+    assert!(
+        old.is_empty(),
+        "old term no longer matches after UPDATE: {old:?}"
+    );
     let new = ints(&db, "SELECT id FROM art WHERE MATCH(content, 'gamma')");
     assert_eq!(new, vec![1], "new term matches after UPDATE");
 }
@@ -73,21 +87,35 @@ fn probe_fts_after_text_update() {
 #[test]
 fn probe_window_running_sum() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE s (id INT PRIMARY KEY, g TEXT, v INT)").unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, g TEXT, v INT)")
+        .unwrap();
     for (i, g, v) in [(1, "a", 10), (2, "a", 20), (3, "b", 5), (4, "b", 15)] {
-        db.execute(&format!("INSERT INTO s VALUES ({i}, '{g}', {v})")).unwrap();
+        db.execute(&format!("INSERT INTO s VALUES ({i}, '{g}', {v})"))
+            .unwrap();
     }
     let r = rows(
         &db,
         "SELECT id, SUM(v) OVER (ORDER BY id) AS rt FROM s ORDER BY id",
     );
-    let rt: Vec<i64> = r.iter().map(|x| match &x[1] { V::Integer(n) => *n, _ => -1 }).collect();
+    let rt: Vec<i64> = r
+        .iter()
+        .map(|x| match &x[1] {
+            V::Integer(n) => *n,
+            _ => -1,
+        })
+        .collect();
     assert_eq!(rt, vec![10, 30, 35, 50], "global running sum");
     let r2 = rows(
         &db,
         "SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY id) AS pt FROM s ORDER BY id",
     );
-    let pt: Vec<i64> = r2.iter().map(|x| match &x[1] { V::Integer(n) => *n, _ => -1 }).collect();
+    let pt: Vec<i64> = r2
+        .iter()
+        .map(|x| match &x[1] {
+            V::Integer(n) => *n,
+            _ => -1,
+        })
+        .collect();
     assert_eq!(pt, vec![10, 30, 5, 20], "per-partition running sum");
 }
 
@@ -119,7 +147,8 @@ fn probe_nested_savepoints() {
 #[test]
 fn probe_filtered_vector_search() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE v (id INT PRIMARY KEY, cat TEXT, emb VECTOR(2))").unwrap();
+    db.execute("CREATE TABLE v (id INT PRIMARY KEY, cat TEXT, emb VECTOR(2))")
+        .unwrap();
     // 6 行: cat=a 的在近处, cat=b 的在远处。
     for i in 0..6i64 {
         let cat = if i < 3 { "a" } else { "b" };
@@ -143,11 +172,13 @@ fn probe_filtered_vector_search() {
 #[test]
 fn probe_timeseries_gc() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE m (ts TIMESTAMP, v INT) TIMESERIES(ts)").unwrap();
+    db.execute("CREATE TABLE m (ts TIMESTAMP, v INT) TIMESERIES(ts)")
+        .unwrap();
     let base = 1_700_000_000_000_000i64;
     for i in 0..4i64 {
         let ts = base + i * 1_000_000;
-        db.execute(&format!("INSERT INTO m VALUES ({ts}, {i})")).unwrap();
+        db.execute(&format!("INSERT INTO m VALUES ({ts}, {i})"))
+            .unwrap();
     }
     let n = ints(&db, "SELECT COUNT(*) FROM m");
     assert_eq!(n, vec![4]);
@@ -199,7 +230,8 @@ fn probe_cross_join() {
 #[test]
 fn probe_batch_insert_map() {
     let (db, _d) = new_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, s TEXT)")
+        .unwrap();
     let batch: Vec<motedb::types::SqlRow> = (1..=100)
         .map(|i| {
             let mut m = motedb::types::SqlRow::new();
@@ -223,7 +255,8 @@ fn probe_batch_insert_map() {
 fn probe_upsert_auto_increment() {
     let (db, _d) = new_db();
     // NOTE: `k INT UNIQUE` 列约束语法尚不支持 (Expected RParen) — 记录为缺口。
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES (10)").unwrap();
     let id1 = ints(&db, "SELECT id FROM t")[0];
     let r = db.execute(&format!(

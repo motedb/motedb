@@ -21,7 +21,8 @@ use tempfile::TempDir;
 fn deleted_rows_never_resurface_via_pk_select() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path().join("ghost.mote")).unwrap());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     const N: i64 = 50;
     for i in 1..=N {
         db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
@@ -37,7 +38,8 @@ fn deleted_rows_never_resurface_via_pk_select() {
             while !stop.load(Ordering::Relaxed) {
                 db.execute("BEGIN").unwrap();
                 for i in 1..=N {
-                    db.execute(&format!("DELETE FROM t WHERE id = {i}")).unwrap();
+                    db.execute(&format!("DELETE FROM t WHERE id = {i}"))
+                        .unwrap();
                 }
                 for i in 1..=N {
                     db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
@@ -68,7 +70,8 @@ fn deleted_rows_never_resurface_via_pk_select() {
     // 终态: 全删 (确认提交), 逐 PK SELECT — 必须全部为空。
     db.execute("BEGIN").unwrap();
     for i in 1..=N {
-        db.execute(&format!("DELETE FROM t WHERE id = {i}")).unwrap();
+        db.execute(&format!("DELETE FROM t WHERE id = {i}"))
+            .unwrap();
     }
     db.execute("COMMIT").unwrap();
     let cnt: i64 = {

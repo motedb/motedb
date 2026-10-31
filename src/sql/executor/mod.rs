@@ -9632,7 +9632,9 @@ impl QueryExecutor {
             // 🔴 round-26: TIMESTAMP - INTEGER(µs) — see positional_add.
             (Value::Timestamp(t), Value::Integer(us)) => match t.as_micros().checked_sub(*us) {
                 Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
-                None => Err(MoteDBError::TypeError("timestamp subtraction overflow".into())),
+                None => Err(MoteDBError::TypeError(
+                    "timestamp subtraction overflow".into(),
+                )),
             },
             (Value::Integer(a), Value::Integer(b)) => match a.checked_sub(*b) {
                 Some(v) => Ok(Value::Integer(v)),
@@ -10789,7 +10791,9 @@ impl QueryExecutor {
                 Ok(())
             }
             Expr::InHashset { expr, .. } => Self::validate_where_columns(expr, schema),
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 Self::validate_where_columns(expr, schema)?;
                 Self::validate_where_columns(low, schema)?;
                 Self::validate_where_columns(high, schema)
@@ -13628,7 +13632,11 @@ impl QueryExecutor {
                     }
                     let value_cmp = order_by_cmp(va, vb);
                     if value_cmp != std::cmp::Ordering::Equal {
-                        return if order.asc { value_cmp } else { value_cmp.reverse() };
+                        return if order.asc {
+                            value_cmp
+                        } else {
+                            value_cmp.reverse()
+                        };
                     }
                 }
                 std::cmp::Ordering::Equal
@@ -17680,14 +17688,14 @@ impl QueryExecutor {
             //    (extra_order_aggs were appended per group, in the order the
             //    non-selected ORDER BY aggregates were encountered).
             let mut extra_cursor = 0usize; // index into extra_order_aggs
-            // 🔴 round-22: ORDER BY clauses that resolve to NONE of the shapes
-            // below (e.g. a bare expression `ORDER BY v / 10`) used to be
-            // silently DROPPED from the sort plan — grouped queries returned
-            // arbitrary (HashMap) group order with no error. Now: an
-            // expression key matching a SELECT-list expression sorts by that
-            // output column; anything unresolvable declines the whole fast
-            // path to the materialized path (which evaluates expression keys
-            // against group member rows).
+                                           // 🔴 round-22: ORDER BY clauses that resolve to NONE of the shapes
+                                           // below (e.g. a bare expression `ORDER BY v / 10`) used to be
+                                           // silently DROPPED from the sort plan — grouped queries returned
+                                           // arbitrary (HashMap) group order with no error. Now: an
+                                           // expression key matching a SELECT-list expression sorts by that
+                                           // output column; anything unresolvable declines the whole fast
+                                           // path to the materialized path (which evaluates expression keys
+                                           // against group member rows).
             let mut declined = false;
             let order_specs: Vec<(usize, bool, Option<bool>)> = order_by
                 .iter()
@@ -17729,9 +17737,9 @@ impl QueryExecutor {
                     // string; different trees never collide in practice
                     // because every variant embeds its full structure).
                     let ob_key = format!("{:?}", ob.expr);
-                    if let Some(idx) = stmt.columns.iter().position(|sc| {
-                        matches!(sc, SelectColumn::Expr(e, _) if format!("{:?}", e) == ob_key)
-                    }) {
+                    if let Some(idx) = stmt.columns.iter().position(
+                        |sc| matches!(sc, SelectColumn::Expr(e, _) if format!("{:?}", e) == ob_key),
+                    ) {
                         return Some((idx, ob.asc, ob.nulls_first));
                     }
                     declined = true;
@@ -18181,9 +18189,9 @@ impl QueryExecutor {
                     }
                     // Expression key matching a projected expression → its output.
                     let ob_key = format!("{:?}", ob.expr);
-                    if let Some(idx) = stmt.columns.iter().position(|sc| {
-                        matches!(sc, SelectColumn::Expr(e, _) if format!("{:?}", e) == ob_key)
-                    }) {
+                    if let Some(idx) = stmt.columns.iter().position(
+                        |sc| matches!(sc, SelectColumn::Expr(e, _) if format!("{:?}", e) == ob_key),
+                    ) {
                         return Some((idx, ob.asc, ob.nulls_first));
                     }
                     order_declined = true;
