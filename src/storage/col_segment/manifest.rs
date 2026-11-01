@@ -510,7 +510,12 @@ impl Manifest {
         while pos < data.len() {
             if version < 2 {
                 // Legacy v1: [tag][payload] without table_id.
-                let tag = data[pos - 1];
+                // 🔴 Off-by-one: `data[pos - 1]` read the high byte of the
+                // count field (always 0 for < 2^24 records) — every v1
+                // manifest replayed as EMPTY, and migrate_to_global then
+                // wrote the empty state and deleted the legacy files.
+                let tag = data[pos];
+                pos += 1;
                 let Some(rec) = decode_v1(&data, &mut pos, tag) else {
                     break;
                 };

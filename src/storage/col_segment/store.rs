@@ -126,6 +126,92 @@ fn cmp_str(v: Option<&str>, target: Option<&str>, op: &crate::sql::ast::BinaryOp
 /// (fixed direct / text paged window / var-length per-row); a column
 /// missing from a pre-ALTER segment gets the ADD COLUMN DEFAULT backfill
 /// or a width-correct NULL placeholder.
+/// Width-correct NULL placeholder for one column of a merge-emitted row.
+/// The builder's column buffers must stay aligned with the column's
+/// declared encoding: fixed 8 bytes (INT/FLOAT/TIMESTAMP/DATE), BOOL 1,
+/// TEXT/BLOB a u32 length prefix, var-length (VECTOR/SPATIAL) a u16 dim.
+/// 🔴 round-23: var-length columns use [0x0000] (dim/len 0 = NULL) — the
+/// old bare [0xFFFF] parsed as a VALID non-null dim=65535 with no payload
+/// and misaligned every later row for sequential walkers (post-merge
+/// vector reads came back as 65535-dim zero vectors). The same class
+/// recurred for DATE (8-byte column given a 2-byte placeholder) and BLOB
+/// (u32-prefixed column given a 2-byte placeholder) when the widths were
+/// spelled out per call site — keep them here only.
+fn null_placeholder(ct: Option<&crate::types::ColumnType>) -> &'static [u8] {
+    use crate::types::ColumnType;
+    match ct {
+        Some(
+            ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp | ColumnType::Date,
+        ) => &[0u8; 8],
+        Some(ColumnType::Boolean) => &[0u8],
+        Some(ColumnType::Text | ColumnType::Blob) => &[0u8; 4],
+        _ => &[0u8; 2],
+    }
+}
+
+/// ADD COLUMN DEFAULT backfill for a pre-ALTER segment, encoded in the
+/// builder's raw layout for the column's *declared* type. A literal that
+/// cannot be coerced to the column (or any var-length column) yields None
+/// so the caller falls back to a NULL placeholder — writing a foreign
+/// layout (e.g. TEXT `[len][bytes]` for `DEFAULT '2024-01-01'` on a DATE
+/// column) into a fixed-width column buffer misaligns every later row.
+fn encode_default_for_column(
+    ct: Option<&crate::types::ColumnType>,
+    dv: &crate::types::Value,
+) -> Option<Vec<u8>> {
+    use crate::types::{ColumnType, Date, Timestamp, Value};
+    let fixed = |v: i64| Some(v.to_le_bytes().to_vec());
+    match (ct, dv) {
+        (Some(ColumnType::Integer), Value::Integer(iv)) => fixed(*iv),
+        (Some(ColumnType::Integer), Value::Float(fv)) if fv.is_finite() && fv.fract() == 0.0 => {
+            fixed(*fv as i64)
+        }
+        (Some(ColumnType::Float), Value::Float(fv)) => Some(fv.to_le_bytes().to_vec()),
+        (Some(ColumnType::Float), Value::Integer(iv)) => Some((*iv as f64).to_le_bytes().to_vec()),
+        (Some(ColumnType::Boolean), Value::Bool(bv)) => Some(vec![u8::from(*bv)]),
+        (Some(ColumnType::Boolean), Value::Integer(iv)) if *iv == 0 || *iv == 1 => {
+            Some(vec![*iv as u8])
+        }
+        (Some(ColumnType::Timestamp), Value::Timestamp(tv)) => fixed(tv.as_micros()),
+        (Some(ColumnType::Timestamp), Value::Integer(iv)) => fixed(*iv),
+        (Some(ColumnType::Timestamp), Value::Text(s)) => {
+            Timestamp::parse_iso(s.as_str()).and_then(|t| fixed(t.as_micros()))
+        }
+        (Some(ColumnType::Date), Value::Date(d)) => fixed(d.days() as i64),
+        (Some(ColumnType::Date), Value::Text(s)) => {
+            Date::parse(s.as_str()).and_then(|d| fixed(d.days() as i64))
+        }
+        (Some(ColumnType::Text), Value::Text(ts)) => {
+            let bytes = ts.as_bytes();
+            let mut b = (bytes.len() as u32).to_le_bytes().to_vec();
+            b.extend_from_slice(bytes);
+            Some(b)
+        }
+        // VECTOR columns only ever receive their default as a quoted
+        // '[…]' literal (Value::Text) — parse it so ALTER's backfill writes
+        // the real default instead of silently NULL-ing pre-existing rows
+        // (post-ALTER inserts DO get the parsed default via coerce_row_to_
+        // schema; the asymmetry showed as old rows NULL, new rows set).
+        (Some(ColumnType::Tensor(dim)), Value::Text(ts)) => {
+            let inner = ts.as_str().trim().strip_prefix('[')?.strip_suffix(']')?;
+            let floats: Option<Vec<f32>> = inner
+                .split(',')
+                .map(|p| p.trim().parse::<f32>().ok())
+                .collect();
+            let floats = floats?;
+            if floats.len() != *dim {
+                return None;
+            }
+            let mut b = (floats.len() as u16).to_le_bytes().to_vec();
+            for f in &floats {
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+            Some(b)
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_column_raw(
     seg: &Segment,
@@ -135,52 +221,20 @@ fn encode_column_raw(
     new_col_default: Option<&crate::types::Value>,
     row_bytes: &mut Vec<Vec<u8>>,
     row_nulls: &mut Vec<bool>,
-) {
-    use crate::types::{ColumnType, Value};
+) -> Result<()> {
+    use crate::types::Value;
 
     if ci >= seg.sst.column_tags.len() {
         // Column doesn't exist in this segment (ALTER TABLE ADD COLUMN).
-        let mut buf = Vec::new();
-        if let Some(dv) = new_col_default {
-            let encoded = match dv {
-                Value::Integer(iv) => iv.to_le_bytes().to_vec(),
-                Value::Float(fv) => fv.to_le_bytes().to_vec(),
-                Value::Timestamp(tv) => tv.as_micros().to_le_bytes().to_vec(),
-                Value::Bool(bv) => vec![if *bv { 1u8 } else { 0u8 }],
-                Value::Text(ts) => {
-                    // [len:u32][bytes] — matches the builder's Text encoding.
-                    let bytes = ts.as_bytes();
-                    let mut b = (bytes.len() as u32).to_le_bytes().to_vec();
-                    b.extend_from_slice(bytes);
-                    b
-                }
-                _ => Vec::new(),
-            };
-            if !encoded.is_empty() {
-                buf.extend_from_slice(&encoded);
-                row_nulls.push(false);
-                row_bytes.push(buf);
-                return;
-            }
-        }
-        // No default — width-correct NULL placeholder so the raw buffer
-        // matches the column's declared encoding.
-        // 🔴 round-23: var-length columns (VECTOR/SPATIAL) use [0x0000]
-        // (dim/len 0 = NULL) — the old bare [0xFFFF] parsed as a VALID
-        // non-null dim=65535 with no payload, misaligning every later row
-        // in the column for sequential walkers (post-merge vector reads
-        // came back as 65535-dim zero vectors).
-        match col_types.get(ci) {
-            Some(ColumnType::Integer) | Some(ColumnType::Float) | Some(ColumnType::Timestamp) => {
-                buf.extend_from_slice(&[0u8; 8]);
-            }
-            Some(ColumnType::Boolean) => buf.push(0u8),
-            Some(ColumnType::Text | ColumnType::Blob) => buf.extend_from_slice(&0u32.to_le_bytes()),
-            _ => buf.extend_from_slice(&0u16.to_le_bytes()),
+        let ct = col_types.get(ci);
+        if let Some(encoded) = new_col_default.and_then(|dv| encode_default_for_column(ct, dv)) {
+            row_nulls.push(false);
+            row_bytes.push(encoded);
+            return Ok(());
         }
         row_nulls.push(true);
-        row_bytes.push(buf);
-        return;
+        row_bytes.push(null_placeholder(ct).to_vec());
+        return Ok(());
     }
 
     let ct = &col_types[ci];
@@ -216,6 +270,12 @@ fn encode_column_raw(
             // [dim:u16][f32×dim le] — one block copy: on LE targets the
             // f32 bit pattern IS the encoded form (per-element to_le_bytes
             // dominated vector-column merge time: 384 extends per row).
+            if v.len() > u16::MAX as usize {
+                return Err(crate::StorageError::InvalidData(format!(
+                    "vector dimension {} exceeds the 65535 storage limit",
+                    v.len()
+                )));
+            }
             buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
             let bytes =
                 unsafe { std::slice::from_raw_parts(v.0.as_ptr().cast::<u8>(), v.0.len() * 4) };
@@ -231,21 +291,18 @@ fn encode_column_raw(
             buf.extend_from_slice(&bytes);
             false
         }
+        Value::Date(d) => {
+            buf.extend_from_slice(&(d.days() as i64).to_le_bytes());
+            false
+        }
         _ => {
-            // Stored NULL: type-correct prefix width (text u32 / var u16).
-            match ct {
-                ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp => {
-                    buf.extend_from_slice(&[0u8; 8])
-                }
-                ColumnType::Boolean => buf.push(0u8),
-                ColumnType::Text | ColumnType::Blob => buf.extend_from_slice(&0u32.to_le_bytes()),
-                _ => buf.extend_from_slice(&0u16.to_le_bytes()),
-            }
+            buf.extend_from_slice(null_placeholder(Some(ct)));
             true
         }
     };
     row_nulls.push(null);
     row_bytes.push(buf);
+    Ok(())
 }
 
 fn projected_value_at(
@@ -5111,19 +5168,8 @@ impl ColSegmentStore {
                     // Tiered merge keeps the tombstone: width-correct NULL
                     // placeholders (values are never read, but the builder's
                     // column buffers must stay in sync with num_rows).
-                    // 🔴 round-23: var-length columns use [0x0000] (dim/len
-                    // 0 = NULL) — the old bare [0xFFFF] parsed as a VALID
-                    // non-null dim=65535 with no payload and misaligned
-                    // every later row of the column for sequential walkers.
                     for ct in col_types.iter().take(ncols) {
-                        match ct {
-                            ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp => {
-                                row_bytes.push(vec![0u8; 8])
-                            }
-                            ColumnType::Boolean => row_bytes.push(vec![0u8]),
-                            ColumnType::Text => row_bytes.push(0u32.to_le_bytes().to_vec()),
-                            _ => row_bytes.push(0u16.to_le_bytes().to_vec()),
-                        }
+                        row_bytes.push(null_placeholder(Some(ct)).to_vec());
                         row_nulls.push(true);
                     }
                 } else {
@@ -5136,7 +5182,7 @@ impl ColSegmentStore {
                             new_col_default,
                             &mut row_bytes,
                             &mut row_nulls,
-                        );
+                        )?;
                     }
                 }
                 let slices: Vec<&[u8]> = row_bytes.iter().map(|b| b.as_slice()).collect();

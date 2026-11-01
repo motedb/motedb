@@ -3077,13 +3077,16 @@ impl ColumnarSSTableBuilder {
         self.timestamps.push(timestamp);
         self.deleted.push(deleted);
 
-        for (col_idx, value) in row.iter().enumerate() {
-            // Guard: a row with more columns than the builder expects (e.g.
-            // from a corrupted/orphan SSTable file) must not panic — skip the
-            // extra columns. This is the test_orphan_cleanup_on_open fix.
-            if col_idx >= self.column_buffers.len() {
-                break;
-            }
+        // 🔴 Iterate the BUILDER's columns, not the row: a row may legitimately
+        // be narrower than the current schema (UPDATE of a pre-ALTER row after
+        // `ALTER TABLE ADD COLUMN` — the stored old row still has the old
+        // width). Per-column padding with the tag's NULL encoding keeps every
+        // column buffer exactly num_rows long; iterating the row instead left
+        // the new column's null_flags empty and finish() panicked slicing it —
+        // in the close/Drop path, aborting the process and stranding a
+        // half-written directory that could not be reopened.
+        for col_idx in 0..self.column_buffers.len() {
+            let value = row.get(col_idx).unwrap_or(&Value::Null);
             let buf = &mut self.column_buffers[col_idx];
             // Track explicit NULL flag (authoritative; no value sentinel needed).
             self.null_flags[col_idx].push(matches!(value, Value::Null));
@@ -3189,6 +3192,12 @@ impl ColumnarSSTableBuilder {
                     match value {
                         Value::Vector(v) => {
                             let floats: &[f32] = &v.0;
+                            if floats.len() > u16::MAX as usize {
+                                return Err(StorageError::InvalidData(format!(
+                                    "vector dimension {} exceeds the 65535 storage limit",
+                                    floats.len()
+                                )));
+                            }
                             buf.extend_from_slice(&(floats.len() as u16).to_le_bytes());
                             for f in floats {
                                 buf.extend_from_slice(&f.to_le_bytes());
@@ -3196,6 +3205,12 @@ impl ColumnarSSTableBuilder {
                         }
                         Value::Tensor(t) => {
                             let floats = t.to_f32();
+                            if floats.len() > u16::MAX as usize {
+                                return Err(StorageError::InvalidData(format!(
+                                    "tensor dimension {} exceeds the 65535 storage limit",
+                                    floats.len()
+                                )));
+                            }
                             buf.extend_from_slice(&(floats.len() as u16).to_le_bytes());
                             for f in &floats {
                                 buf.extend_from_slice(&f.to_le_bytes());
@@ -3317,13 +3332,16 @@ impl ColumnarSSTableBuilder {
         self.timestamps.push(timestamp);
         self.deleted.push(deleted);
 
-        for (col_idx, value) in row.iter().enumerate() {
-            // Guard: a row with more columns than the builder expects (e.g.
-            // from a corrupted/orphan SSTable file) must not panic — skip the
-            // extra columns. This is the test_orphan_cleanup_on_open fix.
-            if col_idx >= self.column_buffers.len() {
-                break;
-            }
+        // 🔴 Iterate the BUILDER's columns, not the row: a row may legitimately
+        // be narrower than the current schema (UPDATE of a pre-ALTER row after
+        // `ALTER TABLE ADD COLUMN` — the stored old row still has the old
+        // width). Per-column padding with the tag's NULL encoding keeps every
+        // column buffer exactly num_rows long; iterating the row instead left
+        // the new column's null_flags empty and finish() panicked slicing it —
+        // in the close/Drop path, aborting the process and stranding a
+        // half-written directory that could not be reopened.
+        for col_idx in 0..self.column_buffers.len() {
+            let value = row.get(col_idx).unwrap_or(&Value::Null);
             let buf = &mut self.column_buffers[col_idx];
             // Track explicit NULL flag (authoritative; no value sentinel needed).
             self.null_flags[col_idx].push(matches!(value, Value::Null));
@@ -3401,6 +3419,12 @@ impl ColumnarSSTableBuilder {
                     let bytes = match value {
                         Value::Vector(v) => {
                             let floats: &[f32] = &v.0;
+                            if floats.len() > u16::MAX as usize {
+                                return Err(StorageError::InvalidData(format!(
+                                    "vector dimension {} exceeds the 65535 storage limit",
+                                    floats.len()
+                                )));
+                            }
                             let mut b = Vec::with_capacity(2 + floats.len() * 4);
                             b.extend_from_slice(&(floats.len() as u16).to_le_bytes());
                             for f in floats {

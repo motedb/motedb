@@ -278,9 +278,13 @@ impl SchemaDecodeContext {
             };
             let var_header_start = var_section_start + 2;
             let vds = var_header_start + var_count * 10;
-            let mut entries: [(usize, usize); 16] = [(0, 0); 16];
+            let mut entries: [(usize, usize); 64] = [(0, 0); 64];
             let mut count = 0usize;
-            for i in 0..var_count.min(16) {
+            // 🔴 Was min(16) with a 16-slot stack — the encoder writes up to 64
+            // var-width columns, so tables with ≥17 of them decoded columns
+            // 17+ as NULL on these scan paths while the 64-entry map
+            // decoders were correct: same table, different rows per path.
+            for i in 0..var_count.min(64) {
                 let off = var_header_start + i * 10 + 2;
                 if off + 8 > data.len() {
                     break;
@@ -299,7 +303,7 @@ impl SchemaDecodeContext {
             }
             (vds, entries, count)
         } else {
-            (data.len(), [(0, 0); 16], 0)
+            (data.len(), [(0, 0); 64], 0)
         };
 
         let mut var_idx = 0usize;
@@ -483,9 +487,13 @@ impl SchemaDecodeContext {
             };
             let var_header_start = var_section_start + 2;
             let vds = var_header_start + var_count * 10;
-            let mut entries: [(usize, usize); 16] = [(0, 0); 16];
+            let mut entries: [(usize, usize); 64] = [(0, 0); 64];
             let mut count = 0usize;
-            for i in 0..var_count.min(16) {
+            // 🔴 Was min(16) with a 16-slot stack — the encoder writes up to 64
+            // var-width columns, so tables with ≥17 of them decoded columns
+            // 17+ as NULL on these scan paths while the 64-entry map
+            // decoders were correct: same table, different rows per path.
+            for i in 0..var_count.min(64) {
                 let off = var_header_start + i * 10 + 2; // skip 2-byte col_idx
                 if off + 8 > data.len() {
                     break;
@@ -504,7 +512,7 @@ impl SchemaDecodeContext {
             }
             (vds, entries, count)
         } else {
-            (data.len(), [(0, 0); 16], 0)
+            (data.len(), [(0, 0); 64], 0)
         };
 
         // Decode columns using specialized dispatch
@@ -836,9 +844,13 @@ pub fn decode_row_into_columns(
         };
         let var_header_start = var_section_start + 2;
         let vds = var_header_start + var_count * 10;
-        let mut entries: [(usize, usize); 16] = [(0, 0); 16];
+        let mut entries: [(usize, usize); 64] = [(0, 0); 64];
         let mut count = 0usize;
-        for i in 0..var_count.min(16) {
+        // 🔴 Was min(16) with a 16-slot stack — the encoder writes up to 64
+        // var-width columns, so tables with ≥17 of them decoded columns
+        // 17+ as NULL on these scan paths while the 64-entry map
+        // decoders were correct: same table, different rows per path.
+        for i in 0..var_count.min(64) {
             let off = var_header_start + i * 10 + 2;
             if off + 8 > data.len() {
                 break;
@@ -853,7 +865,7 @@ pub fn decode_row_into_columns(
         }
         (vds, entries, count)
     } else {
-        (data.len(), [(0, 0); 16], 0)
+        (data.len(), [(0, 0); 64], 0)
     };
 
     let mut var_idx = 0usize;
