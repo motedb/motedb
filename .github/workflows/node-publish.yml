@@ -2,8 +2,17 @@ name: Node SDK publish (npm)
 
 # Multi-platform prebuilt napi binaries → npmjs.org (unscoped):
 #   motedb (main, pure JS loader) + one platform package per target:
-#   motedb-darwin-arm64 / -darwin-x64 / -linux-x64-gnu / -linux-arm64-gnu /
-#   -win32-x64-msvc
+#   motedb-darwin-arm64 / -darwin-x64 / -linux-x64-gnu / -linux-arm64-gnu
+#
+# 🔴 B-01: the win32-x64-msvc target is DISABLED — the platform package has
+#   never actually landed on npm (npm's anti-spam gate kept rejecting the
+#   brand-new package), while the root package declared it as an
+#   optionalDependency, so `npm i motedb` on Windows pulled a 404 and the
+#   install failed outright for three releases. Removed until a real
+#   motedb-win32-x64-msvc is on the registry: re-add the matrix entry below,
+#   the `x86_64-pc-windows-msvc` line in bindings/node/package.json
+#   (napi.targets + optionalDependencies), the npm/win32-x64-msvc dir, and
+#   the windows entry in release-smoke.yml's node matrix — TOGETHER.
 # Triggers on v* tags (publish) and PRs touching the binding (build-only).
 # 🔑 Publishing needs the NPM_TOKEN repository secret (an npmjs.org automation
 #   token with publish rights on the motedb* packages). The publish job fails
@@ -31,6 +40,7 @@ permissions:
   contents: write
   id-token: write
   packages: write
+  issues: write
 
 jobs:
   build:
@@ -59,8 +69,6 @@ jobs:
           # - os: ubuntu-latest
           #   target: aarch64-unknown-linux-musl
           #   docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -302,3 +310,52 @@ jobs:
           rc=0
           for d in npm/*/; do pub "$d" || rc=1; sleep 120; done
           exit $rc
+
+  report:
+    # 🔴 B-04: a red publish job must never be silent again. 0.15.1/0.15.2
+    # failures were caught by release-smoke's install check; 0.16.0's win32
+    # package was missing for three releases with no issue opened. Open (or
+    # bump) a tracking issue as soon as any job of a TAG publish run fails.
+    needs: [build, package, publish]
+    if: ${{ always() && contains(needs.*.result, 'failure') && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const results = JSON.parse(process.env.RESULTS);
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const version = (context.refName || '').replace(/^v/, '') || 'unknown';
+            const title = `Node npm publish failed for v${version}`;
+            const table = Object.entries(results)
+              .map(([name, r]) => `| ${name} | ${r.result} |`)
+              .join('\n');
+            const body = [
+              `The npm publish run for **v${version}** did not fully succeed.`,
+              'A red platform package means users cannot install the version —',
+              'the root loader declares platform packages as optionalDependencies,',
+              'and a missing one is an E404 at `npm install` time.',
+              '',
+              `Run: ${runUrl}`,
+              '',
+              '| job | result |', '|---|---|', table,
+              '',
+              'Fix forward with the version still unpublished for the affected platform:',
+              're-run the workflow (workflow_dispatch) after resolving, or drop the platform',
+              'from package.json + matrix so the remaining platforms ship clean.',
+            ].join('\n');
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const existing = open.find((i) => i.title === title && !i.pull_request);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `Failed again: ${runUrl}\n\n| job | result |\n|---|---|\n${table}`,
+              });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }

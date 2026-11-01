@@ -304,8 +304,11 @@ SELECT a.x, b.y FROM a, b WHERE a.x = 1;   -- implicit cross join + WHERE
 ```
 
 Regressions: `tests/test_bug_hunt_v108.rs::probe_cross_join`.
-Known gap: column-level `UNIQUE` (`k INT UNIQUE`) is not supported yet —
-use PRIMARY KEY or application-side checks for uniqueness.
+Known gaps: column-level `UNIQUE` (`k INT UNIQUE`) is not supported yet —
+use PRIMARY KEY or application-side checks for uniqueness. The **table-level
+composite form** `PRIMARY KEY (a, b)` / `CONSTRAINT … PRIMARY KEY (a, b)` is
+not parsed either (single column-level `PRIMARY KEY` only); composite keys
+are available through the raw API (`TableSchema` with several PK columns).
 
 #### SUBSTRING — standard FROM/FOR form
 

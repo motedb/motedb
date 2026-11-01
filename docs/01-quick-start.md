@@ -29,6 +29,13 @@ fn main() -> Result<()> {
 }
 ```
 
+> **Path handling (B-18):** the engine stores a database as a DIRECTORY
+> (holding `meta.bin`, `wal/`, `columnar_ms/`, `lsm/`, `indexes/`). If the
+> path you pass has no `.mote` suffix, one is appended silently
+> (`myapp` → `myapp.mote/`; an existing `myapp.motedb` suffix is rewritten
+> to `myapp.mote`). Pass the exact directory name (with `.mote`) when you
+> need to script backups — copy the whole directory, not a single file.
+
 ### 2. Create Tables
 
 ```rust

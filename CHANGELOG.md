@@ -1,5 +1,327 @@
 # Changelog
 
+## [0.17.0] — 2026-11-02
+
+> 第三轮（自查）：上轮报告的 16 项确认发现全数处理——其中 **7 项是前两轮
+> 修复自身引入或暴露的**（如实标注），5 项为 v0.16.0 原生、此前任何报告
+> 都未实锤的重磅问题。新增回归测试 `tests/test_report_round3_regressions.rs`
+> （7 用例）+ btree/FTS 各 2 项。
+
+### 🔴🔴 存储损坏 / 数据丢失类
+
+- **🔴🔴 时间戳索引超过 ~18 万条后被 flush 自毁**（P7，v0.16.0 原生）:
+  `LruCache::put`（capturing_put=false）**静默丢弃**被逐出的页 — 脏页在
+  逐出瞬间即丢；`flush()` 又只重写缓存内还活着的页并按它们重建页表 +
+  截断文件 → 被逐出页全部销毁。实测 25 万行时序表 backup + 重开后
+  `query_timestamp_range` 返回 **0 行**。四层修复: `put`→`push`（逐出
+  返回 victim）+ 逐出写回 flush_page + flush 前预加载遍收敛 + 全部缓冲
+  收集完再统一顺序写（旧顺序写会碾过写回追加区）。回归:
+  `flush_persists_pages_beyond_cache_capacity`
+- **🔴 重开后 UPDATE 主键到已存在 PK 静默吞行**（P5，v0.16.0 原生）:
+  pk 缓存对 ColSegmentStore 表**开箱即空**（只有 legacy LSM 表预热），
+  UPDATE-PK 查重只查缓存 → 重开后 `SET id=<已存在>` 直接通过，重定位
+  按最新时间戳顶掉原行 — 实测 10 行变 9 行、id=7 的值变成 v3。
+  UPDATE-PK 补存储回退（Integer PK 点查 + 非 Integer 走 query_by_column，
+  镜像事务路径）；**autocommit INSERT 的同族冷缓存洞一并修**（
+  insert_if_absent 成功 ≠ 不存在）。回归: `update_pk_to_existing_value_
+  after_reopen_is_rejected` / `insert_existing_pk_after_reopen_is_rejected`
+- **🔴 checkpoint 与并发 commit 无互斥 → 已确认事务可丢**（第三轮报告
+  表二#1，v0.16.0 原生）: flush 段缓冲 → 截断 WAL 的窗口（含最长 2 秒的
+  FTS flush）内落盘的 commit，kill -9 后丢失。`checkpoint_impl` 现按
+  backup_to 的 BUG #35 纪律持有全部 autocommit 条带 + 全局写锁跨越
+  [缓冲 flush → WAL 截断 + LSN 持久化]（写者为此阻塞 checkpoint 时长 —
+  不丢已确认提交的代价）
+- **🔴 VECTOR 维度无上限 → 整列损坏**（P9，v0.16.0 原生）:
+  `CREATE TABLE t (v VECTOR(70000))` 被接受，`dim as u16` 截断后顺序遍历
+  失步 — 实测 flush 后读回 dim=55575 乱数据。CREATE/ALTER/ raw
+  TableSchema 三处加 65535 上限校验，四处编码器 `as u16` 改显式报错。
+  回归: `oversized_vector_dims_are_rejected` /
+  `vector_at_boundary_dim_round_trips`
+
+### 🟠 静默错误结果类
+
+- **FTS 更新后 BM25 永久用旧词频**（P8，v0.16.0 原生，比原线索更糟）:
+  shard 合并按升序 + 首遇优先 = 最旧 shard 的 tf 永久获胜；且合并的
+  `add_with_freq` 对已存在 doc 丢弃新 tf — 旧词频被水泥化。改为磁盘源
+  倒序（最新优先）+ 合并覆盖 tf。实测 tf=3→1 的更新后得分恢复一致。
+  回归: `bm25_uses_fresh_tf_after_update`
+- **key=0 的重复时间戳 run 漏行/删不掉**（P1，**第一轮修复引入**）:
+  `first_leaf_for_scan` 的 `saturating_sub(1)` 探测在 key=0 时失效 —
+  1970 前时间戳全部钳到 0，实测 300 行只返回 122。key=0 改从最左叶起扫。
+  回归: `key_zero_run_is_fully_visible`
+- **raw `insert_rows` 恰在第 100 行行为分裂**（P3，我的补齐被快路径绕过）:
+  ≥100 行走 fast_batch_insert 跳过 coerce/padding — 99 行拿 DEFAULT、
+  100 行拿 NULL（NOT NULL 也失效）。coerce+补齐挪到闸门之前。回归:
+  `short_batch_rows_get_defaults_at_any_size`
+- **`INSERT INTO t SELECT` 少列静默补默认**（P4，**我 B-17 改过头**）:
+  SELECT 形式恢复精确列数（PostgreSQL/SQLite 都如此），仅 VALUES 允许
+  省略尾列。回归: `insert_select_short_source_is_rejected`
+- **`60000000 - '2026-01-01'` 语义分裂**（P2，**我 B-03 修不全**）:
+  补齐 (Integer, Date) 加法镜像臂；`(Integer, Text-as-timestamp)` 减法
+  在 positional 路径从静默 NULL 改为响亮 TypeError（该形状不可表示）。
+  回归: `timestamp_arithmetic_both_operand_orders`
+- **0.15 中文 FTS 索引升级后全查不到**（表二#7，v0.16.0 原生）:
+  元数据无分词器戳 — 0.15 空白分词器建的索引干净重开后用 Jieba 查询
+  全 miss。`TextFTSMetadata` 加 `tokenizer` 戳（serde default 兼容旧
+  文件），错配走现有 HARD RESET 重建通道
+- **manifest v1 重放差一错**（表二#8，v0.16.0 原生）: `data[pos-1]` 读到
+  count 字段高位 → 所有 v1 manifest 重放为空，migrate_to_global 删旧文件
+  后仅靠孤儿领养兜底（VERSIONING.md 明文承诺 0.12→0.15→1.x 迁移）。
+  一行修复 `data[pos]; pos += 1`
+
+### 🟡 可用性 / 事务
+
+- **commit 失败后缓冲写永久丢弃**（表二#2，v0.16.0 原生）: `mem::take`
+  排空 pending 在 WW 校验之前；错误文案建议 "retry" — 但重试会静默提交
+  空事务。现冲突时回滚本次写入的 stamp 并明确 "ROLLBACK and replay"；
+  回滚本身曾有嵌套 DashMap 守卫自锁（开发中实测死锁后重构为守卫出域再
+  回滚），SQL COMMIT 失败路径补 clear_txn_context（不再卡幽灵事务）
+- **row_cache put_if_absent 复活已删行**（表二#6，v0.16.0 原生）: 墓碑
+  检查与插入之间放锁 — DELETE 可在间隙完成"插墓碑+弹条目"，读回填把
+  已删行装回缓存。shard 锁内复查墓碑
+- **非 2 幂 `num_partitions` 导致不确定恢复**（表二#5，v0.16.0 原生）:
+  autocommit 按 composite_key 分区、事务按 row_id 分区，仅 2 幂时一致 —
+  `validate()` 现要求 2 幂
+
+### 🟢 次要 / 一致性
+
+- B-09 文案其余 4 处 "MOTESNAP container" 改如实表述（上轮只改了 1/5）
+- row_format 变宽列 16 槽上限 → 64（编码器写 64，三处解码读 16 — 17+
+  列按扫描路径返回不同数据）
+- ALTER ADD COLUMN 的 VECTOR DEFAULT '[…]' 回填解析为真值（此前旧行
+  NULL、新行有值的不对称）
+- ColumnIndex `try_invalidate` 加 3 次让步重试（竞争放弃 → 单值点查
+  可能长期陈旧）
+- contains_entry 两段式: 先降到 key 自己的叶（仅当叶首 == key 才全链
+  走查）— 逐插入全链走查在相同时间戳批量导入上是 O(N²)
+
+### 第三轮补遗（遗留项落地 + 新实锤）
+
+- **🔴🔴 批量导入路径（≥100 行 fast_batch）三重索引缺口**（新实锤，
+  v0.16.0 原生）:
+  1. 时间戳索引**完全不维护** — 宣传的 197K rows/s `insert_rows` 批量
+     导入后 `query_timestamp_range` 返回 **0 行**（实测 5000 行导入 0 条；
+     只有逐行 SQL 插入被索引）
+  2. 列索引/二级索引按 zip 配对 row_id，但 store_rows 先按 key 排序 —
+     **乱序显式 PK 批次把值绑到错误的 row_id**（实测倒序 150 行批次后
+     `WHERE tag='tag0'` 查空，而全表扫数据正确）
+  3. 统一修复: 全部改为从排序后的 key 低 32 位还原 row_id + 补时间戳
+     索引。回归: `bulk_insert_maintains_timestamp_and_column_indexes_for_
+     shuffled_pks`（乱序显式 PK + AUTO_INCREMENT 双快路径）
+- **version store 跨表误报冲突落地**（上轮回退项）: 键从裸 row_id 改为
+  `(table, row_id)` — 两表 Integer PK 同值时不再互相误报 "Write-write
+  conflict"（生产写入路径为 coordinator.commit；MVCC 读路径确认为死
+  代码后一并改键）。回归: 50×2 并发跨表提交零冲突
+- **wal_group_barrier 真实同步**（上轮遗留项）: 旧实现"队列空 + 2ms
+  sleep" — gc 线程取走但未 fsync 的批次既不在队列也无人等待，批量
+  UPDATE/DELETE 在持久化前返回成功。新增 in_flight 计数（持队列锁
+  drain 时 +1，全部 done 信号后 -1 并唤醒），barrier 等待
+  [队列空 且 in_flight==0]，10s 超时兜底。崩溃注入/持久化套件验证
+
+### 第三轮补遗二（B-07 排查中的新实锤 + 收尾）
+
+- **🔴🔴 `CREATE INDEX` 百万级构建被自己的超块碾压**（新实锤，v0.16.0
+  原生）: bulk_load 把页写在固定 128KB `SUPERBLOCK_RESERVE` 之后，收尾的
+  `sync_superblock` 从偏移 0 写入**带全量页偏移表**的超块 — 百万条目
+  （74B key ⇒ 49 键/叶）≈ 21K 页 ⇒ 偏移表 ~171KB **超过预留区**，开头
+  ~11 个页被静默碾掉；下次 flush 以 "skipping corrupt page 1..11" 告警并
+  **把坏页从重写中丢弃**（索引丢条目），doctor FAIL。实测复现于 100 万
+  行 `CREATE INDEX` + checkpoint + 重开。修复: 页按相对偏移构建、按
+  "页数×8B" 精确推导超块实际长度后再定基地址（超块恰好填满预留区）；
+  `sync_superblock` 加碾压防御闸（超块长度 > 盘上最小页偏移 ⇒ 响亮
+  Corruption 而非静默毁数据）；打开路径的 "超块 >64KB 即荒谬" 上限改为
+  按文件长度校验。回归: `bulk_load_offsets_table_fits_its_reserve`
+  （512B 宽 key × 11.5 万条 ⇒ 16.5K 页，恰越门槛；旧代码上实测被防御闸
+  拦截/损坏）。开发中顺带修掉自己引入的 bulk_load 双重 page_offsets
+  写锁自死锁（复用原守卫）
+- **Vector 值相等性**: `Value::PartialEq` 无 Vector 分支 — 向量永远
+  互不相等，GROUP BY/DISTINCT 对 VECTOR 列静默产出全单例组。补位级相等
+  分支（`-0.0`/NaN 与 Hash 的 Debug-string 语义精确一致）。实测 GROUP BY
+  3+1 分组、COUNT(DISTINCT)=2。已知边角: IN 列表带向量字面量仍不匹配
+  （字面量类型问题，未随本条处理）
+- **FTS df 双计清零**（上条遗留落地）: 磁盘侧在 posting_cache 填入时
+  一次 k 路合并算出**唯一** df；pending 侧经有序 seek 对齐扣除与磁盘
+  重叠的文档 — 被更新重发的文档从此只计一次，IDF 不再漂移。回归:
+  `df_counts_reposted_docs_once`（重发前后 BM25 分数稳定）
+- **B-07 复核结论 — 未复现，记录为闭环**: 修复后的树上（100 万行、1%
+  选择性、取行）列索引路径 37ms vs 全表扫 107ms（快 ~3 倍）；报告的
+  "慢 5~6 倍"可能测自旧构建或冷缓存形态。真正的 5~6 倍问题其实是上面
+  的超块碾压（坏页被跳过 ⇒ 索引残缺退化为扫描+告警）
+- **B-15 向量索引构建进度**: 进度原本全走默认编译掉的 debug_log，且批内
+  "Progress" 计数器从未被实际工作线程递增（死循环假报）。改为真实
+  stderr: 阶段（向量落盘/选 medoid 建图/完成）+ 每批一行带已完成数与
+  ETA（>1 批才输出）
+
+### 未能落地（如实记录）
+
+- ~~version store 键控 / wal_group_barrier~~（两项已于补遗落地）
+- FTS df 对多 shard 同 doc 双计 → 全体词 IDF 轻微失真（影响排序而非
+  成员正确性；需去重重构 TermStream 的 df 预计，随下次 FTS 改造处理）
+
+## [0.16.0] — 2026-10-30
+
+### S1 · 数据损坏 / 崩溃类（B-02 + B-16，同根同验）
+
+- **🔴 ALTER 后改存量行：非事务报错、事务崩溃并写坏目录**: `ALTER TABLE
+  ADD COLUMN` 扩了 schema 宽度，但旧宽度的行照旧写进新宽度的段 builder —
+  非事务 UPDATE 被 "Column count mismatch: expected N, got N-1" 拦下
+  （B-02，Node/Python 双复现）；事务里的 UPDATE 则在 **close 时**于
+  `flush_buffer_locked` panic（越界切片）→ 析构中 abort（exit 134），
+  半写状态落盘，**重开同目录再次 abort**（B-16，0.16 回归，0.15.2 是
+  静默写坏）。两层修复:
+  1. `ColumnarSSTableBuilder::add_values/add_row` 改为按 **builder 的列数**
+     遍历，缺的尾列按各 tag 的 NULL 编码补齐 — 窄行不再撕开列缓冲
+     （整个 panic 类随之消灭）
+  2. `coerce_row_to_schema` 先把短行补齐到 schema 宽度（缺列取 DEFAULT，
+     与 ALTER 回填一致）— 覆盖 UPDATE 自动提交、事务缓冲（`coerce` 在
+     `record_pending_update` 前调用）与 raw API 插入
+  验收: 子进程跑完整 txn→commit→close 序列（abort 会带走测试进程），
+  再重开验证数据；坏目录用旧代码复刻、新代码实测可打开。回归:
+  `tests/test_report_s1_regressions.rs`（旧代码上实测 SIGABRT）
+- **🔴 附带**: 被 B-16 写坏的 0.16.0 目录，升级后可直接打开（数据可读）；
+  遗留限制: 崩溃瞬间的行可能以 (key, ts) 相同的两份存在（孤儿段 + WAL
+  重放），PK 点查已去重、全扫会看到重复 — 用 DELETE 清理
+
+### S1 · 静默错误结果类
+
+- **B-03 · `TIMESTAMP ± INTEGER` 字面量侧静默 0 行**（CHANGELOG 声称已修
+  的遗漏面）: round-26 只补了 (Timestamp, Integer) 臂；`'2026-01-01
+  00:00:00' + 60000` 这种 TEXT 字面量在 WHERE 的 positional 求值器里折叠
+  成 NULL → 比较恒 false。`positional_add/sub` 与 `add_values/sub_values`
+  均补 TEXT(ISO)/DATE→Timestamp 臂（非时间戳文本保持良性 NULL）。回归:
+  `timestamp_arithmetic_with_iso_text_literal`（含 BETWEEN 内字面量算术）
+
+### S1 · 分发类（repo 侧）
+
+- **B-01 · Windows 平台包从未发布、根包却声明它**: win32 从 napi targets、
+  optionalDependencies、npm 目录、发布矩阵**整体摘除** — 声明了不存在
+  的平台包 = Windows 用户 `npm i motedb` 直接 404 安装失败（0.15.1 起三个
+  版本）。Windows 现走源码编译，README/docs 同步改口径；真发包时按
+  workflow 头部清单四处一起加回
+- **B-04 · npm 发布失败不再静默**: `node-publish.yml` 新增 report job —
+  tag 发布任一 job 红 → 自动开/顶追踪 issue（0.15.1/0.15.2 的 bot issue
+  来自 release-smoke 的安装冒烟，0.16.0 的漏网正是本条的直接后果）；
+  release-smoke 的 node 矩阵同步摘除 windows（win32 包上架前必红）
+
+### SQL 兼容性
+
+- **B-17 · 位置式 INSERT 省略末列填 DEFAULT**（SQLite/PostgreSQL 语义）:
+  `INSERT INTO h VALUES (1,'a')` 在 4 列表上此前报 Column count mismatch，
+  现按 DEFAULT/NULL 补齐；显式列列表仍须精确匹配，值多于列数、
+  NOT NULL 无默认仍然报错。回归: `positional_insert_fills_trailing_defaults`
+
+### Python 绑定
+
+- **B-13 · numpy 整数 2D 数组进 VECTOR 列被拒**: `decode_array_bytes` 补
+  2D 整数（i1..i8/u1..u8，符号正确扩展）与 2D f64 → 向量；1D 整数补齐
+  各宽度 → Integer。**顺带**（上轮报告遗留）: 大端（'>'）dtype 从静默按
+  小端解码改为响亮报错
+- **B-12 · `insert_arrays` 文档/签名/实现不一致**: 接受列式 dict 之外再收
+  (列, 值) 二元组序列；其他类型报错写明期望形态。docstring 同步
+- **B-14 · 无参 `rollback()`/`commit()` 抛 TypeError**: 记录最近一次
+  begin() 的 tx id，sqlite3 风格的无参回滚/提交可用；无事务时报错文案
+  指路
+
+### MCP
+
+- **B-09 · 只读门拒写文案误称 "MOTESNAP container"**: 引擎侧文案改为
+  如实的 "database is opened read-only — writes are disabled"（两种只读
+  来由共用）
+- **B-10 · `list_tables` 对 LLM 不友好**: 改为 `{"tables": [{"name", "rows"}]}`
+  结构化摘要（含行数），一次往返可用；顺带修 `doctor` 工具把 dict 直接塞进
+  MCP `text` 字段（协议要求字符串）— JSON 序列化
+
+### 文档止损
+
+- **B-08 · 复合 PRIMARY KEY**: 实测 SQL 层四种表级语法全部解析失败；
+  CHANGELOG 的"验证钉住"指 raw API 路径 — 三处文档改为如实声明
+  （CHANGELOG 加 ⚠️、docs/03 Known gaps、CAPABILITIES "不支持"表）
+- **B-18 · 库路径后缀静默改写**: quick-start 写明 — 库是**目录**，无
+  `.mote` 后缀会静默追加（`myapp` → `myapp.mote/`），备份需整目录
+
+### 第一轮（修复会话产物：9 类缺陷，其中 2 个经最小复现实证、1 个修复
+### 过程中顺带挖出，全部带回归测试，`tests/test_*.rs` 新增 7 个文件）
+
+### 数据损坏类
+
+- **🔴 DATE 列在段合并后整列变 NULL**: `encode_column_raw` 无
+  `Value::Date` 分支，合并时每个日期走"存储 NULL"占位符（且宽度错：
+  2 字节 vs 布局 8 字节/行），旧段合并后被 GC → 不可逆。回归:
+  `test_merge_placeholder_width`（存储层 + SQL 层 + 对照组）
+- **🔴 同类**: 合并墓碑占位符对 BLOB 用 2 字节（应为 u32 前缀）→ 合并段
+  内后续所有 blob 错位读空。宽度逻辑三处合一为 `null_placeholder()`
+- **🔴 UPDATE 写 TIMESTAMP 列静默归零**: `UPDATE … SET ts = 3000000`（或
+  ISO 串）落库成 epoch — 共享的 `coerce_row_to_schema` 缺
+  Integer/Text→Timestamp 转换（列名 INSERT 路径有、UPDATE 没有）
+- ALTER ADD COLUMN 的 DEFAULT 回填改为按**列声明类型**编码
+  （`encode_default_for_column`）: `ADD COLUMN d DATE DEFAULT '2024-01-01'`
+  此前把 TEXT 布局写进 8 字节定宽缓冲，破坏该列每一行
+
+### 静默错误结果类
+
+- INSERT 列名不存在不再静默丢值存 NULL（`affected_rows` 还报 1）——
+  与 v0.16 的 WHERE 校验同类，现在报 `ColumnNotFound`。
+  回归: `test_insert_unknown_column`
+- 向量化 GROUP BY 的整数 `%`/`/` 与行式求值器语义分叉: `%` 用了
+  `rem_euclid`（负数键并错桶：-7%5=3），`/` 不整除时返回 Float
+  （`GROUP BY v/10, w` 与 `GROUP BY v/10` 分组不同）。统一为截断余数/
+  截断除法，溢出回退通用求值器。回归: `test_group_by_arith_semantics`
+  （execute 与 prepared 双路径）
+- 短语查询在每次索引 flush 后丢失此前 flush 的文档: 位置 blob（每词
+  一个 key）被本批次覆盖。改为追加自包含段（解码循环读段、新段覆盖
+  同 doc），shard 合并时压缩为单段并剔除已删文档
+- **短语查询在有未 flush 文档时整体失明**: `search_phrase` 对每个词
+  "要么 pending 要么磁盘"二选一——只要该词有等待 flush 的新文档，
+  磁盘上所有文档都被跳过。新增 `PostingList::overlay`（pending 覆盖
+  磁盘，同 doc 以新为准）。回归: `test_fts_phrase_multi_flush`
+- 短格式 `MATCH(col, '"a b"')` 强制 `phrase: false`——引号短语静默
+  退化为 `a AND b`。与 `MATCH … AGAINST` 共用 `split_match_phrase`
+- **时间戳索引一微秒只留一行**: `BTreeConfig::unique_keys` 从未被读取，
+  叶子插入对已存在 key 一律覆盖；且全库无任何 remove 调用，
+  DELETE/UPDATE 后 `query_timestamp_range` 永久返回幽灵 row_id。
+  B-tree 支持非唯一键（同 key 多 value、精确 `remove_entry`、range/
+  remove 从 key-1 的叶子起扫防跨页漏键），删除/更新/事务提交经
+  `unindex_row_timestamp` 维护。回归: `test_timestamp_index_duplicates`
+- B-tree 内部节点: 插入遇分隔键相等时向左下降（search/range/remove 向右）
+  → 同 key 二次插入在左叶子生成 `get` 永远看不见的第二条目；子节点分裂
+  后用 `binary_search(split_key)` 定位（重复分隔键时 children 与叶子链
+  错序）——均改为右降/按下降位置插入
+- WAL 恢复重建时间戳索引只认第 0 列（写路径已支持任意列），且不处理
+  Delete/Update 记录 → 恢复后幽灵/漏索引。对齐写路径（任意列 + 增删改）
+
+### 持久性类
+
+- **显式事务的 COMMIT 标记在 GroupCommit（默认）下不 fsync**: 数据记录
+  走 `batch_append`（fsync），标记走 `log_commit` → `append` 只到页缓存，
+  group-commit 线程只 fsync 本批次分区。掉电窗口内已确认事务整笔回滚。
+  `log_commit` 现对 GroupCommit 直接 `sync_flush`
+- **commit 吞掉段存储 append 失败**: `append_txn_ops` 的 Err 只
+  `eprintln!("@@APPEND-FAIL…")` 然后返回 Ok——提交成功但行对所有
+  segment-store 读者不可见，checkpoint 截断 WAL 后永久丢失。现返回
+  带恢复指引的错误
+
+### API 一致性
+
+- raw API `drop_table()` 不清理 ColSegmentStore/segment 文件（SQL DROP
+  TABLE 有）→ 删表重建同名表旧行复活、重启后恢复程序重新认领旧段目录。
+  清理移入 `MoteDB::drop_table`，SQL 路径去重。回归:
+  `test_drop_table_raw_api`
+
+### FFI 安全
+
+- **C ABI 全面 panic 防护**: 13 个 `extern "C"` 入口此前无 `catch_unwind`，
+  panic 跨界 = 进程 abort（实测 `INSERT INTO t VALUES (中文)` 经 Go 绑定
+  直接 SIGABRT）。panic 现转为 `motedb_last_error` 文本。触发点本身也修了:
+  fast-insert 字面量预解析的 `s[start..start+4]` 字节切片改为字节比较。
+  回归: `test_ffi_panic_guard`（旧代码上实测 SIGABRT）
+
+### 审查后确认无需修改
+
+- "SELECT 结果默认静默截断 10 万行"——`max_result_rows` 在标量/向量表、
+  execute/prepared、有/无 ORDER BY、显式 1000 上限下均不生效，不成立
+- 词法器"反斜杠 + 多字节字符损坏字符串"——`'C:\桌面'`、`'\é'` 存取正确，
+  不成立
+
 ## [0.16.0] — 2026-10-30
 
 > 28 轮系统性猎虫与验证后的正确性版本。**42 个缺陷修复**（含 1 个数据
@@ -41,6 +363,9 @@
   全部死于误导性解析错误；别名可在 ORDER BY/GROUP BY/HAVING 引用
 - 验证钉住: 复合 PRIMARY KEY（重复拒绝/双键点查/复合 upsert/重开强制）、
   列 DEFAULT 值、NOT NULL 双路径强制、LIMIT ?/OFFSET ? 绑定参数
+  （⚠️ 复合 PRIMARY KEY 仅指 raw API 的 `TableSchema` 路径；SQL 层的
+  表级 `PRIMARY KEY (a, b)` 约束目前**解析失败**，见 CAPABILITIES.md —
+  B-08 报告指出该文案曾被误读为 SQL 已支持）
 
 ### 语义钉住（文档化，防止引擎间歧义）
 

@@ -283,7 +283,7 @@ Every push runs through three CI workflows:
 |---|---|---|
 | Rust | `motedb` (crates.io) | stable |
 | Python | `motedb-python` (PyPI, `import motedb`) | stable |
-| Node.js | `motedb` (npm, bindings/node, napi-rs v3) | preview — prebuilt for macOS arm64/x64, Linux x64/arm64 (glibc), Windows x64; musl/Alpine builds in progress |
+| Node.js | `motedb` (npm, bindings/node, napi-rs v3) | preview — prebuilt for macOS arm64/x64, Linux x64/arm64 (glibc); Windows = build from source for now (win32 prebuild pending), musl/Alpine in progress |
 | Go | `bindings/go` (cgo) | preview |
 
 Installation problems? See [docs/18-install-troubleshooting.md](docs/18-install-troubleshooting.md).

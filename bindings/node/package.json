@@ -1,6 +1,6 @@
 {
   "name": "motedb",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "description": "AI-native embedded multimodal database for embodied AI & robotics — vectors, time series, full text and binary in one embedded SQL engine. Node.js bindings (napi-rs).",
   "license": "MIT",
   "homepage": "https://motedb.github.io",
@@ -47,15 +47,13 @@
       "x86_64-apple-darwin",
       "aarch64-apple-darwin",
       "x86_64-unknown-linux-gnu",
-      "aarch64-unknown-linux-gnu",
-      "x86_64-pc-windows-msvc"
+      "aarch64-unknown-linux-gnu"
     ]
   },
   "optionalDependencies": {
-    "motedb-darwin-x64": "0.16.0",
-    "motedb-darwin-arm64": "0.16.0",
-    "motedb-linux-x64-gnu": "0.16.0",
-    "motedb-linux-arm64-gnu": "0.16.0",
-    "motedb-win32-x64-msvc": "0.16.0"
+    "motedb-darwin-x64": "0.17.0",
+    "motedb-darwin-arm64": "0.17.0",
+    "motedb-linux-x64-gnu": "0.17.0",
+    "motedb-linux-arm64-gnu": "0.17.0"
   }
 }

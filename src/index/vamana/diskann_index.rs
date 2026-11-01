@@ -409,7 +409,12 @@ impl DiskANNIndex {
             return Ok(());
         }
 
-        debug_log!("[DiskANN] Building index for {} vectors...", vectors.len());
+        // 🔴 Real stderr, not debug_log: a 10-100s build with zero output
+        // looks like a hang (B-15). debug_log is compiled out by default.
+        eprintln!(
+            "[MoteDB] vector index: building for {} vectors…",
+            vectors.len()
+        );
         let _start = Instant::now();
 
         // 1. Insert all vectors to disk
@@ -421,7 +426,10 @@ impl DiskANNIndex {
         // in-memory LRU (batch larger than cache capacity) are unfindable —
         // "Failed to get medoid vector" and broken graph builds.
         self.vectors.flush()?;
-        debug_log!("[DiskANN] Vectors written in {:?}", _vector_start.elapsed());
+        eprintln!(
+            "[MoteDB] vector index: vectors written in {:?} (selecting medoid, building graph…)",
+            _vector_start.elapsed()
+        );
 
         let ids: Vec<RowId> = vectors.iter().map(|(id, _)| *id).collect();
 
@@ -449,7 +457,10 @@ impl DiskANNIndex {
         let graph = self.batch_build_graph(&ids);
         self.vectors.unpin_all();
         graph?;
-        debug_log!("[DiskANN] Graph built in {:?}", _graph_start.elapsed());
+        eprintln!(
+            "[MoteDB] vector index: graph built in {:?}",
+            _graph_start.elapsed()
+        );
 
         // 4. 🚀 Flush to disk (会自动清理slack边)
         debug_log!("[DiskANN] Flushing and cleaning up slack edges...");
@@ -457,7 +468,10 @@ impl DiskANNIndex {
         self.flush()?;
         debug_log!("[DiskANN] Flushed in {:?}", _flush_start.elapsed());
 
-        debug_log!("[DiskANN] Build completed in {:?}", _start.elapsed());
+        eprintln!(
+            "[MoteDB] vector index: build completed in {:?}",
+            _start.elapsed()
+        );
 
         Ok(())
     }
@@ -645,7 +659,6 @@ impl DiskANNIndex {
         }
 
         // 🚀 分批渐进式构建
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
         // 预排序：按距离medoid排序（保证核心区域高质量）
         let medoid_vec = match self.vectors.get(medoid_id) {
@@ -671,21 +684,27 @@ impl DiskANNIndex {
         let sorted_ids: Vec<RowId> = nodes_with_dist.into_iter().map(|(id, _)| id).collect();
 
         // 分批处理
+        let build_t0 = Instant::now();
         for batch_idx in 0..num_batches {
             let batch_start = batch_idx * batch_size;
             let batch_end = ((batch_idx + 1) * batch_size).min(sorted_ids.len());
             let batch = &sorted_ids[batch_start..batch_end];
 
-            if show_progress {
-                debug_log!(
-                    "\n[DiskANN] === Batch {}/{} === ({} nodes)",
+            if show_progress && num_batches > 1 {
+                let done = batch_start as u64;
+                let elapsed = build_t0.elapsed().as_secs_f64();
+                let rate = done as f64 / elapsed.max(1e-9);
+                let eta = ((new_count as u64 - done) as f64 / rate.max(1e-9)) as u64;
+                eprintln!(
+                    "[MoteDB] vector index: batch {}/{} (~{} nodes, {}/{} done, eta ~{}s)",
                     batch_idx + 1,
                     num_batches,
-                    batch.len()
+                    batch.len(),
+                    done,
+                    new_count,
+                    eta
                 );
             }
-
-            let progress = AtomicUsize::new(0);
 
             // 🔑 逐节点双向连边（经典增量图构建语义）：
             // greedy_search 全部从 medoid 出发 —— 若前向边延迟落图、或反向边
@@ -708,16 +727,8 @@ impl DiskANNIndex {
             if let Some(e) = errs.into_iter().next() {
                 return Err(e);
             }
-            for &id in batch.iter() {
-                let _ = id;
-
-                if show_progress {
-                    let p = progress.fetch_add(1, Ordering::Relaxed);
-                    if p.is_multiple_of(500) && p > 0 {
-                        debug_log!("  Progress: {}/{}", p, batch.len());
-                    }
-                }
-            }
+            // (progress reporting moved to the per-batch stderr line above —
+            // this loop previously counted a counter nothing incremented)
         } // End of batch loop
 
         Ok(())

@@ -5,7 +5,7 @@ Detailed installation instructions and database configuration guide.
 ## System Requirements
 
 - **Rust**: 1.87 or later (the crate's `rust-version`; CI tests stable)
-- **Operating System**: Linux (glibc; musl via source build), macOS (arm64 / x64), Windows x64
+- **Operating System**: Linux (glibc; musl via source build), macOS (arm64 / x64); Windows via source build (Node prebuilt win32 pending)
 - **Memory**: 512MB or more recommended
 - **Disk**: Depends on data volume
 
@@ -16,8 +16,8 @@ MoteDB ships on three registries — same engine, same storage format:
 | Language | Install | Notes |
 |---|---|---|
 | Rust | `cargo add motedb` | crates.io `motedb` |
-| Python | `pip install motedb-python` | PyPI package `motedb-python`, imported as `import motedb`; prebuilt wheels for Linux x64/arm64, macOS arm64/x64, Windows x64 (Python ≥ 3.9, abi3) |
-| Node.js | `npm install motedb` | prebuilt per-platform binaries for glibc Linux x64/arm64, macOS arm64/x64, Windows x64; musl (Alpine) in progress |
+| Python | `pip install motedb-python` | PyPI package `motedb-python`, imported as `import motedb`; prebuilt wheels for Linux x64/arm64, macOS arm64/x64, Windows x64 (Python ≥ 3.9, abi3). Note: the Rust crate itself (and thus Node) has no Windows prebuilt yet — Python wheels are unaffected |
+| Node.js | `npm install motedb` | prebuilt per-platform binaries for glibc Linux x64/arm64, macOS arm64/x64; Windows and musl (Alpine) via source build for now |
 | Go | see `bindings/go/README.md` | cgo against the static lib, build from source |
 
 If an install fails, start at [18-install-troubleshooting.md](./18-install-troubleshooting.md).

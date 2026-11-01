@@ -159,6 +159,7 @@ Legend: `✅ supported` · `🟡 partial (see note)` · `❌ not supported` · `
 | **Multi-user permission system** | In embedded deployments the host application owns that |
 | **Array types** | Use BLOB, a separate table, or TEXT + JOIN |
 | **`DECIMAL` / `DATE` types** | Planned |
+| **SQL table-level composite `PRIMARY KEY (a, b)`** | Not parsed — single column-level PK only; composite keys via the raw `TableSchema` API (B-08) |
 | **Cross-statement server-side cursors** | Planned |
 
 ---
