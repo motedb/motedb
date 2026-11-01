@@ -96,7 +96,9 @@ pub struct TextFTSIndex {
     /// Arc, ~3 bits/doc compressed). Avoids re-reading + re-decoding posting
     /// shards from the B+Tree on every search. Invalidated on flush (a flush
     /// appends new shards / consolidates old ones).
-    posting_cache: Arc<RwLock<LruCache<TermId, DiskPostings>>>,
+    /// (disk sources, unique doc count across them — a doc re-posted by a
+    /// later UPDATE shard must count ONCE toward df, not per shard).
+    posting_cache: Arc<RwLock<LruCache<TermId, (DiskPostings, u64)>>>,
 
     /// 🚀 Top-K results cache: (token_string) → Vec<(doc_id, score)>.
     /// Avoids re-scoring the entire posting list on repeated queries.
@@ -113,6 +115,13 @@ struct TextFTSMetadata {
     enable_positions: bool,
     deleted_docs: Vec<DocId>,
     deleted_term_docs: Vec<(TermId, DocId)>,
+    /// 🔴 Tokenizer identity stamp. A 0.15-era index was built with the
+    /// whitespace tokenizer (each Chinese sentence interned as ONE token);
+    /// reopened under the AutoTokenizer, queries tokenize with Jieba and
+    /// miss every pre-upgrade doc while doctor stays PASS. Missing field
+    /// (serde default, i.e. anything ≤0.15) ⇒ mismatch ⇒ rebuild.
+    #[serde(default)]
+    tokenizer: String,
 }
 
 /// Document length map
@@ -132,6 +141,50 @@ enum DiskSource {
 
 /// Cached per-term disk sources (all shards).
 type DiskPostings = Vec<DiskSource>;
+
+/// Positional cursor over one disk source for merge counting / membership.
+enum DiskCursor {
+    Pairs {
+        slice: Arc<[(u32, u16)]>,
+        pos: usize,
+    },
+    Block(super::text_types::BlockStream),
+}
+
+impl DiskCursor {
+    fn current_doc(&self) -> Option<u32> {
+        match self {
+            DiskCursor::Pairs { slice, pos } => slice.get(*pos).map(|(d, _)| *d),
+            DiskCursor::Block(b) => b.current().map(|(d, _)| d),
+        }
+    }
+    fn advance(&mut self) {
+        match self {
+            DiskCursor::Pairs { slice, pos } => {
+                if *pos < slice.len() {
+                    *pos += 1;
+                }
+            }
+            DiskCursor::Block(b) => {
+                b.advance();
+            }
+        }
+    }
+    /// Seek forward to the first doc >= target (sources are sorted).
+    fn seek(&mut self, target: u32) {
+        match self {
+            DiskCursor::Pairs { slice, pos } => {
+                *pos = match slice[*pos..].binary_search_by(|(d, _)| d.cmp(&target)) {
+                    Ok(i) => *pos + i,
+                    Err(i) => *pos + i,
+                };
+            }
+            DiskCursor::Block(b) => {
+                b.seek(target);
+            }
+        }
+    }
+}
 
 /// Suffix-max tf of an ascending pairs slice: `out[i]` = max tf from entry
 /// i on (trailing 0 for the exhausted position). B2 WAND bound for
@@ -348,6 +401,11 @@ fn intersect_streams_limited(
 }
 
 impl TextFTSIndex {
+    /// Identity of the tokenizer this build indexes with. Bump when the
+    /// tokenizer selection changes — open() rebuilds indexes whose stored
+    /// stamp differs (see core.rs staleness gate).
+    pub const TOKENIZER_STAMP: &'static str = "auto_v1";
+
     /// Create a new text FTS index
     pub fn new(storage_path: PathBuf) -> Result<Self> {
         Self::with_config(
@@ -906,13 +964,54 @@ impl TextFTSIndex {
         Ok(count)
     }
 
+    /// Unique doc count across the sorted disk sources (k-way merge; equal
+    /// docs in several shards — the UPDATE re-post case — count once).
+    fn count_unique_disk_docs(sources: &[DiskSource]) -> u64 {
+        let mut cursors: Vec<DiskCursor> = Vec::with_capacity(sources.len());
+        for src in sources {
+            match src {
+                DiskSource::Pairs(p) => cursors.push(DiskCursor::Pairs {
+                    slice: p.clone(),
+                    pos: 0,
+                }),
+                DiskSource::Block(b) => {
+                    cursors.push(DiskCursor::Block(b.clone().stream()));
+                }
+            }
+        }
+        let mut unique = 0u64;
+        let mut last: Option<u32> = None;
+        loop {
+            let mut best: Option<(u32, usize)> = None;
+            for (i, c) in cursors.iter_mut().enumerate() {
+                let doc = match c.current_doc() {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if best.is_none_or(|(bd, _)| doc < bd) {
+                    best = Some((doc, i));
+                }
+            }
+            let (doc, idx) = match best {
+                Some(b) => b,
+                None => break,
+            };
+            if last != Some(doc) {
+                unique += 1;
+                last = Some(doc);
+            }
+            cursors[idx].advance();
+        }
+        unique
+    }
+
     /// Load (and cache) a term's DISK sources — one per shard, block format
     /// kept compressed. `None` = no shard on disk at all.
     fn load_disk_sources(
         &self,
         term_id: TermId,
         btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
-    ) -> Result<Option<DiskPostings>> {
+    ) -> Result<Option<(DiskPostings, u64)>> {
         if let Some(cached) = self.posting_cache.write().get(&term_id) {
             return Ok(Some(cached.clone()));
         }
@@ -959,8 +1058,11 @@ impl TextFTSIndex {
         if !found_any {
             return Ok(None);
         }
-        self.posting_cache.write().put(term_id, sources.clone());
-        Ok(Some(sources))
+        let unique_df = Self::count_unique_disk_docs(&sources);
+        self.posting_cache
+            .write()
+            .put(term_id, (sources.clone(), unique_df));
+        Ok(Some((sources, unique_df)))
     }
 
     /// Build the streaming cursor for one term: pending posting first (its
@@ -987,17 +1089,54 @@ impl TextFTSIndex {
             stream.pairs.push(Arc::clone(&d.pairs));
         }
         match self.load_disk_sources(term_id, btree)? {
-            Some(sources) => {
-                for src in sources {
+            Some((sources, unique_disk_df)) => {
+                // 🔴 Exact df — a doc re-posted by a later UPDATE shard (or
+                // sitting in pending while its old posting is on disk) used to
+                // count once PER SOURCE, skewing every term's IDF until
+                // consolidation. Disk side is merge-counted once at cache
+                // fill; the pending side subtracts its overlap with disk via
+                // one sorted seek pass (both sides ascending, cursors only
+                // move forward).
+                if let Some(pairs) = stream.pairs.first() {
+                    let mut cursors: Vec<DiskCursor> = sources
+                        .iter()
+                        .map(|src| match src {
+                            DiskSource::Pairs(p) => DiskCursor::Pairs {
+                                slice: p.clone(),
+                                pos: 0,
+                            },
+                            DiskSource::Block(b) => DiskCursor::Block(b.clone().stream()),
+                        })
+                        .collect();
+                    let mut overlap = 0u64;
+                    for &(doc, _) in pairs.iter() {
+                        for c in cursors.iter_mut() {
+                            c.seek(doc);
+                            if c.current_doc() == Some(doc) {
+                                overlap += 1;
+                                break;
+                            }
+                        }
+                    }
+                    stream.df += unique_disk_df - overlap;
+                } else {
+                    stream.df += unique_disk_df;
+                }
+                // 🔴 NEWEST SHARD FIRST: the merge keeps the FIRST source's tf
+                // for a doc present in several shards, and shards are appended
+                // over time — ascending order let the OLDEST shard's stale tf
+                // win every ranking forever after an UPDATE changed the tf
+                // (P8: doc re-indexed from tf=3 to tf=1 kept scoring tf=3;
+                // consolidation cemented it via add_with_freq's first-wins).
+                // Pending (never flushed) stays first — newest of all.
+                for src in sources.into_iter().rev() {
                     match src {
                         DiskSource::Block(b) => {
-                            stream.df += b.num_docs() as u64;
                             stream.max_tf = stream.max_tf.max(b.skip_max_tf());
                             stream.blocks_suffix.push(b.skip_suffix_max_tf());
                             stream.blocks.push(b.stream());
                         }
                         DiskSource::Pairs(p) => {
-                            stream.df += p.len() as u64;
                             stream.max_tf = stream
                                 .max_tf
                                 .max(p.iter().map(|&(_, t)| t).max().unwrap_or(0));
@@ -1171,12 +1310,19 @@ impl TextFTSIndex {
         let mut postings: Vec<(TermId, PostingList)> = Vec::new();
         for token in &tokens {
             if let Some(term_id) = self.dictionary.get(&token.text) {
-                let posting = if let Some(pend) = pending.get(&term_id) {
-                    pend.clone()
-                } else if let Some(p) = self.load_posting_list_with_positions(term_id, &btree)? {
-                    p
-                } else {
-                    return Ok(Vec::new()); // Term not found → phrase cannot match
+                // 🔴 Disk shards AND the pending batch, overlaid. Taking the
+                // pending posting *instead of* disk whenever one existed made
+                // every flushed doc invisible to phrase queries as soon as a
+                // single new doc containing the term was waiting to flush.
+                let disk = self.load_posting_list_with_positions(term_id, &btree)?;
+                let posting = match (pending.get(&term_id), disk) {
+                    (Some(pend), Some(mut disk)) => {
+                        disk.overlay(pend);
+                        disk
+                    }
+                    (Some(pend), None) => pend.clone(),
+                    (None, Some(disk)) => disk,
+                    (None, None) => return Ok(Vec::new()), // Term not found → phrase cannot match
                 };
                 postings.push((term_id, posting));
             } else {
@@ -1847,6 +1993,11 @@ impl TextFTSIndex {
         // page write per touched leaf.
         let mut batch: Vec<(u32, Vec<u8>)> = Vec::with_capacity(pending_data.len() * 2);
         let mut to_consolidate: Vec<TermId> = Vec::new();
+        // Positions key → blob to write. Collected separately because the
+        // blob is APPENDED to (existing sections + this flush's section),
+        // and two pending term ids sharing a base must land in one value
+        // rather than be dropped by the batch dedup below.
+        let mut position_blobs: HashMap<u32, Vec<u8>> = HashMap::new();
         for (term_id, posting) in pending_data.iter() {
             let base_term_id = *term_id & 0x00FFFFFF;
             // If the shard counter was evicted from LRU, probe the actual
@@ -1898,11 +2049,20 @@ impl TextFTSIndex {
 
             shard_counters.put(*term_id, next_shard_idx + 1);
 
-            // Positions go to a separate key (shard 0xFE) for phrase query
-            // support — replaced in-batch (sorted insert overwrites).
+            // Positions live under one key per term (shard 0xFE) as a
+            // sequence of self-contained sections — this flush APPENDS its
+            // section. 🔴 The old code wrote only this batch's section, so
+            // every flush of a term destroyed the positions of all docs
+            // flushed earlier and phrase queries silently stopped matching
+            // them (membership still matched: the data shards are
+            // append-only). Ghost sections for deleted/updated docs are
+            // squeezed out by consolidate_shards_for_term.
             if let Some(pos_bytes) = posting.serialize_positions_for(&clean_ids) {
                 let pos_key = (0xFEu32 << 24) | base_term_id;
-                batch.push((pos_key, pos_bytes));
+                let blob = position_blobs
+                    .entry(pos_key)
+                    .or_insert_with(|| btree.get(&pos_key).ok().flatten().unwrap_or_default());
+                blob.extend_from_slice(&pos_bytes);
             }
 
             // Lazy consolidation: merge shards when count exceeds threshold
@@ -1913,6 +2073,7 @@ impl TextFTSIndex {
             }
         }
 
+        batch.extend(position_blobs);
         batch.sort_unstable_by_key(|(k, _)| *k);
         batch.dedup_by_key(|(k, _)| *k);
         btree.insert_batch_sorted(batch)?;
@@ -2031,6 +2192,7 @@ impl TextFTSIndex {
             self.deleted_term_docs.read().iter().copied().collect();
 
         let metadata = TextFTSMetadata {
+            tokenizer: Self::TOKENIZER_STAMP.to_string(),
             total_docs: self.total_docs,
             total_tokens: self.total_tokens,
             avg_doc_length: self.avg_doc_length,
@@ -2075,6 +2237,27 @@ impl TextFTSIndex {
             metadata.deleted_docs,
             metadata.deleted_term_docs,
         ))
+    }
+
+    /// Tokenizer stamp stored in this index's metadata ("" for ≤0.15 files
+    /// without the field). Differs from TOKENIZER_STAMP ⇒ the on-disk
+    /// postings were tokenized with a different scheme and must be rebuilt.
+    pub fn stored_tokenizer_stamp(&self) -> String {
+        let stats_path = self.storage_dir.join("index_meta.bin");
+        let Ok(mut file) = File::open(&stats_path) else {
+            return String::new();
+        };
+        let mut buffer = Vec::new();
+        if file.read_to_end(&mut buffer).is_err() {
+            return String::new();
+        }
+        if buffer.is_empty() {
+            return String::new();
+        }
+        match bincode::deserialize::<TextFTSMetadata>(&buffer) {
+            Ok(m) => m.tokenizer,
+            Err(_) => String::new(),
+        }
     }
 
     /// Load doc_lengths from disk (on demand for BM25)
@@ -2220,11 +2403,13 @@ impl TextFTSIndex {
         drop(deleted);
         drop(deleted_term_docs);
 
+        let pos_key = (0xFEu32 << 24) | base_term_id;
         if clean_ids.is_empty() {
-            // Delete all shards
+            // Delete all shards (and the positions blob)
             for shard_idx in 0..shard_count {
                 let _ = btree.delete(&(shard_idx << 24 | base_term_id));
             }
+            let _ = btree.delete(&pos_key);
             shard_counters.put(term_id, 0);
             return Ok(());
         }
@@ -2234,6 +2419,22 @@ impl TextFTSIndex {
             super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
         let bytes = block_list.as_bytes();
         btree.insert(base_term_id, bytes.to_vec())?;
+
+        // Squeeze the positions blob back to one section holding only the
+        // live docs (flushes append a section each; deleted/updated docs
+        // leave ghost entries behind until here).
+        if let Ok(Some(pos_bytes)) = btree.get(&pos_key) {
+            let mut with_positions = PostingList::new();
+            with_positions.load_positions(&pos_bytes);
+            match with_positions.serialize_positions_for(&clean_ids) {
+                Some(compact) => {
+                    btree.insert(pos_key, compact)?;
+                }
+                None => {
+                    let _ = btree.delete(&pos_key);
+                }
+            }
+        }
 
         // Delete old shards
         for shard_idx in 1..shard_count {

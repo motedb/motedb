@@ -505,6 +505,14 @@ impl PostingList {
         self.doc_ids.insert(doc_id as u32);
         if is_new {
             self.doc_freqs.push(tf);
+        } else {
+            // 🔴 Overwrite: consolidation merges shards ascending (oldest
+            // first), so the LAST writer is the NEWEST shard — first-wins
+            // here cemented a doc's stale pre-UPDATE term frequency into the
+            // consolidated shard forever (P8).
+            // rank(x) counts ints <= x (1-based) — the array index is rank - 1.
+            let idx = self.doc_ids.rank(doc_id as u32).saturating_sub(1) as usize;
+            self.doc_freqs[idx] = tf;
         }
     }
 
@@ -556,6 +564,36 @@ impl PostingList {
         {
             for (doc_id, positions) in other_pos {
                 self_pos.entry(*doc_id).or_default().extend(positions);
+            }
+        }
+    }
+
+    /// Lay `newer` over `self`: a doc present in both takes `newer`'s term
+    /// frequency and positions (a doc re-indexed by UPDATE in a later batch
+    /// replaces its old entry, unlike `merge` which sums shards of disjoint
+    /// docs); docs only in `newer` are added. Combines a term's on-disk
+    /// shards with its still-pending batch at query time.
+    pub fn overlay(&mut self, newer: &PostingList) {
+        *self.cached_pairs.lock() = None;
+        let mut freq_map: HashMap<u64, u16> = self
+            .doc_ids
+            .iter()
+            .zip(self.doc_freqs.iter())
+            .map(|(id, &freq)| (id as u64, freq))
+            .collect();
+        for (id, &freq) in newer.doc_ids.iter().zip(newer.doc_freqs.iter()) {
+            freq_map.insert(id as u64, freq);
+        }
+        self.doc_ids |= &newer.doc_ids;
+        self.doc_freqs = self
+            .doc_ids
+            .iter()
+            .map(|id| *freq_map.get(&(id as u64)).unwrap_or(&1))
+            .collect();
+        if let Some(newer_pos) = &newer.positions {
+            let self_pos = self.positions.get_or_insert_with(HashMap::new);
+            for (doc_id, positions) in newer_pos {
+                self_pos.insert(*doc_id, positions.clone());
             }
         }
     }
@@ -741,12 +779,14 @@ impl PostingList {
     }
 
     /// Load positions from serialized bytes into this posting list.
+    ///
+    /// The blob is a sequence of self-contained sections in the
+    /// `serialize_positions_for` format (each starts its doc-id deltas from
+    /// 0). Every flush appends one section for the docs it wrote; a doc
+    /// present in several sections (UPDATE) takes the last one. A blob
+    /// written before sections existed is simply a single section.
     pub fn load_positions(&mut self, data: &[u8]) {
         if data.len() < 4 {
-            return;
-        }
-        let num_docs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if num_docs == 0 {
             return;
         }
         if self.positions.is_none() {
@@ -754,41 +794,50 @@ impl PostingList {
         }
         let positions = self.positions.as_mut().unwrap();
 
-        let mut offset = 4;
-        let mut prev_doc_id = 0u32;
-        for _ in 0..num_docs {
-            if offset + 6 > data.len() {
-                break;
-            }
-            let delta = u32::from_le_bytes([
+        let mut offset = 0;
+        while offset + 4 <= data.len() {
+            let num_docs = u32::from_le_bytes([
                 data[offset],
                 data[offset + 1],
                 data[offset + 2],
                 data[offset + 3],
-            ]);
-            let doc_id = prev_doc_id + delta;
-            prev_doc_id = doc_id;
+            ]) as usize;
             offset += 4;
-            let num_pos = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-            offset += 2;
-            let mut pos_list = Vec::with_capacity(num_pos);
-            let mut prev_pos = 0u32;
-            for _ in 0..num_pos {
-                if offset + 4 > data.len() {
-                    break;
+            let mut prev_doc_id = 0u32;
+            for _ in 0..num_docs {
+                if offset + 6 > data.len() {
+                    return;
                 }
-                let pd = u32::from_le_bytes([
+                let delta = u32::from_le_bytes([
                     data[offset],
                     data[offset + 1],
                     data[offset + 2],
                     data[offset + 3],
                 ]);
-                let pos = prev_pos + pd;
-                prev_pos = pos;
-                pos_list.push(pos);
+                let doc_id = prev_doc_id + delta;
+                prev_doc_id = doc_id;
                 offset += 4;
+                let num_pos = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                offset += 2;
+                let mut pos_list = Vec::with_capacity(num_pos);
+                let mut prev_pos = 0u32;
+                for _ in 0..num_pos {
+                    if offset + 4 > data.len() {
+                        break;
+                    }
+                    let pd = u32::from_le_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]);
+                    let pos = prev_pos + pd;
+                    prev_pos = pos;
+                    pos_list.push(pos);
+                    offset += 4;
+                }
+                positions.insert(doc_id as u64, pos_list);
             }
-            positions.insert(doc_id as u64, pos_list);
         }
     }
 }
