@@ -1297,18 +1297,22 @@ impl KeyExpr {
                     BinaryOperator::Add => x.checked_add(y),
                     BinaryOperator::Sub => x.checked_sub(y),
                     BinaryOperator::Mul => x.checked_mul(y),
+                    // Truncated remainder like the row evaluator (mod_values):
+                    // -7 % 5 = -2. rem_euclid gave 3 here, so negative keys
+                    // collided into the wrong GROUP BY bucket on the vectorized
+                    // path only. i64::MIN % -1 overflows checked_rem → 0.
                     BinaryOperator::Mod => {
                         if y == 0 {
                             None
                         } else {
-                            Some(x.rem_euclid(y))
+                            Some(x.checked_rem(y).unwrap_or(0))
                         }
                     }
                     BinaryOperator::Div => {
                         if y == 0 {
                             None
                         } else {
-                            Some(x / y)
+                            x.checked_div(y)
                         }
                     }
                     _ => None,
@@ -1338,31 +1342,36 @@ impl KeyExpr {
 }
 
 fn arith(a: &Value, op: &BinaryOperator, b: &Value) -> Option<Value> {
-    use std::ops::{Add, Mul, Sub};
     let pair = |x: &Value, y: &Value| -> Option<(i64, i64)> {
         match (x, y) {
             (Value::Integer(p), Value::Integer(q)) => Some((*p, *q)),
             _ => None,
         }
     };
+    // Same integer semantics as the row evaluator (add/sub/mul/div/
+    // mod_values): overflow → None so the caller falls back to the general
+    // path instead of wrapping; `/` truncates to Integer (it used to yield a
+    // Float for inexact quotients, so `GROUP BY v / 10, w` partitioned
+    // differently from `GROUP BY v / 10`); `%` is the truncated remainder.
     match op {
-        BinaryOperator::Add => pair(a, b).map(|(x, y)| Value::Integer(x.add(y))),
-        BinaryOperator::Sub => pair(a, b).map(|(x, y)| Value::Integer(x.sub(y))),
-        BinaryOperator::Mul => pair(a, b).map(|(x, y)| Value::Integer(x.mul(y))),
+        BinaryOperator::Add => pair(a, b).and_then(|(x, y)| x.checked_add(y).map(Value::Integer)),
+        BinaryOperator::Sub => pair(a, b).and_then(|(x, y)| x.checked_sub(y).map(Value::Integer)),
+        BinaryOperator::Mul => pair(a, b).and_then(|(x, y)| x.checked_mul(y).map(Value::Integer)),
         BinaryOperator::Mod => pair(a, b).and_then(|(x, y)| {
             if y == 0 {
                 None
             } else {
-                Some(Value::Integer(x.rem_euclid(y)))
+                Some(Value::Integer(x.checked_rem(y).unwrap_or(0)))
             }
         }),
         BinaryOperator::Div => pair(a, b).and_then(|(x, y)| {
             if y == 0 {
                 None
-            } else if x % y == 0 {
-                Some(Value::Integer(x / y))
             } else {
-                Some(Value::Float(x as f64 / y as f64))
+                Some(match x.checked_div(y) {
+                    Some(q) => Value::Integer(q),
+                    None => Value::Float(x as f64 / y as f64), // i64::MIN / -1
+                })
             }
         }),
         _ => None,

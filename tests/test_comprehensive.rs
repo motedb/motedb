@@ -162,7 +162,8 @@ fn test_insert_wrong_column_count() {
     let db = setup_db(dir.path());
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
-    assert!(db.execute("INSERT INTO t VALUES (1)").is_err());
+    // B-17: fewer values fill trailing DEFAULT/NULL; more values must error.
+    assert!(db.execute("INSERT INTO t VALUES (1)").is_ok());
     assert!(db.execute("INSERT INTO t VALUES (1, 2, 3)").is_err());
 }
 

@@ -839,8 +839,7 @@ impl Database {
                 || head.starts_with("CALL ");
             if writing {
                 return Err(crate::MoteDBError::InvalidArgument(
-                    "database is opened read-only (MOTESNAP container) — writes are disabled"
-                        .into(),
+                    "database is opened read-only — writes are disabled".into(),
                 ));
             }
         }
@@ -966,7 +965,7 @@ impl Database {
     pub fn insert_rows(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
         if self.inner.read_only {
             return Err(crate::MoteDBError::InvalidArgument(
-                "database is opened read-only (MOTESNAP container) — writes are disabled".into(),
+                "database is opened read-only — writes are disabled".into(),
             ));
         }
         let ids = self.inner.batch_insert_rows_to_table(table, rows)?;
@@ -2157,7 +2156,7 @@ impl Database {
             pos += 1; // skip ')'
 
             // Parse values in this tuple
-            let values = match Self::parse_literal_list(tuple_str) {
+            let mut values = match Self::parse_literal_list(tuple_str) {
                 Some(v) => v,
                 None => return Ok(None),
             };
@@ -2179,14 +2178,22 @@ impl Database {
                     Err(_) => return Ok(None),
                 }
             } else {
-                // Without an explicit column list, the value count must match the
-                // table's column count exactly (else fall back for error reporting).
-                if values.len() != schema.columns.len() {
+                // Without an explicit column list, more values than table
+                // columns is an error; fewer is fine — trailing columns take
+                // their DEFAULT (or NULL), as in PostgreSQL/SQLite (B-17).
+                if values.len() > schema.columns.len() {
                     return Err(crate::error::MoteDBError::InvalidArgument(format!(
                         "Column count mismatch: expected {}, got {}",
                         schema.columns.len(),
                         values.len()
                     )));
+                }
+                if values.len() < schema.columns.len() {
+                    values.extend(
+                        schema.columns[values.len()..]
+                            .iter()
+                            .map(|c| c.default_value.clone().unwrap_or(Value::Null)),
+                    );
                 }
                 crate::sql::row_converter::values_to_row_schema_order(&values, &schema)?
             };
@@ -3454,10 +3461,19 @@ impl Database {
 
     /// Parse a comma-separated list of SQL literals from a VALUES clause.
     /// Returns None if any value is not a simple literal.
+    /// Case-insensitive ASCII keyword test on the raw bytes at `at`. A `str`
+    /// slice `s[at..at + kw.len()]` would panic when the input holds a
+    /// multi-byte char there (`VALUES (中文)` → "byte index 4 is not a char
+    /// boundary"), and that panic crossed the C FFI as a process abort.
+    fn keyword_at(s: &str, at: usize, kw: &[u8]) -> bool {
+        s.as_bytes()
+            .get(at..at + kw.len())
+            .is_some_and(|b| b.eq_ignore_ascii_case(kw))
+    }
+
     fn parse_literal_list(s: &str) -> Option<Vec<Value>> {
         let mut values = Vec::new();
         let mut chars = s.char_indices().peekable();
-        let len = s.len();
 
         while chars.peek().is_some() {
             // Skip whitespace
@@ -3534,23 +3550,17 @@ impl Database {
                 } else {
                     values.push(Value::Integer(num_str.parse().ok()?));
                 }
-            } else if len - start_idx >= 4
-                && s[start_idx..start_idx + 4].eq_ignore_ascii_case("NULL")
-            {
+            } else if Self::keyword_at(s, start_idx, b"NULL") {
                 values.push(Value::Null);
                 for _ in 0..4 {
                     chars.next();
                 }
-            } else if len - start_idx >= 4
-                && s[start_idx..start_idx + 4].eq_ignore_ascii_case("TRUE")
-            {
+            } else if Self::keyword_at(s, start_idx, b"TRUE") {
                 values.push(Value::Bool(true));
                 for _ in 0..4 {
                     chars.next();
                 }
-            } else if len - start_idx >= 5
-                && s[start_idx..start_idx + 5].eq_ignore_ascii_case("FALSE")
-            {
+            } else if Self::keyword_at(s, start_idx, b"FALSE") {
                 values.push(Value::Bool(false));
                 for _ in 0..5 {
                     chars.next();

@@ -2151,7 +2151,7 @@ impl QueryExecutor {
     pub fn execute(&self, stmt: Statement) -> Result<QueryResult> {
         if self.db.read_only && Self::statement_requires_write(&stmt) {
             return Err(crate::MoteDBError::InvalidArgument(
-                "database is opened read-only (MOTESNAP container) — writes are disabled".into(),
+                "database is opened read-only — writes are disabled".into(),
             ));
         }
         match stmt {
@@ -2651,7 +2651,7 @@ impl QueryExecutor {
         // write gate as execute()/execute_streaming().
         if self.db.read_only && Self::statement_requires_write(stmt) {
             return Err(crate::MoteDBError::InvalidArgument(
-                "database is opened read-only (MOTESNAP container) — writes are disabled".into(),
+                "database is opened read-only — writes are disabled".into(),
             ));
         }
         let max_rows = self.db.max_result_rows;
@@ -3030,7 +3030,7 @@ impl QueryExecutor {
     pub fn execute_streaming(&self, stmt: Statement) -> Result<StreamingQueryResult> {
         if self.db.read_only && Self::statement_requires_write(&stmt) {
             return Err(crate::MoteDBError::InvalidArgument(
-                "database is opened read-only (MOTESNAP container) — writes are disabled".into(),
+                "database is opened read-only — writes are disabled".into(),
             ));
         }
         self.execute_streaming_ref(&stmt)
@@ -9604,6 +9604,21 @@ impl QueryExecutor {
         dp[t.len()][p.len()]
     }
 
+    /// A timestamp-ish operand for `± INTEGER(µs)` — Timestamp, ISO text
+    /// spelling, or DATE. Shared by positional_add/positional_sub (B-03:
+    /// `WHERE ts >= '2026-01-01 00:00:00' + 60000` used to fold the literal
+    /// side to NULL and match nothing).
+    fn ts_operand(v: &Value) -> Option<crate::types::Timestamp> {
+        match v {
+            Value::Timestamp(t) => Some(*t),
+            Value::Text(s) => crate::types::Timestamp::parse_iso(s.as_str()),
+            Value::Date(d) => Some(crate::types::Timestamp::from_micros(
+                d.days() as i64 * 86_400_000_000,
+            )),
+            _ => None,
+        }
+    }
+
     fn positional_add(l: &Value, r: &Value) -> Result<Value> {
         match (l, r) {
             // 🔴 round-26: TIMESTAMP ± INTEGER(µs) — mirrored from the
@@ -9616,6 +9631,28 @@ impl QueryExecutor {
             (Value::Integer(us), Value::Timestamp(t)) => match t.as_micros().checked_add(*us) {
                 Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
                 None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+            },
+            // B-03: timestamp spelled as an ISO text literal or DATE.
+            (Value::Text(_), Value::Integer(us)) => match Self::ts_operand(l) {
+                Some(t) => match t.as_micros().checked_add(*us) {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+                },
+                None => Ok(Value::Null),
+            },
+            (Value::Integer(us), Value::Text(_)) => match Self::ts_operand(r) {
+                Some(t) => match t.as_micros().checked_add(*us) {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+                },
+                None => Ok(Value::Null),
+            },
+            (Value::Date(_), Value::Integer(us)) => match Self::ts_operand(l) {
+                Some(t) => match t.as_micros().checked_add(*us) {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+                },
+                None => Ok(Value::Null),
             },
             (Value::Integer(a), Value::Integer(b)) => match a.checked_add(*b) {
                 Some(v) => Ok(Value::Integer(v)),
@@ -9636,10 +9673,35 @@ impl QueryExecutor {
                     "timestamp subtraction overflow".into(),
                 )),
             },
+            // B-03: timestamp spelled as an ISO text literal or DATE.
+            (Value::Text(_), Value::Integer(us)) => match Self::ts_operand(l) {
+                Some(t) => match t.as_micros().checked_sub(*us) {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError(
+                        "timestamp subtraction overflow".into(),
+                    )),
+                },
+                None => Ok(Value::Null),
+            },
+            (Value::Date(_), Value::Integer(us)) => match Self::ts_operand(l) {
+                Some(t) => match t.as_micros().checked_sub(*us) {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError(
+                        "timestamp subtraction overflow".into(),
+                    )),
+                },
+                None => Ok(Value::Null),
+            },
             (Value::Integer(a), Value::Integer(b)) => match a.checked_sub(*b) {
                 Some(v) => Ok(Value::Integer(v)),
                 None => Ok(Value::Float(*a as f64 - *b as f64)),
             },
+            // An INTEGER minus a timestamp is not a timestamp (and not
+            // representable here): error loudly instead of the catch-all NULL
+            // — folded to NULL it silently matched nothing (the B-03 class).
+            (Value::Integer(_), Value::Text(_)) if Self::ts_operand(r).is_some() => Err(
+                MoteDBError::TypeError("cannot subtract a timestamp from an integer".into()),
+            ),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a - *b as f64)),
@@ -18993,11 +19055,32 @@ impl QueryExecutor {
         self.execute_insert_ref(&stmt)
     }
 
+    /// Target columns for one VALUES tuple. With an explicit column list the
+    /// counts must match exactly; a positional `INSERT INTO t VALUES (…)`
+    /// may supply FEWER values than the table has columns — the trailing
+    /// columns take their DEFAULT (or NULL), as in PostgreSQL/SQLite. More
+    /// values than columns is always an error.
+    fn insert_target_columns(
+        positional: bool,
+        columns: &[String],
+        n_values: usize,
+    ) -> Result<&[String]> {
+        if n_values > columns.len() || (!positional && n_values != columns.len()) {
+            return Err(MoteDBError::InvalidArgument(format!(
+                "Column count mismatch: expected {}, got {}",
+                columns.len(),
+                n_values
+            )));
+        }
+        Ok(&columns[..n_values])
+    }
+
     /// Execute INSERT statement (borrowed, avoids clone in streaming path)
     fn execute_insert_ref(&self, stmt: &InsertStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
 
         // Determine column order
+        let positional = stmt.columns.is_none();
         let columns = if let Some(ref cols) = stmt.columns {
             cols.clone()
         } else {
@@ -19039,6 +19122,10 @@ impl QueryExecutor {
         let mut prepared_rows = Vec::new();
 
         // SELECT 源: 行已是求值好的 Values — 直接按 columns 映射建行。
+        // 🔴 Exact column count in BOTH forms: only the VALUES form may omit
+        // trailing columns (PostgreSQL/SQLite semantics) — `INSERT INTO t
+        // SELECT id FROM src` silently default-padding every other column
+        // used to manufacture data where both references error.
         if let Some(sel_rows) = &select_rows {
             for value_row in sel_rows {
                 if value_row.len() != columns.len() {
@@ -19056,13 +19143,7 @@ impl QueryExecutor {
         }
 
         for value_row in &stmt.values {
-            if value_row.len() != columns.len() {
-                return Err(MoteDBError::InvalidArgument(format!(
-                    "Column count mismatch: expected {}, got {}",
-                    columns.len(),
-                    value_row.len()
-                )));
-            }
+            let target = Self::insert_target_columns(positional, &columns, value_row.len())?;
 
             // Resolve all expressions to Values (skip HashMap intermediary)
             let resolved: Vec<Value> = value_row
@@ -19088,7 +19169,7 @@ impl QueryExecutor {
 
             // Build Row directly using column mapping (no HashMap)
             let row =
-                crate::sql::row_converter::values_to_row_by_columns(&resolved, &columns, &schema)?;
+                crate::sql::row_converter::values_to_row_by_columns(&resolved, target, &schema)?;
             prepared_rows.push(row);
         }
 
@@ -19209,15 +19290,10 @@ impl QueryExecutor {
         let txn_id = self.current_txn_id();
         let mut affected_rows = 0usize;
         let mut last_row_id: Option<u64> = None;
+        let positional = stmt.columns.is_none();
 
         for value_row in &stmt.values {
-            if value_row.len() != columns.len() {
-                return Err(MoteDBError::InvalidArgument(format!(
-                    "Column count mismatch: expected {}, got {}",
-                    columns.len(),
-                    value_row.len()
-                )));
-            }
+            let target = Self::insert_target_columns(positional, columns, value_row.len())?;
 
             let resolved: Vec<Value> = value_row
                 .iter()
@@ -19239,7 +19315,7 @@ impl QueryExecutor {
                 .collect::<Result<Vec<_>>>()?;
 
             let new_row =
-                crate::sql::row_converter::values_to_row_by_columns(&resolved, columns, schema)?;
+                crate::sql::row_converter::values_to_row_by_columns(&resolved, target, schema)?;
 
             // Proposed PK value. None/Null ⇒ no conflict possible: either the
             // table has no PK, or it's an AUTO_INCREMENT slot the insert will
@@ -21174,7 +21250,7 @@ impl QueryExecutor {
             .columns
             .iter()
             .enumerate()
-            .map(|(pos, col)| {
+            .map(|(pos, col)| -> Result<crate::types::ColumnDef> {
                 let column_type = match col.data_type {
                     DataType::Integer => ColumnType::Integer,
                     DataType::BigInt => ColumnType::Integer, // 🚀 Phase 4: Map BIGINT to Integer (both i64)
@@ -21183,7 +21259,16 @@ impl QueryExecutor {
                     DataType::Boolean => ColumnType::Boolean,
                     DataType::Timestamp => ColumnType::Timestamp,
                     DataType::Date => ColumnType::Date,
-                    DataType::Vector(dim) => ColumnType::Tensor(dim.unwrap_or(128)),
+                    DataType::Vector(dim) => {
+                        let d = dim.unwrap_or(128);
+                        if d > 65535 {
+                            return Err(MoteDBError::InvalidArgument(format!(
+                                "VECTOR dimension {} exceeds the 65535 storage limit (u16 dim header)",
+                                d
+                            )));
+                        }
+                        ColumnType::Tensor(d)
+                    }
                     DataType::Geometry => ColumnType::Spatial,
                     DataType::Blob => ColumnType::Blob,
                 };
@@ -21202,9 +21287,9 @@ impl QueryExecutor {
                 }
                 // 🔑 DEFAULT value (CREATE TABLE column constraint).
                 col_def.default_value = col.default_value.clone();
-                col_def
+                Ok(col_def)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // Guard: the columnar SSTable format reserves a fixed-width header slot
         // per column (MAX_COLUMNS). Reject early with a clean error instead of
@@ -21734,18 +21819,10 @@ impl QueryExecutor {
             debug_log!("[DROP TABLE] Warning: LSM range delete failed: {}", e);
         }
 
-        // 8. Drop the ColSegmentStore (columnar source of truth) and its on-disk
-        // segment files. Without this, recreating a same-named table sees stale
-        // rows from the dropped one (test_create_drop_recreate returned 2 rows).
-        // Also clear the columnar_write_bufs entry and the synced columnar_sstables
-        // alias so reads don't fall back to the dropped data.
-        if let Some(entry) = self.db.col_segment_stores.get(table_name) {
-            // Best-effort: delete on-disk segment files + manifest.
-            let _ = entry.value().drop_all();
-        }
-        self.db.col_segment_stores.remove(table_name);
-        self.db.columnar_write_bufs.remove(table_name);
-        self.db.columnar_sstables.remove(table_name);
+        // 8. The ColSegmentStore (columnar source of truth), its on-disk
+        // segment files and the write-buffer / synced-sstable aliases are
+        // dropped inside `MoteDB::drop_table` (step 5) so the raw API and
+        // SQL stay in lockstep — see test_create_drop_recreate.
 
         let _ = schema; // used above for validation
 
@@ -21850,7 +21927,16 @@ impl QueryExecutor {
                     super::ast::DataType::Boolean => ColumnType::Boolean,
                     super::ast::DataType::Timestamp => ColumnType::Timestamp,
                     super::ast::DataType::Date => ColumnType::Date,
-                    super::ast::DataType::Vector(dim) => ColumnType::Tensor(dim.unwrap_or(128)),
+                    super::ast::DataType::Vector(dim) => {
+                        let d = dim.unwrap_or(128);
+                        if d > 65535 {
+                            return Err(MoteDBError::InvalidArgument(format!(
+                                "VECTOR dimension {} exceeds the 65535 storage limit (u16 dim header)",
+                                d
+                            )));
+                        }
+                        ColumnType::Tensor(d)
+                    }
                     super::ast::DataType::Geometry => ColumnType::Spatial,
                     super::ast::DataType::Blob => ColumnType::Blob,
                 };
@@ -22096,7 +22182,15 @@ impl QueryExecutor {
     fn execute_commit_transaction(&self) -> Result<QueryResult> {
         let _txn_id_opt = self.current_txn_id();
         if let Some(txn_id) = _txn_id_opt {
-            self.db.commit_transaction(txn_id)?;
+            let result = self.db.commit_transaction(txn_id);
+            if result.is_err() {
+                // 🔴 Commit may have failed AFTER the coordinator committed
+                // (durable-marker path) — either way the session must not
+                // stay wedged in a ghost transaction: every later statement
+                // would fail and a retry COMMIT would report "not active".
+                self.clear_txn_context();
+            }
+            result?;
             self.clear_txn_context();
             Ok(QueryResult::Definition {
                 message: format!("Transaction {} committed", txn_id),

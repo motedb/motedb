@@ -155,8 +155,15 @@ fn select_nonexistent_table_errors() {
 fn insert_wrong_column_count_errors() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT, name TEXT)");
-    // Too few values.
+    // Too few values — B-17: positional INSERT fills trailing columns with
+    // their DEFAULT (or NULL); only MORE values than columns must error.
     let result = db.execute("INSERT INTO t VALUES (1)");
+    assert!(
+        result.is_ok(),
+        "too few values should fill defaults: {:?}",
+        result.err()
+    );
+    let result = db.execute("INSERT INTO t VALUES (1, 2, 3, 'x', 'extra')");
     assert!(result.is_err(), "wrong column count must error");
 }
 

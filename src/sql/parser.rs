@@ -31,6 +31,18 @@ const MAX_IDENTIFIER_LENGTH: usize = 4096;
 /// This makes `a + b IS NULL` parse as `(a + b) IS NULL`, not `a + (b IS NULL)`.
 const POSTFIX_PRECEDENCE: u8 = 3;
 
+/// MATCH query text → (query, is_phrase). A query wrapped in double quotes
+/// (`"machine learning"`) is a phrase: the quotes are stripped and the
+/// executor verifies adjacency via positions. Shared by both MATCH forms.
+fn split_match_phrase(query: String) -> (String, bool) {
+    let phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
+    if phrase {
+        (query[1..query.len() - 1].to_string(), true)
+    } else {
+        (query, false)
+    }
+}
+
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -2863,10 +2875,14 @@ impl Parser {
                                     ))
                                 }
                             };
+                            // Same quoted-phrase detection as MATCH … AGAINST:
+                            // the short form used to force `phrase: false`, so
+                            // `MATCH(body, '"a b"')` silently ran as `a AND b`.
+                            let (query, phrase) = split_match_phrase(query);
                             Ok(Expr::Match {
                                 column,
                                 query,
-                                phrase: false,
+                                phrase,
                             })
                         } else if args.len() == 1 {
                             // Long form: MATCH(column) AGAINST(query)
@@ -2908,14 +2924,7 @@ impl Parser {
                             self.advance();
                             self.expect(TokenType::RParen)?;
 
-                            // Detect phrase query: query starts and ends with double quotes
-                            let phrase =
-                                query.starts_with('"') && query.ends_with('"') && query.len() >= 2;
-                            let query = if phrase {
-                                query[1..query.len() - 1].to_string()
-                            } else {
-                                query
-                            };
+                            let (query, phrase) = split_match_phrase(query);
 
                             Ok(Expr::Match {
                                 column,

@@ -673,9 +673,15 @@ fn test_bad_insert_column_count() {
     let result = db.execute("INSERT INTO t VALUES (1, 2, 3)");
     assert!(result.is_err(), "Should reject too many values");
 
-    // Too few values
+    // Too few values — B-17: positional INSERT now fills trailing columns
+    // with their DEFAULT (or NULL), as in PostgreSQL/SQLite. `v` has no
+    // default and is nullable, so (1, NULL) is accepted.
     let result = db.execute("INSERT INTO t VALUES (1)");
-    assert!(result.is_err(), "Should reject too few values");
+    assert!(
+        result.is_ok(),
+        "Too few values should fill defaults: {:?}",
+        result.err()
+    );
 }
 
 #[test]

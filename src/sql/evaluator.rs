@@ -2482,6 +2482,22 @@ impl ExprEvaluator {
         }
     }
 
+    /// A timestamp-ish operand for `± INTEGER(µs)`: an actual Timestamp, an
+    /// ISO text spelling, or a DATE (midnight UTC). Round-26 added the
+    /// (Timestamp, INTEGER) arms; B-03 is the literal-side shape —
+    /// `WHERE ts >= '2026-01-01 00:00:00' + 60000` — where the TEXT literal
+    /// TypeError'd and the WHERE filter swallowed it as "no match".
+    fn timestamp_operand(v: &Value) -> Option<crate::types::Timestamp> {
+        match v {
+            Value::Timestamp(t) => Some(*t),
+            Value::Text(s) => crate::types::Timestamp::parse_iso(s.as_str()),
+            Value::Date(d) => Some(crate::types::Timestamp::from_micros(
+                d.days() as i64 * 86_400_000_000,
+            )),
+            _ => None,
+        }
+    }
+
     fn add_values(&self, left: Value, right: Value) -> Result<Value> {
         match (left, right) {
             // 🔴 round-26: TIMESTAMP ± INTEGER(µs) — the engine's documented
@@ -2496,6 +2512,46 @@ impl ExprEvaluator {
                 Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
                 None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
             },
+            // B-03: same, with the timestamp spelled as an ISO text literal
+            // ('2026-01-01 00:00:00' + 60000) or a DATE. A TEXT that does not
+            // parse stays a TypeError (string + number stays meaningless).
+            (Value::Text(s), Value::Integer(us)) => {
+                match Self::timestamp_operand(&Value::Text(s))
+                    .and_then(|t| t.as_micros().checked_add(us))
+                {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError(
+                        "cannot add integer to this text (ISO timestamp expected)".into(),
+                    )),
+                }
+            }
+            (Value::Integer(us), Value::Text(s)) => {
+                match Self::timestamp_operand(&Value::Text(s))
+                    .and_then(|t| t.as_micros().checked_add(us))
+                {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError(
+                        "cannot add this text to an integer (ISO timestamp expected)".into(),
+                    )),
+                }
+            }
+            (Value::Date(d), Value::Integer(us)) => {
+                match Self::timestamp_operand(&Value::Date(d))
+                    .and_then(|t| t.as_micros().checked_add(us))
+                {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+                }
+            }
+            // + is commutative: the timestamp may sit on either side.
+            (Value::Integer(us), Value::Date(d)) => {
+                match Self::timestamp_operand(&Value::Date(d))
+                    .and_then(|t| t.as_micros().checked_add(us))
+                {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError("timestamp addition overflow".into())),
+                }
+            }
             (Value::Integer(l), Value::Integer(r)) => match l.checked_add(r) {
                 Some(n) => Ok(Value::Integer(n)),
                 None => Ok(Value::Float(l as f64 + r as f64)),
@@ -2521,6 +2577,27 @@ impl ExprEvaluator {
                     "timestamp subtraction overflow".into(),
                 )),
             },
+            // B-03: TEXT/DATE spelling of the timestamp operand.
+            (Value::Text(s), Value::Integer(us)) => {
+                match Self::timestamp_operand(&Value::Text(s))
+                    .and_then(|t| t.as_micros().checked_sub(us))
+                {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError(
+                        "cannot subtract an integer from this text (ISO timestamp expected)".into(),
+                    )),
+                }
+            }
+            (Value::Date(d), Value::Integer(us)) => {
+                match Self::timestamp_operand(&Value::Date(d))
+                    .and_then(|t| t.as_micros().checked_sub(us))
+                {
+                    Some(m) => Ok(Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                    None => Err(MoteDBError::TypeError(
+                        "timestamp subtraction overflow".into(),
+                    )),
+                }
+            }
             (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
             (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 - r)),
             (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l - r as f64)),

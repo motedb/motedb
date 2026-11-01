@@ -128,8 +128,16 @@ fn insert_extra_column_errors() {
 fn insert_missing_column_errors() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT, name TEXT)");
+    // B-17: positional INSERT fills trailing columns with DEFAULT/NULL
+    // (SQLite semantics) — only MORE values than columns must error.
     let result = db.execute("INSERT INTO t VALUES (1, 10)");
-    assert!(result.is_err(), "missing column should error");
+    assert!(
+        result.is_ok(),
+        "missing trailing column should fill NULL: {:?}",
+        result.err()
+    );
+    let result = db.execute("INSERT INTO t VALUES (1, 2, 'a', 'extra')");
+    assert!(result.is_err(), "extra column should still error");
 }
 
 #[test]

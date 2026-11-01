@@ -509,8 +509,16 @@ fn reopen_multiple_times() {
 fn insert_too_few_values_no_column_list_errors() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
+    // B-17: fewer values now fill trailing DEFAULT/NULL (SQLite semantics);
+    // more values than columns remains an error.
     let result = db.execute("INSERT INTO t VALUES (1)");
-    assert!(result.is_err(), "fewer values than columns should error");
+    assert!(
+        result.is_ok(),
+        "too few values should fill defaults: {:?}",
+        result.err()
+    );
+    let result = db.execute("INSERT INTO t VALUES (1, 2, 3, 4)");
+    assert!(result.is_err(), "more values than columns should error");
 }
 
 #[test]

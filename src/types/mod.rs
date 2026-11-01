@@ -351,6 +351,20 @@ impl PartialEq for Value {
             (Value::Blob(a), Value::Blob(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
+            // 🔴 Bit-level equality (not f32 ==): equal values must hash
+            // equal, and Hash's catch-all hashes the Debug string —
+            // `-0.0 == 0.0` under f32 == but Debugs differently, and NaN
+            // != itself under == while Debug-ing identically. Bits match the
+            // hash contract exactly. Absent arm ⇒ vectors ALWAYS compared
+            // unequal: GROUP BY / DISTINCT / IN on a VECTOR column silently
+            // produced N singleton groups.
+            (Value::Vector(a), Value::Vector(b)) => {
+                a.0.len() == b.0.len()
+                    && a.0
+                        .iter()
+                        .zip(b.0.iter())
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
+            }
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::Date(a), Value::Date(b)) => a == b,
             // 🚨 Date vs Text: parse 'YYYY-MM-DD' so `WHERE d = '2026-10-22'`

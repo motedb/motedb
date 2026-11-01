@@ -114,59 +114,60 @@ pub fn values_to_row_by_columns(
     for (i, col_name) in columns.iter().enumerate() {
         let val = values.get(i).cloned().unwrap_or(Value::Null);
         // Find the column position in schema
-        if let Some(col_def) = schema.get_column(col_name) {
-            // 🔑 Keep explicit AUTO_INCREMENT values (mirrors
-            // values_to_row_schema_order): `INSERT INTO t (id, v) VALUES
-            // (100, 'x')` stores id=100 — insert_row_to_table's explicit-PK
-            // branch then honors it (and bumps the counter past it). Only an
-            // omitted/NULL pk falls through for the system to allocate.
-            if col_def.auto_increment && matches!(val, Value::Null) {
-                continue;
-            }
-            // Enforce NOT NULL (but allow DEFAULT to satisfy it)
-            if !col_def.nullable && matches!(val, Value::Null) && col_def.default_value.is_none() {
-                return Err(crate::error::MoteDBError::InvalidArgument(format!(
-                    "Column '{}' cannot be null",
-                    col_name
-                )));
-            }
-            // Type coercion
-            let coerced = match (&col_def.col_type, &val) {
-                (ColumnType::Timestamp, Value::Integer(ts)) => {
-                    Value::Timestamp(crate::types::Timestamp::from_micros(*ts))
-                }
-                // 🔑 ISO text → Timestamp. The schema-order INSERT path gets
-                // this via a different route; the column-list path stored the
-                // raw Text into the Timestamp column, which encoded as 0
-                // (`INSERT INTO t (id, ts) VALUES (1, '2024-01-15 10:30:00')`
-                // read back ts=0).
-                (ColumnType::Timestamp, Value::Text(s)) => crate::types::Timestamp::parse_iso(s)
-                    .map(Value::Timestamp)
-                    .unwrap_or_else(|| Value::Text(s.clone())),
-                (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
-                // 🚨 Float to Integer: convert whole-number floats (prevents
-                // f64 bit-pattern corruption). Fractional floats fall through
-                // and are rejected by validate_row.
-                (ColumnType::Integer, Value::Float(f))
-                    if f.is_finite()
-                        && f.fract() == 0.0
-                        && *f < 9223372036854775808.0
-                        && *f > -9223372036854775809.0 =>
-                {
-                    Value::Integer(*f as i64)
-                }
-                (ColumnType::Timestamp, Value::Float(f))
-                    if f.is_finite()
-                        && f.fract() == 0.0
-                        && *f < 9223372036854775808.0
-                        && *f > -9223372036854775809.0 =>
-                {
-                    Value::Timestamp(crate::types::Timestamp::from_micros(*f as i64))
-                }
-                _ => val,
-            };
-            row[col_def.position] = coerced;
+        let Some(col_def) = schema.get_column(col_name) else {
+            return Err(crate::error::MoteDBError::ColumnNotFound(col_name.clone()));
+        };
+        // 🔑 Keep explicit AUTO_INCREMENT values (mirrors
+        // values_to_row_schema_order): `INSERT INTO t (id, v) VALUES
+        // (100, 'x')` stores id=100 — insert_row_to_table's explicit-PK
+        // branch then honors it (and bumps the counter past it). Only an
+        // omitted/NULL pk falls through for the system to allocate.
+        if col_def.auto_increment && matches!(val, Value::Null) {
+            continue;
         }
+        // Enforce NOT NULL (but allow DEFAULT to satisfy it)
+        if !col_def.nullable && matches!(val, Value::Null) && col_def.default_value.is_none() {
+            return Err(crate::error::MoteDBError::InvalidArgument(format!(
+                "Column '{}' cannot be null",
+                col_name
+            )));
+        }
+        // Type coercion
+        let coerced = match (&col_def.col_type, &val) {
+            (ColumnType::Timestamp, Value::Integer(ts)) => {
+                Value::Timestamp(crate::types::Timestamp::from_micros(*ts))
+            }
+            // 🔑 ISO text → Timestamp. The schema-order INSERT path gets
+            // this via a different route; the column-list path stored the
+            // raw Text into the Timestamp column, which encoded as 0
+            // (`INSERT INTO t (id, ts) VALUES (1, '2024-01-15 10:30:00')`
+            // read back ts=0).
+            (ColumnType::Timestamp, Value::Text(s)) => crate::types::Timestamp::parse_iso(s)
+                .map(Value::Timestamp)
+                .unwrap_or_else(|| Value::Text(s.clone())),
+            (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
+            // 🚨 Float to Integer: convert whole-number floats (prevents
+            // f64 bit-pattern corruption). Fractional floats fall through
+            // and are rejected by validate_row.
+            (ColumnType::Integer, Value::Float(f))
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f < 9223372036854775808.0
+                    && *f > -9223372036854775809.0 =>
+            {
+                Value::Integer(*f as i64)
+            }
+            (ColumnType::Timestamp, Value::Float(f))
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f < 9223372036854775808.0
+                    && *f > -9223372036854775809.0 =>
+            {
+                Value::Timestamp(crate::types::Timestamp::from_micros(*f as i64))
+            }
+            _ => val,
+        };
+        row[col_def.position] = coerced;
     }
 
     Ok(row)

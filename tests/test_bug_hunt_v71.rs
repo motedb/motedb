@@ -46,8 +46,15 @@ fn test_select_nonexistent_table() {
 fn test_insert_column_count_mismatch() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(a INT, b INT, c INT)").unwrap();
+    // B-17: fewer values fill trailing DEFAULT/NULL; more values must error.
     let res = db.execute("INSERT INTO t VALUES (1, 2)");
-    assert!(res.is_err(), "column count mismatch should error");
+    assert!(
+        res.is_ok(),
+        "too few values should fill defaults: {:?}",
+        res.err()
+    );
+    let res = db.execute("INSERT INTO t VALUES (1, 2, 3, 4)");
+    assert!(res.is_err(), "more values than columns should error");
 }
 
 #[test]
