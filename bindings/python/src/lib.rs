@@ -190,6 +190,14 @@ fn decode_array_bytes(
     bytes: &[u8],
 ) -> PyResult<Vec<motedb_core::types::Value>> {
     use motedb_core::types::Value as MValue;
+    // 🔴 B-13-adjacent: a '>' big-endian dtype used to be decoded as
+    // little-endian — silent garbage values (wrong by 2^56 on i64). Fail
+    // loudly; the caller can np.byteswap() or astype the little-endian form.
+    if dtype.starts_with('>') {
+        return Err(PyValueError::new_err(format!(
+            "big-endian numpy array ('{dtype}') is not supported —              use arr.byteswap().view(arr.dtype.newbyteorder('<')) or arr.astype('<f4')"
+        )));
+    }
     let code = dtype.replace(['<', '=', '|', '>'], "");
     // numpy unicode ('<U7'): UTF-32LE 定宽、尾部 \0 填充 — tobytes 后按
     // itemsize 步长切行, 逐 u32 码点解码 (跳过逐 str 的 C-API 提取)。
@@ -219,10 +227,6 @@ fn decode_array_bytes(
     }
     let code = code.to_ascii_lowercase();
     match (code.as_str(), shape) {
-        ("i8" | "l" | "int64", [_n]) => Ok(bytes
-            .chunks_exact(8)
-            .map(|c| MValue::Integer(i64::from_le_bytes(c.try_into().unwrap())))
-            .collect()),
         ("f8" | "d" | "float64", [_n]) => Ok(bytes
             .chunks_exact(8)
             .map(|c| MValue::Float(f64::from_le_bytes(c.try_into().unwrap())))
@@ -231,20 +235,97 @@ fn decode_array_bytes(
             .chunks_exact(4)
             .map(|c| MValue::Float(f32::from_le_bytes(c.try_into().unwrap()) as f64))
             .collect()),
-        ("f4" | "f" | "float32", [n, d]) => {
-            // 2D float32 → 向量列
+        // 2D 整数 (任意宽度) → 向量列 (B-13: np.int64 (N, 384) 曾被拒)
+        ("i1" | "i2" | "i4" | "i8" | "l" | "int64" | "u1" | "u2" | "u4" | "u8", [n, d]) => {
             let (n, d) = (*n, *d);
+            let w = match code.as_str() {
+                "i1" | "u1" => 1usize,
+                "i2" | "u2" => 2,
+                "i4" | "u4" => 4,
+                _ => 8,
+            };
             let mut out = Vec::with_capacity(n);
             let mut off = 0usize;
             for _ in 0..n {
                 let mut row = Vec::with_capacity(d);
                 for _ in 0..d {
-                    if off + 4 > bytes.len() {
+                    if off + w > bytes.len() {
                         return Err(PyValueError::new_err("array bytes shorter than shape"));
                     }
-                    let c: [u8; 4] = bytes[off..off + 4].try_into().unwrap();
-                    row.push(f32::from_le_bytes(c));
-                    off += 4;
+                    let mut full = [0u8; 8];
+                    full[..w].copy_from_slice(&bytes[off..off + w]);
+                    let raw = u64::from_le_bytes(full);
+                    let v = if code.starts_with('u') {
+                        raw as i64
+                    } else {
+                        ((raw << (64 - 8 * w)) as i64) >> (64 - 8 * w)
+                    };
+                    row.push(v as f32);
+                    off += w;
+                }
+                out.push(MValue::Vector(motedb_core::types::ArcVec::new(row)));
+            }
+            Ok(out)
+        }
+        ("i1" | "i2" | "i4" | "i8" | "l" | "int64" | "u1" | "u2" | "u4" | "u8", [_n]) => {
+            // 1D 整数 (任意宽度) → Integer 列
+            let widths: &[(&str, usize)] = &[
+                ("i1", 1),
+                ("u1", 1),
+                ("i2", 2),
+                ("u2", 2),
+                ("i4", 4),
+                ("u4", 4),
+                ("i8", 8),
+                ("l", 8),
+                ("int64", 8),
+                ("u8", 8),
+            ];
+            let w = widths
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, w)| *w)
+                .unwrap();
+            Ok(bytes
+                .chunks_exact(w)
+                .map(|c| {
+                    let mut full = [0u8; 8];
+                    full[..w].copy_from_slice(c);
+                    // unsigned → zero-extend into i64; signed → sign-extend
+                    // (shift the value into the top, then arithmetic-shift back)
+                    let raw = u64::from_le_bytes(full);
+                    let v = if code.starts_with('u') {
+                        raw as i64
+                    } else {
+                        ((raw << (64 - 8 * w)) as i64) >> (64 - 8 * w)
+                    };
+                    MValue::Integer(v)
+                })
+                .collect())
+        }
+        ("f8" | "d" | "float64" | "f4" | "f" | "float32", [n, d]) => {
+            // 2D 浮点 (f4/f8) → 向量列
+            let (n, d) = (*n, *d);
+            let w = if code == "f8" || code == "d" || code == "float64" {
+                8
+            } else {
+                4
+            };
+            let mut out = Vec::with_capacity(n);
+            let mut off = 0usize;
+            for _ in 0..n {
+                let mut row = Vec::with_capacity(d);
+                for _ in 0..d {
+                    if off + w > bytes.len() {
+                        return Err(PyValueError::new_err("array bytes shorter than shape"));
+                    }
+                    let v = if w == 8 {
+                        f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+                    } else {
+                        f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as f64
+                    };
+                    row.push(v as f32);
+                    off += w;
                 }
                 out.push(MValue::Vector(motedb_core::types::ArcVec::new(row)));
             }
@@ -510,6 +591,9 @@ fn config_for_preset(
 #[pyclass]
 struct PyDatabase {
     db: Database,
+    /// Most recent id returned by begin() — lets commit()/rollback() run
+    /// with no argument (sqlite3-style "roll back the current transaction").
+    last_tx: std::sync::Mutex<Option<u64>>,
 }
 
 #[pymethods]
@@ -537,7 +621,10 @@ impl PyDatabase {
         // create-or-open heuristic would otherwise bypass).
         if motedb_core::database::snapshot::is_motesnap_container(std::path::Path::new(path)) {
             let db = Database::open_readonly(path).map_err(py_err)?;
-            return Ok(Self { db });
+            return Ok(Self {
+                db,
+                last_tx: std::sync::Mutex::new(None),
+            });
         }
         if read_only {
             // Regular directory: engine-level read-only via config (the
@@ -546,7 +633,10 @@ impl PyDatabase {
             let mut config = config_for_preset(preset, None, None, path)?;
             config.read_only = true;
             let db = Database::open_with_config(path, config).map_err(py_err)?;
-            return Ok(Self { db });
+            return Ok(Self {
+                db,
+                last_tx: std::sync::Mutex::new(None),
+            });
         }
         let config = config_for_preset(preset, durability, periodic_ms, path)?;
         let db = if create {
@@ -558,7 +648,10 @@ impl PyDatabase {
         } else {
             Database::open_with_config(path, config).map_err(py_err)?
         };
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            last_tx: std::sync::Mutex::new(None),
+        })
     }
 
     /// 🔑 P4: restore a `.mote` snapshot container into a fresh directory and
@@ -574,7 +667,10 @@ impl PyDatabase {
         dest_dir: &str,
     ) -> PyResult<Self> {
         let db = Database::open_snapshot(src, dest_dir).map_err(py_err)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            last_tx: std::sync::Mutex::new(None),
+        })
     }
 
     /// 🔑 J1 hybrid retrieval: BM25 text list + vector KNN list fused with
@@ -834,9 +930,12 @@ impl PyDatabase {
         self.db.vector_cache_budget_bytes(table).map_err(py_err)
     }
 
-    /// Begin a transaction; returns its id (pass to commit/rollback).
+    /// Begin a transaction; returns its id (pass to commit/rollback — or
+    /// call commit()/rollback() with no argument to act on the latest one).
     fn begin(&self) -> PyResult<u64> {
-        self.db.begin_transaction().map_err(py_err)
+        let tx = self.db.begin_transaction().map_err(py_err)?;
+        *self.last_tx.lock().unwrap() = Some(tx);
+        Ok(tx)
     }
 
     /// Execute one INSERT once per parameter set (executemany).
@@ -844,7 +943,9 @@ impl PyDatabase {
     /// whole batch. `params` is a list of per-row parameter lists.
     /// Returns the affected-row count.
     /// 🔥 列式批量插入: `db.insert_arrays("ev", {"id": np_ids, "emb": emb2d, ...})`
-    /// numpy 数组经 buffer 协议零拷贝读取 (i64/f64/f32/2D-f32), 字符串列接受
+    /// 参数是 {列: numpy 数组或 list} 的列式 dict（也接受 (列, 值) 二元组序列）。
+    /// numpy 数组经 buffer 协议零拷贝读取 (1D: i8/u8..64/f4/f8 标量, 2D: f4/f8/
+    /// 整数 → 向量; 大端 dtype 显式报错而不是静默按小端解码), 字符串列接受
     /// str 列表。跳过 SQL 解析、参数绑定与逐行 Python 对象构造 — 100K×384
     /// 导入的 Python 侧成本从 ~0.8s (.tolist() 每 384 浮点建列表) 降到 ~0。
     #[pyo3(signature = (table, columns))]
@@ -852,9 +953,28 @@ impl PyDatabase {
         &self,
         py: Python<'_>,
         table: &str,
-        columns: Bound<'_, pyo3::types::PyDict>,
+        columns: &Bound<'_, pyo3::types::PyAny>,
     ) -> PyResult<u64> {
         use motedb_core::types::Value as MValue;
+
+        // B-12: the columnar dict {column: array} is THE form (README/docs),
+        // but a bare "cannot be converted to PyDict" told the user nothing.
+        // Also accept a sequence of (column, values) pairs; anything else
+        // fails with the expected shape spelled out.
+        let columns = if let Ok(d) = columns.downcast::<pyo3::types::PyDict>() {
+            d.clone()
+        } else if let Ok(pairs) = columns.extract::<Vec<(String, Bound<'_, pyo3::types::PyAny>)>>()
+        {
+            let d = pyo3::types::PyDict::new_bound(py);
+            for (name, values) in pairs {
+                d.set_item(name, values)?;
+            }
+            d
+        } else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "insert_arrays expects a columnar dict {column: numpy-array-or-list}                  (or a sequence of (column, values) pairs)",
+            ));
+        };
 
         // 🔑 按 schema 位置放置列值。旧实现按字典序转置 — 字典序 ≠ schema
         // 序时值静默落错列 (TEXT 列收到 Float 被清成空串), 省略前导自增 PK
@@ -948,13 +1068,37 @@ impl PyDatabase {
     }
 
     /// Commit a transaction begun with begin().
-    fn commit(&self, tx: u64) -> PyResult<()> {
-        self.db.commit_transaction(tx).map_err(py_err)
+    #[pyo3(signature = (tx=None))]
+    fn commit(&self, tx: Option<u64>) -> PyResult<()> {
+        let tx = tx
+            .or_else(|| *self.last_tx.lock().unwrap())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "no transaction: pass the id returned by begin() or call begin() first",
+                )
+            })?;
+        let r = self.db.commit_transaction(tx).map_err(py_err);
+        if r.is_ok() {
+            *self.last_tx.lock().unwrap() = None;
+        }
+        r
     }
 
-    /// Roll back a transaction begun with begin().
-    fn rollback(&self, tx: u64) -> PyResult<()> {
-        self.db.rollback_transaction(tx).map_err(py_err)
+    /// Roll back a transaction begun with begin() (no argument = the latest).
+    #[pyo3(signature = (tx=None))]
+    fn rollback(&self, tx: Option<u64>) -> PyResult<()> {
+        let tx = tx
+            .or_else(|| *self.last_tx.lock().unwrap())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "no transaction: pass the id returned by begin() or call begin() first",
+                )
+            })?;
+        let r = self.db.rollback_transaction(tx).map_err(py_err);
+        if r.is_ok() {
+            *self.last_tx.lock().unwrap() = None;
+        }
+        r
     }
 
     /// Flush buffers + fsync (durability point).
@@ -1049,10 +1193,10 @@ impl PyDatabase {
         }
         let has_hooks = !hooks.is_empty();
         let mut current_txn: Option<(String, pyo3::Bound<'_, PyAny>)> = None;
-        let mut hook_fn = move |topic: &str, log_time: u64, raw: &[u8]| -> Vec<(
-            String,
-            motedb_core::types::Value,
-        )> {
+        let mut hook_fn = move |topic: &str,
+                                log_time: u64,
+                                raw: &[u8]|
+              -> Vec<(String, motedb_core::types::Value)> {
             // Bind the matching callback (exact topic match; first call wins).
             if current_txn.is_none() {
                 current_txn = hooks.iter().find(|(t, _)| t == topic).cloned();
@@ -1190,9 +1334,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDatabase>()?;
     m.add("Database", m.getattr("PyDatabase")?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    m.add_function(pyo3::wrap_pyfunction!(
-        import_snapshot,
-        m
-    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(import_snapshot, m)?)?;
     Ok(())
 }

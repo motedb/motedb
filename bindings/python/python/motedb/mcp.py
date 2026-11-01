@@ -101,8 +101,17 @@ def _rows_payload(rows: list) -> str:
 
 def _call(db, name: str, args: dict) -> dict:
     if name == "list_tables":
-        rows = db.execute("SHOW TABLES")
-        return _text(json.dumps(rows, ensure_ascii=False, default=str))
+        # B-10: a structured summary the agent can act on without a second
+        # round trip — SHOW TABLES alone yields bare names.
+        names = [next(iter(r.values())) for r in db.execute("SHOW TABLES")]
+        tables = []
+        for n in names:
+            try:
+                cnt = next(iter(db.execute(f'SELECT COUNT(*) FROM "{n}"')[0].values()))
+            except Exception:
+                cnt = None
+            tables.append({"name": n, "rows": cnt})
+        return _text(json.dumps({"tables": tables}, ensure_ascii=False, default=str))
     if name == "describe":
         # 🔴 round-28: this used `cols, _ = fetch_arrays(...)` — it kept the
         # OUTPUT HEADER names (["Field","Type","Nullable","Position"], the
@@ -131,7 +140,9 @@ def _call(db, name: str, args: dict) -> dict:
         rows = db.execute(f"SELECT * FROM EPISODES({table})")
         return _text(_rows_payload(rows))
     if name == "doctor":
-        return _text(db.doctor())
+        # doctor() returns a dict; it must be serialized — a dict in the MCP
+        # `text` field violates the protocol (clients type-check it as str).
+        return _text(json.dumps(db.doctor(), ensure_ascii=False, default=str))
     raise ValueError(f"unknown tool: {name}")
 
 
