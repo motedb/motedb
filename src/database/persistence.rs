@@ -727,6 +727,23 @@ impl MoteDB {
         // is redundant and safe to truncate regardless.
         let immutable_queue_len = self.lsm_engine.immutable_queue_len();
 
+        // 🔴 Writer barrier — BUG #35 for checkpoints. `backup_to`/`export_snapshot_to`
+        // hold ALL autocommit stripes + the global write_lock across their
+        // flush→WAL-truncate sequence for exactly this reason; the checkpoint
+        // path never did: a commit landing between the store-buffer flush pass
+        // and `wal.checkpoint_all()` had its WAL records fsynced, its rows in
+        // the volatile write buffer, returned Ok — and then the WAL files were
+        // deleted. kill -9 in that window lost the acked transaction (reopen:
+        // empty WAL, no segment). The barrier spans [store-buffer flush →
+        // WAL truncation + LSN persist]; writers hold one stripe or the
+        // global lock, so taking all stripes then the global lock cannot
+        // cycle. Lock order checkpoint_mutex → stripes → write_lock, same as
+        // backup_to. Writers block for the barrier's duration — the price of
+        // not losing acked commits.
+        let _stripe_barriers: Vec<parking_lot::MutexGuard<'_, ()>> =
+            self.autocommit_locks.iter().map(|s| s.lock()).collect();
+        let _write_barrier = self.write_lock.lock();
+
         // 🔥 Flush ColSegmentStore write buffers BEFORE the WAL truncation
         // decision. This is critical for two reasons:
         // 1. ColSegmentStore is the source of truth (v0.3.0+). Once flush_buffer

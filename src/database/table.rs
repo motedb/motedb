@@ -26,6 +26,20 @@ impl MoteDB {
     /// ```
     pub fn create_table(&self, schema: TableSchema) -> Result<()> {
         ensure_open!(self);
+        // 🔴 Reject vector dims beyond the storage layout before anything is
+        // written: `dim as u16` truncation corrupts the whole column at flush
+        // (70000-dim inserts read back as 55575-dim garbage). SQL CREATE/ALTER
+        // are gated in the executor; the raw TableSchema path is gated here.
+        for ct in schema.col_types() {
+            if let crate::types::ColumnType::Tensor(dim) = ct {
+                if *dim > 65535 {
+                    return Err(crate::StorageError::InvalidData(format!(
+                        "VECTOR dimension {} exceeds the 65535 storage limit (u16 dim header)",
+                        dim
+                    )));
+                }
+            }
+        }
         // Register table in catalog (acquires metadata.write() lock)
         self.table_registry.create_table(schema.clone())?;
         // 🔓 Lock released here
@@ -172,6 +186,25 @@ impl MoteDB {
         self.pk_lookup.remove(table_name);
         self.table_auto_increment.remove(table_name);
         self.table_row_count.remove(table_name);
+
+        // 8. Drop the ColSegmentStore (columnar source of truth) and its
+        //    on-disk segment files, plus the write-buffer / synced-sstable
+        //    aliases. This used to live only in the SQL DROP TABLE executor;
+        //    the raw API left the store registered, so re-creating a table of
+        //    the same name resurrected the dropped rows (and recovery
+        //    re-adopted the old segment directory for the new table).
+        if let Some(entry) = self.col_segment_stores.get(table_name) {
+            if let Err(e) = entry.value().drop_all() {
+                warn_log!(
+                    "[drop_table] segment store drop failed for '{}': {:?}",
+                    table_name,
+                    e
+                );
+            }
+        }
+        self.col_segment_stores.remove(table_name);
+        self.columnar_write_bufs.remove(table_name);
+        self.columnar_sstables.remove(table_name);
         Ok(())
     }
 

@@ -89,7 +89,48 @@ impl MoteDB {
                                     0, /* placeholder row_id */
                                 ) {
                                     Ok(()) => {
-                                        // Successfully reserved — will update with real row_id below
+                                        // Reserved — but a cache MISS proves
+                                        // nothing: the pk cache is created
+                                        // EMPTY at open for ColSegmentStore
+                                        // tables and LRU-bounded, so a fresh
+                                        // session accepts an existing PK here
+                                        // and the append shadows the old row.
+                                        // Storage check before committing to
+                                        // the reservation (mirrors the txn
+                                        // insert path).
+                                        let mut duplicate = false;
+                                        if let Value::Integer(pk_int) = pk_value {
+                                            let rid = if *pk_int >= 0 {
+                                                *pk_int as RowId
+                                            } else {
+                                                0x8000_0000u64 | (*pk_int as u64 & 0x7FFF_FFFF)
+                                            };
+                                            if self.get_table_row(table_name, rid)?.is_some() {
+                                                duplicate = true;
+                                            }
+                                        }
+                                        if !duplicate {
+                                            if let Ok(found) =
+                                                self.query_by_column(table_name, pk_name, pk_value)
+                                            {
+                                                for &rid in &found {
+                                                    if self
+                                                        .get_table_row(table_name, rid)?
+                                                        .is_some()
+                                                    {
+                                                        duplicate = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if duplicate {
+                                            lookup.remove_pk(&pk_key);
+                                            return Err(StorageError::InvalidData(format!(
+                                                "Duplicate primary key {:?} for table '{}'",
+                                                pk_value, table_name
+                                            )));
+                                        }
                                     }
                                     Err(_) => {
                                         return Err(StorageError::InvalidData(format!(
@@ -777,16 +818,17 @@ impl MoteDB {
     ) -> Result<Option<Arc<Row>>> {
         // Check version store first — if this row_id has transactional data,
         // version store visibility rules take precedence over LSM.
-        if let Some(visible) = self
-            .version_store
-            .get_visible_version(row_id, snapshot, isolation)?
+        let row_key = (table_name.to_string(), row_id);
+        if let Some(visible) =
+            self.version_store
+                .get_visible_version(row_key.clone(), snapshot, isolation)?
         {
             return Ok(Some(Arc::new(visible)));
         }
 
         // Check if version store has any entry (even if not visible). If so, the row
         // exists transactionally but is hidden by MVCC — don't fall through to LSM.
-        if self.version_store.versions.get(&row_id).is_some() {
+        if self.version_store.versions.get(&row_key).is_some() {
             return Ok(None); // Row exists but is not visible under this snapshot
         }
 
@@ -916,6 +958,19 @@ impl MoteDB {
     /// FLOAT column stored the i64 bit pattern → read back as 0.0; E2E
     /// "RELEASE keeps changes" caught it).
     pub(crate) fn coerce_row_to_schema(schema: &crate::types::TableSchema, row: &mut Row) {
+        // 🔴 Pad a short row up to the schema width FIRST. After
+        // `ALTER TABLE ADD COLUMN`, the stored old row still has the old
+        // width, so an UPDATE built a same-width new_row and validation
+        // failed with "Column count mismatch: expected N, got N-1" (B-02);
+        // the transactional SET path buffered it narrow and the builder
+        // panicked at close (B-16). Missing trailing columns take the
+        // column's DEFAULT, matching what the ALTER backfill wrote into old
+        // segments (plain NULL when there is none).
+        if row.len() < schema.columns.len() {
+            for col in &schema.columns[row.len()..] {
+                row.push(col.default_value.clone().unwrap_or(Value::Null));
+            }
+        }
         for (i, ct) in schema.col_types().iter().enumerate() {
             if matches!(
                 ct,
@@ -968,6 +1023,32 @@ impl MoteDB {
                     Some(crate::types::Value::Timestamp(ts)) => {
                         let days = ts.as_micros().div_euclid(86_400_000_000) as i32;
                         row[i] = crate::types::Value::Date(crate::types::Date::from_days(days));
+                    }
+                    _ => {}
+                }
+            }
+            // 🔖 TIMESTAMP columns accept integer microseconds, ISO strings
+            // and DATE values (midnight UTC). The column-list INSERT path
+            // already did this in row_converter; UPDATE … SET ts = 3000000
+            // (and raw-API inserts) reached storage as Integer/Text, which
+            // the Timestamp encoder writes as 0 — the row silently read back
+            // as the epoch.
+            if matches!(ct, crate::types::ColumnType::Timestamp) {
+                match row.get(i) {
+                    Some(crate::types::Value::Integer(us)) => {
+                        row[i] = crate::types::Value::Timestamp(
+                            crate::types::Timestamp::from_micros(*us),
+                        );
+                    }
+                    Some(crate::types::Value::Text(s)) => {
+                        if let Some(ts) = crate::types::Timestamp::parse_iso(s.as_str()) {
+                            row[i] = crate::types::Value::Timestamp(ts);
+                        }
+                    }
+                    Some(crate::types::Value::Date(d)) => {
+                        row[i] = crate::types::Value::Timestamp(
+                            crate::types::Timestamp::from_micros(d.days() as i64 * 86_400_000_000),
+                        );
                     }
                     _ => {}
                 }
@@ -1244,6 +1325,11 @@ impl MoteDB {
                 self.index_registry.mark_stale(&meta.name);
             }
         }
+
+        // Global timestamp index: a changed ts (or a moved row) must move
+        // its entry too, or the range API keeps returning the old row_id.
+        self.unindex_row_timestamp(old_row, row_id);
+        self.index_row_timestamp(new_row, eff_rid);
     }
 
     /// 🔁 Secondary index removal for a DELETEd row (column/vector/text/
@@ -1339,6 +1425,10 @@ impl MoteDB {
                 }
             }
         }
+
+        // Global timestamp index — nothing removed the deleted row's entry
+        // before, so query_timestamp_range kept returning its row_id.
+        self.unindex_row_timestamp(old_row, row_id);
     }
     fn update_row_with_schema_impl(
         &self,
@@ -1377,6 +1467,7 @@ impl MoteDB {
                             if !matches!(new_val, Value::Null) {
                                 let pk_key = crate::database::pk_cache::PkKey::from_value(new_val);
                                 // Check PK cache for existing entry with different row_id
+                                let mut cache_hit = false;
                                 if let Some(lookup) = self.pk_lookup.get(table_name) {
                                     if let Some(existing_rid) = lookup.get_pk(&pk_key) {
                                         if existing_rid != row_id {
@@ -1384,6 +1475,52 @@ impl MoteDB {
                                                 "Duplicate primary key {:?} for table '{}'",
                                                 new_val, table_name
                                             )));
+                                        }
+                                        cache_hit = true;
+                                    }
+                                }
+                                // 🔴 Storage fallback on cache miss: the pk cache
+                                // is created EMPTY at open for ColSegmentStore
+                                // tables (warm_pk_cache only covers legacy LSM
+                                // ones) and is LRU-bounded — a miss proves
+                                // nothing. UPDATE t SET id = <existing> used to
+                                // sail through and the relocation path appended
+                                // the new version at the existing row's key,
+                                // newest-wins shadowing it into oblivion.
+                                // Integer PK's row_id equals the PK value (same
+                                // encoding as the txn insert path).
+                                if !cache_hit {
+                                    if let Value::Integer(pk_int) = new_val {
+                                        let rid = if *pk_int >= 0 {
+                                            *pk_int as RowId
+                                        } else {
+                                            0x8000_0000u64 | (*pk_int as u64 & 0x7FFF_FFFF)
+                                        };
+                                        if rid != row_id
+                                            && self.get_table_row(table_name, rid)?.is_some()
+                                        {
+                                            return Err(StorageError::InvalidData(format!(
+                                                "Duplicate primary key {:?} for table '{}'",
+                                                new_val, table_name
+                                            )));
+                                        }
+                                    }
+                                    // Non-Integer PKs: no row_id==pk shortcut —
+                                    // mirror the txn path's query_by_column
+                                    // fallback (best-effort; errors when the
+                                    // table has no column index are swallowed).
+                                    if let Ok(found) =
+                                        self.query_by_column(table_name, pk_name, new_val)
+                                    {
+                                        for rid in found {
+                                            if rid != row_id
+                                                && self.get_table_row(table_name, rid)?.is_some()
+                                            {
+                                                return Err(StorageError::InvalidData(format!(
+                                                    "Duplicate primary key {:?} for table '{}'",
+                                                    new_val, table_name
+                                                )));
+                                            }
                                         }
                                     }
                                 }
@@ -2191,6 +2328,21 @@ impl MoteDB {
         }
     }
 
+    /// Inverse of `index_row_timestamp` for a deleted or pre-update row:
+    /// removes exactly the (ts, row_id) pair, leaving other rows that share
+    /// the same microsecond in place.
+    pub(crate) fn unindex_row_timestamp(&self, row: &Row, row_id: RowId) {
+        if let Some(crate::types::Value::Timestamp(ts)) = row
+            .iter()
+            .find(|v| matches!(v, crate::types::Value::Timestamp(_)))
+        {
+            // Never materialized ⇒ nothing was ever indexed.
+            if let Some(idx) = self.timestamp_index.get_if_init() {
+                let _ = idx.write().remove_entry(ts.as_micros_u64(), row_id);
+            }
+        }
+    }
+
     pub fn get_or_create_col_segment_store(
         &self,
         table_name: &str,
@@ -2934,6 +3086,16 @@ impl MoteDB {
         // bumps past it, uniqueness enforced); the fast path assigns counter
         // ids — taking it with explicit PKs silently discarded them (a
         // divergence between the two paths, data-affecting).
+        // 1.5 🔖 Coerce literal forms to schema types + pad short rows to the
+        // schema width (DEFAULT/NULL for trailing columns) — BEFORE the
+        // fast-path gates. The ≥100-row fast paths skip the slow path's
+        // coerce+validate section; without this, a short row at row 100 got
+        // NULLs where rows 1..99 got DEFAULTs (P3: same input, different
+        // result at exactly the batch-size threshold).
+        for row in rows.iter_mut() {
+            Self::coerce_row_to_schema(&schema, row);
+        }
+
         let has_explicit_pk = schema
             .primary_key()
             .and_then(|pk| schema.get_column(pk))
@@ -2966,14 +3128,8 @@ impl MoteDB {
             return self.fast_batch_insert_explicit(table_name, rows, &schema);
         }
 
-        // 1.5 🔖 Coerce literal forms to schema types (DATE ← 'YYYY-MM-DD',
-        // Float ← Integer, …) before validation — the batch API path and the
-        // SQL INSERT path both land here, so this is the single choke point.
-        for row in rows.iter_mut() {
-            Self::coerce_row_to_schema(&schema, row);
-        }
-
-        // 2. Validate all rows
+        // 2. Validate all rows (coercion+padding already ran above, ahead of
+        // the fast-path gates)
         for (idx, row) in rows.iter().enumerate() {
             schema.validate_row(row).map_err(|e| {
                 StorageError::InvalidData(format!(
@@ -3685,9 +3841,16 @@ impl MoteDB {
             col_index_key.push_str(&col_def.name);
             if let Some(index_ref) = self.column_indexes.get(&col_index_key) {
                 let mut column_data: Vec<(Value, RowId)> = Vec::with_capacity(n);
-                for (row_id, (_key, _ts, row)) in row_ids.iter().zip(store_rows.iter()) {
+                // 🔴 store_rows was SORTED by key above; zipping it with the
+                // unsorted row_ids paired values with the WRONG row ids for
+                // any batch whose PKs were not ascending (explicit-PK fast
+                // path: `WHERE tag = 'tag0'` returned [] while the row was
+                // plainly there). Recover the row_id from the key's low 32
+                // bits — the exact value the key was built from.
+                for (key, _ts, row) in store_rows.iter() {
+                    let row_id = key & 0xFFFF_FFFF;
                     if let Some(col_value) = row.get(col_def.position) {
-                        column_data.push((col_value.clone(), *row_id));
+                        column_data.push((col_value.clone(), row_id));
                     }
                 }
                 if !column_data.is_empty() {
@@ -3736,8 +3899,19 @@ impl MoteDB {
         // used to be skipped on this path, so bulk-inserted rows never reached
         // an existing vector index (the SQL layer worked around it by forcing
         // vector tables through the per-row insert, one WAL fsync per row).
+        // Same alignment fix: ids derived from the sorted rows' keys, not the
+        // pre-sort row_ids vector.
+        let sorted_ids: Vec<RowId> = store_rows.iter().map(|(k, _, _)| k & 0xFFFF_FFFF).collect();
         let row_refs: Vec<&Row> = store_rows.iter().map(|(_, _, r)| r).collect();
-        self.batch_update_secondary_indexes(table_name, schema, &row_ids, &row_refs);
+        self.batch_update_secondary_indexes(table_name, schema, &sorted_ids, &row_refs);
+
+        // 🔴 Global timestamp index: the bulk paths never indexed timestamps
+        // at all — a 5000-row `insert_rows` import left query_timestamp_range
+        // with ZERO entries (the advertised high-throughput load path produced
+        // an empty index; only row-by-row SQL inserts were indexed).
+        for (rid, row) in sorted_ids.iter().zip(row_refs.iter()) {
+            self.index_row_timestamp(row, *rid);
+        }
 
         // Update row count for COUNT(*) fast path.
         if let Some(counter) = self.table_row_count.get(table_name) {

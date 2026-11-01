@@ -336,10 +336,22 @@ impl RowCache {
     /// lock. Returns true if inserted.
     pub fn put_if_absent(&self, table_name: &str, row_id: RowId, row: Row) -> bool {
         let key = (table_hash(table_name), row_id);
+        {
+            let tombstones = self.tombstones.read();
+            if tombstones.contains(&key) {
+                return false;
+            }
+        }
+        let mut cache = self.cache[self.shard_index(&key)].write();
+        // 🔴 Re-check the tombstone INSIDE the shard-lock section. The early
+        // check above drops its lock before this one; a concurrent DELETE can
+        // complete its whole invalidate (tombstone insert + entry pop) in that
+        // gap, and inserting here would resurrect the deleted row as a cache
+        // ghost served by every later point read (invalidate splits the two
+        // steps across separate locks, so no lock spans check→put).
         if self.tombstones.read().contains(&key) {
             return false;
         }
-        let mut cache = self.cache[self.shard_index(&key)].write();
         if cache.peek(&key).is_some() {
             return false;
         }

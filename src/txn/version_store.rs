@@ -19,7 +19,10 @@ pub type Timestamp = u64;
 /// Version Store - manages all row versions
 pub struct VersionStore {
     /// Row ID -> Version Chain
-    pub(crate) versions: DashMap<RowId, VersionChain>,
+    // 🔴 Keyed (table_name, row_id): row_ids are per-table (Integer PK ==
+    // row_id), so a bare row_id collided across tables and two txns touching
+    // row 1 of DIFFERENT tables got spurious "Write-write conflict" errors.
+    pub(crate) versions: DashMap<(String, RowId), VersionChain>,
 
     /// Global timestamp generator
     timestamp_gen: Arc<AtomicU64>,
@@ -110,7 +113,7 @@ impl VersionStore {
     /// Insert a new version for a row (no conflict check — use during recovery/log replay).
     pub fn insert_version(
         &self,
-        row_id: RowId,
+        row_key: (String, RowId),
         data: Row,
         txn_id: TransactionId,
         timestamp: Timestamp,
@@ -128,7 +131,7 @@ impl VersionStore {
         // This eliminates the TOCTOU race between entry() and get() where
         // an eviction could remove the chain between the two calls.
         self.versions
-            .entry(row_id)
+            .entry(row_key)
             .or_insert_with(VersionChain::new)
             .prepend(new_version);
 
@@ -145,7 +148,7 @@ impl VersionStore {
     /// eliminating the TOCTOU gap present in separate validate+insert calls.
     pub fn insert_version_atomic(
         &self,
-        row_id: RowId,
+        row_key: (String, RowId),
         data: Row,
         txn_id: TransactionId,
         timestamp: Timestamp,
@@ -162,7 +165,7 @@ impl VersionStore {
 
         let chain_ref = self
             .versions
-            .entry(row_id)
+            .entry(row_key.clone())
             .or_insert_with(VersionChain::new);
         {
             let mut head = chain_ref.head.write();
@@ -174,8 +177,8 @@ impl VersionStore {
                     && version.txn_id != txn_id
                 {
                     return Err(StorageError::Transaction(format!(
-                        "Write-write conflict on row {} in txn {}",
-                        row_id, txn_id
+                        "Write-write conflict on row {} of '{}' in txn {}",
+                        row_key.1, row_key.0, txn_id
                     )));
                 }
             }
@@ -200,7 +203,7 @@ impl VersionStore {
     /// write lock, preventing lost-update races.
     pub fn update_version(
         &self,
-        row_id: RowId,
+        row_key: (String, RowId),
         new_data: Row,
         txn_id: TransactionId,
         timestamp: Timestamp,
@@ -218,7 +221,7 @@ impl VersionStore {
         // Ensure chain exists and operate on it directly (no eviction race)
         let chain_ref = self
             .versions
-            .entry(row_id)
+            .entry(row_key.clone())
             .or_insert_with(VersionChain::new);
         {
             let mut head = chain_ref.head.write();
@@ -232,8 +235,8 @@ impl VersionStore {
                         && version.txn_id != txn_id
                     {
                         return Err(StorageError::Transaction(format!(
-                            "Write-write conflict on row {} in txn {}",
-                            row_id, txn_id
+                            "Write-write conflict on row {} of '{}' in txn {}",
+                            row_key.1, row_key.0, txn_id
                         )));
                     }
                 }
@@ -263,15 +266,15 @@ impl VersionStore {
     /// under the same write lock, preventing lost-update races.
     pub fn delete_version(
         &self,
-        row_id: RowId,
+        row_key: (String, RowId),
         txn_id: TransactionId,
         timestamp: Timestamp,
         snapshot: Option<&Snapshot>,
     ) -> Result<()> {
         let chain = self
             .versions
-            .get(&row_id)
-            .ok_or_else(|| StorageError::InvalidData(format!("Row {} not found", row_id)))?;
+            .get(&row_key)
+            .ok_or_else(|| StorageError::InvalidData(format!("Row {} not found", row_key.1)))?;
 
         let mut tombstone = Box::new(RowVersion {
             data: vec![],
@@ -294,8 +297,8 @@ impl VersionStore {
                         && version.txn_id != txn_id
                     {
                         return Err(StorageError::Transaction(format!(
-                            "Write-write conflict on row {} in txn {}",
-                            row_id, txn_id
+                            "Write-write conflict on row {} of '{}' in txn {}",
+                            row_key.1, row_key.0, txn_id
                         )));
                     }
                 }
@@ -387,10 +390,10 @@ impl VersionStore {
                 // If end_ts is 0, the row is still the current live version but
                 // old enough to evict. If end_ts != 0, it has been superseded.
                 // Both are safe to evict since data is in LSM.
-                candidates.push(*entry.key());
+                candidates.push(entry.key().clone());
             } else {
                 // Empty chain — safe to remove
-                candidates.push(*entry.key());
+                candidates.push(entry.key().clone());
             }
         }
 
@@ -416,11 +419,11 @@ impl VersionStore {
     /// Get the visible version for a snapshot
     pub fn get_visible_version(
         &self,
-        row_id: RowId,
+        row_key: (String, RowId),
         snapshot: &Snapshot,
         isolation: crate::txn::IsolationLevel,
     ) -> Result<Option<Row>> {
-        let chain = match self.versions.get(&row_id) {
+        let chain = match self.versions.get(&row_key) {
             Some(c) => c,
             None => return Ok(None), // Row doesn't exist yet
         };
@@ -528,7 +531,7 @@ impl VersionStore {
             };
 
             if should_remove {
-                rows_to_remove.push(*entry.key());
+                rows_to_remove.push(entry.key().clone());
             }
         }
 
@@ -651,7 +654,9 @@ mod tests {
         let row_id = 1;
         let data = vec![Value::Timestamp(Timestamp::from_micros(100))];
 
-        store.insert_version(row_id, data.clone(), 1, 10).unwrap();
+        store
+            .insert_version(("t".into(), row_id), data.clone(), 1, 10)
+            .unwrap();
 
         let snapshot = Snapshot {
             timestamp: 15,
@@ -659,7 +664,11 @@ mod tests {
         };
 
         let result = store
-            .get_visible_version(row_id, &snapshot, crate::txn::IsolationLevel::ReadCommitted)
+            .get_visible_version(
+                ("t".into(), row_id),
+                &snapshot,
+                crate::txn::IsolationLevel::ReadCommitted,
+            )
             .unwrap();
         assert_eq!(result, Some(data));
     }
@@ -672,7 +681,7 @@ mod tests {
         // T1: Insert initial value at ts=10
         store
             .insert_version(
-                row_id,
+                ("t".into(), row_id),
                 vec![Value::Timestamp(Timestamp::from_micros(100))],
                 1,
                 10,
@@ -682,7 +691,7 @@ mod tests {
         // T2: Update at ts=20
         store
             .update_version(
-                row_id,
+                ("t".into(), row_id),
                 vec![Value::Timestamp(Timestamp::from_micros(200))],
                 2,
                 20,
@@ -697,7 +706,7 @@ mod tests {
         };
         let result = store
             .get_visible_version(
-                row_id,
+                ("t".into(), row_id),
                 &snapshot_old,
                 crate::txn::IsolationLevel::ReadCommitted,
             )
@@ -714,7 +723,7 @@ mod tests {
         };
         let result = store
             .get_visible_version(
-                row_id,
+                ("t".into(), row_id),
                 &snapshot_new,
                 crate::txn::IsolationLevel::ReadCommitted,
             )
@@ -733,7 +742,7 @@ mod tests {
         // T1: Insert at ts=10
         store
             .insert_version(
-                row_id,
+                ("t".into(), row_id),
                 vec![Value::Timestamp(Timestamp::from_micros(100))],
                 1,
                 10,
@@ -751,7 +760,11 @@ mod tests {
 
         // Should not see uncommitted data
         let result = store
-            .get_visible_version(row_id, &snapshot, crate::txn::IsolationLevel::ReadCommitted)
+            .get_visible_version(
+                ("t".into(), row_id),
+                &snapshot,
+                crate::txn::IsolationLevel::ReadCommitted,
+            )
             .unwrap();
         assert_eq!(result, None);
     }
@@ -764,7 +777,7 @@ mod tests {
         // Insert
         store
             .insert_version(
-                row_id,
+                ("t".into(), row_id),
                 vec![Value::Timestamp(Timestamp::from_micros(100))],
                 1,
                 10,
@@ -772,7 +785,9 @@ mod tests {
             .unwrap();
 
         // Delete
-        store.delete_version(row_id, 2, 20, None).unwrap();
+        store
+            .delete_version(("t".into(), row_id), 2, 20, None)
+            .unwrap();
 
         // Snapshot before delete should see data
         let snapshot_before = Snapshot {
@@ -781,7 +796,7 @@ mod tests {
         };
         let result = store
             .get_visible_version(
-                row_id,
+                ("t".into(), row_id),
                 &snapshot_before,
                 crate::txn::IsolationLevel::ReadCommitted,
             )
@@ -798,7 +813,7 @@ mod tests {
         };
         let result = store
             .get_visible_version(
-                row_id,
+                ("t".into(), row_id),
                 &snapshot_after,
                 crate::txn::IsolationLevel::ReadCommitted,
             )
@@ -814,7 +829,7 @@ mod tests {
         for i in 0..10 {
             store
                 .insert_version(
-                    i,
+                    ("t".into(), i),
                     vec![Value::Timestamp(Timestamp::from_micros(i as i64))],
                     1,
                     10,
@@ -836,7 +851,7 @@ mod tests {
         // Create multiple versions
         store
             .insert_version(
-                row_id,
+                ("t".into(), row_id),
                 vec![Value::Timestamp(Timestamp::from_micros(100))],
                 1,
                 10,
@@ -844,7 +859,7 @@ mod tests {
             .unwrap();
         store
             .update_version(
-                row_id,
+                ("t".into(), row_id),
                 vec![Value::Timestamp(Timestamp::from_micros(200))],
                 2,
                 20,
@@ -853,7 +868,7 @@ mod tests {
             .unwrap();
         store
             .update_version(
-                row_id,
+                ("t".into(), row_id),
                 vec![Value::Timestamp(Timestamp::from_micros(300))],
                 3,
                 30,
@@ -888,20 +903,24 @@ mod tests {
 
         // Insert initial version
         store
-            .insert_version(row_id, vec![Value::Integer(0)], 1, 10)
+            .insert_version(("t".into(), row_id), vec![Value::Integer(0)], 1, 10)
             .unwrap();
 
         // Simulate two concurrent updates (sequential but testing the atomic prepend)
         store
-            .update_version(row_id, vec![Value::Integer(1)], 2, 20, None)
+            .update_version(("t".into(), row_id), vec![Value::Integer(1)], 2, 20, None)
             .unwrap();
         store
-            .update_version(row_id, vec![Value::Integer(2)], 3, 30, None)
+            .update_version(("t".into(), row_id), vec![Value::Integer(2)], 3, 30, None)
             .unwrap();
 
         // The latest snapshot should see the most recent version
         let result = store
-            .get_visible_version(row_id, &snapshot, crate::txn::IsolationLevel::ReadCommitted)
+            .get_visible_version(
+                ("t".into(), row_id),
+                &snapshot,
+                crate::txn::IsolationLevel::ReadCommitted,
+            )
             .unwrap();
         assert_eq!(result, Some(vec![Value::Integer(2)]));
 
@@ -912,7 +931,7 @@ mod tests {
         };
         let result_25 = store
             .get_visible_version(
-                row_id,
+                ("t".into(), row_id),
                 &snapshot_25,
                 crate::txn::IsolationLevel::ReadCommitted,
             )
@@ -931,11 +950,13 @@ mod tests {
         let row_id = 1;
 
         store
-            .insert_version(row_id, vec![Value::Integer(42)], 1, 10)
+            .insert_version(("t".into(), row_id), vec![Value::Integer(42)], 1, 10)
             .unwrap();
 
         // Delete should succeed and create a tombstone
-        store.delete_version(row_id, 2, 20, None).unwrap();
+        store
+            .delete_version(("t".into(), row_id), 2, 20, None)
+            .unwrap();
 
         // Snapshot before delete sees the data
         let before = Snapshot {
@@ -944,7 +965,11 @@ mod tests {
         };
         assert_eq!(
             store
-                .get_visible_version(row_id, &before, crate::txn::IsolationLevel::ReadCommitted)
+                .get_visible_version(
+                    ("t".into(), row_id),
+                    &before,
+                    crate::txn::IsolationLevel::ReadCommitted
+                )
                 .unwrap(),
             Some(vec![Value::Integer(42)])
         );
@@ -956,7 +981,11 @@ mod tests {
         };
         assert_eq!(
             store
-                .get_visible_version(row_id, &after, crate::txn::IsolationLevel::ReadCommitted)
+                .get_visible_version(
+                    ("t".into(), row_id),
+                    &after,
+                    crate::txn::IsolationLevel::ReadCommitted
+                )
                 .unwrap(),
             None
         );
@@ -970,7 +999,7 @@ mod tests {
 
         // Insert initial version at ts=10 by txn 1
         store
-            .insert_version(row_id, vec![Value::Integer(0)], 1, 10)
+            .insert_version(("t".into(), row_id), vec![Value::Integer(0)], 1, 10)
             .unwrap();
 
         // Snapshot taken at ts=15 (before any concurrent update)
@@ -981,15 +1010,22 @@ mod tests {
 
         // Concurrent update by txn 2 at ts=20 (after our snapshot)
         store
-            .update_version(row_id, vec![Value::Integer(1)], 2, 20, None)
+            .update_version(("t".into(), row_id), vec![Value::Integer(1)], 2, 20, None)
             .unwrap();
 
         // Now txn 3 tries to update with the old snapshot — should detect conflict
-        let result = store.update_version(row_id, vec![Value::Integer(2)], 3, 30, Some(&snapshot));
+        let result = store.update_version(
+            ("t".into(), row_id),
+            vec![Value::Integer(2)],
+            3,
+            30,
+            Some(&snapshot),
+        );
         assert!(result.is_err(), "Should detect write-write conflict");
 
         // Without snapshot, the update should succeed (no conflict check)
-        let result = store.update_version(row_id, vec![Value::Integer(3)], 4, 40, None);
+        let result =
+            store.update_version(("t".into(), row_id), vec![Value::Integer(3)], 4, 40, None);
         assert!(result.is_ok(), "Update without snapshot should succeed");
     }
 
@@ -1000,7 +1036,7 @@ mod tests {
         let row_id = 1;
 
         store
-            .insert_version(row_id, vec![Value::Integer(0)], 1, 10)
+            .insert_version(("t".into(), row_id), vec![Value::Integer(0)], 1, 10)
             .unwrap();
 
         let snapshot = Snapshot {
@@ -1010,15 +1046,15 @@ mod tests {
 
         // Concurrent update after snapshot
         store
-            .update_version(row_id, vec![Value::Integer(1)], 2, 20, None)
+            .update_version(("t".into(), row_id), vec![Value::Integer(1)], 2, 20, None)
             .unwrap();
 
         // Delete with old snapshot should detect conflict
-        let result = store.delete_version(row_id, 3, 30, Some(&snapshot));
+        let result = store.delete_version(("t".into(), row_id), 3, 30, Some(&snapshot));
         assert!(result.is_err(), "Should detect write-write conflict");
 
         // Delete without snapshot should succeed
-        let result = store.delete_version(row_id, 3, 30, None);
+        let result = store.delete_version(("t".into(), row_id), 3, 30, None);
         assert!(result.is_ok(), "Delete without snapshot should succeed");
     }
 }

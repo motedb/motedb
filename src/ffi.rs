@@ -19,6 +19,10 @@ pub struct MoteDBHandle {
 /// - path 必须是有效的 C 字符串
 #[no_mangle]
 pub unsafe extern "C" fn motedb_open(path: *const c_char) -> *mut MoteDBHandle {
+    guarded(ptr::null_mut(), || unsafe { motedb_open_impl(path) })
+}
+
+unsafe fn motedb_open_impl(path: *const c_char) -> *mut MoteDBHandle {
     if path.is_null() {
         return ptr::null_mut();
     }
@@ -41,6 +45,10 @@ pub unsafe extern "C" fn motedb_open(path: *const c_char) -> *mut MoteDBHandle {
 /// - handle 必须是有效的 MoteDBHandle 指针
 #[no_mangle]
 pub unsafe extern "C" fn motedb_close(handle: *mut MoteDBHandle) {
+    guarded((), || unsafe { motedb_close_impl(handle) })
+}
+
+unsafe fn motedb_close_impl(handle: *mut MoteDBHandle) {
     if !handle.is_null() {
         let _ = unsafe { Box::from_raw(handle) };
     }
@@ -56,6 +64,12 @@ pub unsafe extern "C" fn motedb_execute(
     handle: *mut MoteDBHandle,
     sql: *const c_char,
 ) -> *mut c_char {
+    guarded(ptr::null_mut(), || unsafe {
+        motedb_execute_impl(handle, sql)
+    })
+}
+
+unsafe fn motedb_execute_impl(handle: *mut MoteDBHandle, sql: *const c_char) -> *mut c_char {
     if handle.is_null() || sql.is_null() {
         return ptr::null_mut();
     }
@@ -104,6 +118,10 @@ pub unsafe extern "C" fn motedb_execute(
 /// - s 必须是由 motedb_execute 返回的指针
 #[no_mangle]
 pub unsafe extern "C" fn motedb_free_string(s: *mut c_char) {
+    guarded((), || unsafe { motedb_free_string_impl(s) })
+}
+
+unsafe fn motedb_free_string_impl(s: *mut c_char) {
     if !s.is_null() {
         let _ = unsafe { CString::from_raw(s) };
     }
@@ -142,6 +160,27 @@ fn take_err() -> String {
         .unwrap_or_else(|| "unknown error".to_string())
 }
 
+/// Run an FFI entry point with panics caught. A Rust panic unwinding out of
+/// an `extern "C"` function is a guaranteed process abort (Rust ≥ 1.71), so
+/// any engine bug reached through the C ABI used to kill the Go/C host
+/// outright, taking every goroutine with it and leaving no error behind.
+/// The panic becomes `motedb_last_error` text and the call returns
+/// `on_panic` (NULL / -1 / unit, per the entry point's error convention).
+fn guarded<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(v) => v,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            set_err(format!("internal error (panic): {msg}"));
+            on_panic
+        }
+    }
+}
+
 /// Handle type for the v0.15 ABI (high-level Database wrapper).
 pub struct DbHandle {
     db: crate::api::Database,
@@ -155,6 +194,10 @@ pub struct DbHandle {
 ///   (or ignored); it must not outlive the next fallible FFI call.
 #[no_mangle]
 pub unsafe extern "C" fn motedb_last_error() -> *const c_char {
+    guarded(ptr::null(), || unsafe { motedb_last_error_impl() })
+}
+
+unsafe fn motedb_last_error_impl() -> *const c_char {
     let msg = take_err();
     match CString::new(msg) {
         Ok(c) => c.into_raw(),
@@ -168,6 +211,10 @@ pub unsafe extern "C" fn motedb_last_error() -> *const c_char {
 /// - `path` must be a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn motedb_db_open(path: *const c_char) -> *mut DbHandle {
+    guarded(ptr::null_mut(), || unsafe { motedb_db_open_impl(path) })
+}
+
+unsafe fn motedb_db_open_impl(path: *const c_char) -> *mut DbHandle {
     if path.is_null() {
         set_err("path is NULL".into());
         return ptr::null_mut();
@@ -197,6 +244,10 @@ pub unsafe extern "C" fn motedb_db_open(path: *const c_char) -> *mut DbHandle {
 /// - `handle` must come from `motedb_db_open` and not be used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn motedb_db_close(handle: *mut DbHandle) {
+    guarded((), || unsafe { motedb_db_close_impl(handle) })
+}
+
+unsafe fn motedb_db_close_impl(handle: *mut DbHandle) {
     if !handle.is_null() {
         let h = unsafe { Box::from_raw(handle) };
         let _ = h.db.close();
@@ -209,6 +260,10 @@ pub unsafe extern "C" fn motedb_db_close(handle: *mut DbHandle) {
 /// - `handle` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn motedb_db_checkpoint(handle: *mut DbHandle) -> i32 {
+    guarded(-1, || unsafe { motedb_db_checkpoint_impl(handle) })
+}
+
+unsafe fn motedb_db_checkpoint_impl(handle: *mut DbHandle) -> i32 {
     if handle.is_null() {
         set_err("handle is NULL".into());
         return -1;
@@ -229,6 +284,10 @@ pub unsafe extern "C" fn motedb_db_checkpoint(handle: *mut DbHandle) -> i32 {
 /// - both pointers must be valid C strings / handle.
 #[no_mangle]
 pub unsafe extern "C" fn motedb_db_backup(handle: *mut DbHandle, dest: *const c_char) -> i32 {
+    guarded(-1, || unsafe { motedb_db_backup_impl(handle, dest) })
+}
+
+unsafe fn motedb_db_backup_impl(handle: *mut DbHandle, dest: *const c_char) -> i32 {
     if handle.is_null() || dest.is_null() {
         set_err("handle or dest is NULL".into());
         return -1;
@@ -371,6 +430,16 @@ pub unsafe extern "C" fn motedb_db_exec(
     sql: *const c_char,
     params_json: *const c_char,
 ) -> *mut c_char {
+    guarded(ptr::null_mut(), || unsafe {
+        motedb_db_exec_impl(handle, sql, params_json)
+    })
+}
+
+unsafe fn motedb_db_exec_impl(
+    handle: *mut DbHandle,
+    sql: *const c_char,
+    params_json: *const c_char,
+) -> *mut c_char {
     if handle.is_null() || sql.is_null() {
         set_err("handle or sql is NULL".into());
         return ptr::null_mut();
@@ -462,6 +531,10 @@ pub unsafe extern "C" fn motedb_db_exec(
 /// - `s` must be a pointer from those functions (or NULL).
 #[no_mangle]
 pub unsafe extern "C" fn motedb_db_free_string(s: *mut c_char) {
+    guarded((), || unsafe { motedb_db_free_string_impl(s) })
+}
+
+unsafe fn motedb_db_free_string_impl(s: *mut c_char) {
     if !s.is_null() {
         drop(unsafe { CString::from_raw(s) });
     }
@@ -476,6 +549,16 @@ pub unsafe extern "C" fn motedb_db_free_string(s: *mut c_char) {
 /// `dest` must be a valid NUL-terminated UTF-8 C string.
 #[no_mangle]
 pub unsafe extern "C" fn motedb_db_export(
+    handle: *mut DbHandle,
+    dest: *const c_char,
+    compressed: i32,
+) -> i32 {
+    guarded(-1, || unsafe {
+        motedb_db_export_impl(handle, dest, compressed)
+    })
+}
+
+unsafe fn motedb_db_export_impl(
     handle: *mut DbHandle,
     dest: *const c_char,
     compressed: i32,
@@ -510,6 +593,10 @@ pub unsafe extern "C" fn motedb_db_export(
 /// `src` and `dest` must be valid NUL-terminated UTF-8 C strings.
 #[no_mangle]
 pub unsafe extern "C" fn motedb_db_import(src: *const c_char, dest: *const c_char) -> i32 {
+    guarded(-1, || unsafe { motedb_db_import_impl(src, dest) })
+}
+
+unsafe fn motedb_db_import_impl(src: *const c_char, dest: *const c_char) -> i32 {
     if src.is_null() || dest.is_null() {
         set_err("src or dest is NULL".into());
         return -1;

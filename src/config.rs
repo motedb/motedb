@@ -715,6 +715,18 @@ impl DBConfig {
                 "num_partitions must be >= 1".into(),
             ));
         }
+        // 🔴 Must be a power of two: autocommit writes partition by
+        // composite_key (table_id << 32 | row_id) while txn commits
+        // partition by row_id — the two agree only when 2^32 % np == 0.
+        // For np=3 the same row's INSERT and DELETE can land in different
+        // partition files and replay order (a HashMap iteration) decides
+        // which wins — nondeterministic recovery.
+        if !self.num_partitions.is_power_of_two() {
+            return Err(crate::StorageError::InvalidData(
+                "num_partitions must be a power of two (autocommit and                  transaction writes partition by different key forms that                  only coincide for powers of two)"
+                    .into(),
+            ));
+        }
         if self.lsm_config.memtable_size_limit == 0 {
             return Err(crate::StorageError::InvalidData(
                 "lsm.memtable_size_limit must be > 0".into(),

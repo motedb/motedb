@@ -328,16 +328,38 @@ impl MoteDB {
             // row (fallback: BEGIN snapshot) — closes the between-read-and-
             // commit window the BEGIN-only check missed.
             let stamp = self.txn_coordinator.allocate_stamp();
+            // Stamps written by THIS attempt (for revert on conflict — a
+            // leftover stamp made the suggested "retry" deterministically
+            // fail again, and the retry silently committed an EMPTY
+            // transaction because the pending maps were drained above).
+            let mut stamped: Vec<((String, RowId), u64)> = Vec::new();
             for key in rows {
                 let base = read_stamps.get(&key).copied().unwrap_or(snapshot_ts);
-                let mut e = self.row_commit_ts.entry(key.clone()).or_insert(0);
-                if *e > base {
+                let mut conflict = false;
+                {
+                    // 🔴 The entry guard MUST be scoped: reverting the stamps
+                    // below does a nested get_mut on the same DashMap — doing
+                    // it while this shard's guard is held self-deadlocks the
+                    // commit path.
+                    let mut e = self.row_commit_ts.entry(key.clone()).or_insert(0);
+                    if *e > base {
+                        conflict = true;
+                    } else {
+                        stamped.push((key.clone(), *e));
+                        *e = stamp;
+                    }
+                }
+                if conflict {
+                    for (k, prev) in stamped.drain(..) {
+                        if let Some(mut entry) = self.row_commit_ts.get_mut(&k) {
+                            *entry = prev;
+                        }
+                    }
                     return Err(StorageError::Transaction(format!(
-                        "Write-write conflict on {}.{} (txn {}): row committed by a concurrent transaction since it was read — retry",
+                        "Write-write conflict on {}.{} (txn {}): row committed by a concurrent transaction since it was read — ROLLBACK and replay the transaction (COMMIT already consumed its buffered writes, a retry would commit nothing)",
                         key.0, key.1, txn_id
                     )));
                 }
-                *e = stamp;
             }
         }
 
@@ -491,18 +513,21 @@ impl MoteDB {
                 if ops.is_empty() {
                     continue;
                 }
-                let Ok(schema) = self.table_registry.get_table(table_name) else {
-                    continue;
-                };
-                let Ok(store) =
-                    self.get_or_create_col_segment_store(table_name, schema.col_types())
-                else {
-                    continue;
-                };
+                let schema = self.table_registry.get_table(table_name)?;
+                let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
                 let mark = *overlap_tables.get(table_name).unwrap_or(&false);
-                if let Err(e) = store.append_txn_ops(&ops, mark) {
-                    eprintln!("@@APPEND-FAIL table={table_name} n_ops={}: {e}", ops.len());
-                }
+                // The WAL commit marker is already durable at this point, so a
+                // failure here must surface: a swallowed error returned Ok with
+                // the rows invisible to every segment-store reader until the
+                // next WAL replay — and gone for good once a checkpoint
+                // truncated the WAL.
+                store.append_txn_ops(&ops, mark).map_err(|e| {
+                    StorageError::Transaction(format!(
+                        "commit of txn {txn_id} is durable in the WAL but applying {} op(s) to \
+                         table '{table_name}' failed: {e}; reopen the database to replay it",
+                        ops.len()
+                    ))
+                })?;
             }
         }
 

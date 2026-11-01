@@ -1091,62 +1091,131 @@ impl MoteDB {
             }
         }
 
-        // Update timestamp index — only for committed/auto-commit records
-        for records in recovered_records.values() {
-            for record in records {
-                match record {
-                    WALRecord::Insert {
-                        row_id,
-                        data,
-                        txn_id,
-                        ..
-                    } => {
-                        max_row_id = max_row_id.max(*row_id);
-                        if *txn_id == 0 || committed_txns.contains(txn_id) {
-                            if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
-                                let ts_idx = timestamp_index.ensure()?;
-                                let mut guard = ts_idx.write();
-                                if let Err(e) = guard.insert(ts.as_micros_u64(), *row_id) {
-                                    warn_log!(
-                                        "[Recovery] Timestamp index insert failed for row {}: {}",
-                                        row_id,
-                                        e
-                                    );
-                                }
+        // Update timestamp index — only for committed/auto-commit records.
+        // Mirrors the live write path (crud.rs index_row_timestamp /
+        // unindex_row_timestamp): the FIRST Timestamp value anywhere in the
+        // row, not just column 0, and deletes/updates retract the old entry
+        // so a replayed tail cannot resurrect ghost row ids.
+        {
+            let ts_of = |row: &crate::types::Row| -> Option<u64> {
+                row.iter().find_map(|v| match v {
+                    crate::types::Value::Timestamp(ts) => Some(ts.as_micros_u64()),
+                    _ => None,
+                })
+            };
+            // 🔑 Schema-aware decode: decode_any is width-fixed but types
+            // are guessed (Timestamp reads as Integer), which silently
+            // skipped this index.
+            let decode_raw = |table_name: &str, raw: &[u8]| -> Option<crate::types::Row> {
+                let col_types = table_registry
+                    .get_table(table_name)
+                    .map(|s| s.col_types().to_vec())
+                    .unwrap_or_default();
+                crate::storage::row_format::decode(raw, &col_types).ok()
+            };
+            let apply = |row_id: RowId, old_ts: Option<u64>, new_ts: Option<u64>| -> Result<()> {
+                if old_ts.is_none() && new_ts.is_none() {
+                    return Ok(());
+                }
+                let ts_idx = timestamp_index.ensure()?;
+                let mut guard = ts_idx.write();
+                if let Some(ts) = old_ts {
+                    let _ = guard.remove_entry(ts, row_id);
+                }
+                if let Some(ts) = new_ts {
+                    if let Err(e) = guard.insert(ts, row_id) {
+                        warn_log!(
+                            "[Recovery] Timestamp index insert failed for row {}: {}",
+                            row_id,
+                            e
+                        );
+                    }
+                }
+                Ok(())
+            };
+            for records in recovered_records.values() {
+                for record in records {
+                    let committed = |txn_id: &crate::txn::version_store::TransactionId| {
+                        *txn_id == 0 || committed_txns.contains(txn_id)
+                    };
+                    match record {
+                        WALRecord::Insert {
+                            row_id,
+                            data,
+                            txn_id,
+                            ..
+                        } => {
+                            max_row_id = max_row_id.max(*row_id);
+                            if committed(txn_id) {
+                                apply(*row_id, None, ts_of(data))?;
                             }
                         }
-                    }
-                    WALRecord::InsertRaw {
-                        table_name,
-                        row_id,
-                        raw_data,
-                        txn_id,
-                        ..
-                    } => {
-                        max_row_id = max_row_id.max(*row_id);
-                        if *txn_id == 0 || committed_txns.contains(txn_id) {
-                            // Extract timestamp from raw data for index.
-                            // 🔑 Schema-aware decode: decode_any is width-fixed
-                            // but types are guessed (Timestamp reads as
-                            // Integer), which silently skipped this index.
-                            let col_types = table_registry
-                                .get_table(table_name)
-                                .map(|s| s.col_types().to_vec())
-                                .unwrap_or_default();
-                            if let Ok(row) =
-                                crate::storage::row_format::decode(raw_data, &col_types)
-                            {
-                                if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
-                                    let ts_idx = timestamp_index.ensure()?;
-                                    let mut guard = ts_idx.write();
-                                    if let Err(e) = guard.insert(ts.as_micros_u64(), *row_id) {
-                                        warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
-                                    }
-                                }
+                        WALRecord::InsertRaw {
+                            table_name,
+                            row_id,
+                            raw_data,
+                            txn_id,
+                            ..
+                        } => {
+                            max_row_id = max_row_id.max(*row_id);
+                            if committed(txn_id) {
+                                let new_ts =
+                                    decode_raw(table_name, raw_data).and_then(|r| ts_of(&r));
+                                apply(*row_id, None, new_ts)?;
                             }
                         }
+                        WALRecord::Update {
+                            row_id,
+                            old_data,
+                            new_data,
+                            txn_id,
+                            ..
+                        } => {
+                            if committed(txn_id) {
+                                apply(*row_id, ts_of(old_data), ts_of(new_data))?;
+                            }
+                        }
+                        WALRecord::UpdateRaw {
+                            table_name,
+                            row_id,
+                            raw_old,
+                            raw_new,
+                            txn_id,
+                            ..
+                        } => {
+                            if committed(txn_id) {
+                                let old_ts =
+                                    decode_raw(table_name, raw_old).and_then(|r| ts_of(&r));
+                                let new_ts =
+                                    decode_raw(table_name, raw_new).and_then(|r| ts_of(&r));
+                                apply(*row_id, old_ts, new_ts)?;
+                            }
+                        }
+                        WALRecord::Delete {
+                            row_id,
+                            old_data,
+                            txn_id,
+                            ..
+                        } => {
+                            if committed(txn_id) {
+                                apply(*row_id, ts_of(old_data), None)?;
+                            }
+                        }
+                        WALRecord::DeleteRaw {
+                            table_name,
+                            row_id,
+                            raw_old,
+                            txn_id,
+                            ..
+                        } => {
+                            if committed(txn_id) {
+                                let old_ts =
+                                    decode_raw(table_name, raw_old).and_then(|r| ts_of(&r));
+                                apply(*row_id, old_ts, None)?;
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -2083,7 +2152,22 @@ impl MoteDB {
                             .unwrap_or(0);
                         indexed != table_rows
                     };
-                    if !replayed_tables.contains(&table) && !corrupt && !stale {
+                    // 🔴 Tokenizer drift: a pre-0.16 index (whitespace
+                    // tokenizer, whole CJK sentences as one token) reloads
+                    // cleanly and passes the count check — queries then
+                    // tokenize with AutoTokenizer and miss EVERY pre-upgrade
+                    // doc. A stored stamp differing from this build's means
+                    // the postings were tokenized differently: rebuild
+                    // regardless of the clean-close marker.
+                    let tokenizer_drift = db
+                        .text_indexes
+                        .get(&name)
+                        .map(|i| {
+                            i.read().stored_tokenizer_stamp()
+                                != crate::index::text_fts::TextFTSIndex::TOKENIZER_STAMP
+                        })
+                        .unwrap_or(false);
+                    if !replayed_tables.contains(&table) && !corrupt && !stale && !tokenizer_drift {
                         continue;
                     }
                     // 🔒 v0.12.9: HARD RESET before rebuilding. The rebuild

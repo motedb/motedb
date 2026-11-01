@@ -1397,6 +1397,12 @@ fn flush_partition_groups(
 struct GroupCommitState {
     /// Queue of pending records
     queue: PlMutex<Vec<GroupCommitEntry>>,
+    /// 🔴 Batches the gc thread has DRAINED but not yet flushed+signaled.
+    /// Incremented while the queue lock is held during the drain, decremented
+    /// after the done signals — so "queue empty" alone never means durable
+    /// (the old wal_group_barrier trusted exactly that and returned while the
+    /// batch was still in the gc thread's local vec, pre-fsync).
+    in_flight: std::sync::atomic::AtomicUsize,
     /// Signal the flush thread to wake up
     wakeup: PlCondvar,
     /// Maximum records per batch
@@ -1577,6 +1583,7 @@ impl WALManager {
             let should_stop = Arc::new(AtomicBool::new(false));
             let state = Arc::new(GroupCommitState {
                 queue: PlMutex::new(Vec::new()),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
                 wakeup: PlCondvar::new(),
                 max_batch_size,
                 max_wait_us,
@@ -1627,11 +1634,21 @@ impl WALManager {
                             }
                         }
 
-                        // Drain queue (up to max_batch_size)
+                        // Drain queue (up to max_batch_size). in_flight is
+                        // raised INSIDE the queue critical section so the
+                        // barrier can never observe empty-queue-and-no-in-
+                        // flight while a batch is mid-flight.
                         let entries: Vec<GroupCommitEntry> = {
                             let mut queue = state_clone.queue.lock();
                             let drain_count = queue.len().min(state_clone.max_batch_size);
-                            queue.drain(..drain_count).collect()
+                            if drain_count == 0 {
+                                Vec::new()
+                            } else {
+                                state_clone
+                                    .in_flight
+                                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                queue.drain(..drain_count).collect()
+                            }
                         };
 
                         if entries.is_empty() {
@@ -1673,6 +1690,19 @@ impl WALManager {
                             done.1.notify_all();
                         }
 
+                        // Batch durable (or failed): release the in-flight
+                        // marker and wake any barrier waiting on it.
+                        if state_clone
+                            .in_flight
+                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                            == 1
+                        {
+                            {
+                                let _q = state_clone.queue.lock();
+                            }
+                            state_clone.wakeup.notify_all();
+                        }
+
                         if let Err(ref msg) = flush_ok {
                             warn_log!("[GroupCommit] Flush error: {}", msg);
                             *state_clone.last_error.lock() =
@@ -1683,7 +1713,14 @@ impl WALManager {
                     // Final drain on shutdown
                     let entries: Vec<GroupCommitEntry> = {
                         let mut queue = state_clone.queue.lock();
-                        std::mem::take(&mut *queue)
+                        if queue.is_empty() {
+                            Vec::new()
+                        } else {
+                            state_clone
+                                .in_flight
+                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            std::mem::take(&mut *queue)
+                        }
                     };
 
                     if !entries.is_empty() {
@@ -1708,6 +1745,19 @@ impl WALManager {
                                 *flag = Some(drain_ok.clone());
                             }
                             done.1.notify_all();
+                        }
+
+                        // Release the shutdown batch's in-flight marker (see
+                        // the main loop).
+                        if state_clone
+                            .in_flight
+                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                            == 1
+                        {
+                            {
+                                let _q = state_clone.queue.lock();
+                            }
+                            state_clone.wakeup.notify_all();
                         }
 
                         if let Err(ref msg) = drain_ok {
@@ -2072,7 +2122,20 @@ impl WALManager {
             .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
-        wal.append(record)
+        let lsn = wal.append(record)?;
+        // 🔴 The marker is written directly — never through the group-commit
+        // queue — so in GroupCommit mode `append` only reached the OS page
+        // cache and no later batch is guaranteed to fsync this partition.
+        // The data records went through batch_append (fsynced); losing just
+        // the marker on power loss makes recovery roll back an acknowledged
+        // COMMIT. Fsync it before reporting success.
+        if matches!(
+            wal.config.durability_level,
+            DurabilityLevel::GroupCommit { .. }
+        ) {
+            wal.sync_flush()?;
+        }
+        Ok(lsn)
     }
 
     /// Log transaction rollback
@@ -2204,19 +2267,40 @@ impl WALManager {
         }
     }
 
-    /// 🔑 组提交栅栏: 等队列排空 — gc 线程取走的批次已 fsync 后才清空
-    /// 队列语义 (batch→flush_partition_groups→signal dones), 队列空即
-    /// 本批已持久化。给 in-flight 批次留 2ms 窗口。
+    /// 🔑 组提交栅栏: 等到 [队列空 且 in_flight==0] 才返回 — gc 线程在
+    /// 持队列锁 drain 时给 in_flight +1, 完成全部 done 信号后 -1 并唤醒。
+    /// 旧实现只看"队列空 + 2ms sleep": 被取走但尚未 fsync 的批次既不在
+    /// 队列也无人等待, 批量 UPDATE/DELETE 在持久化前就返回成功。
     pub fn wal_group_barrier(&self) {
         if let Some(ref gc) = self.group_commit {
-            let deadline = std::time::Instant::now() + Duration::from_millis(2000);
-            while std::time::Instant::now() < deadline {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
                 gc.state.wakeup.notify_all();
-                if gc.state.queue.lock().is_empty() {
-                    std::thread::sleep(Duration::from_millis(2));
+                let mut queue = gc.state.queue.lock();
+                if queue.is_empty()
+                    && gc
+                        .state
+                        .in_flight
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 0
+                {
                     return;
                 }
-                std::thread::sleep(Duration::from_micros(200));
+                if std::time::Instant::now() >= deadline {
+                    drop(queue);
+                    eprintln!(
+                        "[WAL] group-commit barrier timed out after 10s (queue={}, in_flight={})",
+                        gc.state.queue.lock().len(),
+                        gc.state
+                            .in_flight
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    );
+                    return;
+                }
+                let _ = gc
+                    .state
+                    .wakeup
+                    .wait_for(&mut queue, Duration::from_millis(50));
             }
         }
     }

@@ -232,9 +232,9 @@ impl TransactionCoordinator {
 
         // Insert each row version with atomic validation (validation + insertion
         // happen under a single write lock, eliminating the TOCTOU window).
-        for ((_, row_id), data) in &sorted_rows {
+        for ((table_name, row_id), data) in &sorted_rows {
             self.version_store.insert_version_atomic(
-                *row_id,
+                (table_name.clone(), *row_id),
                 data.clone(),
                 txn_id,
                 commit_ts,
@@ -902,20 +902,12 @@ impl TransactionCoordinator {
     /// Validate read-set for Serializable isolation (read-write conflict detection).
     /// Write-write conflict detection is handled atomically by insert_version_atomic.
     fn validate_read_set(&self, ctx: &TransactionContext) -> Result<()> {
-        let read_set = ctx.read_set.read();
-        for row_id in read_set.iter() {
-            if let Some(chain) = self.version_store.versions.get(row_id) {
-                let head = chain.head.read();
-                if let Some(version) = head.as_ref() {
-                    if version.begin_ts > ctx.snapshot.timestamp && version.txn_id != ctx.txn_id {
-                        return Err(StorageError::Transaction(format!(
-                            "Read-write conflict on row {} in txn {}",
-                            row_id, ctx.txn_id
-                        )));
-                    }
-                }
-            }
-        }
+        // 🔴 Dormant: read_set (bare RowIds) is never populated on any
+        // production path, and version chains are now keyed (table, row_id)
+        // — a bare-id lookup could only ever produce false negatives anyway.
+        // Kept as a no-op so the Serializable hook stays visible.
+        let _ = ctx.read_set.read().len();
+        let _ = ctx.txn_id;
         Ok(())
     }
 
