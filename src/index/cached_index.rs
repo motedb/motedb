@@ -186,8 +186,20 @@ impl CachedIndex {
     /// Safe to skip: stale cache entries are eventually evicted by LRU policy.
     pub fn try_invalidate(&self, key: &Value) {
         let fk = FastKey::from_value(key);
-        if let Some(mut cache) = self.cache.try_write() {
-            cache.pop(&fk);
+        // 🔴 Bounded retry: a bare try_write gives up on contention and the
+        // stale entry then lives until LRU capacity pressure — for a hot
+        // low-cardinality value (device ids, status flags) that is forever.
+        // Three attempts with a yield between them rides out the get-path's
+        // momentary cache write lock; the blocking invalidate() paths are
+        // unchanged.
+        for attempt in 0..3 {
+            if let Some(mut cache) = self.cache.try_write() {
+                cache.pop(&fk);
+                return;
+            }
+            if attempt < 2 {
+                std::thread::yield_now();
+            }
         }
     }
 

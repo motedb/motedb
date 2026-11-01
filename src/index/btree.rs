@@ -131,10 +131,15 @@ pub struct BTreeConfig {
     /// Page cache size
     pub cache_size: usize,
 
-    /// Unique key constraint (disallow duplicate inserts, but allow updates)
+    /// One entry per key: inserting an existing key updates its value (or
+    /// errors when `allow_updates` is false). `false` makes the tree a
+    /// multimap — every distinct (key, value) pair is kept, `range` returns
+    /// all of them and `remove_entry` removes one exact pair (the timestamp
+    /// index: many rows per microsecond).
     pub unique_keys: bool,
 
-    /// Allow key updates (if false, insert on existing key will error)
+    /// Allow key updates (if false, insert on existing key will error).
+    /// Only meaningful when `unique_keys` is true.
     pub allow_updates: bool,
 
     /// Immediate sync (if true, sync after every insert; if false, only on flush())
@@ -146,7 +151,7 @@ impl Default for BTreeConfig {
         Self {
             order: BTREE_ORDER,
             cache_size: DEFAULT_PAGE_CACHE,
-            unique_keys: false,
+            unique_keys: true,
             allow_updates: true,
             immediate_sync: false,
         }
@@ -682,38 +687,54 @@ impl BTree {
             offsets[idx]
         };
 
-        let file = self.storage_file.read();
+        // Scope the file read guard: the eviction writeback below must not
+        // run with storage_file still read-held (flush_page takes the write
+        // side — same-thread read→write is a guaranteed self-deadlock).
+        let page = {
+            let file = self.storage_file.read();
 
-        // Read header to get content_len using positional read (no seek needed)
-        use crate::platform_io::PositionalRead as _;
-        let mut header_buf = [0u8; 15];
-        file.read_exact_at(&mut header_buf, file_offset)?;
-        let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
+            // Read header to get content_len using positional read (no seek needed)
+            use crate::platform_io::PositionalRead as _;
+            let mut header_buf = [0u8; 15];
+            file.read_exact_at(&mut header_buf, file_offset)?;
+            let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
 
-        if !(15..=MAX_PAGE_SIZE).contains(&content_len) {
-            return Err(StorageError::Corruption(format!(
-                "Invalid content_len {} for page {} at offset {}",
-                content_len, page_id, file_offset
-            )));
-        }
+            if !(15..=MAX_PAGE_SIZE).contains(&content_len) {
+                return Err(StorageError::Corruption(format!(
+                    "Invalid content_len {} for page {} at offset {}",
+                    content_len, page_id, file_offset
+                )));
+            }
 
-        // Read full page content using positional read
-        let mut buf = vec![0u8; content_len];
-        file.read_exact_at(&mut buf, file_offset)?;
+            // Read full page content using positional read
+            let mut buf = vec![0u8; content_len];
+            file.read_exact_at(&mut buf, file_offset)?;
 
-        let page = Page::deserialize_compact(page_id, &buf)?;
-        page.validate()?;
+            let page = Page::deserialize_compact(page_id, &buf)?;
+            page.validate()?;
+            page
+        };
 
         let page_arc = Arc::new(RwLock::new(page));
 
         let mut cache = self.page_cache.write();
-        cache.put(page_id, Arc::clone(&page_arc));
+        // 🔴 `push`, not `put`: `LruCache::put` (capturing_put(.., false))
+        // silently DROPS the LRU victim on eviction — a dirty victim lost
+        // every mutation since its last flush, and flush() (which copies
+        // non-resident pages from their on-disk image) then persisted the
+        // loss. `push` returns the evicted entry so it can be written back.
+        let evicted = cache.push(page_id, Arc::clone(&page_arc));
+        drop(cache);
+        if let Some((_, victim)) = evicted {
+            let victim = victim.read();
+            self.flush_page(&victim)?;
+        }
 
         Ok(page_arc)
     }
 
-    /// Flush page to disk with compact storage
-    /// Flush a single page immediately (used during insert for root page safety)
+    /// Flush page to disk with compact storage.
+    /// Flush a single page immediately (used during insert for root page safety).
     fn flush_page(&self, page: &Page) -> Result<()> {
         if !page.dirty {
             return Ok(());
@@ -772,7 +793,13 @@ impl BTree {
 
         // Add to cache
         let mut cache = self.page_cache.write();
-        cache.put(page_id, Arc::clone(&page_arc));
+        // 🔴 `push` not `put` — see load_page (writeback on eviction).
+        let evicted = cache.push(page_id, Arc::clone(&page_arc));
+        drop(cache);
+        if let Some((_, victim)) = evicted {
+            let victim = victim.read();
+            self.flush_page(&victim)?;
+        }
 
         Ok(page_arc)
     }
@@ -847,6 +874,13 @@ impl BTree {
             return Ok(None);
         }
 
+        // Non-unique index: one entry per (key, value) pair. The leaf-level
+        // insert only sees its own page, and a run of equal keys can span
+        // leaves, so the duplicate-pair check happens here with a chain walk.
+        if !self.config.unique_keys && self.contains_entry(key, value)? {
+            return Ok(Some(value));
+        }
+
         // Recursive insert with split handling
         let (old_value, split_info) = self.insert_internal(root_id, key, value)?;
 
@@ -908,6 +942,23 @@ impl BTree {
 
             let search_result = page.keys.binary_search(&key);
             let old_value = match search_result {
+                Ok(idx) if !self.config.unique_keys => {
+                    // Key exists, duplicates allowed: append after this
+                    // key's run (binary_search may land anywhere inside it)
+                    // so the leaf stays sorted. 🔴 The old code took the
+                    // unique-key branch regardless of `unique_keys` and
+                    // overwrote the value — the timestamp index kept one
+                    // row per microsecond.
+                    let mut end = idx;
+                    while end < page.num_keys && page.keys[end] == key {
+                        end += 1;
+                    }
+                    page.keys.insert(end, key);
+                    page.values.insert(end, value);
+                    page.num_keys += 1;
+                    page.dirty = true;
+                    None
+                }
                 Ok(idx) => {
                     // Key exists
                     if !self.config.allow_updates {
@@ -946,7 +997,15 @@ impl BTree {
             // Internal node: find child and recurse
             let child_idx = {
                 let page = page_arc.read();
-                page.keys.binary_search(&key).unwrap_or_else(|idx| idx)
+                // keys[i] is the minimum key of children[i+1], so a key equal
+                // to a separator belongs to the RIGHT child — the same way
+                // search / range / remove descend. Descending left on an
+                // exact match re-created the key in the left leaf as a second
+                // entry that `get` never saw.
+                match page.keys.binary_search(&key) {
+                    Ok(idx) => idx + 1,
+                    Err(idx) => idx,
+                }
             };
 
             let child_page_id = {
@@ -957,13 +1016,15 @@ impl BTree {
             let (old_value, child_split) = self.insert_internal(child_page_id, key, value)?;
 
             if let Some((split_key, new_child_id)) = child_split {
-                // Child was split, insert split key into this node
+                // Child was split: the new (right) half goes immediately after
+                // the child we descended into, with the split key as their
+                // separator. Positional, not `binary_search(&split_key)`:
+                // with duplicate separators (non-unique index, a run of equal
+                // keys split across leaves) the search can land elsewhere and
+                // put `children` out of leaf-chain order.
                 let mut page = page_arc.write();
 
-                let insert_idx = page
-                    .keys
-                    .binary_search(&split_key)
-                    .unwrap_or_else(|idx| idx);
+                let insert_idx = child_idx;
 
                 page.keys.insert(insert_idx, split_key);
                 page.children.insert(insert_idx + 1, new_child_id);
@@ -1204,6 +1265,135 @@ impl BTree {
         }
     }
 
+    /// Non-unique index: is this exact (key, value) pair present?
+    ///
+    /// Two-stage: first descend to the key's OWN leaf (right-routing, the
+    /// same descent insert uses) and scan its run — decisive unless the leaf
+    /// STARTS at `key`, in which case the run may straddle leftward across a
+    /// split and the full chain walk runs. This keeps the per-insert
+    /// duplicate pre-check at insert-descent cost: a full walk per insert was
+    /// O(run × leaves) and quadratic on equal-key bulk loads (date-only
+    /// timestamps).
+    pub fn contains_entry(&self, key: u64, value: u64) -> Result<bool> {
+        let root_id = *self.root_page_id.read();
+        if root_id == 0 {
+            return Ok(false);
+        }
+        {
+            let leaf_id = self.find_leaf_for_key(root_id, key)?;
+            let page_arc = self.load_page(leaf_id)?;
+            let page = page_arc.read();
+            if !page.is_leaf {
+                return Err(StorageError::Index("Expected leaf node".into()));
+            }
+            let mut first_eq_key = false;
+            for i in 0..page.num_keys {
+                let k = page.keys[i];
+                if k > key {
+                    break;
+                }
+                if k == key {
+                    if page.values[i] == value {
+                        return Ok(true);
+                    }
+                    first_eq_key = true;
+                }
+            }
+            if !first_eq_key && page.keys.first().copied().is_none_or(|f| f < key) {
+                // The run lives entirely in this leaf — nothing earlier.
+                return Ok(false);
+            }
+            drop(page);
+            // first == key (or an empty leaf): the run may continue leftward.
+        }
+        let mut leaf_id = self.first_leaf_for_scan(root_id, key)?;
+        while leaf_id != INVALID_PAGE_ID {
+            let page_arc = self.load_page(leaf_id)?;
+            let page = page_arc.read();
+            if !page.is_leaf {
+                return Err(StorageError::Index("Expected leaf node".into()));
+            }
+            for i in 0..page.num_keys {
+                let k = page.keys[i];
+                if k > key {
+                    return Ok(false);
+                }
+                if k == key && page.values[i] == value {
+                    return Ok(true);
+                }
+            }
+            leaf_id = page.next_leaf;
+        }
+        Ok(false)
+    }
+
+    /// Remove one exact (key, value) pair; `remove` takes whichever entry
+    /// of a duplicate run it lands on. Returns whether the pair was present.
+    pub fn remove_entry(&mut self, key: u64, value: u64) -> Result<bool> {
+        let root_id = *self.root_page_id.read();
+        if root_id == 0 {
+            return Ok(false);
+        }
+        let mut leaf_id = self.first_leaf_for_scan(root_id, key)?;
+        while leaf_id != INVALID_PAGE_ID {
+            let page_arc = self.load_page(leaf_id)?;
+            let mut page = page_arc.write();
+            if !page.is_leaf {
+                return Err(StorageError::Index("Expected leaf node".into()));
+            }
+            for i in 0..page.num_keys {
+                let k = page.keys[i];
+                if k > key {
+                    return Ok(false);
+                }
+                if k == key && page.values[i] == value {
+                    page.keys.remove(i);
+                    page.values.remove(i);
+                    page.num_keys -= 1;
+                    page.dirty = true;
+                    drop(page);
+                    let mut stats = self.stats.write();
+                    stats.total_keys = stats.total_keys.saturating_sub(1);
+                    return Ok(true);
+                }
+            }
+            leaf_id = page.next_leaf;
+        }
+        Ok(false)
+    }
+
+    /// Leaf where a scan for keys >= `key` must start. In a non-unique tree
+    /// a run of equal keys can straddle a leaf split: the separator equals
+    /// the run's key and `find_leaf_for_key` descends to the right of it,
+    /// skipping the run's left part. Start one key earlier and let the
+    /// caller drop keys < `key` — except at key 0, where there is no earlier
+    /// key: `saturating_sub(1)` would probe 0 itself and still descend right
+    /// of the run (every pre-1970 timestamp clamps to 0), so start at the
+    /// leftmost leaf instead.
+    fn first_leaf_for_scan(&self, root_id: u64, key: u64) -> Result<u64> {
+        if !self.config.unique_keys && key == 0 {
+            return self.leftmost_leaf(root_id);
+        }
+        let probe = if self.config.unique_keys {
+            key
+        } else {
+            key - 1
+        };
+        self.find_leaf_for_key(root_id, probe)
+    }
+
+    /// Leftmost leaf (children[0] descent) — scan start for a key-0 run.
+    fn leftmost_leaf(&self, page_id: u64) -> Result<u64> {
+        let page_arc = self.load_page(page_id)?;
+        let page = page_arc.read();
+        if page.is_leaf {
+            return Ok(page_id);
+        }
+        let first = page.children[0];
+        drop(page);
+        self.leftmost_leaf(first)
+    }
+
     /// Check if key exists
     pub fn contains_key(&self, key: &u64) -> Result<bool> {
         Ok(self.get(key)?.is_some())
@@ -1240,7 +1430,7 @@ impl BTree {
             return Ok(Vec::new());
         }
 
-        let first_leaf_id = self.find_leaf_for_key(root_id, *start)?;
+        let first_leaf_id = self.first_leaf_for_scan(root_id, *start)?;
         let mut results = Vec::with_capacity(limit.min(64));
         self.scan_leaf_chain_limited(first_leaf_id, *start, *end, &mut results, limit)?;
         Ok(results)
@@ -1263,7 +1453,7 @@ impl BTree {
         }
 
         // Step 1: Find the first leaf node that may contain keys >= start
-        let first_leaf_id = self.find_leaf_for_key(root_id, *start)?;
+        let first_leaf_id = self.first_leaf_for_scan(root_id, *start)?;
 
         // Step 2: Sequentially scan leaf chain
         let mut results = Vec::new();
@@ -1404,51 +1594,122 @@ impl BTree {
         Ok(())
     }
 
-    /// Flush all pages: rewrite compactly and truncate file
+    /// Flush ALL pages: rewrite compactly and truncate the file.
+    ///
+    /// 🔴 Iterates every allocated page id — the old implementation rebuilt
+    /// the page table from the LRU cache alone and then truncated the file,
+    /// silently destroying every page evicted since the last flush (the
+    /// timestamp index loses whole leaves past ~1024 cached pages ≈ 180K
+    /// entries; a backup flushes it unconditionally and reopen either errors
+    /// "Page N not found" or silently misses rows). Non-resident pages are
+    /// copied verbatim through the OLD offset table — their on-disk image is
+    /// the last flushed state, kept correct by the writeback-on-eviction in
+    /// load_page/alloc_page.
     pub fn flush(&self) -> Result<()> {
-        // Collect all pages from cache, sorted by page_id for deterministic layout
-        let cache = self.page_cache.read();
+        // 🔴 Pre-pass: force every allocated page into a consistent state.
+        // A page missing from the LRU is loaded through the battle-tested
+        // load path (header + validate); loading evicts other pages, whose
+        // eviction writeback persists them. Two passes converge: after the
+        // first, every page is either cached or has a freshly-written disk
+        // image, so the copy branch below never sees garbage. This runs
+        // BEFORE flush_lock because load_page's eviction writeback takes it.
+        let mut next_id = *self.next_page_id.read();
+        for _pass in 0..2 {
+            let cache = self.page_cache.read();
+            let missing: Vec<u64> = (1..next_id).filter(|id| !cache.contains(id)).collect();
+            drop(cache);
+            for id in missing {
+                self.load_page(id)?;
+            }
+            next_id = *self.next_page_id.read();
+        }
 
-        let mut pages: Vec<(u64, Arc<RwLock<Page>>)> = cache
-            .iter()
-            .map(|(id, arc)| (*id, Arc::clone(arc)))
-            .collect();
-        pages.sort_by_key(|(id, _)| *id);
-
-        drop(cache);
-
-        // Write all pages sequentially after superblock
         let _flush_guard = self.flush_lock.lock();
 
+        // Snapshot the cache and the OLD offset table before touching the
+        // file. Concurrent mutators may still run before flush_lock matters
+        // to them (they don't take it), so pages allocated after the
+        // snapshot are covered by re-reading next_page_id below — anything
+        // not in the snapshot comes from disk.
+        let snapshot: std::collections::HashMap<u64, Arc<RwLock<Page>>> = {
+            let cache = self.page_cache.read();
+            cache
+                .iter()
+                .map(|(id, arc)| (*id, Arc::clone(arc)))
+                .collect()
+        };
+        let old_offsets = self.page_offsets.read().clone();
+
+        use crate::platform_io::PositionalRead as _;
+
         let mut file = self.storage_file.write();
+
+        // 🔴 Collect ALL page buffers BEFORE writing any of them. The copies
+        // read the append region (eviction writebacks land at the file end),
+        // and the sequential rewrites below grow from the superblock through
+        // that same region — interleaving read-and-write let the rewrites
+        // overwrite writeback images before their copy ran (silent zeros,
+        // "invalid content_len" corruption).
+        let mut buffers: Vec<(usize, Vec<u8>)> = Vec::with_capacity(next_id as usize);
+        for page_id in 1..next_id {
+            let buf = match snapshot.get(&page_id) {
+                Some(page_arc) => {
+                    let page = page_arc.read();
+                    page.serialize_compact()?
+                }
+                None => {
+                    // Not cache-resident (evicted again after the pre-pass):
+                    // verbatim copy of the on-disk image written by the
+                    // eviction writeback. Length comes from the page's own
+                    // header — the offset table is not monotonic (writebacks
+                    // append out of id order after a flush compacted it).
+                    let start = old_offsets
+                        .get(page_id as usize)
+                        .copied()
+                        .filter(|&o| o != 0)
+                        .ok_or_else(|| {
+                            StorageError::Corruption(format!(
+                                "btree flush: page {page_id} is neither cached nor on disk"
+                            ))
+                        })?;
+                    let mut header_buf = [0u8; 15];
+                    file.read_exact_at(&mut header_buf, start)?;
+                    let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
+                    if !(15..=MAX_PAGE_SIZE).contains(&content_len) {
+                        return Err(StorageError::Corruption(format!(
+                            "btree flush: page {page_id} has invalid content_len {content_len}"
+                        )));
+                    }
+                    let mut buf = vec![0u8; content_len];
+                    file.read_exact_at(&mut buf, start)?;
+                    buf
+                }
+            };
+            buffers.push((page_id as usize, buf));
+        }
 
         let mut offset = Self::SUPERBLOCK_SIZE as u64;
         let mut new_offsets = vec![0u64]; // index 0 = superblock
 
-        for (page_id, page_arc) in &pages {
-            let page = page_arc.read();
-
-            let buf = page.serialize_compact()?;
-
+        for (idx, buf) in &buffers {
             file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&buf)?;
+            file.write_all(buf)?;
 
-            // Extend offsets table
-            let idx = *page_id as usize;
-            if idx >= new_offsets.len() {
-                new_offsets.resize(idx + 1, 0);
+            if *idx >= new_offsets.len() {
+                new_offsets.resize(*idx + 1, 0);
             }
-            new_offsets[idx] = offset;
+            new_offsets[*idx] = offset;
             offset += buf.len() as u64;
         }
 
         // Update page_offsets table
-        let mut offsets = self.page_offsets.write();
-        *offsets = new_offsets;
-        drop(offsets);
+        {
+            let mut offsets = self.page_offsets.write();
+            *offsets = new_offsets;
+        }
 
-        // Mark all pages clean
-        for (_, page_arc) in &pages {
+        // Mark snapshot pages clean
+        for page_arc in snapshot.values() {
             let mut page = page_arc.write();
             page.dirty = false;
         }

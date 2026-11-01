@@ -722,7 +722,12 @@ impl<K: BTreeKey> GenericBTree<K> {
             file.read_exact(&mut len_buf)?;
             let sb_size = u32::from_le_bytes(len_buf) as usize;
 
-            if sb_size > 64 * 1024 {
+            // 🔴 The offsets table is 8B/page: past ~16K pages (≈1M entries
+            // on a 74-byte-key column index) a legitimate superblock passes
+            // 128KB. Bound by the FILE length (a garbage length would exceed
+            // it), not a fixed 64KB.
+            let file_len = file.metadata()?.len() as usize;
+            if sb_size > file_len {
                 return Err(StorageError::Corruption(format!(
                     "SuperBlock size {} implausibly large",
                     sb_size
@@ -1624,6 +1629,17 @@ impl<K: BTreeKey> GenericBTree<K> {
 
         // Write [len: u32 LE][data]
         let header_len = 4 + sb_bytes.len();
+        // 🔴 Clobber guard: an oversized offsets table writing past the
+        // first on-disk page destroys live data silently (the bulk_load
+        // bug this gate closes). Fail loudly instead.
+        if let Some(min_page_off) = page_offsets.iter().copied().filter(|&o| o != 0).min() {
+            if header_len as u64 > min_page_off {
+                return Err(StorageError::Corruption(format!(
+                    "superblock ({}B) would overwrite the first page at offset {} —                      page table grew beyond its reserve",
+                    header_len, min_page_off
+                )));
+            }
+        }
         let mut buf = vec![0u8; header_len];
         buf[0..4].copy_from_slice(&(sb_bytes.len() as u32).to_le_bytes());
         buf[4..].copy_from_slice(&sb_bytes);
@@ -2274,11 +2290,44 @@ impl<K: BTreeKey> GenericBTree<K> {
         }
 
         let root_id = current_level[0].0;
+
+        // 🔴 Size the superblock BEFORE placing pages. The offsets table is
+        // 8 bytes per page (fixed-int bincode): at ~49 keys/leaf a
+        // million-entry build makes ~21K pages ⇒ ~171KB of table — MORE than
+        // the 128KB SUPERBLOCK_RESERVE. Pages used to be written at the
+        // fixed reserve and the closing sync_superblock() then overwrote the
+        // first ~40KB of them with the oversized table ("skipping corrupt
+        // page 1..11 during flush" at the next open; every skipped page is
+        // silently dropped from the rewrite, losing index entries). The
+        // table's serialized LENGTH is independent of the offset VALUES, so
+        // a dummy with the final length pins the exact base first.
+        let sb_len = {
+            let dummy = SuperBlock {
+                magic: BTREE_MAGIC,
+                version: BTREE_VERSION,
+                root_page_id: root_id,
+                next_page_id: next_pid,
+                key_size: self.key_size as u32,
+                page_offsets: vec![0u64; next_pid as usize],
+            };
+            4 + bincode::serialize(&dummy)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?
+                .len() as u64
+        };
+        let base = sb_len.max(SUPERBLOCK_RESERVE);
+        // `offsets` (acquired at the top of bulk_load) is still live here —
+        // shift in place under THAT guard; re-acquiring page_offsets.write()
+        // would self-deadlock.
+        for off in offsets.iter_mut() {
+            if *off != 0 {
+                *off += base - SUPERBLOCK_RESERVE;
+            }
+        }
         drop(offsets);
 
         {
             let mut file = self.storage_file.write();
-            file.seek(SeekFrom::Start(SUPERBLOCK_RESERVE))?;
+            file.seek(SeekFrom::Start(base))?;
             file.write_all(&write_buf)?;
             file.sync_all()?;
         }
@@ -2287,7 +2336,8 @@ impl<K: BTreeKey> GenericBTree<K> {
         *self.next_page_id.write() = next_pid;
         self.page_cache.write().clear();
 
-        // Write superblock using the SAME format as normal path.
+        // Write superblock using the SAME format as normal path — it now
+        // exactly fills [0, base) and cannot touch a page.
         self.sync_superblock()?;
 
         Ok(())
@@ -2904,5 +2954,76 @@ mod tests {
         // Retrieve and verify
         let result = tree.get(&1u32).unwrap();
         assert_eq!(result, Some(large_value));
+    }
+
+    /// 🔴 Regression: bulk_load sized the page table against the fixed
+    /// 128KB SUPERBLOCK_RESERVE, but the closing sync_superblock() writes
+    /// [len][superblock] from offset 0 — past ~16K pages the offsets table
+    /// alone exceeds the reserve and clobbered the FIRST pages of the freshly
+    /// written file ("skipping corrupt page 1..11 during flush" on the next
+    /// open; skipped pages were then dropped from the rewrite, losing index
+    /// entries). A 512-byte key makes ~7 keys/page, so 115K entries ≈ 16.5K
+    /// pages ≈ 132KB of table — just over the reserve.
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    struct WideKey([u8; 512]);
+
+    impl BTreeKey for WideKey {
+        fn serialize(&self) -> Vec<u8> {
+            self.0.to_vec()
+        }
+        fn deserialize(bytes: &[u8]) -> Result<Self> {
+            let mut k = [0u8; 512];
+            k.copy_from_slice(&bytes[..512]);
+            Ok(WideKey(k))
+        }
+        fn key_size() -> usize {
+            512
+        }
+    }
+
+    #[test]
+    fn bulk_load_offsets_table_fits_its_reserve() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wide.idx");
+
+        let n = 115_000u64;
+        let entries: Vec<WideKey> = (0..n)
+            .map(|i| {
+                let mut k = [0u8; 512];
+                k[..8].copy_from_slice(&i.to_be_bytes());
+                WideKey(k)
+            })
+            .collect();
+
+        {
+            let mut btree: GenericBTree<WideKey> =
+                GenericBTree::with_config(path.clone(), GenericBTreeConfig::default()).unwrap();
+            btree.bulk_load(entries).unwrap();
+        }
+
+        // Reopen and walk the whole tree: before the fix the superblock had
+        // overwritten the first pages and verify_integrity reported them as
+        // corrupt.
+        let btree: GenericBTree<WideKey> =
+            GenericBTree::with_config(path, GenericBTreeConfig::default()).unwrap();
+        let integrity = btree.verify_integrity();
+        assert!(
+            integrity.problems.is_empty(),
+            "integrity problems: {:?}",
+            integrity.problems
+        );
+        let first = {
+            let mut k = [0u8; 512];
+            k[..8].copy_from_slice(&0u64.to_be_bytes());
+            WideKey(k)
+        };
+        let last = {
+            let mut k = [0u8; 512];
+            k[..8].copy_from_slice(&(n - 1).to_be_bytes());
+            WideKey(k)
+        };
+        let all = btree.range_keys(&first, &last).unwrap();
+        assert_eq!(all.len() as u64, n, "every key must survive the load");
     }
 }
