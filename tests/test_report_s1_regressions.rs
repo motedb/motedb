@@ -223,3 +223,96 @@ fn positional_insert_fills_trailing_defaults() {
         "NOT NULL without default must still reject"
     );
 }
+
+/// B-16 residue: a directory bricked by 0.16.0's crash-at-close holds
+/// segment files whose row_map entries were never appended — rows with
+/// key=0/ts=0 (reproduced with the real 0.16.0 binary: 2 such files plus
+/// the real data). Key `0` can never belong to a table (keys are
+/// `(table_id << 32) | row_id`), so newest-wins dedup never collapsed the
+/// ghost against the real row: every full scan / COUNT(*) / GROUP BY showed
+/// one extra row while the PK point read was fine, and a checkpoint merged
+/// the ghost INTO the real segment permanently. Open now detects foreign
+/// keys and heals the table with one filtered merge.
+#[test]
+fn bricked_directory_ghost_rows_are_dropped_on_open() {
+    use motedb::storage::lsm::ColumnarSSTableBuilder;
+    use motedb::types::ColumnType;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("b16r.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE c (id INT PRIMARY KEY, tag TEXT)")
+            .unwrap();
+        for i in 1..=5 {
+            db.execute(&format!("INSERT INTO c VALUES ({i}, 'a{i}')"))
+                .unwrap();
+        }
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    // Plant the crash residue exactly as found on disk: complete, parseable
+    // orphan segment files (ids the manifest never saw) whose only row has
+    // key=0/ts=0 and the torn column values of the crashing UPDATE.
+    let seg_dir = path.join("columnar_ms").join("c");
+    for id in [40u64, 41] {
+        let mut b = ColumnarSSTableBuilder::new(
+            seg_dir.join(format!("{id:010}.sst")),
+            vec![ColumnType::Integer, ColumnType::Text],
+        );
+        b.add_values(
+            0,
+            0,
+            false,
+            &[Value::Integer(1), Value::Text("ghost".into())],
+        )
+        .unwrap();
+        b.finish().unwrap();
+    }
+
+    let expect = |db: &Database, phase: &str| {
+        assert_eq!(
+            rows(db, "SELECT id, tag FROM c ORDER BY id"),
+            (1..=5)
+                .map(|i| vec![Value::Integer(i), Value::Text(format!("a{i}").into())])
+                .collect::<Vec<_>>(),
+            "{phase}: full scan"
+        );
+        assert_eq!(
+            rows(db, "SELECT COUNT(*) FROM c")[0][0],
+            Value::Integer(5),
+            "{phase}: COUNT(*)"
+        );
+        assert_eq!(
+            rows(db, "SELECT id FROM c WHERE tag = 'ghost'").len(),
+            0,
+            "{phase}: ghost row must be invisible"
+        );
+        assert_eq!(
+            rows(db, "SELECT tag, COUNT(*) FROM c GROUP BY tag").len(),
+            5,
+            "{phase}: GROUP BY"
+        );
+        assert_eq!(
+            rows(db, "SELECT id FROM c WHERE id = 1").len(),
+            1,
+            "{phase}: PK read"
+        );
+    };
+
+    let db = Database::open(&path).unwrap();
+    expect(&db, "after open");
+    // A checkpoint (merge) must not bring the ghost back, and neither must
+    // a reopen — the on-disk table is healed, not just filtered.
+    db.checkpoint().unwrap();
+    expect(&db, "after checkpoint");
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    expect(&db, "after reopen");
+    db.execute("INSERT INTO c VALUES (6, 'a6')").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM c")[0][0],
+        Value::Integer(6),
+        "writes keep working on the healed table"
+    );
+}

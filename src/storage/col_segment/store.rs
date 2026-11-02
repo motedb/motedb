@@ -193,17 +193,14 @@ fn encode_default_for_column(
         // (post-ALTER inserts DO get the parsed default via coerce_row_to_
         // schema; the asymmetry showed as old rows NULL, new rows set).
         (Some(ColumnType::Tensor(dim)), Value::Text(ts)) => {
-            let inner = ts.as_str().trim().strip_prefix('[')?.strip_suffix(']')?;
-            let floats: Option<Vec<f32>> = inner
-                .split(',')
-                .map(|p| p.trim().parse::<f32>().ok())
-                .collect();
-            let floats = floats?;
+            let Some(Value::Vector(floats)) = Value::parse_bracketed_vector(ts.as_str()) else {
+                return None;
+            };
             if floats.len() != *dim {
                 return None;
             }
             let mut b = (floats.len() as u16).to_le_bytes().to_vec();
-            for f in &floats {
+            for f in floats.iter() {
                 b.extend_from_slice(&f.to_le_bytes());
             }
             Some(b)
@@ -619,6 +616,30 @@ impl ColSegmentStore {
     /// Lock-free segment snapshot (Arc clone) for read paths.
     fn segs(&self) -> Arc<Vec<Arc<Segment>>> {
         self.segments.load_full()
+    }
+
+    /// Global-mode row keys are composite `(table_id << 32) | row_id`, so a
+    /// key whose high half is not this table's id cannot be a row of this
+    /// table — it is corruption (the 0.16.0 B-16 crash-at-close wrote
+    /// segment files whose row_map entries were never appended: key=0, ts=0).
+    /// Key-based newest-wins dedup cannot collapse such a row against the
+    /// real one, so it must be dropped at the source. Local-mode stores
+    /// (`LOCAL_TABLE_ID`, unit tests) use raw keys with no table half.
+    #[inline]
+    fn row_key_belongs_to_table(&self, key: u64) -> bool {
+        self.table_id == super::manifest::LOCAL_TABLE_ID || (key >> 32) as u32 == self.table_id
+    }
+
+    /// Does this segment hold any row whose key is not this table's? Keys are
+    /// sorted ascending, so the two end keys decide: both inside ⇒ all inside.
+    /// Reads at most two keys (fence entry + last-key hint), no full key load.
+    fn segment_has_foreign_keys(&self, seg: &Segment) -> bool {
+        if self.table_id == super::manifest::LOCAL_TABLE_ID || seg.sst.num_rows == 0 {
+            return false;
+        }
+        let first = seg.sst.row_map.key(0);
+        let last = seg.sst.last_key_hint().unwrap_or(first);
+        !self.row_key_belongs_to_table(first) || !self.row_key_belongs_to_table(last)
     }
 
     /// 🚀 设置 compact_storage 模式（zstd 压缩 Fixed/Text 列）。
@@ -1347,7 +1368,16 @@ impl ColSegmentStore {
                 }
             });
             let fcol_text = filter_col.and_then(|fc| {
-                if fc < seg.sst.column_tags.len() && !seg.sst.column_tags[fc].is_fixed() {
+                // 🔴 TEXT tag only: Vector/Spatial columns are also
+                // non-fixed, and read_text_cached on them yields empty
+                // strings — a WHERE over a VECTOR column then filtered
+                // against Text("") for every row.
+                if fc < seg.sst.column_tags.len()
+                    && matches!(
+                        seg.sst.column_tags[fc],
+                        crate::storage::lsm::columnar::ColumnTypeTag::Text
+                    )
+                {
                     seg.read_text_cached(fc)
                 } else {
                     None
@@ -1489,6 +1519,14 @@ impl ColSegmentStore {
                             } else {
                                 t.get_str(i).map(|s| Value::Text(s.into()))
                             }
+                        } else if let (Some(fc), Some(ct)) = (filter_col, fcol_type) {
+                            // 🔴 Var-width filter columns (VECTOR / SPATIAL):
+                            // decode per row through the general reader — the
+                            // fixed/text readers above cover everything else.
+                            // Per-row cost is acceptable: vector-column WHERE
+                            // predicates are rare and the general reader is
+                            // the only correct decoder for the tag.
+                            Some(seg.read_column_at_idx(i, fc, ct))
                         } else {
                             None
                         };
@@ -4946,6 +4984,31 @@ impl ColSegmentStore {
 
         // Already in push order (ascending id) — correct.
 
+        // 🔴 B-16 residue (0.16.0 bricked directories): the crash-at-close
+        // wrote segment files whose row_map entries were never appended —
+        // rows with key=0/ts=0 that key-based dedup cannot collapse against
+        // the real row, so every full scan emitted a ghost duplicate (PK
+        // point reads were fine), and a later checkpoint merged the ghost
+        // INTO the real segment. Detect any foreign-key row on open and heal
+        // with one full merge, which drops such rows. One O(table) rewrite
+        // per corrupted directory; a clean directory pays two key reads per
+        // segment.
+        if self.segs().iter().any(|s| self.segment_has_foreign_keys(s)) {
+            let all: Vec<Arc<Segment>> = self.segs().iter().cloned().collect();
+            let _guard = self.flush_merge_lock.lock();
+            match self.merge_segments_locked(all) {
+                Ok(()) => warn_log!(
+                    "[Recovery] table '{}': dropped foreign-key rows from segment files (crash residue)",
+                    self.table_name
+                ),
+                Err(e) => warn_log!(
+                    "[Recovery] table '{}': foreign-key rows present but the repair merge failed: {:?}",
+                    self.table_name,
+                    e
+                ),
+            }
+        }
+
         // Conservative on reopen: if 2+ segments were persisted, an
         // un-compacted UPDATE/DELETE overlap may exist on disk. A full merge
         // will clear it.
@@ -5161,7 +5224,10 @@ impl ColSegmentStore {
             let seg = &old_segs[head.rank as usize];
             let ts = seg.sst.row_map.timestamp_loaded(head.idx);
             let deleted = seg.sst.row_map.is_deleted(head.idx);
-            if !deleted || keep_tombstones {
+            // 🔴 A row whose key is not this table's (see
+            // row_key_belongs_to_table) is never emitted — the merge is the
+            // repair path for a corrupted segment, and its columns may be torn.
+            if self.row_key_belongs_to_table(key) && (!deleted || keep_tombstones) {
                 row_bytes.clear();
                 row_nulls.clear();
                 if deleted {

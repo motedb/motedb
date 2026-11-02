@@ -1993,7 +1993,14 @@ impl MoteDB {
                         .write_lsn
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let r = match op {
-                        ReplayOp::Row(row) => store.append_row_ref(key, ts, &row),
+                        ReplayOp::Row(mut row) => {
+                            // A WAL written before an ALTER ADD COLUMN (or by
+                            // 0.16.0's narrow-row UPDATE path) carries the old
+                            // width — pad with the column DEFAULTs exactly as
+                            // the ALTER backfill did for already-stored rows.
+                            Self::coerce_row_to_schema(&schema, &mut row);
+                            store.append_row_ref(key, ts, &row)
+                        }
                         ReplayOp::Tombstone => store.append_tombstone(key, ts),
                     };
                     if let Err(e) = r {
