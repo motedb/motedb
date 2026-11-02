@@ -719,6 +719,23 @@ impl ExprEvaluator {
         }
     }
 
+    /// Parse a bracketed-vector TEXT operand when the other operand is a
+    /// Vector (`emb = '[1.0, 2.0]'`, `'[…]' <> emb`, `emb <-> '[…]'`), so the
+    /// operators compare two Vectors. Non-vector text is left alone.
+    pub(crate) fn coerce_vector_text(left: Value, right: Value) -> (Value, Value) {
+        match (&left, &right) {
+            (Value::Vector(_), Value::Text(s)) => match Value::parse_bracketed_vector(s.as_str()) {
+                Some(v) => (left, v),
+                None => (left, right),
+            },
+            (Value::Text(s), Value::Vector(_)) => match Value::parse_bracketed_vector(s.as_str()) {
+                Some(v) => (v, right),
+                None => (left, right),
+            },
+            _ => (left, right),
+        }
+    }
+
     /// Equality with the same Bool/numeric coercion as `=`. Returns true when
     /// the two values are equal after coercion. Used by IN-list matching so
     /// `TRUE IN (1)` and `b IN (1)` (BOOLEAN column) behave like `=`.
@@ -755,6 +772,13 @@ impl ExprEvaluator {
         // and FALSE=0. When one side is Bool and the other is Integer/Float,
         // coerce Bool to Integer so `1 = TRUE`, `TRUE + 0`, etc. work.
         let (left, right) = Self::coerce_bool_numeric(left, right);
+        // 🔴 `emb = '[1.0, 2.0]'`: the bracketed-vector spelling arrives as
+        // TEXT (no vector literal token). Parse it when the other side is a
+        // Vector so every operator below sees two Vectors — bare partial_cmp
+        // made `=` never match and `<>` match everything (DELETE ... WHERE
+        // emb = '[…]' deleted nothing while UPDATE, on another evaluator,
+        // worked).
+        let (left, right) = Self::coerce_vector_text(left, right);
 
         // SQL three-valued logic: NULL comparison → UNKNOWN → NULL (not
         // Bool(false)).  WHERE/HAVING filtering treats NULL predicate results as

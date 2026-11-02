@@ -851,7 +851,10 @@ impl QueryExecutor {
             .filter_map(|(_, bare, op, lit)| {
                 let spos = schema.get_column_position(bare)?;
                 let pidx = proj.iter().position(|&x| x == spos)?;
-                Some((pidx, op.clone(), lit.clone()))
+                // Parse a bracketed-vector literal for a VECTOR column once
+                // here rather than per row in apply_op_value.
+                let lit = Self::coerce_vector_literal_for_column(schema, spos, lit.clone());
+                Some((pidx, op.clone(), lit))
             })
             .collect()
     }
@@ -2525,8 +2528,9 @@ impl QueryExecutor {
             if let (Expr::Column(cn), Expr::Literal(v), true) =
                 (left.as_ref(), right.as_ref(), ok_op)
             {
-                if schema.columns.iter().any(|c| c.name == *cn) {
-                    return Some((cn.clone(), op.clone(), v.clone()));
+                if let Some(pos) = schema.columns.iter().position(|c| c.name == *cn) {
+                    let v = Self::coerce_vector_literal_for_column(schema, pos, v.clone());
+                    return Some((cn.clone(), op.clone(), v));
                 }
             }
         }

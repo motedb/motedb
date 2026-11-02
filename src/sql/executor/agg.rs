@@ -552,7 +552,17 @@ impl QueryExecutor {
         }
         let pos = match (left.as_ref(), right.as_ref()) {
             // col OP literal  (normal form)
-            (Expr::Column(cn), Expr::Literal(v)) => (schema.get_column_position(cn)?, v.clone()),
+            // 🔴 A bracketed-vector literal against a VECTOR column is parsed
+            // here (as extract_col_literal_cmp does for compiled predicates):
+            // the JOIN filter and the txn write-set overlay compare these
+            // targets positionally, and Text vs Vector never matched.
+            (Expr::Column(cn), Expr::Literal(v)) => {
+                let p = schema.get_column_position(cn)?;
+                (
+                    p,
+                    Self::coerce_vector_literal_for_column(schema, p, v.clone()),
+                )
+            }
             // col OP negative-literal  (e.g. WHERE v = -100 → UnaryOp(Minus, Literal(100)))
             (
                 Expr::Column(cn),
@@ -571,6 +581,7 @@ impl QueryExecutor {
             // literal OP col  (swapped operand form, e.g. 49000 < id)
             (Expr::Literal(v), Expr::Column(cn)) => {
                 let p = schema.get_column_position(cn)?;
+                let v = Self::coerce_vector_literal_for_column(schema, p, v.clone());
                 // Flip the operator to match the swapped operands.
                 let flipped = match op {
                     BinaryOperator::Eq => BinaryOperator::Eq,
@@ -581,7 +592,7 @@ impl QueryExecutor {
                     BinaryOperator::Ge => BinaryOperator::Le,
                     _ => return None,
                 };
-                return Some((p, flipped, v.clone()));
+                return Some((p, flipped, v));
             }
             _ => return None,
         };

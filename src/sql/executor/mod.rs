@@ -227,6 +227,23 @@ fn apply_op_value(
     if matches!(v, Value::Null) {
         return false;
     }
+    // 🔴 Bracketed-vector literal against a VECTOR field: the predicate
+    // producers that have no schema at hand (residual ON-clause terms, the
+    // join COUNT fold) pass the literal through as Text, and Vector vs Text
+    // made `=` never match and `<>` match every row. Parse it here so the
+    // comparison is Vector-vs-Vector; only taken when the field really is a
+    // Vector, so the scalar hot path pays one discriminant check.
+    let parsed_target;
+    let target = match (v, target) {
+        (Value::Vector(_), Value::Text(s)) => match Value::parse_bracketed_vector(s.as_str()) {
+            Some(p) => {
+                parsed_target = p;
+                &parsed_target
+            }
+            None => target,
+        },
+        _ => target,
+    };
     match op {
         BinaryOperator::Eq => v == target,
         BinaryOperator::Ne => v != target,
@@ -10326,6 +10343,11 @@ impl QueryExecutor {
             Expr::BinaryOp { left, op, right } => {
                 let lv = Self::eval_expr_simple(left, row)?;
                 let rv = Self::eval_expr_simple(right, row)?;
+                // 🔴 Bracketed-vector TEXT operand next to a Vector: parse it
+                // once so the distance operators (`emb <-> '[…]'` projected
+                // or in WHERE evaluated to NULL) and the ordering operators
+                // see two Vectors.
+                let (lv, rv) = crate::sql::evaluator::ExprEvaluator::coerce_vector_text(lv, rv);
                 match op {
                     BinaryOperator::Eq => {
                         // NULL = NULL should return false (SQL standard)
@@ -11674,6 +11696,10 @@ impl QueryExecutor {
                 // 🔑 Bool/Int coercion (TRUE=1, FALSE=0) so `flag = 1` matches
                 // a BOOLEAN column with TRUE, and `1 = TRUE` is true.
                 let (lv, rv) = Self::coerce_bool_int(lv, rv);
+                // 🔴 Bracketed-vector TEXT operand next to a Vector: parse it
+                // once so `emb <-> '[…]'` (projected / in WHERE) and the
+                // ordering operators see two Vectors instead of NULL / false.
+                let (lv, rv) = crate::sql::evaluator::ExprEvaluator::coerce_vector_text(lv, rv);
                 match op {
                     BinaryOperator::Eq => {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
@@ -11694,8 +11720,13 @@ impl QueryExecutor {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
                             Ok(Value::Null) // SQL: NULL != anything => NULL
                         } else {
+                            // Negation of the same coerced equality `=` uses
+                            // (bare partial_cmp made `emb <> '[…]'` true for
+                            // every row).
                             Ok(Value::Bool(
-                                lv.partial_cmp(&rv) != Some(std::cmp::Ordering::Equal),
+                                !crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
+                                    &lv, &rv,
+                                ),
                             ))
                         }
                     }
@@ -13369,16 +13400,26 @@ impl QueryExecutor {
                     // on join rows (same query returned 0/1/2 across runs).
                     let bare = col_name.rsplit('.').next().unwrap_or(&col_name).to_string();
                     let suffix = format!(".{}", bare);
+                    // 🔴 `=` semantics, not bare PartialEq: a bracketed-vector
+                    // TEXT literal must match the VECTOR it spells and TRUE
+                    // must match 1 — the generic JOIN path lands here for
+                    // `… WHERE a.emb = '[…]'` and returned 0 rows.
+                    let eq = |row_value: &Value| {
+                        crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
+                            row_value,
+                            &target_value,
+                        )
+                    };
                     all_sql_rows
                         .into_iter()
                         .filter(|(_, row)| {
                             // 尝试直接匹配（含限定名）
                             if let Some(row_value) = row.get(&col_name) {
-                                return row_value == &target_value;
+                                return eq(row_value);
                             }
                             if col_name != bare {
                                 if let Some(row_value) = row.get(&bare) {
-                                    return row_value == &target_value;
+                                    return eq(row_value);
                                 }
                                 // 唯一的 ".{bare}" 后缀键才匹配；二义 = 不匹配
                                 let mut hits = row
@@ -13387,7 +13428,7 @@ impl QueryExecutor {
                                     .collect::<Vec<_>>();
                                 hits.dedup();
                                 if hits.len() == 1 {
-                                    return row.get(hits[0]) == Some(&target_value);
+                                    return row.get(hits[0]).is_some_and(eq);
                                 }
                                 return false;
                             }
@@ -13399,7 +13440,7 @@ impl QueryExecutor {
                                 .collect::<Vec<_>>();
                             hits.dedup();
                             if hits.len() == 1 {
-                                return row.get(hits[0]) == Some(&target_value);
+                                return row.get(hits[0]).is_some_and(eq);
                             }
                             false
                         })
@@ -14903,12 +14944,23 @@ impl QueryExecutor {
                 }
                 // Use simple comparison logic
                 match op {
-                    BinaryOperator::Lt => Ok(Value::Bool(left_val < right_val)),
-                    BinaryOperator::Le => Ok(Value::Bool(left_val <= right_val)),
-                    BinaryOperator::Gt => Ok(Value::Bool(left_val > right_val)),
-                    BinaryOperator::Ge => Ok(Value::Bool(left_val >= right_val)),
-                    BinaryOperator::Eq => Ok(Value::Bool(left_val == right_val)),
-                    BinaryOperator::Ne => Ok(Value::Bool(left_val != right_val)),
+                    // 🔴 Shared `=`/ordering semantics (Bool/Int and
+                    // bracketed-vector coercion live in eval_binary_op): the
+                    // inline ==/< here made `a.emb = '[…]'` false on the
+                    // comma-join slow path while every JOIN … ON form matched.
+                    // Both operands are non-NULL here (checked above), so the
+                    // result is a Bool.
+                    BinaryOperator::Lt
+                    | BinaryOperator::Le
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Ge
+                    | BinaryOperator::Eq
+                    | BinaryOperator::Ne => {
+                        match self.evaluator.eval_binary_op(op, left_val, right_val)? {
+                            Value::Null => Ok(Value::Bool(false)),
+                            v => Ok(v),
+                        }
+                    }
                     BinaryOperator::And => {
                         let left_bool = match left_val {
                             Value::Bool(b) => b,
@@ -23518,51 +23570,65 @@ impl QueryExecutor {
                     if let Expr::Literal(value) = right.as_ref() {
                         let col = col_name.clone();
                         let val = value.clone();
-
+                        // 🔴 A bracketed-vector literal is parsed ONCE here; a
+                        // VECTOR row value compares against the parsed form,
+                        // anything else against the literal as written (the
+                        // row map carries no column types). Bare `==` /
+                        // partial_cmp on Text vs Vector made `=` never match
+                        // and `<>` match every row. NULL row values never
+                        // match any operator (SQL three-valued logic).
+                        let val_vec: Option<Value> = match &val {
+                            Value::Text(s) => Value::parse_bracketed_vector(s.as_str()),
+                            _ => None,
+                        };
+                        fn target<'a>(
+                            v: &Value,
+                            val: &'a Value,
+                            val_vec: &'a Option<Value>,
+                        ) -> &'a Value {
+                            match (v, val_vec) {
+                                (Value::Vector(_), Some(vv)) => vv,
+                                _ => val,
+                            }
+                        }
+                        let ordered = |want: fn(std::cmp::Ordering) -> bool| -> RowPredicate {
+                            let col = col.clone();
+                            let val = val.clone();
+                            let val_vec = val_vec.clone();
+                            Some(Box::new(move |row: &SqlRow| {
+                                Self::get_column_value_static(row, &col)
+                                    .filter(|v| !matches!(v, Value::Null))
+                                    .and_then(|v| {
+                                        Self::compare_values(v, target(v, &val, &val_vec))
+                                    })
+                                    .map(want)
+                                    .unwrap_or(false)
+                            }))
+                        };
                         match op {
                             BinaryOperator::Gt => {
-                                return Some(Box::new(move |row: &SqlRow| {
-                                    Self::get_column_value_static(row, &col)
-                                        .and_then(|v| Self::compare_values(v, &val))
-                                        .map(|ord| ord == std::cmp::Ordering::Greater)
-                                        .unwrap_or(false)
-                                }));
+                                return ordered(|ord| ord == std::cmp::Ordering::Greater);
                             }
                             BinaryOperator::Lt => {
-                                return Some(Box::new(move |row: &SqlRow| {
-                                    Self::get_column_value_static(row, &col)
-                                        .and_then(|v| Self::compare_values(v, &val))
-                                        .map(|ord| ord == std::cmp::Ordering::Less)
-                                        .unwrap_or(false)
-                                }));
+                                return ordered(|ord| ord == std::cmp::Ordering::Less);
                             }
                             BinaryOperator::Ge => {
-                                return Some(Box::new(move |row: &SqlRow| {
-                                    Self::get_column_value_static(row, &col)
-                                        .and_then(|v| Self::compare_values(v, &val))
-                                        .map(|ord| ord != std::cmp::Ordering::Less)
-                                        .unwrap_or(false)
-                                }));
+                                return ordered(|ord| ord != std::cmp::Ordering::Less);
                             }
                             BinaryOperator::Le => {
-                                return Some(Box::new(move |row: &SqlRow| {
-                                    Self::get_column_value_static(row, &col)
-                                        .and_then(|v| Self::compare_values(v, &val))
-                                        .map(|ord| ord != std::cmp::Ordering::Greater)
-                                        .unwrap_or(false)
-                                }));
+                                return ordered(|ord| ord != std::cmp::Ordering::Greater);
                             }
-                            BinaryOperator::Eq => {
+                            BinaryOperator::Eq | BinaryOperator::Ne => {
+                                let negate = *op == BinaryOperator::Ne;
                                 return Some(Box::new(move |row: &SqlRow| {
                                     Self::get_column_value_static(row, &col)
-                                        .map(|v| v == &val)
-                                        .unwrap_or(false)
-                                }));
-                            }
-                            BinaryOperator::Ne => {
-                                return Some(Box::new(move |row: &SqlRow| {
-                                    Self::get_column_value_static(row, &col)
-                                        .map(|v| v != &val)
+                                        .filter(|v| !matches!(v, Value::Null))
+                                        .map(|v| {
+                                            crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
+                                                v,
+                                                target(v, &val, &val_vec),
+                                            ) != negate
+                                        })
                                         .unwrap_or(false)
                                 }));
                             }
