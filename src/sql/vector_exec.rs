@@ -311,6 +311,13 @@ impl VecPred {
                         None => lit,
                     }
                 }
+                // 🔴 Bracketed-vector spelling against a VECTOR column
+                // (`WHERE emb = '[1,2]'` / IN): the lexer yields TEXT; every
+                // other vector context parses it. Without this the batch
+                // leaf compares Vector vs Text → UNKNOWN → row filtered out.
+                (Value::Text(s), Some(ColumnType::Tensor(_))) => {
+                    Value::parse_bracketed_vector(s.as_str()).unwrap_or(lit)
+                }
                 // 🔖 DATE 同理: 'YYYY-MM-DD' 预解析为天数 i64, I64 批比较才通
                 (Value::Text(s), Some(ColumnType::Date)) => {
                     match crate::types::Date::parse(s.as_str()) {

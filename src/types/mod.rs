@@ -303,6 +303,26 @@ impl PartialOrd for Value {
                 .and_then(|t| a.as_micros().partial_cmp(&t.as_micros())),
             (Value::Text(s), Value::Timestamp(b)) => crate::types::Timestamp::parse_iso(s.as_str())
                 .and_then(|t| t.as_micros().partial_cmp(&b.as_micros())),
+            // 🔴 Vectors compare lexicographically element-wise (NaN in
+            // either operand → None, propagating as UNKNOWN like SQL NULL).
+            // Absent arm meant Vector <op> ANYTHING returned None → every
+            // WHERE comparison on a VECTOR column filtered the row out.
+            (Value::Vector(a), Value::Vector(b)) => match a.0.len().cmp(&b.0.len()) {
+                std::cmp::Ordering::Equal => {
+                    let mut ord = std::cmp::Ordering::Equal;
+                    for (x, y) in a.0.iter().zip(b.0.iter()) {
+                        match x.partial_cmp(y) {
+                            Some(std::cmp::Ordering::Equal) => continue,
+                            non_eq => {
+                                ord = non_eq.unwrap_or(std::cmp::Ordering::Greater);
+                                break;
+                            }
+                        }
+                    }
+                    Some(ord)
+                }
+                len => Some(len),
+            },
             _ => None,
         }
     }
@@ -464,6 +484,23 @@ impl Value {
     /// Create a TextDoc value
     pub fn textdoc(t: Text) -> Self {
         Value::TextDoc(Box::new(t))
+    }
+
+    /// Parse the bracketed-vector spelling `'[1.0, 2.0]'` into a Vector.
+    /// The SQL lexer has no vector literal token, so a vector reaches every
+    /// comparison / coercion / default site as TEXT — this is the one parser
+    /// they all share. `None` unless the whole text is a bracketed,
+    /// non-empty, all-float list (other text stays text).
+    pub fn parse_bracketed_vector(s: &str) -> Option<Value> {
+        let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
+        if inner.trim().is_empty() {
+            return None;
+        }
+        let floats: Option<Vec<f32>> = inner
+            .split(',')
+            .map(|p| p.trim().parse::<f32>().ok())
+            .collect();
+        floats.map(|f| Value::Vector(ArcVec::new(f)))
     }
 
     /// Convert to a hashable string key for use in HashMap/DashMap lookups.

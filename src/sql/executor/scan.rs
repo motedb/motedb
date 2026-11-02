@@ -781,11 +781,14 @@ impl QueryExecutor {
                     match expr.as_ref() {
                         crate::sql::ast::Expr::Column(col_name) => {
                             schema.get_column_position(col_name).map(|pos| {
+                                // 🔑 normalize_for_in: parse ISO-text→Timestamp and
+                                // bracketed '[…]'→Vector literals, or the per-row
+                                // lookup (also normalized) never matches them.
                                 let set: std::collections::HashSet<Value> = list
                                     .iter()
                                     .filter_map(|e| {
                                         if let crate::sql::ast::Expr::Literal(v) = e {
-                                            Some(v.clone())
+                                            Some(normalize_for_in(v))
                                         } else {
                                             None
                                         }
@@ -2243,7 +2246,12 @@ impl QueryExecutor {
                                 );
                             }
                         };
-                        let val = v.clone();
+                        // 🔴 `emb = '[1.0, 2.0]'` on a VECTOR column: the literal
+                        // arrives as Text (no vector token in the lexer) and the
+                        // bare `fv == &val` below compared Text against the
+                        // decoded Vector → 0 rows after checkpoint. Parse it
+                        // once, up front, the same way the IN arm does.
+                        let val = Self::coerce_vector_literal_for_column(schema, pos, v.clone());
                         // 🚀 #1: 仅当涉及 Bool 时才 coerce（99% 的 Int/Text PK 直接比较）
                         let needs_coerce = matches!(v, Value::Bool(_));
                         // If filtering on PK, at most 1 row matches → early-stop.

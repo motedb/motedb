@@ -728,6 +728,23 @@ impl ExprEvaluator {
         if matches!(a, Value::Bool(_)) || matches!(b, Value::Bool(_)) {
             let (a2, b2) = Self::coerce_bool_numeric(a.clone(), b.clone());
             a2 == b2
+        } else if matches!(a, Value::Vector(_)) || matches!(b, Value::Vector(_)) {
+            // 🔴 Bracketed-vector spelling on one side ('[1.0, 2.0]' arrives
+            // as TEXT — the lexer has no vector literal token). Every other
+            // vector context (KNN ordering, INSERT coercion) parses it; `=`/
+            // IN comparisons silently matched nothing without this arm.
+            // Bit-level equality (via PartialEq) — a parsed '1.0' is the
+            // same f32 that was stored.
+            let parsed_other = match (a, b) {
+                (Value::Vector(_), Value::Text(s)) | (Value::Text(s), Value::Vector(_)) => {
+                    Value::parse_bracketed_vector(s.as_str())
+                }
+                _ => None,
+            };
+            match parsed_other {
+                Some(v) => a == &v || b == &v,
+                None => a == b,
+            }
         } else {
             a == b
         }
@@ -3218,6 +3235,7 @@ pub(crate) fn match_local_match(cell: Option<&str>, query: &str, phrase: bool) -
         .iter()
         .any(|g| !g.is_empty() && g.iter().all(|term| hay_tokens.contains(term)))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2383,6 +2383,23 @@ impl Database {
             .map(|pk| pk == col_name)
             .unwrap_or(false);
 
+        // 🔴 Bracketed-vector literal against a VECTOR column: parse it to a
+        // Vector before any comparison — the raw-string WHERE parser keeps
+        // it as Text, and every branch below (columnar scan, column index,
+        // row fetch) compares Values directly, so `emb = '[1,2]'` matched
+        // nothing. Same spelling INSERT/ORDER BY already parse.
+        let value = match (schema.get_column_position(col_name), &value) {
+            (Some(pos), Value::Text(t))
+                if matches!(
+                    schema.columns.get(pos).map(|c| &c.col_type),
+                    Some(crate::types::ColumnType::Tensor(_))
+                ) =>
+            {
+                Value::parse_bracketed_vector(t.as_str()).unwrap_or_else(|| value.clone())
+            }
+            _ => value.clone(),
+        };
+
         // Determine select columns (shared by both PK and column-index paths)
         let select_part = after_select[..from_pos].trim();
         let is_star = select_part == "*";

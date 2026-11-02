@@ -71,6 +71,12 @@ fn normalize_for_in(v: &Value) -> Value {
         // Non-date text (parse_iso returns None) is left as Text.
         Value::Text(s) => crate::types::Timestamp::parse_iso(s.as_str())
             .map(Value::Timestamp)
+            // 🔴 Bracketed-vector spelling `WHERE emb IN ('[1,2]')`: the SQL
+            // lexer has no vector literal token, so vectors arrive as quoted
+            // text everywhere else (KNN parses them at its sites). Parse them
+            // here so an IN list matches a VECTOR column; non-vector text is
+            // left as Text.
+            .or_else(|| Value::parse_bracketed_vector(s.as_str()))
             .unwrap_or_else(|| v.clone()),
         other => other.clone(),
     }
@@ -5997,6 +6003,16 @@ impl QueryExecutor {
                     other => unreachable!("count fast path returns Select, got {other:?}"),
                 });
             }
+            // 🚨 VECTOR / SPATIAL predicates: every aggregate fast path below
+            // either declines or compares raw scalar bytes without decoding a
+            // var-width filter column — `COUNT(*) WHERE emb = '[1,2]'` came
+            // back as an EMPTY row and `SUM(..)` as 0 (the legacy columnar /
+            // partial-scan paths), after a pointless last-resort sync. The
+            // materialized path evaluates the predicate through the general
+            // evaluator, which parses the bracketed literal.
+            if self.stmt_where_touches_complex_column(stmt) {
+                return self.materialize_as_streaming(stmt);
+            }
             // 🔑 TimeSeries FIRST: every fast path below (count, columnar
             // pushdown, column index) reads LSM/ColSegmentStore, which hold
             // no TS data — with a WHERE they returned 0. ts_simple_aggregate
@@ -10316,8 +10332,14 @@ impl QueryExecutor {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
                             Ok(Value::Bool(false))
                         } else {
+                            // values_equal_coerced: bracketed-vector TEXT
+                            // literals must equal the VECTOR they spell
+                            // (partial_cmp alone made bare `emb = '[…]'`
+                            // false on this path).
                             Ok(Value::Bool(
-                                lv.partial_cmp(&rv) == Some(std::cmp::Ordering::Equal),
+                                crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
+                                    &lv, &rv,
+                                ),
                             ))
                         }
                     }
@@ -10326,7 +10348,9 @@ impl QueryExecutor {
                             Ok(Value::Bool(false))
                         } else {
                             Ok(Value::Bool(
-                                lv.partial_cmp(&rv) != Some(std::cmp::Ordering::Equal),
+                                !crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
+                                    &lv, &rv,
+                                ),
                             ))
                         }
                     }
@@ -11073,6 +11097,22 @@ impl QueryExecutor {
 
     /// Helper: extract (col_pos, op, literal_value) from a binary comparison.
     /// Handles both `col op literal` and `literal op col` (swapping op).
+    /// A bracketed-vector literal ('[1.0, 2.0]') compared against a VECTOR
+    /// column must be parsed to a Vector, or every compiled Eq/Ne silently
+    /// matched nothing (the lexer has no vector literal token — the same
+    /// spelling works in INSERT and ORDER BY contexts).
+    fn coerce_vector_literal_for_column(schema: &TableSchema, pos: usize, val: Value) -> Value {
+        if let (Some(col), Value::Text(s)) = (schema.columns.get(pos), &val) {
+            if matches!(col.col_type, crate::types::ColumnType::Tensor(_)) {
+                if let Some(vector) = Value::parse_bracketed_vector(s.as_str()) {
+                    return vector;
+                }
+            }
+        }
+        val
+    }
+
+    #[allow(clippy::type_complexity)]
     fn extract_col_literal_cmp(
         left: &Expr,
         right: &Expr,
@@ -11088,7 +11128,8 @@ impl QueryExecutor {
                     col_name
                 };
                 let pos = schema.get_column_position(bare)?;
-                return Some((pos, op.clone(), val.clone()));
+                let val = Self::coerce_vector_literal_for_column(schema, pos, val.clone());
+                return Some((pos, op.clone(), val));
             }
         }
         // Try left=literal, right=column (swap op direction)
@@ -11100,6 +11141,7 @@ impl QueryExecutor {
                     col_name
                 };
                 let pos = schema.get_column_position(bare)?;
+                let val = Self::coerce_vector_literal_for_column(schema, pos, val.clone());
                 let swapped = match op {
                     BinaryOperator::Lt => BinaryOperator::Gt,
                     BinaryOperator::Le => BinaryOperator::Ge,
@@ -11107,7 +11149,7 @@ impl QueryExecutor {
                     BinaryOperator::Ge => BinaryOperator::Le,
                     other => other.clone(),
                 };
-                return Some((pos, swapped, val.clone()));
+                return Some((pos, swapped, val));
             }
         }
         None
@@ -11637,8 +11679,14 @@ impl QueryExecutor {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
                             Ok(Value::Null) // SQL: NULL = anything => NULL
                         } else {
+                            // values_equal_coerced (not bare partial_cmp):
+                            // a bracketed-vector TEXT literal must equal the
+                            // VECTOR column value it spells (same parse every
+                            // other vector context applies).
                             Ok(Value::Bool(
-                                lv.partial_cmp(&rv) == Some(std::cmp::Ordering::Equal),
+                                crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
+                                    &lv, &rv,
+                                ),
                             ))
                         }
                     }
@@ -24981,23 +25029,13 @@ impl QueryExecutor {
                     // sorter silently skips expression keys → ARBITRARY
                     // order (our own examples used this spelling). Accept a
                     // bracketed-vector string here instead of mis-sorting.
-                    (Expr::Column(col), Expr::Literal(Value::Text(s)))
-                        if s.starts_with('[') && s.ends_with(']') =>
-                    {
-                        let parsed: Option<Vec<f32>> = s[1..s.len() - 1]
-                            .split(',')
-                            .map(|p| p.trim().parse::<f32>().ok())
-                            .collect();
-                        if let Some(vec) = parsed.filter(|v| !v.is_empty()) {
-                            let cosine = matches!(*op, BinaryOperator::CosineDistance);
-                            (
-                                col.clone(),
-                                crate::types::ArcVec::new(vec),
-                                order_by.asc,
-                                cosine,
-                            )
-                        } else {
-                            return Ok(None);
+                    (Expr::Column(col), Expr::Literal(Value::Text(s))) => {
+                        match Value::parse_bracketed_vector(s.as_str()) {
+                            Some(Value::Vector(vec)) => {
+                                let cosine = matches!(*op, BinaryOperator::CosineDistance);
+                                (col.clone(), vec, order_by.asc, cosine)
+                            }
+                            _ => return Ok(None),
                         }
                     }
                     (Expr::Column(_col), _other) => {
@@ -25090,16 +25128,20 @@ impl QueryExecutor {
             )
             .unwrap_or_else(|| format!("{}_{}", plan.table, plan.column));
 
-        // 🔑 Correctness-first routing: the SIMD columnar brute force is
-        // EXACT (scans every live row, segments + write buffer) and fast in
-        // the embedded envelope (~1.2ms @ 50K rows), while the DiskANN graph
-        // index's incremental/rebuild machinery has multiple LRU-capacity
-        // hazards that strand nodes and silently drop rows from top-k
-        // (measured recall@10 as low as 0.03-0.09). Below the threshold the
-        // brute force is used unconditionally — index or not; the graph
-        // index only serves tables large enough that an exact scan would
-        // dominate query latency.
-        const EXACT_SCAN_MAX_ROWS: usize = 200_000;
+        // 🔑 Index-first routing (B-06): the DiskANN graph + exact rerank is
+        // now the default whenever the user built a vector index — measured
+        // recall@10 10/10 fresh and 98/100 after deleting 14% + inserting
+        // 2K rows, and rerank_exact fixes ordering/distance precision among
+        // candidates. The old gate (brute force below 200K rows) was based
+        // on a stale recall measurement (0.03-0.09) and meant a 12-30s
+        // CREATE VECTOR INDEX bought NOTHING for typical table sizes. A
+        // small floor keeps sub-millisecond scans for tiny tables where the
+        // graph adds latency without benefit; overfetch (×4 candidates)
+        // absorbs graph misses before the rerank.
+        let index_min_rows: usize = std::env::var("MOTE_VEC_INDEX_MIN_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
         let use_index = {
             let has_index = self.db.has_vector_index(&index_name);
             has_index
@@ -25114,7 +25156,7 @@ impl QueryExecutor {
                             .map(|s| s.sst.num_rows)
                             .sum::<usize>()
                             + store.buffered_row_count();
-                        rows > EXACT_SCAN_MAX_ROWS
+                        rows >= index_min_rows
                     })
                     .unwrap_or(false)
         };
@@ -25145,7 +25187,14 @@ impl QueryExecutor {
             live_rows.max(plan.k)
         };
         let schema = self.db.get_table_schema(&plan.table)?;
-        let mut depth = plan.k.max(16);
+        // 🔴 Overfetch on the graph path: candidates the graph missed are
+        // unrecoverable after rerank — searching k×4 (min 64) and reranking
+        // down costs a fraction of the graph walk and absorbs misses.
+        let mut depth = if use_index {
+            plan.k.saturating_mul(4).max(64)
+        } else {
+            plan.k.max(16)
+        };
         let filtered_rows: Vec<(u64, SqlRow)> = loop {
             let depth_k = depth.min(max_depth);
             let candidates = if use_index {

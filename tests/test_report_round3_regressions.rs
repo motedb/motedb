@@ -311,3 +311,180 @@ fn concurrent_transactions_on_same_row_id_different_tables_do_not_conflict() {
         .unwrap()
         .expect("no spurious cross-table conflict");
 }
+
+/// `WHERE emb IN ('[1,2]')` — the bracketed-vector spelling every other
+/// vector context accepts — must match VECTOR column values (normalize_for_in
+/// parses it into a Vector so the HashSet lookup hits).
+#[test]
+fn in_list_matches_bracketed_vector_literals() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path().join("d.mote")).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, emb VECTOR(2))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '[1.0, 2.0]')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, '[3.0, 4.0]')")
+        .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id FROM t WHERE emb IN ('[1.0, 2.0]')").len(),
+        1
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id FROM t WHERE emb IN ('[3.0,4.0]', '[1.0,2.0]')"
+        )
+        .len(),
+        2
+    );
+    // Plain-text IN on a TEXT column still matches the literal string.
+    db.execute("CREATE TABLE s (k TEXT)").unwrap();
+    db.execute("INSERT INTO s VALUES ('[1.0, 2.0]')").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT k FROM s WHERE k IN ('[1.0, 2.0]')").len(),
+        1
+    );
+    // NOT IN excludes.
+    assert_eq!(
+        rows(&db, "SELECT id FROM t WHERE emb NOT IN ('[1.0, 2.0]')").len(),
+        1
+    );
+}
+
+/// Every comparison shape against a bracketed-vector literal must give the
+/// same answer before and after checkpoint. Each shape used to be served by a
+/// different evaluator (try_fast_select, the single-predicate projected scan,
+/// CompiledWhere, eval_expr_simple, scan_projected_filtered decode) and each
+/// one dropped the Text→Vector coercion somewhere: the segmented bare `=`
+/// path was the last one returning 0 rows.
+#[test]
+fn vector_comparisons_agree_before_and_after_checkpoint() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path().join("d.mote")).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, emb VECTOR(2))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a', '[1.0, 2.0]')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'a', '[3.0, 4.0]')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (3, 'b', '[1.0, 2.0]')")
+        .unwrap();
+
+    let check = |phase: &str| {
+        let ids = |sql: &str| -> Vec<i64> {
+            let mut v: Vec<i64> = rows(&db, sql)
+                .into_iter()
+                .map(|r| match &r[0] {
+                    Value::Integer(i) => *i,
+                    other => panic!("{phase}: non-integer id {other:?}"),
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb = '[1.0, 2.0]'"),
+            vec![1, 3],
+            "{phase}: ="
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE '[1.0, 2.0]' = emb"),
+            vec![1, 3],
+            "{phase}: swapped ="
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb != '[1.0, 2.0]'"),
+            vec![2],
+            "{phase}: !="
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb <> '[1.0, 2.0]'"),
+            vec![2],
+            "{phase}: <>"
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb < '[2.0, 0.0]'"),
+            vec![1, 3],
+            "{phase}: <"
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb = '[1.0, 2.0]' AND cat = 'a'"),
+            vec![1],
+            "{phase}: = AND text"
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE cat = 'b' AND emb = '[1.0, 2.0]'"),
+            vec![3],
+            "{phase}: text AND ="
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb IN ('[1.0, 2.0]')"),
+            vec![1, 3],
+            "{phase}: IN"
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb NOT IN ('[1.0, 2.0]')"),
+            vec![2],
+            "{phase}: NOT IN"
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb = '[9.0, 9.0]'"),
+            Vec::<i64>::new(),
+            "{phase}: no match"
+        );
+        // A malformed literal is just text: never equal to a vector, never an error.
+        assert_eq!(
+            ids("SELECT id FROM t WHERE emb = '[1.0, x]'"),
+            Vec::<i64>::new(),
+            "{phase}: malformed"
+        );
+        assert_eq!(
+            rows(&db, "SELECT COUNT(*) FROM t WHERE emb = '[1.0, 2.0]'")[0][0],
+            Value::Integer(2),
+            "{phase}: COUNT(*)"
+        );
+        assert_eq!(
+            rows(&db, "SELECT SUM(id) FROM t WHERE emb = '[1.0, 2.0]'")[0][0],
+            Value::Integer(4),
+            "{phase}: SUM WHERE vector"
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT COUNT(*), MAX(id) FROM t WHERE emb = '[1.0, 2.0]' AND cat = 'a'"
+            )[0],
+            vec![Value::Integer(1), Value::Integer(1)],
+            "{phase}: multi-agg WHERE vector AND text"
+        );
+        let mut grouped = rows(
+            &db,
+            "SELECT cat, COUNT(*) FROM t WHERE emb = '[1.0, 2.0]' GROUP BY cat",
+        );
+        grouped.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        assert_eq!(
+            grouped,
+            vec![
+                vec![Value::Text("a".into()), Value::Integer(1)],
+                vec![Value::Text("b".into()), Value::Integer(1)],
+            ],
+            "{phase}: GROUP BY WHERE vector"
+        );
+    };
+
+    check("write-buffer");
+    db.checkpoint().unwrap();
+    check("after checkpoint");
+
+    // Mixed: one segmented row plus one fresh write-buffer row with the same vector.
+    db.execute("INSERT INTO t VALUES (4, 'c', '[1.0, 2.0]')")
+        .unwrap();
+    let mut ids: Vec<i64> = rows(&db, "SELECT id FROM t WHERE emb = '[1.0, 2.0]'")
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Integer(i) => *i,
+            other => panic!("non-integer id {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 3, 4], "mixed segment + buffer");
+}

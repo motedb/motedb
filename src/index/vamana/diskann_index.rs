@@ -693,16 +693,20 @@ impl DiskANNIndex {
             if show_progress && num_batches > 1 {
                 let done = batch_start as u64;
                 let elapsed = build_t0.elapsed().as_secs_f64();
-                let rate = done as f64 / elapsed.max(1e-9);
-                let eta = ((new_count as u64 - done) as f64 / rate.max(1e-9)) as u64;
+                let eta_text = if done == 0 {
+                    String::from("estimating…")
+                } else {
+                    let rate = done as f64 / elapsed;
+                    format!("eta ~{}s", ((new_count as u64 - done) as f64 / rate) as u64)
+                };
                 eprintln!(
-                    "[MoteDB] vector index: batch {}/{} (~{} nodes, {}/{} done, eta ~{}s)",
+                    "[MoteDB] vector index: batch {}/{} (~{} nodes, {}/{} done, {})",
                     batch_idx + 1,
                     num_batches,
                     batch.len(),
                     done,
                     new_count,
-                    eta
+                    eta_text
                 );
             }
 

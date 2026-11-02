@@ -33,6 +33,18 @@ impl QueryExecutor {
             Some(s) => s,
             None => return Ok(None),
         };
+        // 🚨 VECTOR / SPATIAL predicates: count_filtered / aggregate_filtered
+        // compare raw Integer/Float/Text/Bool bytes and decode nothing for a
+        // var-width column, so `COUNT(*) WHERE emb = '[1,2]'` silently counted
+        // 0. The materialized path parses the bracketed literal correctly
+        // (the VEC M1 aggregate declines these the same way).
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(|wc| Self::where_touches_complex_column(wc, &schema))
+        {
+            return Ok(None);
+        }
         let col_types = schema.col_types().to_vec();
 
         // Detect simple COUNT(*) with optional WHERE.
@@ -476,6 +488,39 @@ impl QueryExecutor {
         }
     }
 
+    /// True when the WHERE clause references a VECTOR or SPATIAL column —
+    /// the segment-store aggregate pushdowns only decode scalar filter
+    /// columns, so such predicates must take the materialized path.
+    pub(super) fn where_touches_complex_column(
+        wc: &crate::sql::ast::Expr,
+        schema: &TableSchema,
+    ) -> bool {
+        Self::expr_referenced_columns(wc, schema)
+            .into_iter()
+            .any(|p| {
+                matches!(
+                    schema.col_types().get(p),
+                    Some(ColumnType::Tensor(_) | ColumnType::Spatial)
+                )
+            })
+    }
+
+    /// Single-table SELECT whose WHERE references a VECTOR/SPATIAL column
+    /// (see `where_touches_complex_column`). JOIN / subquery FROMs are routed
+    /// to the materialized path by their own dispatch.
+    pub(super) fn stmt_where_touches_complex_column(&self, stmt: &SelectStmt) -> bool {
+        let Some(wc) = stmt.where_clause.as_ref() else {
+            return false;
+        };
+        let Some(TableRef::Table { name, .. }) = stmt.from.as_ref() else {
+            return false;
+        };
+        self.db
+            .get_table_schema(name)
+            .map(|schema| Self::where_touches_complex_column(wc, &schema))
+            .unwrap_or(false)
+    }
+
     pub(super) fn parse_simple_comparison_where(
         wc: &crate::sql::ast::Expr,
         schema: &TableSchema,
@@ -689,6 +734,15 @@ impl QueryExecutor {
             .where_clause
             .as_ref()
             .is_some_and(Self::expr_contains_subquery)
+        {
+            return Ok(None);
+        }
+        // 🚨 VECTOR / SPATIAL predicates can't be served by the raw-byte
+        // comparators (see col_segment_aggregate) — fall back.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(|wc| Self::where_touches_complex_column(wc, schema))
         {
             return Ok(None);
         }
