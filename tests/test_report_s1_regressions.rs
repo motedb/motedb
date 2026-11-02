@@ -316,3 +316,164 @@ fn bricked_directory_ghost_rows_are_dropped_on_open() {
         "writes keep working on the healed table"
     );
 }
+
+/// B-16 residue, degenerate shape: the table's ONLY segments are ghost
+/// files. The filtering merge would have nothing to write (the builder
+/// emits no file for zero rows), so such segments are not loaded at all —
+/// the table opens empty, accepts writes, and stays clean across reopen.
+#[test]
+fn bricked_directory_ghost_only_table_opens_empty() {
+    use motedb::storage::lsm::ColumnarSSTableBuilder;
+    use motedb::types::ColumnType;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("g.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE g (id INT PRIMARY KEY, tag TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO g VALUES (7, 'will-be-removed')")
+            .unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let seg_dir = path.join("columnar_ms").join("g");
+    for e in std::fs::read_dir(&seg_dir).unwrap().flatten() {
+        let _ = std::fs::remove_file(e.path());
+    }
+    for id in [50u64, 51] {
+        let mut b = ColumnarSSTableBuilder::new(
+            seg_dir.join(format!("{id:010}.sst")),
+            vec![ColumnType::Integer, ColumnType::Text],
+        );
+        b.add_values(
+            0,
+            0,
+            false,
+            &[Value::Integer(1), Value::Text("ghost".into())],
+        )
+        .unwrap();
+        b.finish().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT * FROM g").len(),
+        0,
+        "ghost-only table must open empty"
+    );
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM g")[0][0], Value::Integer(0));
+    db.execute("INSERT INTO g VALUES (1, 'real')").unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM g")[0][0], Value::Integer(1));
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, tag FROM g"),
+        vec![vec![Value::Integer(1), Value::Text("real".into())]],
+        "reopen after repair"
+    );
+    // The ghost files are gone (orphans are deleted outright).
+    let leftover: Vec<String> = std::fs::read_dir(&seg_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n == "0000000050.sst" || n == "0000000051.sst")
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "ghost orphans must be deleted: {leftover:?}"
+    );
+}
+
+/// B-16 residue, mixed shape: a checkpoint on a preview build merged the
+/// ghost INTO a real segment, so one segment holds key=0 next to the real
+/// keys. Open must rewrite it through the filtering merge: every real row
+/// survives with its newest version, the ghost does not.
+#[test]
+fn bricked_directory_mixed_segment_is_healed_on_open() {
+    use motedb::storage::lsm::ColumnarSSTableBuilder;
+    use motedb::types::ColumnType;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.mote");
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE m (id INT PRIMARY KEY, tag TEXT)")
+            .unwrap();
+        for i in 1..=5 {
+            db.execute(&format!("INSERT INTO m VALUES ({i}, 'a{i}')"))
+                .unwrap();
+        }
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    // Read the real composite keys straight from the segment so the planted
+    // segment can carry them (older ts ⇒ the real versions keep winning).
+    let real_keys: Vec<u64> = {
+        let core = motedb::MoteDB::open(&path).unwrap();
+        let store = core.get_or_create_col_segment_store("m", &[]).unwrap();
+        let segs = store.segments_snapshot();
+        let seg = &segs[0];
+        let _ = seg.sst.load_full_keys();
+        (0..seg.sst.num_rows)
+            .map(|i| seg.sst.row_map.key(i))
+            .collect()
+    };
+    assert_eq!(real_keys.len(), 5);
+    let _ = std::fs::remove_file(path.join(".lock"));
+    let seg_dir = path.join("columnar_ms").join("m");
+    let mut b = ColumnarSSTableBuilder::new(
+        seg_dir.join("0000000060.sst"),
+        vec![ColumnType::Integer, ColumnType::Text],
+    );
+    b.add_values(
+        0,
+        0,
+        false,
+        &[Value::Integer(1), Value::Text("ghost".into())],
+    )
+    .unwrap();
+    for (i, &k) in real_keys.iter().enumerate() {
+        b.add_values(
+            k,
+            1,
+            false,
+            &[Value::Integer(i as i64 + 1), Value::Text("stale".into())],
+        )
+        .unwrap();
+    }
+    b.finish().unwrap();
+
+    let expect = |db: &Database, phase: &str| {
+        assert_eq!(
+            rows(db, "SELECT id, tag FROM m ORDER BY id"),
+            (1..=5)
+                .map(|i| vec![Value::Integer(i), Value::Text(format!("a{i}").into())])
+                .collect::<Vec<_>>(),
+            "{phase}: real rows, newest versions, no ghost"
+        );
+        assert_eq!(
+            rows(db, "SELECT COUNT(*) FROM m")[0][0],
+            Value::Integer(5),
+            "{phase}: COUNT"
+        );
+        assert_eq!(
+            rows(db, "SELECT id FROM m WHERE tag = 'ghost'").len(),
+            0,
+            "{phase}: ghost"
+        );
+        assert_eq!(
+            rows(db, "SELECT id FROM m WHERE tag = 'stale'").len(),
+            0,
+            "{phase}: stale"
+        );
+    };
+    let db = Database::open(&path).unwrap();
+    expect(&db, "after open");
+    db.checkpoint().unwrap();
+    expect(&db, "after checkpoint");
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    expect(&db, "after reopen");
+}

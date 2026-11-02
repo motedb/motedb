@@ -550,6 +550,19 @@ pub const DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// tiny (~40KB/segment) and should stay warm.
 const POINT_QUERY_EVICT_INTERVAL: u64 = 4096;
 
+/// Where a segment's keys sit relative to its table's composite-key range
+/// (see `ColSegmentStore::segment_key_status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentKeyStatus {
+    /// Every key belongs to the table.
+    Clean,
+    /// Some keys belong to the table, some cannot — rewrite through the
+    /// filtering merge.
+    Mixed,
+    /// No key belongs to the table — pure crash residue, drop the segment.
+    AllForeign,
+}
+
 impl ColSegmentStore {
     /// Create a new store for a table at `base_dir/columnar_ms/<table_name>/`.
     /// (`columnar_ms` to avoid clashing with the time-series `columnar/` dir.)
@@ -630,16 +643,25 @@ impl ColSegmentStore {
         self.table_id == super::manifest::LOCAL_TABLE_ID || (key >> 32) as u32 == self.table_id
     }
 
-    /// Does this segment hold any row whose key is not this table's? Keys are
-    /// sorted ascending, so the two end keys decide: both inside ⇒ all inside.
+    /// Does this segment hold rows whose key is not this table's? Keys are
+    /// sorted ascending, so the two end keys decide: both inside the table's
+    /// key range ⇒ every key is; both on the same side outside it ⇒ none is.
     /// Reads at most two keys (fence entry + last-key hint), no full key load.
-    fn segment_has_foreign_keys(&self, seg: &Segment) -> bool {
+    fn segment_key_status(&self, seg: &Segment) -> SegmentKeyStatus {
         if self.table_id == super::manifest::LOCAL_TABLE_ID || seg.sst.num_rows == 0 {
-            return false;
+            return SegmentKeyStatus::Clean;
         }
         let first = seg.sst.row_map.key(0);
         let last = seg.sst.last_key_hint().unwrap_or(first);
-        !self.row_key_belongs_to_table(first) || !self.row_key_belongs_to_table(last)
+        let lo = (self.table_id as u64) << 32;
+        let hi = lo | 0xFFFF_FFFF;
+        if first >= lo && last <= hi {
+            SegmentKeyStatus::Clean
+        } else if last < lo || first > hi {
+            SegmentKeyStatus::AllForeign
+        } else {
+            SegmentKeyStatus::Mixed
+        }
     }
 
     /// 🚀 设置 compact_storage 模式（zstd 压缩 Fixed/Text 列）。
@@ -4958,14 +4980,46 @@ impl ColSegmentStore {
             .collect();
         loadable.sort_unstable();
         loadable.dedup();
+        // 🔴 B-16 residue (0.16.0 bricked directories): the crash-at-close
+        // wrote segment files whose row_map entries were never appended —
+        // rows with key=0/ts=0 that key-based dedup cannot collapse against
+        // the real row, so every full scan emitted a ghost duplicate (PK
+        // point reads were fine), and a later checkpoint merged the ghost
+        // INTO the real segment. Classify each segment by its two end keys:
+        // a segment with NO key of this table is pure residue and is not
+        // loaded at all (its file is deleted when it was never recorded —
+        // the crash shape — or queued for GC otherwise); a MIXED segment is
+        // healed below by one filtering full merge. A clean directory pays
+        // two key reads per segment.
+        let mut needs_repair_merge = false;
         for id in loadable {
             let path = self.dir.join(format!("{:010}.sst", id));
-            if path.exists() {
-                if let Ok(seg) = Segment::open(&path, id) {
-                    loaded.push(Arc::new(seg));
-                    loaded_ids.push(id);
+            if !path.exists() {
+                continue;
+            }
+            let Ok(seg) = Segment::open(&path, id) else {
+                continue;
+            };
+            match self.segment_key_status(&seg) {
+                SegmentKeyStatus::Clean => {}
+                SegmentKeyStatus::Mixed => needs_repair_merge = true,
+                SegmentKeyStatus::AllForeign => {
+                    warn_log!(
+                        "[Recovery] table '{}': segment {} holds no row of this table (crash residue) — discarded",
+                        self.table_name,
+                        id
+                    );
+                    drop(seg);
+                    if orphans.contains(&id) {
+                        let _ = std::fs::remove_file(&path);
+                    } else {
+                        self.pending_gc.lock().push(id);
+                    }
+                    continue;
                 }
             }
+            loaded.push(Arc::new(seg));
+            loaded_ids.push(id);
         }
         self.segments.store(Arc::new(loaded));
         let _ = loaded_ids; // (kept for crash-recovery debugging)
@@ -4984,16 +5038,10 @@ impl ColSegmentStore {
 
         // Already in push order (ascending id) — correct.
 
-        // 🔴 B-16 residue (0.16.0 bricked directories): the crash-at-close
-        // wrote segment files whose row_map entries were never appended —
-        // rows with key=0/ts=0 that key-based dedup cannot collapse against
-        // the real row, so every full scan emitted a ghost duplicate (PK
-        // point reads were fine), and a later checkpoint merged the ghost
-        // INTO the real segment. Detect any foreign-key row on open and heal
-        // with one full merge, which drops such rows. One O(table) rewrite
-        // per corrupted directory; a clean directory pays two key reads per
-        // segment.
-        if self.segs().iter().any(|s| self.segment_has_foreign_keys(s)) {
+        // Mixed segments: one O(table) rewrite per corrupted directory; the
+        // merge never emits foreign-key rows, and because at least one real
+        // key is present the output is never empty.
+        if needs_repair_merge {
             let all: Vec<Arc<Segment>> = self.segs().iter().cloned().collect();
             let _guard = self.flush_merge_lock.lock();
             match self.merge_segments_locked(all) {
