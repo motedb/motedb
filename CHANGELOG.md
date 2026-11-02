@@ -137,8 +137,8 @@
 - **Vector 值相等性**: `Value::PartialEq` 无 Vector 分支 — 向量永远
   互不相等，GROUP BY/DISTINCT 对 VECTOR 列静默产出全单例组。补位级相等
   分支（`-0.0`/NaN 与 Hash 的 Debug-string 语义精确一致）。实测 GROUP BY
-  3+1 分组、COUNT(DISTINCT)=2。已知边角: IN 列表带向量字面量仍不匹配
-  （字面量类型问题，未随本条处理）
+  3+1 分组、COUNT(DISTINCT)=2。（后续: IN 列表向量字面量与全部向量谓词
+  形状已于补遗三一并落地）
 - **FTS df 双计清零**（上条遗留落地）: 磁盘侧在 posting_cache 填入时
   一次 k 路合并算出**唯一** df；pending 侧经有序 seek 对齐扣除与磁盘
   重叠的文档 — 被更新重发的文档从此只计一次，IDF 不再漂移。回归:
@@ -152,11 +152,59 @@
   stderr: 阶段（向量落盘/选 medoid 建图/完成）+ 每批一行带已完成数与
   ETA（>1 批才输出）
 
+### 第三轮补遗三（收尾：SQL KNN 索引路由 / 向量谓词 / B-16 残留 / Node 对齐）
+
+- **🔴 B-06 · SQL KNN 从不走 DiskANN 索引**（v0.16.0 原生）:
+  `ORDER BY emb <-> q LIMIT k` 的执行器被一个 `EXACT_SCAN_MAX_ROWS =
+  200_000` 硬门槛锁死在 SIMD 暴力扫描 — 建了向量索引的表在 20 万行以内
+  一律不用它（`EXPLAIN` 看得到 strategy）。改为 `MOTE_VEC_INDEX_MIN_ROWS`
+  （默认 20_000）以上索引优先: 索引取 ×4 候选 + 精确距离 rerank（候选
+  不足再 ×4 加深），索引缺失/小表仍走暴力精确扫。回归:
+  `tests/test_vector_knn_sql_uses_index.rs`（索引路径 top-k 与暴力扫逐
+  项一致）
+- **🔴 向量字面量谓词全线失效**（上条"已知边角"的完整根因，v0.16.0
+  原生）: 词法器没有向量字面量 token，`'[1.0, 2.0]'` 在 WHERE 里是 TEXT；
+  而每一层求值器都各自比较 — `=` / `!=` / `<` / `IN` / `NOT IN` /
+  AND 复合 / `COUNT(*)` / `SUM` / `GROUP BY ... WHERE emb = '[…]'` 在
+  checkpoint 前后分别由 **9 条不同路径**服务（try_fast_select、单谓词
+  投影扫描、CompiledWhere、eval_expr_simple、VecPred、聚合下推、段层
+  过滤解码…），每条都在某处丢了 Text→Vector 转换: 裸 `=` 在 checkpoint
+  后恒 0 行，`COUNT(*) WHERE emb = '[…]'` 返回**空行**（连 0 都没有），
+  `SUM` 返回 0。统一修复: 按列类型在各入口把方括号文本解析为 Vector；
+  `scan_projected_filtered` 对 VECTOR/SPATIAL 过滤列改走通用逐行解码
+  （此前按 TEXT 读 → 永远 `""`）；`Value::PartialOrd` 补 Vector 字典序
+  分支；聚合快路径对触及 VECTOR/SPATIAL 列的 WHERE 一律让位物化路径
+  （原始字节比较器不解码变宽列）。回归:
+  `vector_comparisons_agree_before_and_after_checkpoint`（12 种形状 ×
+  写缓冲/checkpoint 后/混合三阶段）+ `in_list_matches_bracketed_vector_
+  literals`。顺带移除了调试期留在逐行比较热路径上的 env 查询
+- **🔴 B-16 残留 · 坏目录全扫幽灵行 — 真因与修复**（0.16.0 "遗留限制"
+  落地）: 用真实 0.16.0 二进制复刻坏目录后实测，根因**不是**"同 key+ts
+  两份"，而是崩溃关库时 builder 已越界 panic、析构再 `finish()` 写出的
+  **完整可解析段文件里 row_map 条目从未追加 — 行的 key=0 / ts=0**。
+  key 0 不可能属于任何表（key = `table_id<<32 | row_id`），按 key 去重
+  永远合不掉它: 全扫 / COUNT(*) / GROUP BY 多一行，PK 点查正常，而一次
+  checkpoint 会把幽灵行**合并进真段永久化**（已用 0.17 预览版开过坏库
+  的用户正处于这种混合段状态）。修复三层: ① 开库时按段首/尾 key（已
+  排序，两次读取、不加载全量 key）检测"外表 key"，命中则做一次过滤全量
+  合并修复 ② 合并永不输出外表 key 行（之后每次 compaction 自愈）③ WAL
+  回放的旧宽度行按列 DEFAULT 补齐（与 ALTER 回填一致，此前补 NULL）。
+  回归: `bricked_directory_ghost_rows_are_dropped_on_open`（按真实盘上
+  形态植入 key=0 孤儿段；关掉过滤实测复现 6 行含 ghost）
+- **B-05 · Node 绑定补齐 Python 同款 API**: `executeMany`（单批多行
+  INSERT、一次 WAL fsync）/ `insertArrays`（列式批量插入: 按列名对位、
+  缺列 NULL、未知列/参差列显式报错）/ `hybridSearch`（BM25 + KNN RRF
+  融合，行附 `__rrf__ / __bm25__ / __distance__`）/ `begin / commit /
+  rollback`（无参作用于最近 begin）。typings + README + api-reference
+  同步，`smoke_ci.js` 覆盖全部六项；Node crate 版本对齐 0.17.0
+- B-15 补充: 批进度首批完成数为 0 时 ETA 显示 "estimating…" 而非除零
+  伪值
+
 ### 未能落地（如实记录）
 
 - ~~version store 键控 / wal_group_barrier~~（两项已于补遗落地）
-- FTS df 对多 shard 同 doc 双计 → 全体词 IDF 轻微失真（影响排序而非
-  成员正确性；需去重重构 TermStream 的 df 预计，随下次 FTS 改造处理）
+- ~~FTS df 对多 shard 同 doc 双计~~（已于补遗二 "FTS df 双计清零" 落地）
+- ~~IN 列表向量字面量不匹配~~（已于补遗三落地，连同全部向量谓词形状）
 
 ## [0.16.0] — 2026-10-30
 
@@ -179,8 +227,9 @@
   再重开验证数据；坏目录用旧代码复刻、新代码实测可打开。回归:
   `tests/test_report_s1_regressions.rs`（旧代码上实测 SIGABRT）
 - **🔴 附带**: 被 B-16 写坏的 0.16.0 目录，升级后可直接打开（数据可读）；
-  遗留限制: 崩溃瞬间的行可能以 (key, ts) 相同的两份存在（孤儿段 + WAL
-  重放），PK 点查已去重、全扫会看到重复 — 用 DELETE 清理
+  遗留限制: 崩溃瞬间的行可能以重复形式存在（孤儿段 + WAL 重放），PK
+  点查已去重、全扫会看到重复 — 用 DELETE 清理（**0.17.0 已根治**:
+  真因为 key=0/ts=0 幽灵行，见 0.17.0 补遗三）
 
 ### S1 · 静默错误结果类
 
