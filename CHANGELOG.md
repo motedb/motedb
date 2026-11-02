@@ -1,11 +1,12 @@
 # Changelog
 
-## [0.17.0] — 2026-11-02
+## [0.17.0] — 2026-11-03
 
 > 第三轮（自查）：上轮报告的 16 项确认发现全数处理——其中 **7 项是前两轮
 > 修复自身引入或暴露的**（如实标注），5 项为 v0.16.0 原生、此前任何报告
 > 都未实锤的重磅问题。新增回归测试 `tests/test_report_round3_regressions.rs`
-> （7 用例）+ btree/FTS 各 2 项。
+> （11 用例）+ `tests/test_report_round4_regressions.rs`（4 用例）+
+> btree/FTS 各 2 项 + B-16 残留 3 项；补遗一至四见文末。
 
 ### 🔴🔴 存储损坏 / 数据丢失类
 
@@ -199,6 +200,42 @@
   同步，`smoke_ci.js` 覆盖全部六项；Node crate 版本对齐 0.17.0
 - B-15 补充: 批进度首批完成数为 0 时 ETA 显示 "estimating…" 而非除零
   伪值
+
+### 第三轮补遗四（对抗性复测：DML / JOIN / 距离算子里的向量谓词 + B-16 退化形态）
+
+- **🔴 `DELETE … WHERE emb = '[…]'` 一行都删不掉，`<>` 删光**（v0.16.0
+  原生）: DELETE 的扫描路径用 `ExprEvaluator::eval_binary_op`，它的
+  `=`/`<>` 是裸 `partial_cmp` — Text vs Vector 永远不等（UPDATE 走位置
+  求值器，所以同一谓词 UPDATE 能改、DELETE 删不掉）。`eval_binary_op`
+  现在在 Bool/Int 转换之后同样做"Vector 旁的方括号文本 → Vector"转换，
+  六个比较算子和三个距离算子一并受益
+- **🔴 JOIN 里的向量谓词按表的位置/写法分别失效**（v0.16.0 原生）:
+  `a JOIN b … WHERE a.emb = '[…]'` 能查，`b JOIN a`（右表连接列是 PK
+  → 通用 join）和 `FROM b, a WHERE …`（逗号连接 → 慢路径）返回 0 行、
+  `<>` 返回全部。四处各自比较: 物化路径的内存点查过滤（裸 `==`，连
+  `flag = 1` 的 Bool/Int 转换也没有）、`compile_simple_comparison`
+  （裸 `==`/partial_cmp，且 `col <> x` 放过 NULL 行）、`eval_with_
+  materialized`（内联 `==`/`<`）、join 下推谓词生产者（`map_pushdown_
+  preds` / `residual_single_table` / `parse_simple_comparison_where` 原样
+  传 Text）。统一: 前两者改走 `values_equal_coerced`（并对 NULL 行按
+  三值逻辑不匹配）、第三者委托 `eval_binary_op`、生产者按列类型预解析
+  一次 + 消费者 `apply_op_value` 兜底。回归:
+  `join_with_vector_predicates_all_shapes`（6 种 `=` 形状 + 3 种 `<>`
+  + join 聚合，写缓冲/checkpoint 两阶段）、`dml_with_vector_predicates`
+- **🟠 `emb <-> '[…]'` 在投影 / WHERE 阈值里恒 NULL**（v0.16.0 原生）:
+  `SELECT id, emb <-> '[1,2]' AS d` 每行 NULL，`WHERE emb <-> '[1,2]' <
+  0.5` 空集 — 两个位置求值器的距离算子拿到 (Vector, Text)。两处在求值
+  操作数后补同一转换。回归: `distance_operator_with_quoted_vector_literal`
+  （L2 / 余弦 / 字面量在左）
+- **B-16 退化形态补齐**: 段里**全部** key 都不属于本表（纯崩溃残渣）时
+  过滤合并无行可写（builder 对 0 行不落文件 → `Segment::open` 报错，
+  残渣继续可见）。现按段首尾 key 三分: 干净 / 混合（才走过滤合并）/
+  全外表（不加载: 孤儿直接删文件，manifest 在册的排 GC）。回归:
+  `bricked_directory_ghost_only_table_opens_empty`、
+  `bricked_directory_mixed_segment_is_healed_on_open`（预览版 checkpoint
+  把幽灵行并进真段后的形态）
+- 顺带: `compile_simple_comparison` / `apply_op_value` 的 `<>` 对 NULL 行
+  不再为真（SQL 三值逻辑）；物化点查过滤获得与 `=` 一致的 Bool/Int 转换
 
 ### 未能落地（如实记录）
 
