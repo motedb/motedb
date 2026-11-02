@@ -168,6 +168,31 @@ pub struct ExecResult {
 #[napi]
 pub struct Database {
     inner: motedb_core::Database,
+    /// Latest begun-but-unresolved transaction id (commit/rollback with no
+    /// argument act on it) — mirrors the Python binding's `last_tx`.
+    last_tx: std::sync::Mutex<Option<u64>>,
+}
+
+impl Database {
+    /// Transaction id for commit()/rollback(): the explicit argument, else
+    /// the latest begin(). Ids are small counters, exact as f64.
+    fn resolve_tx(&self, tx: Option<f64>) -> Result<u64> {
+        if let Some(t) = tx {
+            if !t.is_finite() || t < 0.0 || t.fract() != 0.0 {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("invalid transaction id {t}"),
+                ));
+            }
+            return Ok(t as u64);
+        }
+        self.last_tx.lock().unwrap().ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                "no transaction: pass the id returned by begin() or call begin() first",
+            )
+        })
+    }
 }
 
 #[napi]
@@ -181,14 +206,20 @@ impl Database {
             motedb_core::Database::create(&path)
         }
         .map_err(py_err)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            last_tx: std::sync::Mutex::new(None),
+        })
     }
 
     /// 🔑 容器模式: open a MOTESNAP container read-only.
     #[napi]
     pub fn open_readonly(container: String) -> Result<Self> {
         let inner = motedb_core::Database::open_readonly(&container).map_err(py_err)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            last_tx: std::sync::Mutex::new(None),
+        })
     }
 
     /// Run a mutation/DDL statement (with optional `?` params). Returns
@@ -247,6 +278,189 @@ impl Database {
         Ok(out)
     }
 
+    /// Run one INSERT/UPDATE/DELETE template once per parameter row as a
+    /// single batch (one multi-row INSERT, one WAL fsync). `params` is an
+    /// array of per-row parameter arrays. Returns { affectedRows }.
+    #[napi]
+    pub fn execute_many(&self, sql: String, params: Array) -> Result<ExecResult> {
+        let n = params.len();
+        let mut batch: Vec<Vec<MValue>> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let row = params.get::<Array>(i).ok().flatten().ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("params[{i}] must be an array of parameters"),
+                )
+            })?;
+            batch.push(convert_params(Some(&row))?);
+        }
+        let affected = self
+            .inner
+            .execute_prepared_many(&sql, batch)
+            .map_err(py_err)?;
+        Ok(ExecResult {
+            affected_rows: affected as f64,
+        })
+    }
+
+    /// Columnar bulk insert — the bulk-load form of the Python binding:
+    ///   db.insertArrays("ev", { id: [1, 2], emb: [[0.1, 0.2], [0.3, 0.4]], tag: ["a", "b"] })
+    /// Values are placed by schema position (column names are matched
+    /// case-insensitively); omitted columns are NULL, so an auto-increment PK
+    /// can be left out. Every given column must have the same length. Skips
+    /// SQL parsing and per-row parameter binding. Returns the row count.
+    #[napi]
+    pub fn insert_arrays(&self, table: String, columns: Object) -> Result<f64> {
+        let schema_cols = self.inner.table_columns(&table).map_err(py_err)?;
+        let mut by_pos: Vec<Option<Vec<MValue>>> = vec![None; schema_cols.len()];
+        for name in Object::keys(&columns)? {
+            let pos = schema_cols
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| {
+                    Error::new(
+                        Status::InvalidArg,
+                        format!("unknown column '{name}' for table '{table}'"),
+                    )
+                })?;
+            if by_pos[pos].is_some() {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("column '{name}' given twice"),
+                ));
+            }
+            let arr = columns.get::<Array>(&name)?.ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("column '{name}' must be an array of values"),
+                )
+            })?;
+            let len = arr.len();
+            let mut vals = Vec::with_capacity(len as usize);
+            for i in 0..len {
+                vals.push(elem_to_mote(&arr, i).map_err(|e| {
+                    Error::new(Status::InvalidArg, format!("column '{name}': {}", e.reason))
+                })?);
+            }
+            by_pos[pos] = Some(vals);
+        }
+        if by_pos.iter().all(|c| c.is_none()) {
+            return Err(Error::new(Status::InvalidArg, "columns object is empty"));
+        }
+        let nrows = by_pos
+            .iter()
+            .find_map(|c| c.as_ref().map(|v| v.len()))
+            .unwrap_or(0);
+        for (i, c) in by_pos.iter().enumerate() {
+            if let Some(vals) = c {
+                if vals.len() != nrows {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!(
+                            "column '{}' has {} rows, expected {}",
+                            schema_cols[i],
+                            vals.len(),
+                            nrows
+                        ),
+                    ));
+                }
+            }
+        }
+        if nrows == 0 {
+            return Ok(0.0);
+        }
+        let ncols = by_pos.len();
+        let mut rows: Vec<Vec<MValue>> = Vec::with_capacity(nrows);
+        for r in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for c in by_pos.iter_mut() {
+                row.push(match c {
+                    Some(vals) => std::mem::replace(&mut vals[r], MValue::Null),
+                    None => MValue::Null,
+                });
+            }
+            rows.push(row);
+        }
+        let n = self.inner.insert_rows(&table, rows).map_err(py_err)?;
+        Ok(n as f64)
+    }
+
+    /// Hybrid search: BM25 text hits and vector KNN hits fused by Reciprocal
+    /// Rank Fusion. Rows come back as objects plus `__rrf__` (fused score,
+    /// higher = better), `__bm25__` (null when the text list missed the doc)
+    /// and `__distance__` (null when KNN missed it).
+    ///   db.hybridSearch("docs_body", "rust database", "docs_emb", [0.1, 0.2, 0.3, 0.4], 10)
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search(
+        &self,
+        text_index: String,
+        text_query: String,
+        vector_index: String,
+        query_vector: Vec<f64>,
+        k: Option<u32>,
+        rrf_k: Option<u32>,
+        fetch_mult: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let qv: Vec<f32> = query_vector.into_iter().map(|x| x as f32).collect();
+        let (names, rows, hits) = self
+            .inner
+            .hybrid_search_rows(
+                &text_index,
+                &text_query,
+                &vector_index,
+                &qv,
+                k.unwrap_or(10) as usize,
+                rrf_k.unwrap_or(60) as usize,
+                fetch_mult.unwrap_or(4) as usize,
+            )
+            .map_err(py_err)?;
+        let score = |s: Option<f32>| {
+            s.and_then(|v| serde_json::Number::from_f64(v as f64))
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (row, hit) in rows.iter().zip(hits.iter()) {
+            let mut m = serde_json::Map::with_capacity(names.len() + 3);
+            for (col, v) in names.iter().zip(row.iter()) {
+                m.insert(col.clone(), value_to_json(v));
+            }
+            m.insert("__rrf__".into(), score(Some(hit.rrf)));
+            m.insert("__bm25__".into(), score(hit.bm25));
+            m.insert("__distance__".into(), score(hit.distance));
+            out.push(serde_json::Value::Object(m));
+        }
+        Ok(out)
+    }
+
+    /// Begin a transaction; returns its id. Statements run through this
+    /// handle until commit()/rollback() belong to it.
+    #[napi]
+    pub fn begin(&self) -> Result<f64> {
+        let tx = self.inner.begin_transaction().map_err(py_err)?;
+        *self.last_tx.lock().unwrap() = Some(tx);
+        Ok(tx as f64)
+    }
+
+    /// Commit a transaction begun with begin() (no argument = the latest).
+    #[napi]
+    pub fn commit(&self, tx: Option<f64>) -> Result<()> {
+        let tx = self.resolve_tx(tx)?;
+        self.inner.commit_transaction(tx).map_err(py_err)?;
+        *self.last_tx.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// Roll back a transaction begun with begin() (no argument = the latest).
+    #[napi]
+    pub fn rollback(&self, tx: Option<f64>) -> Result<()> {
+        let tx = self.resolve_tx(tx)?;
+        self.inner.rollback_transaction(tx).map_err(py_err)?;
+        *self.last_tx.lock().unwrap() = None;
+        Ok(())
+    }
+
     /// Flush pending writes + truncate the WAL.
     #[napi]
     pub fn checkpoint(&self) -> Result<()> {
@@ -272,9 +486,11 @@ impl Database {
     /// 🔑 P4: unpack a MOTESNAP into a fresh directory and open it.
     #[napi]
     pub fn open_snapshot(src: String, dest_dir: String) -> Result<Self> {
-        let inner =
-            motedb_core::Database::open_snapshot(&src, &dest_dir).map_err(st_err)?;
-        Ok(Self { inner })
+        let inner = motedb_core::Database::open_snapshot(&src, &dest_dir).map_err(st_err)?;
+        Ok(Self {
+            inner,
+            last_tx: std::sync::Mutex::new(None),
+        })
     }
 
     /// Close the database (flush + clean-close marker).

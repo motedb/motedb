@@ -14,6 +14,39 @@ export declare class Database {
   execute(sql: string, params?: ParamValue[]): { affectedRows: number };
   /** Run a SELECT; rows come back as objects (column → value). */
   query(sql: string, params?: ParamValue[]): Record<string, unknown>[];
+  /**
+   * Run one INSERT/UPDATE/DELETE template once per parameter row as a single
+   * batch (one WAL fsync). `params` is an array of per-row parameter arrays.
+   */
+  executeMany(sql: string, params: ParamValue[][]): { affectedRows: number };
+  /**
+   * Columnar bulk insert:
+   *   db.insertArrays("ev", { id: [1, 2], emb: [[0.1, 0.2], [0.3, 0.4]] })
+   * Columns are placed by schema position; omitted columns are NULL (an
+   * auto-increment PK can be left out); all given columns must be equal
+   * length. Returns the row count.
+   */
+  insertArrays(table: string, columns: Record<string, ParamValue[]>): number;
+  /**
+   * Hybrid search: BM25 text hits + vector KNN hits fused by Reciprocal Rank
+   * Fusion. Rows also carry __rrf__ (higher = better), __bm25__ and
+   * __distance__ (null when the respective list missed the doc).
+   */
+  hybridSearch(
+    textIndex: string,
+    textQuery: string,
+    vectorIndex: string,
+    queryVector: number[],
+    k?: number,
+    rrfK?: number,
+    fetchMult?: number
+  ): Record<string, unknown>[];
+  /** Begin a transaction; returns its id (commit/rollback take it, or act on the latest). */
+  begin(): number;
+  /** Commit a transaction begun with begin() (no argument = the latest). */
+  commit(tx?: number): void;
+  /** Roll back a transaction begun with begin() (no argument = the latest). */
+  rollback(tx?: number): void;
   /** Flush pending writes + truncate the WAL. */
   checkpoint(): void;
   /** Online snapshot into a new directory (must be outside the DB dir). */

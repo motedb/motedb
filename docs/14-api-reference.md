@@ -33,11 +33,14 @@ narrowing):
 Freeze baseline: `docs/api/` (cargo-public-api listing; additions allowed,
 removals/signature changes only in 2.0).
 
-**Node package `motedb` (11 members)**: `new Database(path)` /
+**Node package `motedb` (17 members)**: `new Database(path)` /
 `Database.open_readonly / open_snapshot` (static) / instance `execute ->
-ExecResult / query / checkpoint / backup_to / export_snapshot / close /
-doctor`. Frozen behaviors: Date values ↔ `'YYYY-MM-DD'` strings, BLOB ↔
-base64, float parameters are never truncated.
+ExecResult / query / executeMany -> ExecResult / insertArrays / hybridSearch
+/ begin / commit / rollback / checkpoint / backup_to / export_snapshot /
+close / doctor`. Frozen behaviors: Date values ↔ `'YYYY-MM-DD'` strings,
+BLOB ↔ base64, float parameters are never truncated. `executeMany`,
+`insertArrays` and `hybridSearch` mirror the Python binding's
+`executemany` / `insert_arrays` / `hybrid_search` (same semantics, camelCase).
 
 ## Database Struct
 
