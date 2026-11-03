@@ -6,7 +6,8 @@
 > 修复自身引入或暴露的**（如实标注），5 项为 v0.16.0 原生、此前任何报告
 > 都未实锤的重磅问题。新增回归测试 `tests/test_report_round3_regressions.rs`
 > （11 用例）+ `tests/test_report_round4_regressions.rs`（4 用例）+
-> btree/FTS 各 2 项 + B-16 残留 3 项；补遗一至四见文末。
+> `tests/test_stability_round5.rs`（稳定性专项 4 用例）+ btree/FTS 各 2 项 +
+> B-16 残留 3 项；补遗一至五见文末。
 
 ### 🔴🔴 存储损坏 / 数据丢失类
 
@@ -236,6 +237,33 @@
   把幽灵行并进真段后的形态）
 - 顺带: `compile_simple_comparison` / `apply_op_value` 的 `<>` 对 NULL 行
   不再为真（SQL 三值逻辑）；物化点查过滤获得与 `=` 一致的 Bool/Int 转换
+
+### 第三轮补遗五（稳定性专项：崩溃注入 × 二级索引 × 反复循环）
+
+- **新增稳定性套件 `tests/test_stability_round5.rs`（3 项，均通过）**，
+  填补既有 kill-9 套件（裸表 WAL 前缀/持久性）与并发套件之间的空白:
+  1. **kill -9 × 三种二级索引 × 周期 checkpoint，同目录连续 6 个
+     崩溃→重开→续写循环**: 子进程按确定性序做 INSERT/UPDATE/DELETE +
+     每 50 行 checkpoint（列索引/向量索引/FTS 全程维护），父进程随机
+     时刻 SIGKILL 后重开，按 journal 精确重建期望状态（含"至多一条
+     已执行未落账 op"的恢复语义，验证后回记账本），逐循环校验:
+     全扫行集与模型逐行相等、COUNT、列索引点查与全扫一致、**索引路由
+     的 SQL KNN**（MOTE_VEC_INDEX_MIN_ROWS=100 强制走 DiskANN）自查
+     top-1、FTS 唯一词命中且不复活已删行、doctor 无 FAIL；随后在重开
+     的句柄上继续写入再验——目录在反复崩溃下持续可写可查
+  2. **反复开关库卫生**: 40 个 open→200 插入→checkpoint→close 循环后
+     段文件数保持在压缩阈值内、manifest 有界（<256KB）、开关库耗时不
+     退化
+  3. **并发混合负载 + 周期 checkpoint**: 4 个转账写者 + 审计表插入/删除
+     搅动 + 2 个读者 + checkpoint 线程并发 3 秒 — 总额守恒、无负余额、
+     重开后不变量保持
+- **本轮未发现引擎缺陷**（如实记录）: 开发中三次红灯均为测试自身建模
+  错误 — ① tagX 续写行的期望向量按 [id,2id,3id,1] 模型生成而实际插入
+  '[9,9,9,9]'，追查到底层时靠把查询向量打进 trace 才发现引擎返回的
+  恰是该查询的正确最近邻；② 父进程续写行在 journal 里复用 "I" 操作
+  导致下一循环模型错位（新增 "X" 操作）；③ 一条写反的断言在并行测试
+  抢 CPU、kill 早于首条 ack 时误报。引擎在全部 6 个循环中状态、索引、
+  doctor 一致
 
 ### 未能落地（如实记录）
 
