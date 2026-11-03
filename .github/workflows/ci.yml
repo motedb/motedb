@@ -116,6 +116,15 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    # 🔴 v0.17.0: the workspace crossed ~300 test binaries and the ubuntu
+    # runner's disk filled during linking — `ld terminated with signal 7
+    # [Bus error]` on several binaries, twice in a row (not a test failure;
+    # macOS passed). Debug info is ~80% of every debug test binary and none
+    # of it is used by CI, so build the suite without it: 5-10× smaller
+    # artifacts, much faster links, same coverage.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
