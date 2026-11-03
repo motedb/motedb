@@ -81,8 +81,9 @@ jobs:
       matrix:
         # windows: OFF until motedb-win32-x64-msvc actually ships (B-01) —
         # the loader throws on Windows today, so this job would be red every
-        # release. Re-add windows-latest together with the package's return
-        # (see node-publish.yml header).
+        # release. Re-add windows-latest TOGETHER with the package's return
+        # (node-publish.yml matrix + package.json targets/optionalDependencies
+        # + npm/win32-x64-msvc — the win32-node branch carries all four).
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
