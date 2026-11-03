@@ -4,15 +4,16 @@ name: Node SDK publish (npm)
 #   motedb (main, pure JS loader) + one platform package per target:
 #   motedb-darwin-arm64 / -darwin-x64 / -linux-x64-gnu / -linux-arm64-gnu
 #
-# 🔴 B-01: the win32-x64-msvc target is DISABLED — the platform package has
-#   never actually landed on npm (npm's anti-spam gate kept rejecting the
-#   brand-new package), while the root package declared it as an
-#   optionalDependency, so `npm i motedb` on Windows pulled a 404 and the
-#   install failed outright for three releases. Removed until a real
-#   motedb-win32-x64-msvc is on the registry: re-add the matrix entry below,
-#   the `x86_64-pc-windows-msvc` line in bindings/node/package.json
-#   (napi.targets + optionalDependencies), the npm/win32-x64-msvc dir, and
-#   the windows entry in release-smoke.yml's node matrix — TOGETHER.
+# 🔁 B-01 (win32 re-trial, win32-node branch): the platform package never
+#   landed on npm (anti-spam gate rejected the brand-new package) while the
+#   root package declared it — `npm i motedb` on Windows 404'd for three
+#   releases, so it was removed in 0.17.0. The four pieces are now BACK
+#   TOGETHER (matrix entry below, package.json napi.targets +
+#   optionalDependencies, npm/win32-x64-msvc dir) and validation-first: a PR
+#   run of this workflow must prove the windows-latest build + smoke +
+#   dry-run BEFORE the next v* tag publishes it for real; release-smoke's
+#   windows entry returns together with the registry package. The publish
+#   step's escalating-backoff path exists precisely for the anti-spam gate.
 # Triggers on v* tags (publish) and PRs touching the binding (build-only).
 # 🔑 Publishing needs the NPM_TOKEN repository secret (an npmjs.org automation
 #   token with publish rights on the motedb* packages). The publish job fails
@@ -59,6 +60,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # 🔁 B-01 re-trial (win32 return), validation-first: the PR run of
+          # this workflow builds the target and dry-run-publishes the npm
+          # dir; the REAL publish happens at the next v* tag (or a manual
+          # workflow_dispatch). The historical blocker was npm's anti-spam
+          # gate on the brand-new package, not the build itself.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
           # musl: GitHub runners are glibc, so these build in the napi-rs
           # Alpine image (same recipe as the napi-rs project template; the
           # image carries the aarch64-linux-musl cross toolchain). Commented
@@ -131,7 +139,7 @@ jobs:
             fi
 
       - name: Smoke (JS loader)
-        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-pc-windows-msvc'
         working-directory: bindings/node
         shell: bash
         # smoke_ci.js is committed (also reused by scripts/release_smoke.sh);
