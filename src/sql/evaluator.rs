@@ -705,66 +705,32 @@ impl ExprEvaluator {
     /// Coerce a pair of values for Bool/numeric equality, mirroring the
     /// coercion in `eval_binary_op`. Used by IN / InHashset so that
     /// `b IN (1)` matches a BOOLEAN column the same way `b = 1` does.
+    /// 🔀 L2 委托（0.18 §A1 PR-2）: 归一唯一定义在 `semantics::coerce_pair`。
     pub(crate) fn coerce_bool_numeric(left: Value, right: Value) -> (Value, Value) {
-        match (&left, &right) {
-            (Value::Bool(b), Value::Integer(_)) => (Value::Integer(if *b { 1 } else { 0 }), right),
-            (Value::Integer(_), Value::Bool(b)) => (left, Value::Integer(if *b { 1 } else { 0 })),
-            (Value::Bool(b), Value::Float(_)) => (Value::Float(if *b { 1.0 } else { 0.0 }), right),
-            (Value::Float(_), Value::Bool(b)) => (left, Value::Float(if *b { 1.0 } else { 0.0 })),
-            (Value::Bool(a), Value::Bool(b)) => (
-                Value::Integer(if *a { 1 } else { 0 }),
-                Value::Integer(if *b { 1 } else { 0 }),
-            ),
-            _ => (left, right),
-        }
+        let (a, b) = crate::sql::semantics::coerce_pair(&left, &right);
+        (a.into_owned(), b.into_owned())
     }
 
     /// Parse a bracketed-vector TEXT operand when the other operand is a
     /// Vector (`emb = '[1.0, 2.0]'`, `'[…]' <> emb`, `emb <-> '[…]'`), so the
     /// operators compare two Vectors. Non-vector text is left alone.
+    /// 🔀 L2 委托（0.18 §A1 PR-2）。
     pub(crate) fn coerce_vector_text(left: Value, right: Value) -> (Value, Value) {
-        match (&left, &right) {
-            (Value::Vector(_), Value::Text(s)) => match Value::parse_bracketed_vector(s.as_str()) {
-                Some(v) => (left, v),
-                None => (left, right),
-            },
-            (Value::Text(s), Value::Vector(_)) => match Value::parse_bracketed_vector(s.as_str()) {
-                Some(v) => (v, right),
-                None => (left, right),
-            },
-            _ => (left, right),
-        }
+        let (a, b) = crate::sql::semantics::coerce_pair(&left, &right);
+        (a.into_owned(), b.into_owned())
     }
 
     /// Equality with the same Bool/numeric coercion as `=`. Returns true when
     /// the two values are equal after coercion. Used by IN-list matching so
     /// `TRUE IN (1)` and `b IN (1)` (BOOLEAN column) behave like `=`.
-    /// 🚀 快速路径：绝大多数 IN 匹配不涉及 Bool，直接比较（零 clone）。
-    ///    仅当任一方是 Bool 时才 coerce（TRUE↔1 场景）。
+    /// 🔀 L2 委托（0.18 §A1 PR-2）: 归一与相等判定唯一定义在
+    /// `semantics::equal`。NULL 契约保持不变（调用方前置判空;
+    /// 历史行为 Null==Null → true、Null==x → false）。
     pub(crate) fn values_equal_coerced(a: &Value, b: &Value) -> bool {
-        if matches!(a, Value::Bool(_)) || matches!(b, Value::Bool(_)) {
-            let (a2, b2) = Self::coerce_bool_numeric(a.clone(), b.clone());
-            a2 == b2
-        } else if matches!(a, Value::Vector(_)) || matches!(b, Value::Vector(_)) {
-            // 🔴 Bracketed-vector spelling on one side ('[1.0, 2.0]' arrives
-            // as TEXT — the lexer has no vector literal token). Every other
-            // vector context (KNN ordering, INSERT coercion) parses it; `=`/
-            // IN comparisons silently matched nothing without this arm.
-            // Bit-level equality (via PartialEq) — a parsed '1.0' is the
-            // same f32 that was stored.
-            let parsed_other = match (a, b) {
-                (Value::Vector(_), Value::Text(s)) | (Value::Text(s), Value::Vector(_)) => {
-                    Value::parse_bracketed_vector(s.as_str())
-                }
-                _ => None,
-            };
-            match parsed_other {
-                Some(v) => a == &v || b == &v,
-                None => a == b,
-            }
-        } else {
-            a == b
+        if matches!(a, Value::Null) || matches!(b, Value::Null) {
+            return a == b;
         }
+        crate::sql::semantics::equal(a, b).is_true()
     }
 
     pub fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
@@ -854,26 +820,20 @@ impl ExprEvaluator {
             }
         }
 
-        match op {
-            BinaryOperator::Eq => Ok(Value::Bool(
-                left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal),
-            )),
-            BinaryOperator::Ne => Ok(Value::Bool(
-                left.partial_cmp(&right) != Some(std::cmp::Ordering::Equal),
-            )),
-            BinaryOperator::Lt => {
-                // 🐛 DEBUG: Print comparison for debugging
-                let result = left < right;
-                Ok(Value::Bool(result))
-            }
-            BinaryOperator::Gt => {
-                // 🐛 DEBUG: Print comparison for debugging
-                let result = left > right;
-                Ok(Value::Bool(result))
-            }
-            BinaryOperator::Le => Ok(Value::Bool(left <= right)),
-            BinaryOperator::Ge => Ok(Value::Bool(left >= right)),
+        // 🔀 L2 统一（0.18 §A1 PR-2）: 六比较走 sql::semantics::eval_cmp。
+        // 行为对齐说明见该函数文档——Eq/Ne 从偏序路线切到相等路线
+        // （NaN 向量的 `=` 现为按位判真；不可比对 Eq 仍为 False、Ne
+        // 仍为 True，与 0.17 发布行为一致），Lt..Ge 不可比从 False
+        // 变为 NULL（三值语义，WHERE 过滤视角等价）。
+        if let Some(ord) = crate::sql::semantics::OrdOp::from_binary(op) {
+            return Ok(match crate::sql::semantics::eval_cmp(&left, &right, ord) {
+                crate::sql::semantics::Cmp3::True => Value::Bool(true),
+                crate::sql::semantics::Cmp3::False => Value::Bool(false),
+                crate::sql::semantics::Cmp3::Unknown => Value::Null,
+            });
+        }
 
+        match op {
             BinaryOperator::And => {
                 let left_bool = self.to_bool(&left)?;
                 let right_bool = self.to_bool(&right)?;
@@ -929,6 +889,8 @@ impl ExprEvaluator {
             BinaryOperator::L2Distance => self.l2_distance(left, right),
             BinaryOperator::CosineDistance => self.cosine_distance(left, right),
             BinaryOperator::DotProduct => self.dot_product(left, right),
+            // 六比较已在上方 eval_cmp 提前返回
+            _ => unreachable!("comparison ops handled by semantics::eval_cmp"),
         }
     }
 

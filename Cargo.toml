@@ -186,3 +186,9 @@ lto = "fat"
 [profile.release-test]
 # Benchmark profile: same as release, kept for backward compat
 inherits = "release"
+
+# 🔬 A1 §A1.6 L2 语义层微基准（接线前后回归 ≤3% 门禁）
+# Run: cargo bench --bench cmp_semantics
+[[bench]]
+name = "cmp_semantics"
+harness = false

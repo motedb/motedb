@@ -209,6 +209,25 @@ pub fn coerce_distance_operands<'a>(
     coerce_pair(a, b)
 }
 
+/// 六比较的**复合总入口**——0.18 统一后的 `=` 裁决（PR-2 起 #1/#5/#6
+/// 全走这里）:
+/// - `Eq`/`Ne` 走**相等路线**（`equal`，与 IN / values_equal_coerced
+///   同源）: NaN 向量按位相等判真、不可比对判 False（→ Ne 为 True）;
+/// - `Lt..Ge` 走**偏序路线**（`compare`）: 不可比 → Unknown。
+///
+/// 与裸 `compare(Ne)` 的差异（不可比对: True vs Unknown）是有意裁决:
+/// 解释器家族 0.17 发布行为是"不可比 → Ne 真、行放行"（SQLite 同款），
+/// 已发布行为优先。批路径 `lit_cmp` 的 Unknown 分歧由 PR-4 统一到本
+/// 入口，差分 harness（PR-5）做九路验收。
+#[inline]
+pub fn eval_cmp(a: &Value, b: &Value, op: OrdOp) -> Cmp3 {
+    match op {
+        OrdOp::Eq => equal(a, b),
+        OrdOp::Ne => equal(a, b).flip(),
+        OrdOp::Lt | OrdOp::Le | OrdOp::Gt | OrdOp::Ge => compare(a, b, op),
+    }
+}
+
 /// IN 集合成员/探测值归一（吸收 `executor::normalize_for_in`，语义不变）:
 /// - Bool → Integer（`TRUE IN (1)` 与 `=` 同语义）;
 /// - ISO 文本 → Timestamp（HashSet 匹配要求 eq 与 hash 同型——L1 的 eq

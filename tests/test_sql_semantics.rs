@@ -764,3 +764,32 @@ fn engine_null_three_valued_current_state() {
         0
     );
 }
+
+// ── eval_cmp 复合入口（PR-2 起解释器家族的 `=` 裁决） ───────────────────
+
+#[test]
+fn eval_cmp_composite_adjudication() {
+    use motedb::sql::semantics::eval_cmp;
+
+    // Eq/Ne 走相等路线: NaN 向量按位判真 → Ne 为 False（与裸 compare 的
+    // ord 路线结论相反——复合入口的裁决，见其文档）。
+    let nan_vec = v_vec(&[f32::NAN]);
+    assert_eq!(eval_cmp(&nan_vec, &nan_vec, OrdOp::Eq), True);
+    assert_eq!(eval_cmp(&nan_vec, &nan_vec, OrdOp::Ne), False);
+    // 不可比对: Eq False / Ne True（解释器 0.17 发布行为，SQLite 同款）;
+    // Lt..Ge → Unknown。
+    let t1 = v_text("x");
+    let i1 = v_int(5);
+    assert_eq!(eval_cmp(&t1, &i1, OrdOp::Eq), False);
+    assert_eq!(eval_cmp(&t1, &i1, OrdOp::Ne), True);
+    assert_eq!(eval_cmp(&t1, &i1, OrdOp::Lt), Unknown);
+    // NULL 三值不变
+    assert_eq!(eval_cmp(&v_null(), &i1, OrdOp::Eq), Unknown);
+    assert_eq!(eval_cmp(&v_null(), &i1, OrdOp::Ne), Unknown);
+    // Bool/方括号向量归一内置
+    assert_eq!(eval_cmp(&v_bool(true), &v_int(1), OrdOp::Eq), True);
+    assert_eq!(
+        eval_cmp(&v_vec(&[1.0, 2.0]), &v_text("[1.0, 2.0]"), OrdOp::Ne),
+        False
+    );
+}

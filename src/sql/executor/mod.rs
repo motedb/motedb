@@ -10345,62 +10345,43 @@ impl QueryExecutor {
                 let rv = Self::eval_expr_simple(right, row)?;
                 // 🔴 Bracketed-vector TEXT operand next to a Vector: parse it
                 // once so the distance operators (`emb <-> '[…]'` projected
-                // or in WHERE evaluated to NULL) and the ordering operators
-                // see two Vectors.
+                // or in WHERE evaluated to NULL) see two Vectors. 比较算子
+                // 的归一已内置在 L2 eval_cmp 里，这里只为距离/算术服务。
                 let (lv, rv) = crate::sql::evaluator::ExprEvaluator::coerce_vector_text(lv, rv);
+                // 🔀 L2 统一（0.18 §A1 PR-2）: 六比较走 semantics::eval_cmp。
+                // 行为变化: Eq 的 NULL 从 Bool(false) → NULL（对齐解释器与
+                // SQL 标准）、不可比对 Lt..Ge 从 false → NULL；WHERE 过滤
+                // 视角全部等价（Unknown 不放行）。
+                if let Some(ord) = crate::sql::semantics::OrdOp::from_binary(op) {
+                    return Ok(match crate::sql::semantics::eval_cmp(&lv, &rv, ord) {
+                        crate::sql::semantics::Cmp3::True => Value::Bool(true),
+                        crate::sql::semantics::Cmp3::False => Value::Bool(false),
+                        crate::sql::semantics::Cmp3::Unknown => Value::Null,
+                    });
+                }
                 match op {
-                    BinaryOperator::Eq => {
-                        // NULL = NULL should return false (SQL standard)
-                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Bool(false))
-                        } else {
-                            // values_equal_coerced: bracketed-vector TEXT
-                            // literals must equal the VECTOR they spell
-                            // (partial_cmp alone made bare `emb = '[…]'`
-                            // false on this path).
-                            Ok(Value::Bool(
-                                crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
-                                    &lv, &rv,
-                                ),
-                            ))
-                        }
-                    }
-                    BinaryOperator::Ne => {
-                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Bool(false))
-                        } else {
-                            Ok(Value::Bool(
-                                !crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
-                                    &lv, &rv,
-                                ),
-                            ))
-                        }
-                    }
-                    BinaryOperator::Lt
-                    | BinaryOperator::Le
-                    | BinaryOperator::Gt
-                    | BinaryOperator::Ge => {
-                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Null) // SQL: NULL comparison => UNKNOWN (3-valued logic)
-                        } else {
-                            Ok(Value::Bool(match op {
-                                BinaryOperator::Lt => lv < rv,
-                                BinaryOperator::Le => lv <= rv,
-                                BinaryOperator::Gt => lv > rv,
-                                BinaryOperator::Ge => lv >= rv,
-                                _ => unreachable!(),
-                            }))
-                        }
-                    }
                     BinaryOperator::And => {
-                        let lb = Self::is_truthy(&lv);
-                        let rb = Self::is_truthy(&rv);
-                        Ok(Value::Bool(lb && rb))
+                        // 🔑 Kleene 三值（PR-2，对齐 eval_expr_on_row / 解释器）:
+                        // FALSE AND 任何 = FALSE，TRUE AND TRUE = TRUE，其余 NULL。
+                        // 此前 is_truthy && is_truthy 两值化，NULL 被压成 FALSE。
+                        let lb = Self::truth3(&lv);
+                        let rb = Self::truth3(&rv);
+                        Ok(match (lb, rb) {
+                            (Some(false), _) | (_, Some(false)) => Value::Bool(false),
+                            (Some(true), Some(true)) => Value::Bool(true),
+                            _ => Value::Null,
+                        })
                     }
                     BinaryOperator::Or => {
-                        let lb = Self::is_truthy(&lv);
-                        let rb = Self::is_truthy(&rv);
-                        Ok(Value::Bool(lb || rb))
+                        // 🔑 Kleene 三值: TRUE OR 任何 = TRUE，
+                        // FALSE OR FALSE = FALSE，其余 NULL。
+                        let lb = Self::truth3(&lv);
+                        let rb = Self::truth3(&rv);
+                        Ok(match (lb, rb) {
+                            (Some(true), _) | (_, Some(true)) => Value::Bool(true),
+                            (Some(false), Some(false)) => Value::Bool(false),
+                            _ => Value::Null,
+                        })
                     }
                     BinaryOperator::Add => Self::positional_add(&lv, &rv),
                     BinaryOperator::Sub => Self::positional_sub(&lv, &rv),
@@ -10411,6 +10392,8 @@ impl QueryExecutor {
                     BinaryOperator::L2Distance => Self::positional_vector_l2(&lv, &rv),
                     BinaryOperator::CosineDistance => Self::positional_vector_cosine(&lv, &rv),
                     BinaryOperator::DotProduct => Self::positional_vector_dot(&lv, &rv),
+                    // 六比较已在上方 eval_cmp 提前返回
+                    _ => unreachable!("comparison ops handled by semantics::eval_cmp"),
                 }
             }
             Expr::Column(name) => {
@@ -10432,7 +10415,13 @@ impl QueryExecutor {
                 expr,
             } => {
                 let v = Self::eval_expr_simple(expr, row)?;
-                Ok(Value::Bool(!Self::is_truthy(&v)))
+                // 🔑 NOT UNKNOWN = UNKNOWN（PR-2）: 此前 is_truthy(Null)=false
+                // 再取反 → true，NULL 谓词被 NOT 错误放行。
+                if matches!(v, Value::Null) {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Bool(!Self::is_truthy(&v)))
+                }
             }
             // For complex expressions that require the materialized path,
             // return the pre-computed result if available, otherwise false.
@@ -11697,55 +11686,22 @@ impl QueryExecutor {
                 // a BOOLEAN column with TRUE, and `1 = TRUE` is true.
                 let (lv, rv) = Self::coerce_bool_int(lv, rv);
                 // 🔴 Bracketed-vector TEXT operand next to a Vector: parse it
-                // once so `emb <-> '[…]'` (projected / in WHERE) and the
-                // ordering operators see two Vectors instead of NULL / false.
+                // once so `emb <-> '[…]'` (projected / in WHERE) sees two
+                // Vectors instead of NULL. 比较算子的归一已内置在 L2
+                // eval_cmp（含 Bool↔数值——上面的 coerce_bool_int 对算术/
+                // 距离仍然必要）。
                 let (lv, rv) = crate::sql::evaluator::ExprEvaluator::coerce_vector_text(lv, rv);
+                // 🔀 L2 统一（0.18 §A1 PR-2）: 六比较走 semantics::eval_cmp。
+                // NULL → Unknown → NULL 与原路径一致; 不可比对 Lt..Ge 从
+                // false → NULL（过滤视角等价）。
+                if let Some(ord) = crate::sql::semantics::OrdOp::from_binary(op) {
+                    return Ok(match crate::sql::semantics::eval_cmp(&lv, &rv, ord) {
+                        crate::sql::semantics::Cmp3::True => Value::Bool(true),
+                        crate::sql::semantics::Cmp3::False => Value::Bool(false),
+                        crate::sql::semantics::Cmp3::Unknown => Value::Null,
+                    });
+                }
                 match op {
-                    BinaryOperator::Eq => {
-                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Null) // SQL: NULL = anything => NULL
-                        } else {
-                            // values_equal_coerced (not bare partial_cmp):
-                            // a bracketed-vector TEXT literal must equal the
-                            // VECTOR column value it spells (same parse every
-                            // other vector context applies).
-                            Ok(Value::Bool(
-                                crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
-                                    &lv, &rv,
-                                ),
-                            ))
-                        }
-                    }
-                    BinaryOperator::Ne => {
-                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Null) // SQL: NULL != anything => NULL
-                        } else {
-                            // Negation of the same coerced equality `=` uses
-                            // (bare partial_cmp made `emb <> '[…]'` true for
-                            // every row).
-                            Ok(Value::Bool(
-                                !crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
-                                    &lv, &rv,
-                                ),
-                            ))
-                        }
-                    }
-                    BinaryOperator::Lt
-                    | BinaryOperator::Le
-                    | BinaryOperator::Gt
-                    | BinaryOperator::Ge => {
-                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Null) // SQL: NULL comparison => UNKNOWN
-                        } else {
-                            Ok(Value::Bool(match op {
-                                BinaryOperator::Lt => lv < rv,
-                                BinaryOperator::Le => lv <= rv,
-                                BinaryOperator::Gt => lv > rv,
-                                BinaryOperator::Ge => lv >= rv,
-                                _ => unreachable!(),
-                            }))
-                        }
-                    }
                     BinaryOperator::And => {
                         // 🔑 Kleene 三值逻辑: FALSE AND 任何 = FALSE,
                         // TRUE AND TRUE = TRUE, 其余 (含 NULL) = NULL。
@@ -11780,6 +11736,8 @@ impl QueryExecutor {
                     BinaryOperator::L2Distance => Self::positional_vector_l2(&lv, &rv),
                     BinaryOperator::CosineDistance => Self::positional_vector_cosine(&lv, &rv),
                     BinaryOperator::DotProduct => Self::positional_vector_dot(&lv, &rv),
+                    // 六比较已在上方 eval_cmp 提前返回
+                    _ => unreachable!("comparison ops handled by semantics::eval_cmp"),
                 }
             }
             Expr::Column(name) => {
@@ -14917,39 +14875,14 @@ impl QueryExecutor {
             Expr::BinaryOp { left, op, right } => {
                 let left_val = self.eval_with_materialized(left, row)?;
                 let right_val = self.eval_with_materialized(right, row)?;
-                // 🚨 SQL three-valued logic: any comparison with NULL is UNKNOWN.
-                // The previous code used Rust's `PartialOrd for Value` which
-                // orders Null below all values — so `NULL < 5` returned `true`
-                // and `NULL > 5` returned `false`, letting unmatched LEFT-JOIN
-                // NULLs pass WHERE filters incorrectly. Defer NULL handling to
-                // the evaluator's eval_binary_op, which correctly returns
-                // Bool(false) for any NULL comparison (filtering the row out).
-                if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
-                    // For comparison ops, NULL → false (UNKNOWN treated as not-true
-                    // for WHERE filtering). For AND/OR, defer to evaluator for
-                    // proper three-valued logic.
-                    match op {
-                        BinaryOperator::Lt
-                        | BinaryOperator::Le
-                        | BinaryOperator::Gt
-                        | BinaryOperator::Ge
-                        | BinaryOperator::Eq
-                        | BinaryOperator::Ne => return Ok(Value::Bool(false)),
-                        BinaryOperator::And | BinaryOperator::Or => {
-                            // Fall through to evaluator for proper 3VL.
-                            return self.evaluator.eval(expr, row);
-                        }
-                        _ => return self.evaluator.eval(expr, row),
-                    }
-                }
-                // Use simple comparison logic
+                // 🔀 L2 统一（0.18 §A1 PR-2）: 删除 NULL 前转 Bool(false) 块
+                // 与两值化 AND/OR，全部委托 eval_binary_op（内部已走
+                // semantics::eval_cmp + Kleene 三值）。此前 NULL 比较被前置
+                // 压成 FALSE，套上 NOT 后会错误放行; AND/OR 对非布尔操作数
+                // 一律 false 而非三值。
                 match op {
-                    // 🔴 Shared `=`/ordering semantics (Bool/Int and
-                    // bracketed-vector coercion live in eval_binary_op): the
-                    // inline ==/< here made `a.emb = '[…]'` false on the
-                    // comma-join slow path while every JOIN … ON form matched.
-                    // Both operands are non-NULL here (checked above), so the
-                    // result is a Bool.
+                    // WHERE 过滤视角: Unknown 不放行（投影语义由解释器保真，
+                    // 此处的 Bool(false) 映射保留该路径历史过滤行为）。
                     BinaryOperator::Lt
                     | BinaryOperator::Le
                     | BinaryOperator::Gt
@@ -14961,35 +14894,9 @@ impl QueryExecutor {
                             v => Ok(v),
                         }
                     }
-                    BinaryOperator::And => {
-                        let left_bool = match left_val {
-                            Value::Bool(b) => b,
-                            Value::Integer(i) => i != 0,
-                            Value::Float(f) => f != 0.0 && !f.is_nan(),
-                            _ => false,
-                        };
-                        let right_bool = match right_val {
-                            Value::Bool(b) => b,
-                            Value::Integer(i) => i != 0,
-                            Value::Float(f) => f != 0.0 && !f.is_nan(),
-                            _ => false,
-                        };
-                        Ok(Value::Bool(left_bool && right_bool))
-                    }
-                    BinaryOperator::Or => {
-                        let left_bool = match left_val {
-                            Value::Bool(b) => b,
-                            Value::Integer(i) => i != 0,
-                            Value::Float(f) => f != 0.0 && !f.is_nan(),
-                            _ => false,
-                        };
-                        let right_bool = match right_val {
-                            Value::Bool(b) => b,
-                            Value::Integer(i) => i != 0,
-                            Value::Float(f) => f != 0.0 && !f.is_nan(),
-                            _ => false,
-                        };
-                        Ok(Value::Bool(left_bool || right_bool))
+                    // Kleene AND/OR 委托解释器（TRUE/FALSE 支配律 + NULL 传播）
+                    BinaryOperator::And | BinaryOperator::Or => {
+                        self.evaluator.eval_binary_op(op, left_val, right_val)
                     }
                     _ => self.evaluator.eval(expr, row), // Fall back to evaluator for complex ops
                 }

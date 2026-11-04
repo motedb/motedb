@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.18.0] — 开发中
+
+> 主线: 求值器统一（技术债清偿，设计文档
+> `docs/design/2026-11-018-unification-and-capabilities.md`）+ 产品能力
+> 硬伤补全。工作流 A 先行。
+
+### 🔀 A2 测试卫生
+
+- 10 文件 30 处固定 `/tmp` 路径唯一化: 功能测试（mvcc/crash/e2e/disk）
+  改每用例 TempDir 自清理；bench 报告类改按进程 id 唯一根目录。验收:
+  同文件两进程并发连跑双绿（此前固定路径下必然互踩产生假失败）。
+
+### 🔀 A1 求值器统一 — PR-1/PR-2
+
+- **PR-1** 新增 `src/sql/semantics.rs`（L2 语义层）: `Cmp3` 三值 /
+  `OrdOp` / `coerce_pair`（Cow 零分配归一: Bool↔数值、方括号向量文本）/
+  `equal` / `compare` / `eval_cmp` / `coerce_distance_operands` /
+  `normalize_set_member` / `coerce_literal_for_column`。特征测试
+  `tests/test_sql_semantics.rs`: 38 行类型对 × 8 算子矩阵（eq 路线与
+  ord 路线分开断言）+ IN/NOT IN 三值建模 + 引擎级 NULL/Kleene 现状
+  锁定（12 探针全部符合 SQL 三值标准）。
+- **PR-2** 解释器家族接线（#1 `eval_binary_op` / #2
+  `values_equal_coerced` / #5 `eval_expr_simple` / #6 `eval_expr_on_row` /
+  #7 `eval_with_materialized`），行为变更（全部有特征测试锁定）:
+  - `=` 统一到**相等路线**（`PartialEq` 位级，与 IN 同源）:
+    NaN 向量的 `=` 从 False → **True**（`[NaN] = '[NaN]'` 现在命中）;
+    不可比对 `Eq` 仍 False、`Ne` 仍 True（0.17 发布行为保持）。
+  - 不可比对 `Lt..Ge` 从 False → **NULL**（三值语义; WHERE 过滤视角
+    等价——Unknown 不放行）。
+  - #5 快路径 `NULL = x` 投影从 Bool(false) → **NULL**（对齐解释器与
+    SQL 标准; 过滤视角等价）。
+  - #5 AND/OR 从两值化 → **Kleene 三值**（NULL AND TRUE = NULL 等），
+    `NOT (NULL = x)` 从 Bool(true) → **NULL**——此前 NOT 套 NULL 谓词
+    在该路径会错误放行全部行。
+  - #7 物化路径删除 NULL→Bool(false) 前转与两值化 AND/OR，全部委托
+    解释器（Kleene）。此前 NULL 比较被前置压成 FALSE 后再被 NOT 反转
+    是潜在错放行源。
+- 微基准 `benches/cmp_semantics.rs`（criterion）: L2 非命中路径 vs
+  裸 L1 比较，接线回归 ≤3% 门禁。
+
 ## [0.17.0] — 2026-11-03
 
 > 第三轮（自查）：上轮报告的 16 项确认发现全数处理——其中 **7 项是前两轮
