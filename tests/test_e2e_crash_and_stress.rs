@@ -2,11 +2,21 @@
 //!
 //! Run: cargo test --release --test test_e2e_crash_and_stress -- --nocapture --test-threads=1
 
-use motedb::{sql::QueryResult, types::Value, Database};
+use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use motedb::{sql::QueryResult, types::Value, Database};
 use tempfile::TempDir;
+
+/// Per-test unique temp dir; keep the guard alive for the whole test so the
+/// directory is removed on drop (after `close`).
+fn temp_db_dir() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().to_path_buf();
+    (dir, path)
+}
 
 fn exec(db: &Database, sql: &str) -> QueryResult {
     db.execute(sql).unwrap().materialize().unwrap()
@@ -26,11 +36,6 @@ fn count_all(db: &Database, table: &str) -> i64 {
     }
 }
 
-fn remove_db(path: &str) {
-    let _ = std::fs::remove_dir_all(path);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", path));
-}
-
 // ═══════════════════════════════════════════════════════════════
 // CRASH RECOVERY TESTS
 // ═══════════════════════════════════════════════════════════════
@@ -39,12 +44,11 @@ fn remove_db(path: &str) {
 #[test]
 #[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_crash_uncommitted_txn_rollback() {
-    let dir = "/tmp/motedb_e2e_rollback";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     // Phase 1: Insert, begin txn, insert more, DON'T commit, close (simulate crash)
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
             .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'committed')").unwrap();
@@ -63,25 +67,23 @@ fn test_crash_uncommitted_txn_rollback() {
 
     // Phase 2: Reopen — only committed rows exist
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = count_all(&db, "t");
         assert_eq!(cnt, 1, "uncommitted row should NOT survive crash");
         let rows = select_rows(&db, "SELECT val FROM t WHERE id = 1");
         assert_eq!(rows[0][0], Value::Text("committed".into()));
         db.close().unwrap();
     }
-    remove_db(dir);
 }
 
 /// Kill after commit and flush — all data must survive
 #[test]
 #[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_crash_committed_and_flushed_survives() {
-    let dir = "/tmp/motedb_e2e_commit";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT, price FLOAT, qty INT)")
             .unwrap();
 
@@ -101,7 +103,7 @@ fn test_crash_committed_and_flushed_survives() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         assert_eq!(count_all(&db, "items"), 500);
 
         // Verify data integrity with ORDER BY + LIMIT
@@ -123,18 +125,16 @@ fn test_crash_committed_and_flushed_survives() {
 
         db.close().unwrap();
     }
-    remove_db(dir);
 }
 
 /// Repeated close + reopen cycles — data integrity across sessions
 #[test]
 #[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_repeated_open_close_cycles() {
-    let dir = "/tmp/motedb_e2e_cycles";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE cycle (k INT PRIMARY KEY, v INT)")
             .unwrap();
 
@@ -149,25 +149,23 @@ fn test_repeated_open_close_cycles() {
 
     // Reopen and verify all 500 rows
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         assert_eq!(count_all(&db, "cycle"), 500);
         let rows = select_rows(&db, "SELECT MIN(v), MAX(v) FROM cycle");
         assert_eq!(rows[0][0], Value::Integer(0));
         assert_eq!(rows[0][1], Value::Integer(4990));
         db.close().unwrap();
     }
-    remove_db(dir);
 }
 
 /// Transaction commit + rollback semantics (basic)
 #[test]
 #[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_transaction_commit_and_rollback() {
-    let dir = "/tmp/motedb_e2e_txn";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE txn (id INT PRIMARY KEY, v INT)")
             .unwrap();
 
@@ -188,7 +186,7 @@ fn test_transaction_commit_and_rollback() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         assert_eq!(
             count_all(&db, "txn"),
             1,
@@ -198,7 +196,6 @@ fn test_transaction_commit_and_rollback() {
         assert_eq!(rows[0][0], Value::Integer(10));
         db.close().unwrap();
     }
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════════

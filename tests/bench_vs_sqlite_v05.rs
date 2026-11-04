@@ -5,11 +5,16 @@
 use motedb::Database;
 use std::time::Instant;
 
+/// Per-process unique bench root so concurrent runs never share a directory.
+fn mote_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("motedb_vs_sqlite_{}", std::process::id()))
+}
+
 fn setup_motedb(n: usize) -> Database {
-    let dir = "/tmp/motedb_vs_sqlite";
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", &dir));
-    let db = Database::create(dir).unwrap();
+    let dir = mote_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(format!("{}.mote", dir.display()));
+    let db = Database::create(&dir).unwrap();
     db.execute(
         "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, product TEXT, qty INT, price FLOAT)",
     )
@@ -42,9 +47,9 @@ fn setup_motedb(n: usize) -> Database {
 }
 
 fn setup_sqlite(n: usize) -> rusqlite::Connection {
-    let path = "/tmp/motedb_vs_sqlite.sqlite";
-    let _ = std::fs::remove_file(path);
-    let conn = rusqlite::Connection::open(path).unwrap();
+    let path = format!("{}.sqlite", mote_dir().display());
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         .unwrap();
     conn.execute_batch("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER, price REAL)").unwrap();

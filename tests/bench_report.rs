@@ -5,10 +5,15 @@
 use motedb::{sql::QueryResult, types::Value, Database};
 use std::time::Instant;
 
+/// Per-process unique bench root so concurrent runs never share a directory.
+fn bench_root(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("motedb_bench_{}_{}", name, std::process::id()))
+}
+
 fn setup_db(name: &str) -> Database {
-    let dir = format!("/tmp/motedb_bench_{}", name);
+    let dir = bench_root(name);
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", &dir));
+    let _ = std::fs::remove_dir_all(format!("{}.mote", dir.display()));
     Database::create(&dir).unwrap()
 }
 
@@ -537,11 +542,11 @@ fn bench_report_v020() {
 
     // ─── 10. WAL RECOVERY ───
     {
-        let dir = "/tmp/motedb_bench_recovery";
-        let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_dir_all(format!("{}.mote", dir));
+        let dir = bench_root("recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(format!("{}.mote", dir.display()));
         {
-            let db = Database::create(dir).unwrap();
+            let db = Database::create(&dir).unwrap();
             db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
                 .unwrap();
             for i in 0..n {
@@ -553,7 +558,7 @@ fn bench_report_v020() {
         }
 
         let t = Instant::now();
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let elapsed = t.elapsed().as_micros();
         let result = exec(&db, "SELECT COUNT(*) FROM t");
         let count = count_rows(&result);

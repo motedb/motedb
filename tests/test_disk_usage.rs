@@ -30,9 +30,11 @@ fn collect_files(path: &std::path::Path, out: &mut Vec<(String, u64)>) {
 #[test]
 #[ignore = "slow: measures disk usage of 100K rows, ~37s in debug"]
 fn disk_usage_measurement() {
-    let base = format!("/tmp/motedb_disk_test_{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&base);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", &base));
+    // Parent TempDir owns both artifacts: the db path we hand out and the
+    // `<base>.mote` storage directory the engine creates next to it.
+    let parent = tempfile::TempDir::new().expect("create temp dir");
+    let base = parent.path().join("motedb_disk_test");
+    let mote_path = parent.path().join("motedb_disk_test.mote");
 
     let db = Database::create(&base).unwrap();
 
@@ -71,8 +73,7 @@ fn disk_usage_measurement() {
     ];
     let encoded = motedb::storage::row_format::encode(&row, &col_types).unwrap();
 
-    let mote_path = format!("{}.mote", base);
-    let mote_bytes = dir_walk_bytes(std::path::Path::new(&mote_path));
+    let mote_bytes = dir_walk_bytes(&mote_path);
 
     println!("\n=== Disk Usage: Scalar Table (10K rows, 4 cols) ===");
     println!("Total on disk: {} KB", mote_bytes / 1024);
@@ -86,7 +87,7 @@ fn disk_usage_measurement() {
     // Sub-directory breakdown (all files, including hidden)
     println!("\n  Directory breakdown:");
     let mut all_files: Vec<(String, u64)> = Vec::new();
-    collect_files(std::path::Path::new(&mote_path), &mut all_files);
+    collect_files(&mote_path, &mut all_files);
     let mut by_dir: Vec<(String, u64)> = Vec::new();
     for (path, size) in &all_files {
         let dir = path
@@ -117,7 +118,7 @@ fn disk_usage_measurement() {
     }
 
     // LSM SSTable files
-    let lsm_dir = std::path::Path::new(&mote_path).join("lsm");
+    let lsm_dir = mote_path.join("lsm");
     if lsm_dir.exists() {
         println!("\n  SSTable files:");
         let mut sst_total = 0u64;
@@ -161,6 +162,5 @@ fn disk_usage_measurement() {
     );
 
     drop(db);
-    let _ = std::fs::remove_dir_all(&base);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", &base));
+    // parent TempDir removes both the db path and the `.mote` storage dir.
 }

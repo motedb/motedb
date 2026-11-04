@@ -18,10 +18,15 @@
 use motedb::{sql::QueryResult, types::Value, Database};
 use std::time::Instant;
 
+/// Per-process unique bench root so concurrent runs never share a directory.
+fn bench_root(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("motedb_bench_{}_{}", name, std::process::id()))
+}
+
 fn setup_db(name: &str) -> Database {
-    let dir = format!("/tmp/motedb_bench_{}", name);
+    let dir = bench_root(name);
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", &dir));
+    let _ = std::fs::remove_dir_all(format!("{}.mote", dir.display()));
     Database::create(&dir).unwrap()
 }
 

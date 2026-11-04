@@ -1,8 +1,20 @@
 //! Crash Recovery Tests — Verify durability across process crash simulation
 //!
-//! Run: cargo test --release --test test_crash_recovery -- --test-threads=1
+//! Run: cargo test --release --test test_crash_recovery -- --ignored
+//! (each test gets its own TempDir — parallel-safe)
+
+use std::path::PathBuf;
 
 use motedb::{sql::QueryResult, types::Value, Database};
+use tempfile::TempDir;
+
+/// Per-test unique temp dir; keep the guard alive for the whole test so the
+/// directory is removed on drop (after `close`).
+fn temp_db_dir() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().to_path_buf();
+    (dir, path)
+}
 
 fn exec(db: &Database, sql: &str) -> QueryResult {
     db.execute(sql).unwrap().materialize().unwrap()
@@ -22,23 +34,17 @@ fn get_first_count(db: &Database, sql: &str) -> i64 {
     }
 }
 
-fn remove_db(path: &str) {
-    let _ = std::fs::remove_dir_all(path);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", path));
-}
-
 // ═══════════════════════════════════════════════════════════════
 // Test 1: Basic durability — committed rows survive crash
 // ═══════════════════════════════════════════════════════════════
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
 fn test_crash_committed_rows_survive() {
-    let dir = "/tmp/motedb_crash_test_1";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     // Phase 1: Create, insert, commit, close
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
 
@@ -55,7 +61,7 @@ fn test_crash_committed_rows_survive() {
 
     // Phase 2: Reopen and verify
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let result = exec(&db, "SELECT * FROM t WHERE id = 1");
         let rows = match result {
             QueryResult::Select { rows, .. } => rows,
@@ -68,8 +74,6 @@ fn test_crash_committed_rows_survive() {
         assert_eq!(cnt, 2, "Should have 2 committed rows");
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -80,11 +84,10 @@ fn test_crash_committed_rows_survive() {
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
 fn test_crash_raw_insert_survives() {
-    let dir = "/tmp/motedb_crash_test_2";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
@@ -94,13 +97,11 @@ fn test_crash_raw_insert_survives() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(cnt, 2, "Raw INSERT rows should survive crash");
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -109,12 +110,11 @@ fn test_crash_raw_insert_survives() {
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
 fn test_crash_multiple_checkpoints() {
-    let dir = "/tmp/motedb_crash_test_4";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     let n = 500;
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
 
@@ -136,7 +136,7 @@ fn test_crash_multiple_checkpoints() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(cnt, n as i64, "All {} rows should survive crash", n);
 
@@ -160,8 +160,6 @@ fn test_crash_multiple_checkpoints() {
 
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -170,11 +168,10 @@ fn test_crash_multiple_checkpoints() {
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
 fn test_crash_multiple_transactions() {
-    let dir = "/tmp/motedb_crash_test_5";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
 
@@ -197,7 +194,7 @@ fn test_crash_multiple_transactions() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(cnt, 50, "All 50 transaction rows should survive crash");
 
@@ -219,8 +216,6 @@ fn test_crash_multiple_transactions() {
 
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -229,12 +224,11 @@ fn test_crash_multiple_transactions() {
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
 fn test_crash_many_small_writes() {
-    let dir = "/tmp/motedb_crash_test_6";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     let n = 2000;
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, data TEXT)")
             .unwrap();
 
@@ -247,13 +241,11 @@ fn test_crash_many_small_writes() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(cnt, n as i64, "All {} rows should survive crash", n);
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -262,11 +254,10 @@ fn test_crash_many_small_writes() {
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
 fn test_crash_update_survives() {
-    let dir = "/tmp/motedb_crash_test_7";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
@@ -276,7 +267,7 @@ fn test_crash_update_survives() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let result = exec(&db, "SELECT val FROM t WHERE id = 1");
         let rows = match result {
             QueryResult::Select { rows, .. } => rows,
@@ -290,8 +281,6 @@ fn test_crash_update_survives() {
         );
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -300,11 +289,10 @@ fn test_crash_update_survives() {
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
 fn test_crash_delete_survives() {
-    let dir = "/tmp/motedb_crash_test_8";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
@@ -315,7 +303,7 @@ fn test_crash_delete_survives() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(
             cnt, 1,
@@ -337,6 +325,4 @@ fn test_crash_delete_survives() {
         assert!(!rows2.is_empty(), "Non-deleted row should survive");
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }

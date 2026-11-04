@@ -12,12 +12,12 @@ fn us(d: std::time::Duration) -> u64 {
 #[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn perf_report() {
     let n: i64 = 20_000;
-    let dir = "/tmp/motedb_final";
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", dir));
+    let dir = std::env::temp_dir().join(format!("motedb_final_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(format!("{}.mote", dir.display()));
     let mut cfg = DBConfig::default();
     cfg.wal_config.durability_level = DurabilityLevel::no_sync();
-    let db = Database::create_with_config(dir, cfg).unwrap();
+    let db = Database::create_with_config(&dir, cfg).unwrap();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT, cat TEXT, amt INT)")
         .unwrap();
 

@@ -9,15 +9,20 @@ use std::time::Instant;
 // Helpers
 // ═══════════════════════════════════════════════════════════════
 
+/// Per-process unique bench root so concurrent runs never share a directory.
+fn bench_root(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("motedb_bench_{}_{}", name, std::process::id()))
+}
+
 fn setup_motedb(name: &str) -> Database {
-    let dir = format!("/tmp/motedb_bench_{}", name);
+    let dir = bench_root(name);
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", &dir));
+    let _ = std::fs::remove_dir_all(format!("{}.mote", dir.display()));
     Database::create(&dir).unwrap()
 }
 
 fn setup_sqlite(name: &str) -> rusqlite::Connection {
-    let path = format!("/tmp/motedb_bench_{}.sqlite", name);
+    let path = format!("{}.sqlite", bench_root(name).display());
     let _ = std::fs::remove_file(&path);
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
@@ -792,11 +797,11 @@ fn bench_motedb_vs_sqlite() {
     // ═══════════════════════════════════════════════════
     let (mote_recovery, sqlite_recovery) = {
         // MoteDB
-        let dir = "/tmp/motedb_bench_recovery";
-        let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_dir_all(format!("{}.mote", dir));
+        let dir = bench_root("recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(format!("{}.mote", dir.display()));
         {
-            let db = Database::create(dir).unwrap();
+            let db = Database::create(&dir).unwrap();
             db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
                 .unwrap();
             for i in 0..n {
@@ -807,16 +812,16 @@ fn bench_motedb_vs_sqlite() {
             db.close().unwrap();
         }
         let t = Instant::now();
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let _ = m_exec(&db, "SELECT COUNT(*) FROM t");
         let mote_us = t.elapsed().as_micros();
         db.close().unwrap();
 
         // SQLite
-        let path = "/tmp/motedb_bench_recovery.sqlite";
-        let _ = std::fs::remove_file(path);
+        let path = format!("{}.sqlite", bench_root("recovery").display());
+        let _ = std::fs::remove_file(&path);
         {
-            let conn = rusqlite::Connection::open(path).unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
                 .unwrap();
             conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -830,7 +835,7 @@ fn bench_motedb_vs_sqlite() {
             drop(conn);
         }
         let t = Instant::now();
-        let conn = rusqlite::Connection::open(path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
         let _: i64 = conn
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .unwrap();
@@ -1020,7 +1025,8 @@ fn bench_motedb_vs_sqlite() {
         db.flush().unwrap();
         db.close().unwrap();
 
-        let mote_size: u64 = walkdir_size("/tmp/motedb_bench_disk");
+        let disk_root = bench_root("disk");
+        let mote_size: u64 = walkdir_size(&disk_root.to_string_lossy());
 
         let conn = setup_sqlite("disk");
         conn.execute_batch(
@@ -1046,7 +1052,7 @@ fn bench_motedb_vs_sqlite() {
             .unwrap();
         drop(conn);
 
-        let sqlite_size = std::fs::metadata("/tmp/motedb_bench_disk.sqlite")
+        let sqlite_size = std::fs::metadata(format!("{}.sqlite", disk_root.display()))
             .map(|m| m.len())
             .unwrap_or(0);
 

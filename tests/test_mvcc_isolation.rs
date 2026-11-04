@@ -1,8 +1,20 @@
 //! MVCC Isolation Tests — Verify transactional reads see correct data
 //!
-//! Run: cargo test --release --test test_mvcc_isolation -- --test-threads=1
+//! Run: cargo test --release --test test_mvcc_isolation
+//! (each test gets its own TempDir — parallel-safe)
+
+use std::path::PathBuf;
 
 use motedb::{sql::QueryResult, types::Value, Database};
+use tempfile::TempDir;
+
+/// Per-test unique temp dir; keep the guard alive for the whole test so the
+/// directory is removed on drop (after `close`).
+fn temp_db_dir() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().to_path_buf();
+    (dir, path)
+}
 
 fn exec(db: &Database, sql: &str) -> QueryResult {
     db.execute(sql).unwrap().materialize().unwrap()
@@ -22,20 +34,14 @@ fn get_first_count(db: &Database, sql: &str) -> i64 {
     }
 }
 
-fn remove_db(path: &str) {
-    let _ = std::fs::remove_dir_all(path);
-    let _ = std::fs::remove_dir_all(format!("{}.mote", path));
-}
-
 // ═══════════════════════════════════════════════════════════
 // Test 1: Transaction writes are visible after commit (via LSM)
 // ═══════════════════════════════════════════════════════════
 #[test]
 fn test_txn_writes_visible_after_commit_lsm() {
-    let dir = "/tmp/motedb_mvcc_test_1";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
-    let db = Database::create(dir).unwrap();
+    let db = Database::create(&dir).unwrap();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
         .unwrap();
 
@@ -59,7 +65,6 @@ fn test_txn_writes_visible_after_commit_lsm() {
     assert_eq!(rows[0][1], Value::Integer(100));
 
     db.close().unwrap();
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -67,11 +72,10 @@ fn test_txn_writes_visible_after_commit_lsm() {
 // ═══════════════════════════════════════════════════════════
 #[test]
 fn test_txn_inserts_survive_crash() {
-    let dir = "/tmp/motedb_mvcc_test_2";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
 
@@ -90,7 +94,7 @@ fn test_txn_inserts_survive_crash() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(
             cnt, 3,
@@ -114,8 +118,6 @@ fn test_txn_inserts_survive_crash() {
 
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -125,10 +127,9 @@ fn test_txn_inserts_survive_crash() {
 // ═══════════════════════════════════════════════════════════
 #[test]
 fn test_write_write_conflict_detection() {
-    let dir = "/tmp/motedb_mvcc_test_3";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
-    let db = Database::create(dir).unwrap();
+    let db = Database::create(&dir).unwrap();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
         .unwrap();
 
@@ -151,7 +152,6 @@ fn test_write_write_conflict_detection() {
     assert_eq!(rows[0][1], Value::Integer(100));
 
     db.close().unwrap();
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -159,11 +159,10 @@ fn test_write_write_conflict_detection() {
 // ═══════════════════════════════════════════════════════════
 #[test]
 fn test_txn_rollback_discards_writes() {
-    let dir = "/tmp/motedb_mvcc_test_4";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
 
@@ -186,13 +185,11 @@ fn test_txn_rollback_discards_writes() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(cnt, 0, "Rolled-back data should not survive crash");
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -200,11 +197,10 @@ fn test_txn_rollback_discards_writes() {
 // ═══════════════════════════════════════════════════════════
 #[test]
 fn test_mixed_autocommit_and_txn_writes() {
-    let dir = "/tmp/motedb_mvcc_test_5";
-    remove_db(dir);
+    let (_dir, dir) = temp_db_dir();
 
     {
-        let db = Database::create(dir).unwrap();
+        let db = Database::create(&dir).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
             .unwrap();
 
@@ -225,11 +221,9 @@ fn test_mixed_autocommit_and_txn_writes() {
     }
 
     {
-        let db = Database::open(dir).unwrap();
+        let db = Database::open(&dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
         assert_eq!(cnt, 3, "All 3 rows should survive crash");
         db.close().unwrap();
     }
-
-    remove_db(dir);
 }
