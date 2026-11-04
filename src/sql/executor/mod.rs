@@ -56,35 +56,8 @@ fn value_to_concat_string(v: &Value) -> String {
 /// the IN-list members (at compile time) and the column value (at match time)
 /// so `b IN (1)` (BOOLEAN column) and `x IN (TRUE)` (INTEGER column) both match.
 fn normalize_for_in(v: &Value) -> Value {
-    match v {
-        Value::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
-        // 🔑 Parse ISO-date text into Timestamp so a TIMESTAMP column matches
-        // an IN list of string literals (e.g. `WHERE ts IN ('2024-01-15T00:00:00')`).
-        // Value::eq already treats Timestamp==ISO-Text as equal, but HashSet
-        // matching requires matching Hash too — Timestamp and Text hash
-        // differently, so we normalize the set members (and the column value,
-        // which stays Timestamp) to the same Timestamp representation.
-        // Non-date text (parse_iso returns None) is left as Text.
-        Value::Text(s) => {
-            // 🔀 PR-4 裁决: 纯数字文本不按微秒时间戳归一（ISO 形状才解析）
-            // —— 与 semantics::normalize_set_member 同源; 差分 harness
-            // round=161: `a NOT IN (0, '7')` 哈希路径曾因此把 7 与 '7' 判等。
-            if s.bytes().all(|b| b.is_ascii_digit()) {
-                None
-            } else {
-                crate::types::Timestamp::parse_iso(s.as_str())
-            }
-        }
-        .map(Value::Timestamp)
-        // 🔴 Bracketed-vector spelling `WHERE emb IN ('[1,2]')`: the SQL
-        // lexer has no vector literal token, so vectors arrive as quoted
-        // text everywhere else (KNN parses them at its sites). Parse them
-        // here so an IN list matches a VECTOR column; non-vector text is
-        // left as Text.
-        .or_else(|| Value::parse_bracketed_vector(s.as_str()))
-        .unwrap_or_else(|| v.clone()),
-        other => other.clone(),
-    }
+    // 🔀 L2 委托（0.18 §A1 PR-5 收编）: 唯一定义 semantics::normalize_set_member。
+    crate::sql::semantics::normalize_set_member(v)
 }
 
 /// Wrapper around f32 that implements Ord (for use in BinaryHeap top-K).
@@ -10998,14 +10971,9 @@ impl QueryExecutor {
     /// matched nothing (the lexer has no vector literal token — the same
     /// spelling works in INSERT and ORDER BY contexts).
     fn coerce_vector_literal_for_column(schema: &TableSchema, pos: usize, val: Value) -> Value {
-        if let (Some(col), Value::Text(s)) = (schema.columns.get(pos), &val) {
-            if matches!(col.col_type, crate::types::ColumnType::Tensor(_)) {
-                if let Some(vector) = Value::parse_bracketed_vector(s.as_str()) {
-                    return vector;
-                }
-            }
-        }
-        val
+        // 🔀 L2 委托（0.18 §A1 PR-5 收编）: 唯一定义
+        // semantics::coerce_literal_for_column。
+        crate::sql::semantics::coerce_literal_for_column(schema, pos, val)
     }
 
     #[allow(clippy::type_complexity)]

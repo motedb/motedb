@@ -29,6 +29,11 @@ jobs:
           components: rustfmt, clippy
       - name: cargo fmt --check (strict)
         run: cargo fmt --check
+      # 0.18 A1 求值器统一（设计文档 docs/design/2026-11-018 §A1.4）:
+      # src/sql 内裸值比较语义棘轮门禁——只减不增，防止语义实现回潮
+      # 分裂。上限在 scripts/check_sql_cmp.ceiling，清偿后调低。
+      - name: check_sql_cmp (ratchet — bare Value comparisons in src/sql)
+        run: ./scripts/check_sql_cmp.sh
       - name: cargo clippy (advisory — warnings do not fail the job)
         run: cargo clippy --all-targets --all-features --no-deps
         continue-on-error: true

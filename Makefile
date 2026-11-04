@@ -24,7 +24,7 @@
 #
 # See docs/benchmark_methodology.md for what is measured and how.
 
-.PHONY: compete compete-quick compete-full test wheel release-smoke release-smoke-local bench-industry
+.PHONY: compete compete-quick compete-full test test-fast wheel release-smoke release-smoke-local bench-industry
 
 LANGS ?= python,node,rust
 
@@ -39,6 +39,13 @@ compete-full:
 
 test:
 	cargo test --lib --all-features
+
+# 0.18 A 工作流: 全量门禁的提速形态。独立 profile（Cargo.toml
+# [profile.release-test]: 关 LTO + codegen-units=16）——300+ 测试二进制
+# 的链接时间是全量门禁的大头（release LTO 下 ~2h），正确性测试不需要
+# LTO 性能; 独立 profile 不污染 release 构建缓存。PASS/FAIL 等价。
+test-fast:
+	cargo test --profile release-test --no-fail-fast
 
 wheel:
 	python3 -m pip install --quiet maturin

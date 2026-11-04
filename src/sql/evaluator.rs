@@ -429,7 +429,7 @@ impl ExprEvaluator {
                             if matches!(v, Value::Null) {
                                 has_null = true;
                             }
-                            Self::values_equal_coerced(&val, v)
+                            crate::sql::semantics::equal(&val, v).is_true()
                         } else {
                             false
                         }
@@ -454,7 +454,7 @@ impl ExprEvaluator {
                         has_null = true;
                         continue;
                     }
-                    if Self::values_equal_coerced(&val, &item_val) {
+                    if crate::sql::semantics::equal(&val, &item_val).is_true() {
                         found = true;
                         break;
                     }
@@ -686,7 +686,8 @@ impl ExprEvaluator {
                 // would. HashSet.contains uses raw Value::eq which doesn't
                 // coerce Bool↔Int, so we fall back to a coerced scan.
                 let found = if matches!(val, Value::Bool(_)) {
-                    set.iter().any(|s| Self::values_equal_coerced(&val, s))
+                    set.iter()
+                        .any(|s| crate::sql::semantics::equal(&val, s).is_true())
                 } else {
                     // Fast path: only Bool values need coercion (Integer/Float/
                     // Text already hash/eq consistently across the set type).
@@ -735,16 +736,6 @@ impl ExprEvaluator {
     /// Equality with the same Bool/numeric coercion as `=`. Returns true when
     /// the two values are equal after coercion. Used by IN-list matching so
     /// `TRUE IN (1)` and `b IN (1)` (BOOLEAN column) behave like `=`.
-    /// 🔀 L2 委托（0.18 §A1 PR-2）: 归一与相等判定唯一定义在
-    /// `semantics::equal`。NULL 契约保持不变（调用方前置判空;
-    /// 历史行为 Null==Null → true、Null==x → false）。
-    pub(crate) fn values_equal_coerced(a: &Value, b: &Value) -> bool {
-        if matches!(a, Value::Null) || matches!(b, Value::Null) {
-            return a == b;
-        }
-        crate::sql::semantics::equal(a, b).is_true()
-    }
-
     pub fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
         // 🔑 Bool/Int coercion for comparisons and arithmetic: in SQL, TRUE=1
         // and FALSE=0. When one side is Bool and the other is Integer/Float,

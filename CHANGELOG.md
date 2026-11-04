@@ -55,6 +55,22 @@
   已由生产者防御兜住）。孤儿 helper（needs_bool_coerce、WHERE 用
   compare_values）删除; ORDER BY 上下文的 compare_values 保留并注释。
 
+### 🔀 A1 PR-5 — 收编收尾 + CI 门禁 + 测试提速
+
+- **收编**: `normalize_for_in` / `coerce_vector_literal_for_column` /
+  `values_equal_coerced` 三个旧实现删除或改为
+  `semantics::{normalize_set_member, coerce_literal_for_column, equal}`
+  的薄委托——SQL 比较语义的**唯一定义点**自此是 `src/sql/semantics.rs`。
+- **CI 门禁（棘轮）**: `scripts/check_sql_cmp.sh` +
+  `check_sql_cmp.ceiling`（当前 50，只减不增）接入 ci.yml lint job——
+  src/sql 内新增裸值比较（`== &`/`partial_cmp` 等）直接 FAIL，防回潮;
+  非值语义位点（排序键/列名字符串匹配）行内 `cmp-gate-allow` 豁免。
+- **全量门禁提速**: `[profile.release-test]`（继承 release、关 LTO、
+  codegen-units=16）+ `make test-fast`——300+ 测试二进制的 fat-LTO
+  链接是门禁大头（~2h），正确性测试不消费 LTO 性能; 独立 profile
+  不污染 release 构建缓存。
+- 差分 harness（PR-4 落地）随全量套件常跑。
+
 ### 🔀 A1 PR-4 — 批与扫描路径接线 + 差分 harness 九路验收
 
 - **差分 harness**（`tests/test_cmp_differential.rs`）: 随机谓词（类型

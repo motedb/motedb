@@ -184,8 +184,13 @@ opt-level = "z"
 lto = "fat"
 
 [profile.release-test]
-# Benchmark profile: same as release, kept for backward compat
+# 全量测试门禁提速 profile（make test-fast）: 继承 release 但关 LTO、
+# 放开 codegen-units——300+ 测试二进制的链接时间从 ~2h 降到 ~20min。
+# 正确性测试不消费 LTO 性能; 独立 profile 不污染 release 构建缓存。
+# （此前是 bench 用的向后兼容 profile，bench 一直走默认 bench profile。）
 inherits = "release"
+lto = false
+codegen-units = 16
 
 # 🔬 A1 §A1.6 L2 语义层微基准（接线前后回归 ≤3% 门禁）
 # Run: cargo bench --bench cmp_semantics
