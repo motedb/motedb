@@ -34,3 +34,4 @@ __pycache__/
 *.pyc
 bindings/python/dist/
 _native.abi3.so
+/target-a2/

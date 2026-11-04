@@ -26,6 +26,10 @@ pub use lexer::Lexer;
 pub use optimizer::{IndexStats, QueryOptimizer, QueryPlan, ScanMethod};
 pub use parser::Parser;
 pub use row_converter::{row_to_sql_row, rows_to_sql_rows, sql_row_to_row};
+/// SQL 比较语义层（L2）— NULL 三值 / Bool↔数值 / 方括号向量文本的唯一
+/// 实现。0.18 求值器统一（设计文档 §A1）。
+pub mod semantics;
+pub use semantics::{coerce_pair, equal, Cmp3, OrdOp};
 pub use token::{Token, TokenType};
 
 // ✅ 移除了传统的 execute_sql()，改用流式 API
