@@ -35,10 +35,6 @@ fn coerce_bool_int(lv: Value, rv: Value) -> (Value, Value) {
 /// 绝大多数 WHERE 等值比较是 Int=Int / Text=Text / Float=Float，不涉及 Bool，
 /// 调用此函数短路可直接用 == 比较（零 clone）。
 #[inline]
-fn needs_bool_coerce(a: &Value, b: &Value) -> bool {
-    matches!(a, Value::Bool(_)) || matches!(b, Value::Bool(_))
-}
-
 /// Convert a Value to its string representation for GROUP_CONCAT.
 /// Integers print without decimal point; floats print naturally; booleans
 /// print as 1/0 (matching SQLite's GROUP_CONCAT behavior for TRUE/FALSE).
@@ -210,54 +206,24 @@ fn prefix_schema(schema: &TableSchema, prefix: &str) -> TableSchema {
 /// Apply a comparison operator to an optional field value (None = NULL) and a
 /// target. NULLs never match. Used for post-filtering scanned rows by AND'd
 /// predicates that weren't pushed into the single-column scan predicate.
+/// 🔀 L2 委托（0.18 §A1 PR-3）: 统一走 `semantics::eval_cmp` — NULL 三值
+/// （任一侧 NULL → 不匹配）、Bool↔数值、方括号向量文本归一内置，替代
+/// 此前手写的 NULL 检查 + 向量文本预解析 + 裸 PartialEq/偏序（裸路线下
+/// Bool↔Int 的 = 不归一、target 侧 NULL 在 Ne 时会全匹配——引擎层此前
+/// 靠生产者防御兜住，叶子层现在自身正确）。
+#[inline]
 fn apply_op_value(
     op: &crate::sql::ast::BinaryOperator,
     fv: Option<&Value>,
     target: &Value,
 ) -> bool {
-    use crate::sql::ast::BinaryOperator;
     let v = match fv {
         Some(v) => v,
         None => return false,
     };
-    // 🔑 SQL 三值逻辑: NULL 与任何值比较 (含 <>) 结果为 UNKNOWN → 过滤。
-    // 此前 `Ne => v != target` 在 v=Null 时为 true，JOIN/WHERE 快过滤把
-    // `col <> x` 的 NULL 行也算进来 (differential fuzz: JOIN+WHERE qty <> 10
-    // 多返回恰好等于 NULL 行数)。
-    if matches!(v, Value::Null) {
-        return false;
-    }
-    // 🔴 Bracketed-vector literal against a VECTOR field: the predicate
-    // producers that have no schema at hand (residual ON-clause terms, the
-    // join COUNT fold) pass the literal through as Text, and Vector vs Text
-    // made `=` never match and `<>` match every row. Parse it here so the
-    // comparison is Vector-vs-Vector; only taken when the field really is a
-    // Vector, so the scalar hot path pays one discriminant check.
-    let parsed_target;
-    let target = match (v, target) {
-        (Value::Vector(_), Value::Text(s)) => match Value::parse_bracketed_vector(s.as_str()) {
-            Some(p) => {
-                parsed_target = p;
-                &parsed_target
-            }
-            None => target,
-        },
-        _ => target,
-    };
-    match op {
-        BinaryOperator::Eq => v == target,
-        BinaryOperator::Ne => v != target,
-        BinaryOperator::Lt => v.partial_cmp(target) == Some(Ordering::Less),
-        BinaryOperator::Gt => v.partial_cmp(target) == Some(Ordering::Greater),
-        BinaryOperator::Le => matches!(
-            v.partial_cmp(target),
-            Some(Ordering::Less | Ordering::Equal)
-        ),
-        BinaryOperator::Ge => matches!(
-            v.partial_cmp(target),
-            Some(Ordering::Greater | Ordering::Equal)
-        ),
-        _ => false,
+    match crate::sql::semantics::OrdOp::from_binary(op) {
+        Some(ord) => crate::sql::semantics::eval_cmp(v, target, ord).is_true(),
+        None => false,
     }
 }
 
@@ -1392,103 +1358,44 @@ enum CompiledWhere {
 }
 
 impl CompiledWhere {
+    /// 🔀 L2 委托（0.18 §A1 PR-3）: 编译谓词叶子求值统一走
+    /// `semantics::eval_cmp` — NULL（任一侧）→ Unknown → 不匹配（BUG #40
+    /// 语义保持）、Bool↔数值归一、方括号向量文本归一、不可比对 Eq/Ne 按
+    /// 相等路线（与 0.17 发布行为一致）全部内置。替代此前每臂手写的
+    /// NULL 检查 + needs_bool_coerce + coerce_bool_int 双 clone。
+    #[inline]
+    fn leaf_matches(v: &Value, val: &Value, op: crate::sql::semantics::OrdOp) -> bool {
+        crate::sql::semantics::eval_cmp(v, val, op).is_true()
+    }
+
     /// Evaluate the compiled WHERE against a row.
     /// Returns `Some(bool)` if successful, `None` if fallback is needed.
     #[inline]
     fn eval(&self, row: &[Value]) -> Option<bool> {
         match self {
-            CompiledWhere::Eq(pos, val) => {
-                // SQL: NULL = val → NULL (false). Value PartialEq already returns false for Null==NonNull,
-                // 🔑 但 Null == Null 在 Rust 里是 true —— NULL = NULL 必须显式
-                // 判 false（BUG #40，prepared `v = ?` 传 NULL 曾错误命中 NULL 行）。
-                if matches!(val, Value::Null) {
-                    return Some(false);
-                }
-                // 🔑 Bool/Int coercion: `flag = 1` should match a BOOLEAN TRUE.
-                // 🚀 快速路径：绝大多数列非 Bool，直接比较（零 clone）。
-                //    仅当任一方是 Bool 时才 coerce（flag=1 ↔ TRUE 场景）。
-                Some(row.get(*pos).is_some_and(|v| {
-                    if needs_bool_coerce(v, val) {
-                        let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                        a == b
-                    } else {
-                        v == val
-                    }
-                }))
-            }
-            CompiledWhere::Ne(pos, val) => {
-                // SQL: NULL <> val → NULL (false). Must check NULL explicitly.
-                Some(row.get(*pos).is_some_and(|v| {
-                    if matches!(v, Value::Null) {
-                        return false;
-                    }
-                    if needs_bool_coerce(v, val) {
-                        let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                        a != b
-                    } else {
-                        v != val
-                    }
-                }))
-            }
+            CompiledWhere::Eq(pos, val) => Some(
+                row.get(*pos)
+                    .is_some_and(|v| Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Eq)),
+            ),
+            CompiledWhere::Ne(pos, val) => Some(
+                row.get(*pos)
+                    .is_some_and(|v| Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Ne)),
+            ),
             CompiledWhere::Lt(pos, val) => Some(
                 row.get(*pos)
-                    .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| {
-                        // 🔑 Bool↔Int 强制转换（与 Eq 一致）：-3 < TRUE 应按
-                        // -3 < 1 判 —— Value 的 Ord 对跨类型是任意全序
-                        //（BUG #44，差分对拍捕获）。
-                        if needs_bool_coerce(v, val) {
-                            let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                            a < b
-                        } else {
-                            v < val
-                        }
-                    }),
+                    .is_some_and(|v| Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Lt)),
             ),
             CompiledWhere::Le(pos, val) => Some(
                 row.get(*pos)
-                    .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| {
-                        // 🔑 Bool↔Int 强制转换（与 Eq 一致）：-3 < TRUE 应按
-                        // -3 < 1 判 —— Value 的 Ord 对跨类型是任意全序
-                        //（BUG #44，差分对拍捕获）。
-                        if needs_bool_coerce(v, val) {
-                            let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                            a <= b
-                        } else {
-                            v <= val
-                        }
-                    }),
+                    .is_some_and(|v| Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Le)),
             ),
             CompiledWhere::Gt(pos, val) => Some(
                 row.get(*pos)
-                    .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| {
-                        // 🔑 Bool↔Int 强制转换（与 Eq 一致）：-3 < TRUE 应按
-                        // -3 < 1 判 —— Value 的 Ord 对跨类型是任意全序
-                        //（BUG #44，差分对拍捕获）。
-                        if needs_bool_coerce(v, val) {
-                            let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                            a > b
-                        } else {
-                            v > val
-                        }
-                    }),
+                    .is_some_and(|v| Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Gt)),
             ),
             CompiledWhere::Ge(pos, val) => Some(
                 row.get(*pos)
-                    .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| {
-                        // 🔑 Bool↔Int 强制转换（与 Eq 一致）：-3 < TRUE 应按
-                        // -3 < 1 判 —— Value 的 Ord 对跨类型是任意全序
-                        //（BUG #44，差分对拍捕获）。
-                        if needs_bool_coerce(v, val) {
-                            let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                            a >= b
-                        } else {
-                            v >= val
-                        }
-                    }),
+                    .is_some_and(|v| Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Ge)),
             ),
             CompiledWhere::InHash(pos, set, negated, has_null) => {
                 // SQL: NULL IN (...) → NULL (false); NULL NOT IN (...) → false
@@ -1578,83 +1485,50 @@ impl CompiledWhere {
         match self {
             CompiledWhere::Eq(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
-                // 🔑 NULL = 任何值（含 NULL）→ UNKNOWN → false（BUG #40）
-                if matches!(val, Value::Null) {
-                    return Some(false);
-                }
-                Some(row.get(*idx).is_some_and(|v| {
-                    let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                    a == b
-                }))
+                Some(
+                    row.get(*idx).is_some_and(|v| {
+                        Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Eq)
+                    }),
+                )
             }
             CompiledWhere::Ne(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
-                Some(row.get(*idx).is_some_and(|v| {
-                    if matches!(v, Value::Null) {
-                        return false;
-                    }
-                    let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                    a != b
-                }))
+                Some(
+                    row.get(*idx).is_some_and(|v| {
+                        Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Ne)
+                    }),
+                )
             }
             CompiledWhere::Lt(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
                 Some(
-                    row.get(*idx)
-                        .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| {
-                            if needs_bool_coerce(v, val) {
-                                let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                                a < b
-                            } else {
-                                v < val
-                            }
-                        }),
+                    row.get(*idx).is_some_and(|v| {
+                        Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Lt)
+                    }),
                 )
             }
             CompiledWhere::Le(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
                 Some(
-                    row.get(*idx)
-                        .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| {
-                            if needs_bool_coerce(v, val) {
-                                let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                                a <= b
-                            } else {
-                                v <= val
-                            }
-                        }),
+                    row.get(*idx).is_some_and(|v| {
+                        Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Le)
+                    }),
                 )
             }
             CompiledWhere::Gt(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
                 Some(
-                    row.get(*idx)
-                        .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| {
-                            if needs_bool_coerce(v, val) {
-                                let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                                a > b
-                            } else {
-                                v > val
-                            }
-                        }),
+                    row.get(*idx).is_some_and(|v| {
+                        Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Gt)
+                    }),
                 )
             }
             CompiledWhere::Ge(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
                 Some(
-                    row.get(*idx)
-                        .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| {
-                            if needs_bool_coerce(v, val) {
-                                let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                                a >= b
-                            } else {
-                                v >= val
-                            }
-                        }),
+                    row.get(*idx).is_some_and(|v| {
+                        Self::leaf_matches(v, val, crate::sql::semantics::OrdOp::Ge)
+                    }),
                 )
             }
             CompiledWhere::InHash(pos, set, negated, has_null) => {
@@ -23498,32 +23372,40 @@ impl QueryExecutor {
                                 _ => val,
                             }
                         }
-                        let ordered = |want: fn(std::cmp::Ordering) -> bool| -> RowPredicate {
+                        // 🔀 L2 委托（0.18 §A1 PR-3）: 语义核心统一
+                        // `semantics::{equal,compare}` — Bool↔数值归一从此
+                        // 覆盖 Lt..Ge（此前裸偏序对 Bool↔Int 判 False，与
+                        // CompiledWhere/解释器不一致）。编译期 val_vec 预解析
+                        // 保留（热路径每行一次 parse 不可接受）。
+                        let ordered = |ord_op: crate::sql::semantics::OrdOp| -> RowPredicate {
                             let col = col.clone();
                             let val = val.clone();
                             let val_vec = val_vec.clone();
                             Some(Box::new(move |row: &SqlRow| {
                                 Self::get_column_value_static(row, &col)
                                     .filter(|v| !matches!(v, Value::Null))
-                                    .and_then(|v| {
-                                        Self::compare_values(v, target(v, &val, &val_vec))
+                                    .is_some_and(|v| {
+                                        crate::sql::semantics::compare(
+                                            v,
+                                            target(v, &val, &val_vec),
+                                            ord_op,
+                                        )
+                                        .is_true()
                                     })
-                                    .map(want)
-                                    .unwrap_or(false)
                             }))
                         };
                         match op {
                             BinaryOperator::Gt => {
-                                return ordered(|ord| ord == std::cmp::Ordering::Greater);
+                                return ordered(crate::sql::semantics::OrdOp::Gt);
                             }
                             BinaryOperator::Lt => {
-                                return ordered(|ord| ord == std::cmp::Ordering::Less);
+                                return ordered(crate::sql::semantics::OrdOp::Lt);
                             }
                             BinaryOperator::Ge => {
-                                return ordered(|ord| ord != std::cmp::Ordering::Less);
+                                return ordered(crate::sql::semantics::OrdOp::Ge);
                             }
                             BinaryOperator::Le => {
-                                return ordered(|ord| ord != std::cmp::Ordering::Greater);
+                                return ordered(crate::sql::semantics::OrdOp::Le);
                             }
                             BinaryOperator::Eq | BinaryOperator::Ne => {
                                 let negate = *op == BinaryOperator::Ne;
@@ -23531,10 +23413,12 @@ impl QueryExecutor {
                                     Self::get_column_value_static(row, &col)
                                         .filter(|v| !matches!(v, Value::Null))
                                         .map(|v| {
-                                            crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
+                                            crate::sql::semantics::equal(
                                                 v,
                                                 target(v, &val, &val_vec),
-                                            ) != negate
+                                            )
+                                            .is_true()
+                                                != negate
                                         })
                                         .unwrap_or(false)
                                 }));
@@ -23560,6 +23444,25 @@ impl QueryExecutor {
         }
     }
 
+    /// Helper: Compare two values — ORDER BY / sort contexts (returns
+    /// Option<Ordering>; None → arbitrary-but-stable fallback at callers).
+    /// Delegates to `Value::partial_cmp`, which handles every cross-type pair
+    /// (Timestamp vs Integer/Float/Text-ISO, exact int-vs-float, …). The old
+    /// hand-rolled match only knew Integer/Float/Text — `(Timestamp, Integer)`
+    /// fell to `None` → `unwrap_or(false)`, so a materialized-path WHERE like
+    /// `ts >= 1700000899000000` silently matched ZERO rows (BETWEEN survived
+    /// only because it takes the evaluator path). WHERE 语义已由 L2
+    /// semantics::compare 承接（PR-3），本函数只服务排序上下文。
+    fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+        // SQL three-valued logic: comparing against NULL is UNKNOWN → no
+        // match. (`Value::partial_cmp` would order Null below everything,
+        // turning `col >= NULL` into "true for every row".)
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return None;
+        }
+        left.partial_cmp(right)
+    }
+
     /// Helper: Get column value from row (handles table prefixes)
     fn get_column_value_static<'a>(row: &'a SqlRow, col_name: &str) -> Option<&'a Value> {
         // Try exact match first
@@ -23577,24 +23480,6 @@ impl QueryExecutor {
         }
 
         None
-    }
-
-    /// Helper: Compare two values
-    ///
-    /// Delegates to `Value::partial_cmp`, which handles every cross-type pair
-    /// (Timestamp vs Integer/Float/Text-ISO, exact int-vs-float, …). The old
-    /// hand-rolled match only knew Integer/Float/Text — `(Timestamp, Integer)`
-    /// fell to `None` → `unwrap_or(false)`, so a materialized-path WHERE like
-    /// `ts >= 1700000899000000` silently matched ZERO rows (BETWEEN survived
-    /// only because it takes the evaluator path).
-    fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
-        // SQL three-valued logic: comparing against NULL is UNKNOWN → no
-        // match. (`Value::partial_cmp` would order Null below everything,
-        // turning `col >= NULL` into "true for every row".)
-        if matches!(left, Value::Null) || matches!(right, Value::Null) {
-            return None;
-        }
-        left.partial_cmp(right)
     }
 
     // 🚀 P0 FIX: Primary Key Point Query optimization

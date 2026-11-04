@@ -31,6 +31,9 @@
     等价——Unknown 不放行）。
   - #5 快路径 `NULL = x` 投影从 Bool(false) → **NULL**（对齐解释器与
     SQL 标准; 过滤视角等价）。
+  - #5 快路径 BOOLEAN 列参与 `Lt..Ge` 现按 `TRUE=1` 数值归一
+    （`flag < 2` 命中 TRUE 行）——此前该路径裸偏序对 Bool↔Int 判
+    False，与 #1/#6/CompiledWhere（BUG #44）不一致。
   - #5 AND/OR 从两值化 → **Kleene 三值**（NULL AND TRUE = NULL 等），
     `NOT (NULL = x)` 从 Bool(true) → **NULL**——此前 NOT 套 NULL 谓词
     在该路径会错误放行全部行。
@@ -39,6 +42,27 @@
     是潜在错放行源。
 - 微基准 `benches/cmp_semantics.rs`（criterion）: L2 非命中路径 vs
   裸 L1 比较，接线回归 ≤3% 门禁。
+
+### 🔀 A1 PR-3 — 逐行比较三件套接线
+
+- #9 `apply_op_value`（JOIN 下推/写集过滤）、#8
+  `compile_simple_comparison`（编译期预解析保留，语义核心换
+  `semantics::{equal,compare}`）、`CompiledWhere::eval` 与孪生的
+  `eval_at`（六臂 → `leaf_matches` 单点委托，删除每臂手写 NULL 检查 +
+  needs_bool_coerce + 双 clone）。行为对齐: BOOL 列 `Lt..Ge` 在 #8/#9
+  现按 TRUE=1 归一（与 CompiledWhere BUG #44/解释器一致）; 引擎级
+  探针确认无用户可见回归（`v <> NULL`、JOIN Bool 字面量等形态此前
+  已由生产者防御兜住）。孤儿 helper（needs_bool_coerce、WHERE 用
+  compare_values）删除; ORDER BY 上下文的 compare_values 保留并注释。
+
+### 🔧 稳定性 harness 修复（第二轮全量跑实测踩中）
+
+- `test_stability_round5` 的 kill-9 候选包络缺口: 父进程自写的 "X"
+  journal 行之后 `next_op_after` 返回 None → "child 首个 execute 已
+  落盘但未记账"形态不在候选内，极端负载（12+ 并发测试进程、45ms
+  杀点）下误报 "matches neither candidate"。修复: X 行后候选 =
+  sim + `I <next_start>`（child 循环总以 INSERT 开头），空 journal
+  候选同理泛化。复跑 3× + 全套件 4/4 绿。
 
 ## [0.17.0] — 2026-11-03
 
