@@ -1471,6 +1471,30 @@ impl WALManager {
         Self::open_with_config(base_path, num_partitions, WALConfig::default())
     }
 
+    /// 🔒 B1 共享只读（0.18）: 只打开**已存在**的分区文件（缺失分区保持
+    /// 缺失——P1 惰性布局，不落文件），不启动任何后台线程。调用方
+    /// （`open_shared_readonly`）已先验证 WAL 为空——本构造只服务
+    /// recover() 的空扫描与句柄形态，写路径在上游被 read_only 拒绝。
+    pub fn open_readonly(base_path: &Path, num_partitions: u8) -> Result<Self> {
+        let partitions = DashMap::new();
+        for partition_id in 0..num_partitions {
+            let wal_path = base_path.join(format!("partition_{}.wal", partition_id));
+            if wal_path.exists() {
+                let wal = PartitionWAL::open_with_config(wal_path, WALConfig::default())?;
+                partitions.insert(partition_id, parking_lot::Mutex::new(wal));
+            }
+        }
+        Ok(Self {
+            _base_path: base_path.to_path_buf(),
+            partitions: Arc::new(partitions),
+            num_partitions,
+            config: WALConfig::default(),
+            flush_thread: None,
+            group_commit: None,
+            periodic_new_writes: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Open existing WAL manager with config
     pub fn open_with_config<P: AsRef<Path>>(
         base_path: P,

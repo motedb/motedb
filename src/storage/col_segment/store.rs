@@ -268,7 +268,7 @@ fn encode_column_raw(
             // f32 bit pattern IS the encoded form (per-element to_le_bytes
             // dominated vector-column merge time: 384 extends per row).
             if v.len() > u16::MAX as usize {
-                return Err(crate::StorageError::InvalidData(format!(
+                return Err(crate::error::StorageError::InvalidData(format!(
                     "vector dimension {} exceeds the 65535 storage limit",
                     v.len()
                 )));
@@ -5063,6 +5063,111 @@ impl ColSegmentStore {
         if self.segs().len() >= 2 {
             self.note_overlapping_write();
         }
+    }
+    /// 🔒 B1 共享只读（0.18, `open_shared_readonly`）: strictly-no-mutation
+    /// 的恢复变体。与 `recover_from_disk` 的差异:
+    /// - 不删除任何文件（孤儿段 / DROP 残留一律保留原样）;
+    /// - 不修复（B-16 混段不做过滤合并）;
+    /// - 不推进 pending_gc / 不写 manifest;
+    /// - **目录必须与 manifest 完全一致**: 磁盘 .sst 集合 == manifest
+    ///   active 集合，且每段首尾键都属于本表。任何不一致 → Err（调用
+    ///   方提示"先以写模式 open+close 一次或 checkpoint"）——只读者不
+    ///   修复，修复是写者的职责（SQLite rollback-journal 模式同语义）。
+    pub fn recover_from_disk_strict_clean(&self) -> Result<()> {
+        let (dropped, state) = {
+            let m = self.manifest.lock();
+            (m.is_dropped(self.table_id), m.table_snapshot(self.table_id))
+        };
+        if dropped {
+            // DROP 已记录但目录仍在: 干净关闭下 close 会清掉文件——仍有
+            // .sst 即为脏。
+            if let Ok(entries) = std::fs::read_dir(&self.dir) {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".sst"))
+                    {
+                        return Err(crate::error::StorageError::InvalidData(format!(
+                            "table '{}': dropped-table segment files remain \
+                             (dirty close) — open read-write once to repair",
+                            self.table_name
+                        )));
+                    }
+                }
+            }
+            self.segments.store(Arc::new(Vec::new()));
+            return Ok(());
+        }
+
+        // 磁盘 .sst 集合
+        let mut on_disk: Vec<u64> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".sst") {
+                        if let Ok(id) = name.trim_end_matches(".sst").parse::<u64>() {
+                            on_disk.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        on_disk.sort_unstable();
+
+        // 严格一致: active == on_disk（无孤儿、无退役残留）。
+        let active_sorted = {
+            let mut a = state.active_segments.clone();
+            a.sort_unstable();
+            a
+        };
+        if on_disk != active_sorted {
+            let orphaned: Vec<u64> = on_disk
+                .iter()
+                .filter(|id| !active_sorted.contains(id))
+                .copied()
+                .collect();
+            let missing: Vec<u64> = active_sorted
+                .iter()
+                .filter(|id| !on_disk.contains(id))
+                .copied()
+                .collect();
+            return Err(crate::error::StorageError::InvalidData(format!(
+                "table '{}': segment files disagree with manifest \
+                 (orphans {orphaned:?}, missing {missing:?}) — dirty close; \
+                 open read-write once to repair",
+                self.table_name
+            )));
+        }
+
+        // 逐段加载 + 键归属校验（B-16 残渣在此暴露为 Err 而非修复）。
+        let mut loaded: Vec<Arc<Segment>> = Vec::with_capacity(on_disk.len());
+        for id in &on_disk {
+            let path = self.dir.join(format!("{:010}.sst", id));
+            let seg = Segment::open(&path, *id)?;
+            match self.segment_key_status(&seg) {
+                SegmentKeyStatus::Clean => loaded.push(Arc::new(seg)),
+                SegmentKeyStatus::Mixed => {
+                    return Err(crate::error::StorageError::InvalidData(format!(
+                        "table '{}': segment {id} mixes foreign-key rows \
+                         (crash residue) — open read-write once to repair",
+                        self.table_name
+                    )));
+                }
+                SegmentKeyStatus::AllForeign => {
+                    return Err(crate::error::StorageError::InvalidData(format!(
+                        "table '{}': segment {id} holds no row of this table \
+                         (crash residue) — open read-write once to repair",
+                        self.table_name
+                    )));
+                }
+            }
+        }
+        self.next_segment_id
+            .store(on_disk.last().copied().unwrap_or(0) + 1, Ordering::Relaxed);
+        self.segments.store(Arc::new(loaded));
+        // 只读者不 compact、不修复 —— 重叠标记不置位（那会引导后续合并写）。
+        Ok(())
     }
 
     /// Returns a cheap `Arc<Vec<ColumnType>>` snapshot of the current column

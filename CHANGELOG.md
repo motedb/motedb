@@ -2,6 +2,27 @@
 
 ## [0.18.0] — 开发中
 
+### 🔒 B1 多进程共享只读 — `Database::open_shared_readonly`
+
+- **打开模式三分**: 独占写（默认，flock EX，不变）/ **共享只读（新，
+  flock SH，N 进程并发读活动目录）**/ 容器只读（MOTESNAP 解包，不变）。
+- **v1 边界（诚实取舍，SQLite rollback-journal 同语义）**: 只读者不
+  重放 WAL、不修复目录——打开前严格校验"干净关闭"（meta clean_close
+  旗标 + WAL 分区全空 + 每表 segment 与 manifest 完全一致 + 无 B-16
+  残渣），任一不满足 → 明确报错（先以写模式 open+close 一次或
+  CHECKPOINT 再试）。修复是写者的职责。
+- **零落盘合同**: 只读会话不创建 WAL 分区/不 mkdir/不删遗留文件/
+  Drop 不盖章（`lock_is_shared` 区分 SH 与 EX——否则 Drop 的干净关闭
+  盖章会写 meta）。验收用**目录字节级指纹**证明。
+- 验收（tests/test_shared_readonly.rs，子进程 flock 语义）: ① 两读者
+  进程并发结果一致; ② 脏 WAL/未干净关闭明确报错; ③ 写者持 EX 时读者
+  失败且提示; ④ kill -9 写者后报错、写模式 open+close 治愈后可读;
+  ⑤ 只读 open+close 后目录字节级不变。
+- 实现: `WALManager::open_readonly`（缺失分区不落文件、无后台线程）;
+  `ColSegmentStore::recover_from_disk_strict_clean`（strictly-no-mutation
+  恢复变体，孤儿/混段/残留 → Err 而非修复）; `acquire_lock_shared`;
+  进程内注册表带 `::shared-ro` 模式后缀（绝不与读写引擎混键）。
+
 > 主线: 求值器统一（技术债清偿，设计文档
 > `docs/design/2026-11-018-unification-and-capabilities.md`）+ 产品能力
 > 硬伤补全。工作流 A 先行。

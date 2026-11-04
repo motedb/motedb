@@ -243,6 +243,9 @@ pub struct MoteDB {
     /// same directory (the test/multi-handle scenario). Wrapped in a Mutex
     /// because close() runs on a &self MoteDB.
     _lock_file: std::sync::Mutex<Option<std::fs::File>>,
+    /// 🔒 B1 共享只读: 本实例持的是 flock SH（非 EX）——Drop 的干净关闭
+    /// 盖章/FTS flush 仅限 EX 持有者（只读者零落盘）。
+    lock_is_shared: bool,
 
     /// True for clone_for_callback() instances — skip Drop checkpoint.
     _is_clone: bool,
@@ -662,6 +665,7 @@ impl MoteDB {
             index_builder_thread: None,
             auto_flush_thread: None,
             _lock_file: std::sync::Mutex::new(Some(lock_file)),
+            lock_is_shared: false,
             _is_clone: false,
         };
 
@@ -942,7 +946,8 @@ impl MoteDB {
             index_builder_thread: None,   // Don't clone thread (only owned by original)
             auto_flush_thread: None,      // Don't clone thread (only owned by original)
             _lock_file: std::sync::Mutex::new(None), // Don't clone lock (only owned by original)
-            _is_clone: true,              // Skip Drop checkpoint for clones
+            lock_is_shared: false,
+            _is_clone: true, // Skip Drop checkpoint for clones
         }
     }
 
@@ -968,7 +973,11 @@ impl MoteDB {
         // 🔒 Acquire exclusive file lock to prevent concurrent opens.
         // 🔑 容器模式: NO lock — read-only opens must coexist (many readers
         // share one extraction cache) and nothing is mutated.
-        let lock_file = if config.read_only {
+        let lock_file = if config.strict_clean_open {
+            // 🔒 B1: 活动目录共享只读 —— SH 锁（与写者 EX 互斥、与只读者并存）。
+            Some(Self::acquire_lock_shared(&db_path)?)
+        } else if config.read_only {
+            // 容器模式: 无锁（解包副本，天然只读）。
             None
         } else {
             Some(Self::acquire_lock(&db_path)?)
@@ -1012,7 +1021,11 @@ impl MoteDB {
 
         // Open or create WAL (pass user config — fixes config loss on reopen)
         let wal_config = crate::txn::wal::WALConfig::from(config.wal_config.clone());
-        let wal = if wal_path.exists() {
+        // 🔒 B1 共享只读: 只读打开（缺失分区不落文件、无后台线程; 干净
+        // 目录的 wal/ 可能整个不存在——P1 惰性布局，不创建）。
+        let wal = if config.strict_clean_open {
+            Arc::new(WALManager::open_readonly(&wal_path, num_partitions)?)
+        } else if wal_path.exists() {
             Arc::new(WALManager::open_with_config(
                 &wal_path,
                 num_partitions,
@@ -1037,7 +1050,9 @@ impl MoteDB {
         // 🔑 P1 lazy-file layout: open the persisted timestamp index ONLY if
         // the file exists (missing ⟺ no TIMESTAMP-first row was ever indexed
         // in any run). Never materialize it merely to count an empty tree.
-        std::fs::create_dir_all(&indexes_dir)?;
+        if !config.strict_clean_open {
+            std::fs::create_dir_all(&indexes_dir)?;
+        }
         let timestamp_storage = indexes_dir.join("timestamp.idx");
         let timestamp_index =
             crate::database::indexes::timestamp::LazyTsIndex::new(timestamp_storage.clone());
@@ -1056,7 +1071,9 @@ impl MoteDB {
         };
 
         // Open LSM-Tree storage engine
-        std::fs::create_dir_all(&lsm_dir)?;
+        if !config.strict_clean_open {
+            std::fs::create_dir_all(&lsm_dir)?;
+        }
         // Use edge-optimized LSM config if memtable_size_limit differs from default
         let lsm_config = crate::storage::lsm::LSMConfig::from_db_config(&config.lsm_config);
         let lsm_engine = Arc::new(LSMEngine::new(lsm_dir, lsm_config)?);
@@ -1483,7 +1500,12 @@ impl MoteDB {
         let vector_indexes = Self::load_vector_indexes(&db_path, &index_registry)?;
 
         // Load existing text indexes
-        let text_indexes = Self::load_text_indexes(&db_path, &index_registry, &replayed_tables)?;
+        let text_indexes = Self::load_text_indexes(
+            &db_path,
+            &index_registry,
+            &replayed_tables,
+            config.read_only,
+        )?;
 
         // Load existing i-Octree indexes
         let ioctree_indexes = Self::load_ioctree_indexes(&db_path)?;
@@ -1623,6 +1645,7 @@ impl MoteDB {
             index_builder_thread: None,
             auto_flush_thread: None,
             _lock_file: std::sync::Mutex::new(lock_file),
+            lock_is_shared: config.strict_clean_open,
             _is_clone: false,
         };
 
@@ -1650,7 +1673,22 @@ impl MoteDB {
                                         Some((db.col_manifest.clone(), table_id)),
                                     )
                                 {
-                                    store.recover_from_disk();
+                                    // 🔒 B1 共享只读: strictly-no-mutation 恢复
+                                    //（脏目录报错而非修复）。
+                                    if config.strict_clean_open {
+                                        if let Err(e) = store.recover_from_disk_strict_clean() {
+                                            return Err(crate::error::StorageError::InvalidData(
+                                                format!(
+                                                    "shared read-only open: {} \
+                                                     (open the database read-write once, \
+                                                     or CHECKPOINT, then retry)",
+                                                    e
+                                                ),
+                                            ));
+                                        }
+                                    } else {
+                                        store.recover_from_disk();
+                                    }
                                     // 🚀 P0-1: 不在启动时强制 compaction。
                                     // prepare_for_query()（store.rs:474）会在首次查询时
                                     // 按需 compaction（segment_count >= 3 触发）+ 预加载单
@@ -2525,12 +2563,14 @@ impl MoteDB {
         db_path: &Path,
         index_registry: &crate::database::index_metadata::IndexRegistry,
         replayed_tables: &std::collections::HashSet<String>,
+        readonly: bool,
     ) -> Result<HashMap<String, Arc<RwLock<TextFTSIndex>>>> {
         let mut indexes = HashMap::new();
 
         // 🧹 Clean up legacy text_indexes_metadata.bin (no longer used)
+        // 🔒 B1 共享只读: 不删文件（只读者不得变更目录）。
         let legacy_metadata_path = db_path.join("text_indexes_metadata.bin");
-        if legacy_metadata_path.exists() {
+        if !readonly && legacy_metadata_path.exists() {
             if let Err(e) = std::fs::remove_file(&legacy_metadata_path) {
                 debug_log!(
                     "⚠️ Failed to remove legacy text_indexes_metadata.bin: {}",
@@ -3220,6 +3260,41 @@ impl MoteDB {
         }
     }
 
+    /// 🔒 B1 共享只读（0.18）: 以 flock **SH** 打开——多个只读者可并存;
+    /// 任一写者持 EX 时打开失败（提示而非误读）。锁随 File drop 释放。
+    fn acquire_lock_shared(db_path: &Path) -> Result<std::fs::File> {
+        let lock_path = db_path.join(".lock");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let result = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
+            if result != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                {
+                    return Err(StorageError::InvalidData(
+                        "Database is open by a writer process (exclusive lock held) \
+                         — shared read-only open is blocked until it closes"
+                            .into(),
+                    ));
+                }
+                return Err(StorageError::Io(err));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // 非 unix 平台无 flock —— 与独占锁路径同款语义（不阻塞）。
+        }
+        Ok(file)
+    }
+
     /// Acquire an exclusive file lock on the database directory.
     ///
     /// Creates a `.lock` file and acquires an exclusive `flock`.
@@ -3391,10 +3466,12 @@ impl MoteDB {
     /// True while this instance still owns the exclusive directory lock,
     /// i.e. `close()` has not run (`release_lock` takes the File).
     fn holds_exclusive_lock(&self) -> bool {
-        self._lock_file
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+        !self.lock_is_shared
+            && self
+                ._lock_file
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false)
     }
 
     /// 🔒 v0.12.9 clean-close marker: flush the FTS indexes (bounded — never

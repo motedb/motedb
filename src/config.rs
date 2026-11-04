@@ -361,6 +361,18 @@ pub struct DBConfig {
     #[serde(default)]
     pub read_only: bool,
 
+    /// 🔒 B1 共享只读（0.18, `Database::open_shared_readonly`）: 以 flock SH
+    /// 打开**活动目录**（N 进程并发读）。与容器模式的 read_only 差异:
+    /// - 打开前严格校验"干净关闭"（meta clean_close 旗标 + WAL 空），
+    ///   不满足 → 明确报错（先以写模式 open+close 一次或 checkpoint）;
+    /// - ColSegmentStore 恢复走 strictly-no-mutation 变体（孤儿段/
+    ///   混段/残留文件一律报错而非修复）;
+    /// - WAL 分区缺失时不落文件、目录不 mkdir。
+    /// 用户不应直接设置本字段 —— 由 `open_shared_readonly` 注入
+    /// （pub 仅为不破坏外部 `..Default::default()` 结构体字面量构造）。
+    #[serde(default, skip_serializing)]
+    pub strict_clean_open: bool,
+
     /// WAL 配置
     pub wal_config: WALConfig,
 
@@ -521,6 +533,7 @@ impl Default for DBConfig {
     fn default() -> Self {
         Self {
             read_only: false,
+            strict_clean_open: false,
             wal_config: WALConfig::default(),
             num_partitions: 4,
             lsm_config: LSMConfig::default(),

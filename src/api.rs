@@ -290,6 +290,122 @@ impl Database {
         })
     }
 
+    /// 🔒 B1 共享只读（0.18）: 以 flock **SH** 打开活动数据库目录——
+    /// 多进程并发读，与写者（flock EX）互斥。
+    ///
+    /// v1 边界（诚实取舍，与 SQLite rollback-journal 模式同语义）:
+    /// - 只读者**不重放 WAL、不修复目录**——仅保证 clean-close（close
+    ///   盖章）或 checkpoint 边界目录的一致视图;
+    /// - 打开时严格校验: meta clean_close 旗标、WAL 分区全空、每表
+    ///   segment 与 manifest 完全一致、无 B-16 残渣——任一不满足 →
+    ///   明确报错（先以写模式 open+close 一次或 CHECKPOINT，再试）;
+    /// - 全部写语句被拒（read_only 路径）。
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let db = Database::open_shared_readonly("data.mote")?;
+    /// ```
+    pub fn open_shared_readonly<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let raw = path.as_ref().to_path_buf();
+        let db_path = crate::database::MoteDB::resolve_open_path(&raw);
+
+        // ── 脏预检（拿锁之前 fail-fast，不给目录留任何痕迹） ──
+        if !db_path.is_dir() {
+            return Err(crate::MoteDBError::InvalidArgument(format!(
+                "not a database directory: {}",
+                db_path.display()
+            )));
+        }
+        let meta_bin = db_path.join("meta.bin");
+        if !meta_bin.exists() {
+            return Err(crate::MoteDBError::InvalidArgument(format!(
+                "no meta.bin under {} — not an initialized database \
+                 (or written by a very old build)",
+                db_path.display()
+            )));
+        }
+        // clean_close 旗标（MetaStore 现有文件路径只读）。
+        let meta = crate::database::meta_store::MetaStore::open_or_migrate(&db_path)?;
+        if !meta.clean_close() {
+            return Err(crate::MoteDBError::InvalidArgument(
+                "database was not cleanly closed (crash or still-open writer) — \
+                 open it read-write once (recovery runs), close, then retry \
+                 shared read-only"
+                    .into(),
+            ));
+        }
+        // WAL 必须为空（P1 惰性: 分区文件可能不存在——存在即须为空文件）。
+        let wal_dir = db_path.join("wal");
+        if wal_dir.exists() {
+            for entry in std::fs::read_dir(&wal_dir)?.flatten() {
+                let name = entry.file_name();
+                if name
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("partition_") && n.ends_with(".wal"))
+                {
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    if len > 0 {
+                        return Err(crate::MoteDBError::InvalidArgument(
+                            "WAL holds unreplayed records (dirty state) — \
+                             open read-write once or CHECKPOINT, then retry \
+                             shared read-only"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // ── 打开（strict_clean_open: SH 锁 + 严格恢复 + 零落盘） ──
+        let config = DBConfig {
+            read_only: true,
+            strict_clean_open: true,
+            ..DBConfig::default()
+        };
+        // 🔑 进程内注册表带模式后缀——绝不与读写引擎混键（否则只读句柄
+        // 可能拿到写引擎、反之亦然）。同进程多只读连接共享同一 SH 引擎。
+        let mut key = std::fs::canonicalize(&db_path).unwrap_or_else(|_| db_path.clone());
+        key.as_mut_os_string().push("::shared-ro");
+        let mut reg = connection_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some((weak, live)) = reg.get(&key) {
+            if let Some(arc) = weak.upgrade() {
+                live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let query_executor = crate::sql::QueryExecutor::new(arc.clone());
+                return Ok(Self {
+                    inner: arc,
+                    stmt_cache: Arc::new(dashmap::DashMap::new()),
+                    stmt_cache_cap: 256,
+                    query_executor,
+                    reg_key: Some(key),
+                });
+            }
+        }
+        reg.retain(|_, (w, _)| w.upgrade().is_some());
+        let engine = {
+            let open_path = db_path.clone();
+            let inner = crate::database::MoteDB::open_with_config(&open_path, config)?;
+            Arc::new(inner)
+        };
+        reg.insert(
+            key.clone(),
+            (
+                Arc::downgrade(&engine),
+                std::sync::atomic::AtomicUsize::new(1),
+            ),
+        );
+        drop(reg);
+        let query_executor = crate::sql::QueryExecutor::new(engine.clone());
+        Ok(Self {
+            inner: engine,
+            stmt_cache: Arc::new(dashmap::DashMap::new()),
+            stmt_cache_cap: 256,
+            query_executor,
+            reg_key: Some(key),
+        })
+    }
+
     /// Stable per-container extraction cache dir (FNV-1a of the absolute path).
     fn container_cache_dir(container: &Path) -> PathBuf {
         let abs = std::fs::canonicalize(container).unwrap_or_else(|_| container.to_path_buf());
