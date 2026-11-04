@@ -69,20 +69,6 @@ enum TV {
     Unknown,
 }
 
-/// Bool/Int/Timestamp/Int-Float 两两强转（fuzz 校准：flag=1 与 TRUE 相等、
-/// Timestamp 与 Integer 同为 micros）。
-fn coerce_pair(a: &Value, b: &Value) -> (Value, Value) {
-    match (a, b) {
-        (Value::Bool(x), Value::Integer(_)) => (Value::Integer(*x as i64), b.clone()),
-        (Value::Integer(_), Value::Bool(y)) => (a.clone(), Value::Integer(*y as i64)),
-        (Value::Timestamp(t), Value::Integer(_)) => (Value::Integer(t.as_micros()), b.clone()),
-        (Value::Integer(_), Value::Timestamp(t)) => (a.clone(), Value::Integer(t.as_micros())),
-        (Value::Integer(i), Value::Float(_)) => (Value::Float(*i as f64), b.clone()),
-        (Value::Float(_), Value::Integer(j)) => (a.clone(), Value::Float(*j as f64)),
-        _ => (a.clone(), b.clone()),
-    }
-}
-
 use std::cmp::Ordering as Ord2;
 
 #[inline]
@@ -119,11 +105,32 @@ fn leaf_tv_leaf(cols: &[std::sync::Arc<ColumnVector>], l: &VecPredLeaf, i: usize
     }
 }
 
+/// 🔀 不可比类型对（Text vs Int 等）的批路径裁决（PR-4，对齐
+/// semantics::eval_cmp/解释器/SQLite）: `=` → False、`<>` → True
+/// （不可比即"必不相等"）、排序 → Unknown。此前一律 Unknown 使
+/// `WHERE text_col <> 3` 批路径 0 命中而解释器路径全命中（差分
+/// harness round=33 实证分歧）。
+#[inline]
+fn incomparable_tv(op: &BinaryOperator) -> TV {
+    match op {
+        BinaryOperator::Ne => TV::True,
+        BinaryOperator::Eq => TV::False,
+        _ => TV::Unknown,
+    }
+}
+
 /// 🔑 类型化叶求值：直接在 ColData 切片上与字面量比较 — 批热循环零
 /// `Value` 构造（行级 Value 版本每行一次分配，Text 还 clone Arc，
 /// 首版实测比旧融合路径慢 10×，差分形状对但性能不达标的教训）。
 #[inline]
 fn leaf_tv(cv: &ColumnVector, op: &BinaryOperator, lit: &Value, i: usize) -> TV {
+    // 🔑 NULL 字面量（任一算子）→ 恒 Unknown——与"类型不可比对"（Eq False/
+    // Ne True，见 incomparable_tv）不同，NULL 走三值逻辑，不能被 NOT 翻转
+    //（PR-4 差分 harness round=19: NOT (a = NULL) 曾被 incomparable 的
+    // Eq→False 翻成 True 而全行放行）。
+    if matches!(lit, Value::Null) {
+        return TV::Unknown;
+    }
     if cv.valid.is_null(i) {
         return TV::Unknown;
     }
@@ -132,18 +139,45 @@ fn leaf_tv(cv: &ColumnVector, op: &BinaryOperator, lit: &Value, i: usize) -> TV 
             let x = v[i];
             match lit {
                 Value::Integer(l) => ord_tv(x.cmp(l), op),
-                Value::Float(l) => f64_tv(x as f64, *l, op),
+                // 🔀 L1 int_float_cmp 对齐（PR-4）: 浮点字面量恰为整数且
+                // 在 i64 范围 → 精确 i64 比较，否则 f64。
+                Value::Float(l) => {
+                    let t = l.trunc();
+                    if *l != t {
+                        f64_tv(x as f64, *l, op)
+                    } else if t >= i64::MIN as f64 && t <= i64::MAX as f64 {
+                        ord_tv(x.cmp(&(t as i64)), op)
+                    } else {
+                        f64_tv(x as f64, *l, op)
+                    }
+                }
                 Value::Timestamp(t) => ord_tv(x.cmp(&t.as_micros()), op),
                 Value::Bool(b) => ord_tv(x.cmp(&(*b as i64)), op),
-                _ => TV::Unknown,
+                _ => incomparable_tv(op),
             }
         }
         ColData::F64(v) => {
             let x = v[i];
             match lit {
-                Value::Integer(l) => f64_tv(x, *l as f64, op),
+                // 🔀 L1 int_float_cmp 对齐（PR-4）: 列值恰为整数时走精确
+                // i64 比较（f64 路线在 |l|>2^53 会舍入），否则 f64。
+                Value::Integer(l) => {
+                    let t = x.trunc();
+                    if x != t {
+                        f64_tv(x, *l as f64, op)
+                    } else if t >= i64::MIN as f64 && t <= i64::MAX as f64 {
+                        ord_tv((t as i64).cmp(l), op)
+                    } else {
+                        f64_tv(x, *l as f64, op)
+                    }
+                }
                 Value::Float(l) => f64_tv(x, *l, op),
-                _ => TV::Unknown,
+                // 🔀 L2 对齐（PR-4）: Bool 字面量按 TRUE=1/FALSE=0 数值化
+                //（semantics::coerce_pair 同臂）。
+                Value::Bool(b) => f64_tv(x, *b as i64 as f64, op),
+                // 🔀 L1 对齐: Timestamp 按 micros（实用范围 < 2^53 精确）。
+                Value::Timestamp(t) => f64_tv(x, t.as_micros() as f64, op),
+                _ => incomparable_tv(op),
             }
         }
         ColData::Bool(bits) => {
@@ -151,7 +185,12 @@ fn leaf_tv(cv: &ColumnVector, op: &BinaryOperator, lit: &Value, i: usize) -> TV 
             match lit {
                 Value::Bool(b) => ord_tv(x.cmp(b), op),
                 Value::Integer(n) => ord_tv((x as i64).cmp(n), op),
-                _ => TV::Unknown,
+                // 🔀 L2 对齐（PR-4）: Bool↔Float 也按 TRUE=1/FALSE=0 数值化。
+                // 此前 `_ → Unknown` 使 `flag <> 1.0` 在批路径 0 命中而
+                // GROUP BY/解释器路径命中全部 FALSE 行（差分 harness
+                // round=2 实证的 0.17 老分歧）。
+                Value::Float(f) => f64_tv(x as i64 as f64, *f, op),
+                _ => incomparable_tv(op),
             }
         }
         ColData::Utf8(v) => match lit {
@@ -160,7 +199,7 @@ fn leaf_tv(cv: &ColumnVector, op: &BinaryOperator, lit: &Value, i: usize) -> TV 
                 let b: &str = l.0.as_ref();
                 ord_tv(a.cmp(b), op)
             }
-            _ => TV::Unknown,
+            _ => incomparable_tv(op),
         },
         ColData::Values(v) => lit_cmp(&v[i], op, lit),
     }
@@ -181,9 +220,16 @@ fn lit_cmp(v: &Value, op: &BinaryOperator, lit: &Value) -> TV {
     if matches!(v, Value::Null) || matches!(lit, Value::Null) {
         return TV::Unknown;
     }
-    let (v, lit) = coerce_pair(v, lit);
+    // 🔀 L2 委托（PR-4）: 操作数归一唯一定义在 semantics::coerce_pair
+    // （Cow——归一未命中零 clone，优于本地版的双 clone）。原本地的
+    // Timestamp↔Int / Int↔Float 臂由 L1 partial_cmp 原生覆盖（批 typed
+    // leaf 已对齐 int_float_cmp 精度）; Bool↔Float / Bool↔Bool /
+    // 方括号向量为新增对齐。
+    let (v, lit) = crate::sql::semantics::coerce_pair(v, lit);
     let Some(ord) = v.partial_cmp(&lit) else {
-        return TV::Unknown; // 不可比较类型（Text vs Int 等）→ UNKNOWN
+        // 🔀 不可比类型（Text vs Int 等）: 对齐 eval_cmp——Ne → True、
+        // Eq → False、排序 → Unknown（此前一律 Unknown，见 incomparable_tv）。
+        return incomparable_tv(op);
     };
     let b = match op {
         BinaryOperator::Eq => ord == Ordering::Equal,

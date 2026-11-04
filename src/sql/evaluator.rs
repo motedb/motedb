@@ -489,7 +489,19 @@ impl ExprEvaluator {
                     return Ok(Value::Null);
                 }
 
-                let in_range = val >= low_val && val <= high_val;
+                // 🔀 L2（PR-4）: 归一偏序（Bool↔数值 TRUE=1 等）。
+                let in_range = crate::sql::semantics::compare(
+                    &val,
+                    &low_val,
+                    crate::sql::semantics::OrdOp::Ge,
+                )
+                .is_true()
+                    && crate::sql::semantics::compare(
+                        &val,
+                        &high_val,
+                        crate::sql::semantics::OrdOp::Le,
+                    )
+                    .is_true();
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
 

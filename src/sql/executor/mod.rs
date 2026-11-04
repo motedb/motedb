@@ -65,15 +65,24 @@ fn normalize_for_in(v: &Value) -> Value {
         // differently, so we normalize the set members (and the column value,
         // which stays Timestamp) to the same Timestamp representation.
         // Non-date text (parse_iso returns None) is left as Text.
-        Value::Text(s) => crate::types::Timestamp::parse_iso(s.as_str())
-            .map(Value::Timestamp)
-            // 🔴 Bracketed-vector spelling `WHERE emb IN ('[1,2]')`: the SQL
-            // lexer has no vector literal token, so vectors arrive as quoted
-            // text everywhere else (KNN parses them at its sites). Parse them
-            // here so an IN list matches a VECTOR column; non-vector text is
-            // left as Text.
-            .or_else(|| Value::parse_bracketed_vector(s.as_str()))
-            .unwrap_or_else(|| v.clone()),
+        Value::Text(s) => {
+            // 🔀 PR-4 裁决: 纯数字文本不按微秒时间戳归一（ISO 形状才解析）
+            // —— 与 semantics::normalize_set_member 同源; 差分 harness
+            // round=161: `a NOT IN (0, '7')` 哈希路径曾因此把 7 与 '7' 判等。
+            if s.bytes().all(|b| b.is_ascii_digit()) {
+                None
+            } else {
+                crate::types::Timestamp::parse_iso(s.as_str())
+            }
+        }
+        .map(Value::Timestamp)
+        // 🔴 Bracketed-vector spelling `WHERE emb IN ('[1,2]')`: the SQL
+        // lexer has no vector literal token, so vectors arrive as quoted
+        // text everywhere else (KNN parses them at its sites). Parse them
+        // here so an IN list matches a VECTOR column; non-vector text is
+        // left as Text.
+        .or_else(|| Value::parse_bracketed_vector(s.as_str()))
+        .unwrap_or_else(|| v.clone()),
         other => other.clone(),
     }
 }
@@ -8490,8 +8499,10 @@ impl QueryExecutor {
             .filter(|(_, opt)| {
                 opt.as_ref()
                     .and_then(|row| filter_pos.and_then(|p| row.get(p)))
-                    .map(|v| v == &filter_value)
-                    .unwrap_or(false)
+                    // 🔀 L2（PR-4）: semantics::equal —— 任一侧 NULL → 不
+                    // 匹配（此前裸 == 使 Null==Null 计入 `col = NULL` 聚合
+                    // 点查; Bool↔数值归一同时补齐）。
+                    .is_some_and(|v| crate::sql::semantics::equal(v, &filter_value).is_true())
             })
             .collect();
         let rows: Vec<&Row> = batch
@@ -11732,7 +11743,10 @@ impl QueryExecutor {
                         has_null = true;
                         continue;
                     }
-                    if val == item_val {
+                    // 🔀 L2（PR-4）: 归一相等（Bool↔数值、方括号向量）。
+                    // 此前裸 `val == item_val` 使 `flag IN (0,1)` 在该路径
+                    // 恒 false，套上 NOT 后全行放行（差分 harness round=26）。
+                    if crate::sql::semantics::equal(&val, &item_val).is_true() {
                         found = true;
                         break;
                     }
@@ -11763,7 +11777,19 @@ impl QueryExecutor {
                 {
                     return Ok(Value::Null);
                 }
-                let in_range = val >= low_val && val <= high_val;
+                // 🔀 L2（PR-4）: 归一偏序（Bool↔数值 TRUE=1 等）。
+                let in_range = crate::sql::semantics::compare(
+                    &val,
+                    &low_val,
+                    crate::sql::semantics::OrdOp::Ge,
+                )
+                .is_true()
+                    && crate::sql::semantics::compare(
+                        &val,
+                        &high_val,
+                        crate::sql::semantics::OrdOp::Le,
+                    )
+                    .is_true();
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
             Expr::Like {
@@ -12575,8 +12601,15 @@ impl QueryExecutor {
                                                             .and_then(|row| {
                                                                 pos.and_then(|p| row.get(p))
                                                             })
-                                                            .map(|v| v == &target_value)
-                                                            .unwrap_or(false)
+                                                            // 🔀 L2（PR-4）: 同上 —— NULL
+                                                            // 字面量不匹配 NULL 值。
+                                                            .is_some_and(|v| {
+                                                                crate::sql::semantics::equal(
+                                                                    v,
+                                                                    &target_value,
+                                                                )
+                                                                .is_true()
+                                                            })
                                                     })
                                                     .count()
                                                     as i64;
@@ -13236,11 +13269,13 @@ impl QueryExecutor {
                     // TEXT literal must match the VECTOR it spells and TRUE
                     // must match 1 — the generic JOIN path lands here for
                     // `… WHERE a.emb = '[…]'` and returned 0 rows.
+                    // 🔀 L2（PR-4）: semantics::equal 任一侧 NULL → Unknown
+                    // → 不匹配。此前 values_equal_coerced 的 Null==Null
+                    // passthrough 使 `WHERE a = NULL` 在通用 JOIN 点查路径
+                    // 匹配全部 a-IS-NULL 行（差分 harness round=20 实证的
+                    // 0.17 原生缺陷——裸 SELECT 路径一直是对的，两路径分歧）。
                     let eq = |row_value: &Value| {
-                        crate::sql::evaluator::ExprEvaluator::values_equal_coerced(
-                            row_value,
-                            &target_value,
-                        )
+                        crate::sql::semantics::equal(row_value, &target_value).is_true()
                     };
                     all_sql_rows
                         .into_iter()
@@ -23351,6 +23386,14 @@ impl QueryExecutor {
                     if let Expr::Literal(value) = right.as_ref() {
                         let col = col_name.clone();
                         let val = value.clone();
+                        // 🔑 SQL 三值（PR-4）: 与 NULL 字面量的比较（`=` 与
+                        // `<>` 皆然）恒为 UNKNOWN → 永不匹配。此前闭包只过滤
+                        // 行值侧 NULL，字面量侧漏判使 `col <> NULL` 被当作
+                        // IS NOT NULL（差分 harness round=20 实证的 0.17 原生
+                        // 缺陷; 单表路径一直正确，两路径分歧）。
+                        if matches!(val, Value::Null) {
+                            return Some(Box::new(|_: &SqlRow| false));
+                        }
                         // 🔴 A bracketed-vector literal is parsed ONCE here; a
                         // VECTOR row value compares against the parsed form,
                         // anything else against the literal as written (the

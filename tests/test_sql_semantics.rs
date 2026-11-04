@@ -598,11 +598,11 @@ fn in_membership_normalized_forms() {
     );
     // 方括号向量文本 ↔ Vector
     assert_eq!(in3(&v_vec(&[1.0, 2.0]), &[v_text("[1.0, 2.0]")]), True);
-    // 🔴 已发布怪癖锁定: parse_iso 先试"纯数字=微秒时间戳"，故 '1' 归一为
-    // Timestamp(1µs)，而 L1 eq 又按 micros 判 Integer==Timestamp → 命中。
-    // 语义上可疑（IN 列表里的数字文本被当微秒），但为 0.17 已发布行为，
-    // 特征测试如实锁定；PR-2 裁决时单独评审。
-    assert_eq!(in3(&v_int(1), &[v_text("1")]), True);
+    // 🔀 PR-4 裁决（推翻 PR-1 的怪癖锁定）: 纯数字文本不再按微秒时间戳
+    // 归一——0.17 哈希路径曾把 '1' 当 Timestamp(1µs) 而与 Int 1 判等，
+    // 与 equal 路线（不可比即不等）分歧（差分 harness round=161）。
+    // ISO 形状照常; 数字时间戳语义由真正的 Timestamp 值承载。
+    assert_eq!(in3(&v_int(1), &[v_text("1")]), False);
     // 真正的非数字文本保持原样 → 不命中（而非报错）
     assert_eq!(in3(&v_int(1), &[v_text("1x")]), False);
 }

@@ -55,6 +55,44 @@
   已由生产者防御兜住）。孤儿 helper（needs_bool_coerce、WHERE 用
   compare_values）删除; ORDER BY 上下文的 compare_values 保留并注释。
 
+### 🔀 A1 PR-4 — 批与扫描路径接线 + 差分 harness 九路验收
+
+- **差分 harness**（`tests/test_cmp_differential.rs`）: 随机谓词（类型
+  感知 + NULL/跨型/方括号拼写 + IN/NOT IN/IS NULL + AND/OR/NOT 嵌套）
+  × 九条执行路径（SELECT/DELETE/UPDATE/JOIN 两表序/逗号 join/子查询
+  IN/聚合/GROUP BY+HAVING）同库对拍; 种子可复现; 默认 80 轮，
+  `MOTEDB_DIFF_ROUNDS=200` 深验。**三种子 × 200 轮全绿**，过程中
+  实证并修复以下 0.17 原生分歧（全部: 一路径对、另一路径错）:
+  - `flag <> 1.0`（BOOLEAN vs FLOAT）: 批 typed-leaf `_ → Unknown` 使
+    SELECT 0 命中而 GROUP BY 全命中 → Bool↔Float 数值化补臂;
+  - `a = NULL` / `a <> NULL` 于 JOIN ON: 通用点查闭包 values_equal_
+    coerced 的 Null==Null passthrough + 编译闭包漏判字面量 NULL →
+    `= NULL` 匹配 IS-NULL 行、`<> NULL` 匹配 IS-NOT-NULL 行（裸
+    SELECT 一直正确）→ 闭包换 semantics::equal + NULL 字面量编译期
+    恒-false;
+  - `NOT (flag IN (0,1))`（BOOLEAN 列、INT 成员）: #6 In 臂裸 `==`
+    使 IN 恒 false、NOT 后全行放行 → equal 归一; Between 臂（含
+    evaluator）裸 `>=`/`<=` → compare 归一;
+  - `c <> 3`（TEXT vs INT 不可比）: 批路径 Unknown vs 解释器 True
+    分歧 → 统一裁决 Eq→False/Ne→True/排序→Unknown（incomparable_tv，
+    与 eval_cmp/SQLite 同款）;
+  - `NOT (a = NULL)` 批路径: NULL 字面量误入不可比对裁决（Eq→False
+    被 NOT 翻转）→ NULL 字面量恒 Unknown 守卫（PR-4 自己引入、差分
+    下一轮即抓）;
+  - `emb IN ('not-a-vec', NULL)`: 扫描 In 闭包把 NULL 成员入集使
+    NULL 值行命中 → NULL 成员不入集 + NULL 探测值不匹配;
+  - `a NOT IN (0, '7')`: IN 哈希归一把纯数字文本当微秒时间戳
+    （parse_iso first-try 连带）与 equal 路线分歧 → **裁决: 纯数字
+    文本不再按时间戳归一**（ISO 形状照常; PR-1 特征测试的怪癖锁定
+    相应推翻）。
+- **接线**: vector_exec typed-leaf 四臂补齐（Bool↔Float、F64↔Bool/
+  Timestamp、int_float_cmp 精度对齐、incomparable/NULL 裁决）;
+  lit_cmp → semantics::coerce_pair（Cow 零 clone）; scan.rs Eq 闭包
+  → semantics::equal（`= NULL` 不再误匹配 NULL 行）; 聚合点查校验
+  两处裸 == → equal。
+- 微基准（criterion, 安静机）: 非命中路径与 PR-2 持平（miss-int
+  2.98ns / miss-text 5.46ns），无回归。
+
 ### 🔧 稳定性 harness 修复（第二轮全量跑实测踩中）
 
 - `test_stability_round5` 的 kill-9 候选包络缺口: 父进程自写的 "X"

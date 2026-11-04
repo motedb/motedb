@@ -238,12 +238,24 @@ pub fn eval_cmp(a: &Value, b: &Value, op: OrdOp) -> Cmp3 {
 pub fn normalize_set_member(v: &Value) -> Value {
     match v {
         Value::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
-        Value::Text(s) => crate::types::Timestamp::parse_iso(s.as_str())
+        Value::Text(s) => iso_text_to_timestamp(s.as_str())
             .map(Value::Timestamp)
             .or_else(|| Value::parse_bracketed_vector(s.as_str()))
             .unwrap_or_else(|| v.clone()),
         other => other.clone(),
     }
+}
+
+/// ISO 形状的日期时间文本才归一为 Timestamp。parse_iso 对**纯数字**文本
+/// 的"当微秒时间戳"first-try 是数字时间戳特性，不能带进 IN 归一——那使
+/// `a NOT IN (0, '7')` 在哈希路径把 Int 7 与 '7' 判等（差分 harness
+/// round=161 与 equal 路线分歧），而 L1 eq 对 (Integer, Text) 本就是 false。
+/// 含 `-`/`:`/`T`/空格 的日期时间形状照常解析。
+fn iso_text_to_timestamp(s: &str) -> Option<crate::types::Timestamp> {
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    crate::types::Timestamp::parse_iso(s)
 }
 
 /// 编译期按列类型归一字面量（吸收

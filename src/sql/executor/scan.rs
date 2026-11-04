@@ -2247,13 +2247,13 @@ impl QueryExecutor {
                             }
                         };
                         // 🔴 `emb = '[1.0, 2.0]'` on a VECTOR column: the literal
-                        // arrives as Text (no vector token in the lexer) and the
-                        // bare `fv == &val` below compared Text against the
-                        // decoded Vector → 0 rows after checkpoint. Parse it
-                        // once, up front, the same way the IN arm does.
+                        // arrives as Text (no vector token in the lexer). The
+                        // column-aware pre-parse stays (one parse up front),
+                        // and the closure itself now delegates to L2
+                        // `semantics::equal`（PR-4）— 内置 Bool↔数值（此前
+                        // 字面量非 Bool 时 `fv == &val` 使 Bool 列 vs Float
+                        // 字面量 0 命中）、`= NULL` 不再误匹配 NULL 行。
                         let val = Self::coerce_vector_literal_for_column(schema, pos, v.clone());
-                        // 🚀 #1: 仅当涉及 Bool 时才 coerce（99% 的 Int/Text PK 直接比较）
-                        let needs_coerce = matches!(v, Value::Bool(_));
                         // If filtering on PK, at most 1 row matches → early-stop.
                         if schema.primary_key() == Some(bare) {
                             early_stop_at = 1;
@@ -2262,12 +2262,7 @@ impl QueryExecutor {
                             Some(pos),
                             Box::new(move |fv: Option<&Value>| {
                                 fv.is_some_and(|fv| {
-                                    if needs_coerce {
-                                        let (a, b) = coerce_bool_int(fv.clone(), val.clone());
-                                        a == b
-                                    } else {
-                                        fv == &val
-                                    }
+                                    crate::sql::semantics::equal(fv, &val).is_true()
                                 })
                             }),
                         )
@@ -2337,11 +2332,14 @@ impl QueryExecutor {
                     let bare = cn.rsplit('.').next().unwrap_or(cn);
                     let pos = schema.get_column_position(bare).unwrap_or(0);
                     // 🔑 Normalize Bool→Int for coerced matching.
+                    // 🔀 PR-4（差分 harness seed=777/31337）: NULL 成员不入集、
+                    // NULL 探测值不匹配——`x IN (…, NULL)` 未命中时是 UNKNOWN
+                    // 而非 FALSE，NULL 值的 x 不得因集合里有 NULL 而命中。
                     let set: std::collections::HashSet<Value> = list
                         .iter()
                         .filter_map(|e| {
                             if let Expr::Literal(v) = e {
-                                Some(normalize_for_in(v))
+                                (!matches!(v, Value::Null)).then(|| normalize_for_in(v))
                             } else {
                                 None
                             }
@@ -2350,8 +2348,9 @@ impl QueryExecutor {
                     (
                         Some(pos),
                         Box::new(move |fv: Option<&Value>| {
-                            fv.map(|v| set.contains(&normalize_for_in(v)))
-                                .unwrap_or(false)
+                            fv.is_some_and(|v| {
+                                !matches!(v, Value::Null) && set.contains(&normalize_for_in(v))
+                            })
                         }),
                     )
                 }
@@ -2382,8 +2381,11 @@ impl QueryExecutor {
                     (
                         Some(pos),
                         Box::new(move |fv: Option<&Value>| {
-                            fv.map(|v| set.contains(&normalize_for_in(v)))
-                                .unwrap_or(false)
+                            // 🔀 PR-4: NULL 探测值不匹配（同上; 集合构建侧
+                            // 已滤 NULL）。
+                            fv.is_some_and(|v| {
+                                !matches!(v, Value::Null) && set.contains(&normalize_for_in(v))
+                            })
                         }),
                     )
                 }
