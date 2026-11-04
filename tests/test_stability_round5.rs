@@ -117,9 +117,20 @@ fn ops_for(i: i64) -> Vec<String> {
 }
 
 /// The id whose op-list contains `last`, then the next op in the global order.
-fn next_op_after(last: &str) -> Option<String> {
+/// `next_start` = the child's resume cursor (last journaled "I" id + 1) —
+/// needed because after a parent-written "X <id>" line the child's in-flight
+/// op is always its FIRST op `I <next_start>`; modeling anything else would
+/// miss the "executed but un-journaled insert right after an X line" shape
+/// (负载下 45ms 杀点实测踩中过: db 多出未记账行、候选包络不含它)。
+fn next_op_after(last: &str, next_start: i64) -> Option<String> {
     if last.is_empty() {
-        return Some("I 0".to_string());
+        return Some(format!("I {next_start}"));
+    }
+    if last.starts_with("X ") {
+        // X 是父进程写的 tagX 行，不推进子进程的 I 游标; 杀点若落在
+        // 子进程首个 execute 与 journal 写之间，未记账操作必为
+        // I <next_start>（child 循环总以 INSERT 开头）。
+        return Some(format!("I {next_start}"));
     }
     let mut it = last.split_whitespace();
     let t = it.next()?;
@@ -444,7 +455,7 @@ fn test_kill9_with_indexes_and_repeated_cycles() {
         let mut sim = simulate(&journal);
         // The recovered state may additionally contain the one un-acked op.
         let mut candidates = vec![(sim.clone(), None::<String>)];
-        if let Some(next) = next_op_after(&last) {
+        if let Some(next) = next_op_after(&last, start) {
             let mut s2 = sim.clone();
             apply_op(&mut s2, &next);
             candidates.push((s2, Some(next)));
