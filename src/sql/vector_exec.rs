@@ -2746,7 +2746,7 @@ pub fn try_vec_projection(
     let mut proj: Vec<usize> = Vec::new();
     for sc in select_cols {
         match sc {
-            SelectColumn::Star => proj.extend(0..schema.columns.len()),
+            SelectColumn::Star => proj.extend(schema.visible_columns().map(|c| c.position)),
             SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => {
                 let bare = if n.contains('.') {
                     n.rsplit('.').next().unwrap_or(n)
@@ -3050,7 +3050,7 @@ pub fn try_vec_filter_topk(
     let mut proj: Vec<usize> = Vec::new();
     for sc in &stmt.columns {
         match sc {
-            SelectColumn::Star => proj.extend(0..schema.columns.len()),
+            SelectColumn::Star => proj.extend(schema.visible_columns().map(|c| c.position)),
             SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => {
                 let bare = if n.contains('.') {
                     n.rsplit('.').next().unwrap_or(n)

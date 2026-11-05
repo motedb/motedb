@@ -2,6 +2,22 @@
 
 ## [0.18.0] — 开发中
 
+### 🏗️ B2 Schema 演进 — DROP COLUMN（逻辑删除）+ RENAME COLUMN
+
+- **DROP COLUMN**: `ColumnDef.dropped` 逻辑删除位——**物理宽度不变**
+  （段按位置存列，收窄会造成新旧段错位——ADD COLUMN 机制已证明的
+  约束），dropped 槽位续写 NULL 占位; 读路径全面跳过（名字映射/
+  get_column/SELECT * 五条投影路径/INSERT 目标列/validate_row）;
+  引用 dropped 列 = ColumnNotFound。物理回收留给未来的 vacuum 变体
+  （如实文档化）。守卫: PK / NOT NULL 无 DEFAULT / 已有索引 → 明确
+  拒绝（v1 不级联）。
+- **RENAME COLUMN**: 纯 schema 层（列按位置存储，position 不变）;
+  有索引的列拒绝（索引命名 `table_col` 联动单独处理）。
+- RENAME TABLE 顺延（目录名含表名 + fs 搬迁，单独立项）。
+- 兼容面: 位置式 INSERT 值对应**可见列**（executor 与 api 快路径
+  双侧）; WAL 回放 coerce / checkpoint 后混合段往返 / reopen / 崩溃
+  窗口全部验收（tests/test_schema_evolution.rs 四用例）。
+
 ### 🧭 B3 向量召回硬化 — 测量基线 + 新鲜度护栏 + 路由降级
 
 - **测量工具** `make vec-recall`（tests/bench_vec_recall.rs）: 20K×

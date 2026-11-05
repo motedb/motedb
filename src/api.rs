@@ -2297,21 +2297,32 @@ impl Database {
                 // Without an explicit column list, more values than table
                 // columns is an error; fewer is fine — trailing columns take
                 // their DEFAULT (or NULL), as in PostgreSQL/SQLite (B-17).
-                if values.len() > schema.columns.len() {
+                // 🔖 B2: 位置式值对应**可见列**（dropped 槽位由行构造器写
+                // NULL 占位）——按名放置，不按物理位置。
+                let visible: Vec<String> =
+                    schema.visible_columns().map(|c| c.name.clone()).collect();
+                if values.len() > visible.len() {
                     return Err(crate::error::MoteDBError::InvalidArgument(format!(
                         "Column count mismatch: expected {}, got {}",
-                        schema.columns.len(),
+                        visible.len(),
                         values.len()
                     )));
                 }
-                if values.len() < schema.columns.len() {
-                    values.extend(
-                        schema.columns[values.len()..]
-                            .iter()
-                            .map(|c| c.default_value.clone().unwrap_or(Value::Null)),
-                    );
+                if values.len() < visible.len() {
+                    for name in &visible[values.len()..] {
+                        let def = schema
+                            .get_column(name)
+                            .and_then(|c| c.default_value.clone())
+                            .unwrap_or(Value::Null);
+                        values.push(def);
+                    }
                 }
-                crate::sql::row_converter::values_to_row_schema_order(&values, &schema)?
+                match crate::sql::row_converter::values_to_row_by_columns(
+                    &values, &visible, &schema,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
+                }
             };
             rows.push(row);
         }

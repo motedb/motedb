@@ -82,7 +82,11 @@ impl QueryExecutor {
             && !stmt.distinct
             && stmt.limit.is_none()
             && stmt.offset.is_none();
-        if is_simple_star && self.db.columnar_sstables.contains_key(table) {
+        if is_simple_star
+            && self.db.columnar_sstables.contains_key(table)
+            // 🔖 B2: 有 dropped 列时走通用路径（本快路径按物理宽度输出）。
+            && schema.columns.iter().all(|c| !c.dropped)
+        {
             // 🚀 Zero-materialization: return column segments directly, no Vec<Value> per row.
             let col_types = schema.col_types();
             let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -864,8 +868,9 @@ impl QueryExecutor {
         }
 
         // Resolve output column positions (needed by several fast paths below).
+        // 🔖 B2: 星号展开 = 可见列位置（dropped 列不输出）。
         let out_positions: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
-            .unwrap_or_else(|| (0..col_types.len()).collect());
+            .unwrap_or_else(|| schema.visible_columns().map(|c| c.position).collect());
 
         // 🚀 TEXT IN-set zero-alloc fast path: WHERE text_col IN (v1, v2, ...)
         // with a large set (e.g. from a subquery). The old path pre-interns
@@ -1976,7 +1981,14 @@ impl QueryExecutor {
                 }
                 let new_row: Vec<Value> = if star_expanded {
                     // SELECT * : emit all schema columns in order.
-                    full.clone()
+                    // 🔖 B2: 跳过 dropped 列（表头来自名字缓存已不含它们;
+                    // 此前按物理宽度输出 4 列 → 与 3 列表头错位）。
+                    schema
+                        .columns
+                        .iter()
+                        .filter(|c| !c.dropped)
+                        .map(|c| full.get(c.position).cloned().unwrap_or(Value::Null))
+                        .collect()
                 } else {
                     let mut built: Vec<Value> = Vec::with_capacity(out_plan.len());
                     for oc in &out_plan {

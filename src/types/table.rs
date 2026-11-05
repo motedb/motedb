@@ -136,6 +136,14 @@ pub struct ColumnDef {
     /// DEFAULT x to backfill existing rows on read).
     #[serde(default)]
     pub default_value: Option<crate::types::Value>,
+    /// 🔖 B2（0.18）: ALTER TABLE DROP COLUMN 的逻辑删除位。物理布局不变
+    /// （段按位置存列、该位置续写 NULL 占位），读路径按 dropped 跳过。
+    /// 物理回收留给未来的 vacuum 变体。
+    /// ⚠️ 必须保持在本结构体**尾部**——bincode 按位置反序列化，旧目录
+    /// 缺此尾部字段时由 serde(default) 兜底（v0.14 episode_config 同款
+    /// 先例）; 插在中间会错位所有后续字段。
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 impl ColumnDef {
@@ -148,6 +156,7 @@ impl ColumnDef {
             auto_increment: false,
             auto_increment_start: None,
             default_value: None,
+            dropped: false,
         }
     }
 
@@ -261,6 +270,81 @@ pub struct TableSchema {
     pub ttl: Option<TTLDuration>,
 }
 
+/// 🔖 B2（0.18）: 0.17 及更早的 `ColumnDef` 序列化形状（无 `dropped`）。
+/// bincode 按位置解码——现代形状读旧字节会在尾部 EOF/错位。所有旧目录
+/// 镜像（V013/V017）的 columns 用本形状。
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ColumnDefLegacy {
+    name: String,
+    col_type: ColumnType,
+    position: usize,
+    nullable: bool,
+    auto_increment: bool,
+    #[serde(default)]
+    auto_increment_start: Option<i64>,
+    #[serde(default)]
+    default_value: Option<crate::types::Value>,
+}
+
+impl From<ColumnDefLegacy> for ColumnDef {
+    fn from(l: ColumnDefLegacy) -> Self {
+        ColumnDef {
+            name: l.name,
+            col_type: l.col_type,
+            position: l.position,
+            nullable: l.nullable,
+            auto_increment: l.auto_increment,
+            auto_increment_start: l.auto_increment_start,
+            default_value: l.default_value,
+            dropped: false,
+        }
+    }
+}
+
+/// 🔖 B2（0.18）: 0.14–0.17 的 `TableSchema` 形状（有 episode_config、
+/// ColumnDef 无 dropped）——现目录升级到 0.18 的解码镜像。
+#[derive(Debug, Deserialize)]
+pub struct TableSchemaV017 {
+    name: String,
+    columns: Vec<ColumnDefLegacy>,
+    indexes: Vec<IndexDef>,
+    primary_key_column: Option<String>,
+    #[serde(default)]
+    primary_key_auto_increment: bool,
+    #[serde(default)]
+    auto_increment_start: Option<i64>,
+    #[serde(default)]
+    episode_config: Option<EpisodeConfig>,
+    #[serde(default)]
+    table_type: TableType,
+    #[serde(default)]
+    timeseries_column: Option<String>,
+    #[serde(default)]
+    ttl: Option<TTLDuration>,
+}
+
+impl From<TableSchemaV017> for TableSchema {
+    fn from(l: TableSchemaV017) -> Self {
+        let mut s = TableSchema {
+            name: l.name,
+            columns: l.columns.into_iter().map(ColumnDef::from).collect(),
+            indexes: l.indexes,
+            primary_key_column: l.primary_key_column,
+            primary_key_auto_increment: l.primary_key_auto_increment,
+            auto_increment_start: l.auto_increment_start,
+            episode_config: l.episode_config,
+            column_map: HashMap::new(),
+            column_names_cache: None,
+            cached_col_types: Vec::new(),
+            table_type: l.table_type,
+            timeseries_column: l.timeseries_column,
+            ttl: l.ttl,
+        };
+        s.rebuild_column_map();
+        s
+    }
+}
+
 /// Legacy (v0.12/v0.13) serialized `TableSchema` shape — predates
 /// `episode_config` (added in v0.14). bincode payloads are POSITIONAL, so
 /// the modern shape cannot decode those bytes (a missing middle field
@@ -269,7 +353,7 @@ pub struct TableSchema {
 #[derive(Debug, Deserialize)]
 pub(crate) struct TableSchemaLegacyV013 {
     name: String,
-    columns: Vec<ColumnDef>,
+    columns: Vec<ColumnDefLegacy>,
     indexes: Vec<IndexDef>,
     primary_key_column: Option<String>,
     #[serde(default)]
@@ -288,7 +372,7 @@ impl From<TableSchemaLegacyV013> for TableSchema {
     fn from(l: TableSchemaLegacyV013) -> Self {
         let mut s = TableSchema {
             name: l.name,
-            columns: l.columns,
+            columns: l.columns.into_iter().map(ColumnDef::from).collect(),
             indexes: l.indexes,
             primary_key_column: l.primary_key_column,
             primary_key_auto_increment: l.primary_key_auto_increment,
@@ -303,6 +387,35 @@ impl From<TableSchemaLegacyV013> for TableSchema {
         };
         s.rebuild_column_map();
         s
+    }
+}
+
+#[cfg(test)]
+mod v017_shape_tests {
+    use super::*;
+
+    /// 🔖 B2: 0.17 形状（ColumnDef 无 dropped）的字节必须能被 V017 镜像
+    /// 解码、且升级路径 dropped=false——迁移链（registry.rs）的形状分裂
+    /// 验证（fixtures 只有 v0.15.2 及更早，0.16/0.17 无 fixture）。
+    #[test]
+    fn v017_shape_decodes_and_upgrades() {
+        let legacy = ColumnDefLegacy {
+            name: "a".into(),
+            col_type: ColumnType::Integer,
+            position: 1,
+            nullable: true,
+            auto_increment: false,
+            auto_increment_start: None,
+            default_value: None,
+        };
+        let bytes = bincode::serialize(&vec![legacy]).unwrap();
+        // 现代形状（含 dropped 尾字段）解码旧字节 → 失败。
+        assert!(bincode::deserialize::<Vec<ColumnDef>>(&bytes).is_err());
+        // V017 镜像解码成功，升级后 dropped=false。
+        let decoded: Vec<ColumnDefLegacy> = bincode::deserialize(&bytes).unwrap();
+        let upgraded: Vec<ColumnDef> = decoded.into_iter().map(ColumnDef::from).collect();
+        assert_eq!(upgraded[0].name, "a");
+        assert!(!upgraded[0].dropped);
     }
 }
 
@@ -347,6 +460,11 @@ impl TableSchema {
     }
 
     /// Get cached column names as Arc (cheap Arc clone).
+    /// 🔖 B2: 可见（未 dropped）列。物理宽度与 position 不变。
+    pub fn visible_columns(&self) -> impl Iterator<Item = &ColumnDef> {
+        self.columns.iter().filter(|c| !c.dropped)
+    }
+
     pub fn column_names_arc(&self) -> Arc<Vec<String>> {
         match self.column_names_cache {
             Some(ref cache) => Arc::clone(cache),
@@ -435,12 +553,13 @@ impl TableSchema {
     /// Standard SQL column identifiers are case-insensitive, so after an
     /// exact match fails we fall back to a case-insensitive comparison.
     pub fn get_column(&self, name: &str) -> Option<&ColumnDef> {
-        if let Some(c) = self.columns.iter().find(|c| c.name == name) {
+        // 🔖 B2: dropped 列不可引用（含大小写不敏感回退臂）。
+        if let Some(c) = self.columns.iter().find(|c| c.name == name && !c.dropped) {
             return Some(c);
         }
         let nl = name.to_lowercase();
         let mut found: Option<&ColumnDef> = None;
-        for c in &self.columns {
+        for c in self.columns.iter().filter(|c| !c.dropped) {
             if c.name.to_lowercase() == nl {
                 if found.is_some() {
                     return None; // ambiguous → treat as not found
@@ -474,10 +593,20 @@ impl TableSchema {
     pub fn rebuild_column_map(&mut self) {
         self.column_map.clear();
         for col in &self.columns {
+            // 🔖 B2: dropped 列不出现在名字映射/名字缓存——引用即
+            // ColumnNotFound（SELECT * 也借 names 缓存跳过）。
+            if col.dropped {
+                continue;
+            }
             self.column_map.insert(col.name.clone(), col.position);
         }
-        // 🚀 Rebuild column names cache
-        let names: Vec<String> = self.columns.iter().map(|c| c.name.clone()).collect();
+        // 🚀 Rebuild column names cache（仅可见列; 物理宽度不变）
+        let names: Vec<String> = self
+            .columns
+            .iter()
+            .filter(|c| !c.dropped)
+            .map(|c| c.name.clone())
+            .collect();
         self.column_names_cache = Some(Arc::new(names));
         // Rebuild cached column types
         self.cached_col_types = self.columns.iter().map(|c| c.col_type.clone()).collect();
@@ -495,6 +624,12 @@ impl TableSchema {
 
         for (i, col) in self.columns.iter().enumerate() {
             let value = &row[i];
+
+            // 🔖 B2: dropped 列是 NULL 占位槽——不参与校验（类型/约束都
+            // 不再适用; DROP 守卫已确保可删）。
+            if col.dropped {
+                continue;
+            }
 
             // Check null constraint (skip AUTO_INCREMENT — system fills value)
             if !col.nullable && !col.auto_increment && matches!(value, crate::types::Value::Null) {

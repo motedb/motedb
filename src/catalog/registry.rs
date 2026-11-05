@@ -47,6 +47,22 @@ struct RegistryMetadataV013 {
     auto_increment_counters: HashMap<String, i64>,
 }
 
+/// 🔖 B2（0.18）: 0.14–0.17 registry 形状（TableSchemaV017 列形状）。
+#[derive(Debug, Deserialize)]
+struct RegistryMetadataV017 {
+    tables: HashMap<String, crate::types::TableSchemaV017>,
+    #[serde(default)]
+    index_map: HashMap<String, (String, String)>,
+    #[serde(default)]
+    next_table_id: u32,
+    #[serde(default)]
+    table_ids: HashMap<String, u32>,
+    #[serde(default)]
+    id_to_name: HashMap<u32, String>,
+    #[serde(default)]
+    auto_increment_counters: HashMap<String, i64>,
+}
+
 /// Table registry for managing table schemas
 pub struct TableRegistry {
     /// Metadata (protected by RwLock)
@@ -116,21 +132,46 @@ impl TableRegistry {
                 // so the modern positional decode misaligns. Retry through
                 // the legacy mirror and convert (episodes are derived data —
                 // None is the faithful value for a pre-v0.14 schema).
-                Err(modern_err) => match bincode::deserialize::<RegistryMetadataV013>(&data) {
-                    Ok(legacy) => RegistryMetadata {
-                        tables: legacy
-                            .tables
-                            .into_iter()
-                            .map(|(k, v)| (k, TableSchema::from(v)))
-                            .collect(),
-                        index_map: legacy.index_map,
-                        next_table_id: legacy.next_table_id,
-                        table_ids: legacy.table_ids,
-                        id_to_name: legacy.id_to_name,
-                        auto_increment_counters: legacy.auto_increment_counters,
-                    },
-                    Err(_) => return Err(StorageError::Serialization(modern_err.to_string())),
-                },
+                // 🔖 B2（0.18）: 现代形状新增 ColumnDef.dropped —— 0.14–0.17
+                // 目录先走 V017 镜像（有 episode_config、无 dropped）。
+                Err(modern_err) => {
+                    match bincode::deserialize::<RegistryMetadataV017>(&data) {
+                        Ok(v017) => RegistryMetadata {
+                            tables: v017
+                                .tables
+                                .into_iter()
+                                .map(|(k, v)| (k, TableSchema::from(v)))
+                                .collect(),
+                            index_map: v017.index_map,
+                            next_table_id: v017.next_table_id,
+                            table_ids: v017.table_ids,
+                            id_to_name: v017.id_to_name,
+                            auto_increment_counters: v017.auto_increment_counters,
+                        },
+                        // 🔒 v0.12/v0.13 catalog: TableSchema lacked
+                        // `episode_config`, so the modern positional decode
+                        // misaligns. Retry through the legacy mirror and
+                        // convert (episodes are derived data — None is the
+                        // faithful value for a pre-v0.14 schema).
+                        Err(_) => match bincode::deserialize::<RegistryMetadataV013>(&data) {
+                            Ok(legacy) => RegistryMetadata {
+                                tables: legacy
+                                    .tables
+                                    .into_iter()
+                                    .map(|(k, v)| (k, TableSchema::from(v)))
+                                    .collect(),
+                                index_map: legacy.index_map,
+                                next_table_id: legacy.next_table_id,
+                                table_ids: legacy.table_ids,
+                                id_to_name: legacy.id_to_name,
+                                auto_increment_counters: legacy.auto_increment_counters,
+                            },
+                            Err(_) => {
+                                return Err(StorageError::Serialization(modern_err.to_string()))
+                            }
+                        },
+                    }
+                }
             };
 
             // Rebuild column maps after deserialization
@@ -321,6 +362,75 @@ impl TableRegistry {
         self.persist()?;
 
         Ok(())
+    }
+
+    /// 🔖 B2（0.18）: ALTER TABLE DROP COLUMN——逻辑删除。position/物理宽度
+    /// 不变; 名字映射与名字缓存跳过该列（引用即 ColumnNotFound）。
+    pub fn drop_column(&self, table_name: &str, col_name: &str) -> Result<()> {
+        let mut meta = self
+            .metadata
+            .write()
+            .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+        let schema = meta.tables.get_mut(table_name).ok_or_else(|| {
+            StorageError::InvalidData(format!("Table '{}' not found", table_name))
+        })?;
+        let col = schema
+            .columns
+            .iter_mut()
+            .find(|c| c.name == col_name)
+            .ok_or_else(|| {
+                StorageError::InvalidData(format!(
+                    "Column '{}' not found in table '{}'",
+                    col_name, table_name
+                ))
+            })?;
+        col.dropped = true;
+        schema.rebuild_column_map();
+        drop(meta);
+        self.rcu_drop_schema(table_name);
+        self.persist()?;
+        Ok(())
+    }
+
+    /// 🔖 B2（0.18）: ALTER TABLE RENAME COLUMN——纯 schema 层（列按位置
+    /// 存储）。position 不变，仅改名字映射。
+    pub fn rename_column(&self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let mut meta = self
+            .metadata
+            .write()
+            .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+        let schema = meta.tables.get_mut(table_name).ok_or_else(|| {
+            StorageError::InvalidData(format!("Table '{}' not found", table_name))
+        })?;
+        let col = schema
+            .columns
+            .iter_mut()
+            .find(|c| c.name == old_name && !c.dropped)
+            .ok_or_else(|| {
+                StorageError::InvalidData(format!(
+                    "Column '{}' not found in table '{}'",
+                    old_name, table_name
+                ))
+            })?;
+        col.name = new_name.to_string();
+        schema.rebuild_column_map();
+        drop(meta);
+        self.rcu_drop_schema(table_name);
+        self.persist()?;
+        Ok(())
+    }
+
+    /// 使某表的 schema 缓存失效（下一次 get_table 重新克隆入 Arc）。
+    fn rcu_drop_schema(&self, table_name: &str) {
+        self.schema_cache.rcu(|cur| {
+            let mut next: HashMap<String, Arc<TableSchema>> = HashMap::new();
+            for (k, v) in cur.iter() {
+                if k != table_name {
+                    next.insert(k.clone(), Arc::clone(v));
+                }
+            }
+            Arc::new(next)
+        });
     }
 
     /// Get table schema (returns Arc clone — O(1) refcount bump via schema cache)

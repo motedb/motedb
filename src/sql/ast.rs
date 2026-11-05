@@ -390,6 +390,14 @@ pub enum AlterTableAction {
         default_value: Option<crate::types::Value>,
         nullable: bool,
     },
+    /// 🔖 B2（0.18）: ALTER TABLE t DROP COLUMN name —— 逻辑删除（物理
+    /// 宽度不变，段按位置存列; 该位置续写 NULL 占位），物理回收留给
+    /// 未来的 vacuum 变体。
+    DropColumn { name: String },
+    /// 🔖 B2（0.18）: ALTER TABLE t RENAME COLUMN a TO b —— 纯 schema 层
+    /// （列按位置存储）; 有索引的列 v1 直接拒绝（索引命名 table_col 联动
+    /// 单独处理）。
+    RenameColumn { old_name: String, new_name: String },
 }
 
 /// Expression

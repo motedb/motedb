@@ -18968,8 +18968,9 @@ impl QueryExecutor {
         let columns = if let Some(ref cols) = stmt.columns {
             cols.clone()
         } else {
-            // Use schema order
-            schema.columns.iter().map(|c| c.name.clone()).collect()
+            // Use schema order（🔖 B2: 跳过 dropped 列——位置式 INSERT 的
+            // 值只对应可见列，dropped 槽位由行构造器写 NULL 占位）。
+            schema.visible_columns().map(|c| c.name.clone()).collect()
         };
 
         // 🆕 INSERT ... SELECT: 先物化 SELECT 行 (execute_select_internal 是
@@ -21869,6 +21870,113 @@ impl QueryExecutor {
 
                 Ok(QueryResult::Definition {
                     message: format!("Added column '{}' to table '{}'", name, stmt.table),
+                })
+            }
+            // 🔖 B2（0.18）: 逻辑删除——物理宽度不变（段按位置存列，收窄
+            // 会造成新旧段错位，ADD COLUMN 机制已证明该约束），该位置续写
+            // NULL 占位（coerce 的 default/NULL 填充），读路径按 dropped
+            // 跳过（名字映射/SELECT */INSERT 目标列均过滤）。物理回收留
+            // 给未来的 vacuum 变体。
+            AlterTableAction::DropColumn { name } => {
+                let schema = self.db.get_table_schema(&stmt.table)?;
+                // dropped 列已被 get_column 过滤——先做"已删"判定再查可见列。
+                if schema.columns.iter().any(|c| c.name == name && c.dropped) {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Column '{}' is already dropped",
+                        name
+                    )));
+                }
+                let col = schema
+                    .get_column(&name)
+                    .ok_or_else(|| MoteDBError::ColumnNotFound(name.clone()))?;
+                // PK 不可删（行身份）; NOT NULL 列不可删（占位 NULL 会破坏
+                // 约束语义）。
+                if schema.primary_key().is_some_and(|pk| pk == name) {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Cannot drop primary key column '{}'",
+                        name
+                    )));
+                }
+                if !col.nullable && col.default_value.is_none() {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Cannot drop NOT NULL column '{}' (no DEFAULT — the NULL \
+                         placeholder would violate the constraint)",
+                        name
+                    )));
+                }
+                // v1: 该列上有索引 → 明确拒绝（不级联）。
+                if [
+                    crate::database::index_metadata::IndexType::Column,
+                    crate::database::index_metadata::IndexType::Vector,
+                    crate::database::index_metadata::IndexType::Text,
+                ]
+                .into_iter()
+                .any(|it| {
+                    self.db
+                        .index_registry
+                        .find_by_column(&stmt.table, &name, it)
+                        .is_some()
+                }) {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Column '{}' has an index — DROP the index first (v1 does \
+                         not cascade)",
+                        name
+                    )));
+                }
+                self.db.table_registry.drop_column(&stmt.table, &name)?;
+                // 🚨 列名相关的缓存失效（列存投影/名字缓存随 schema Arc 一起
+                // 换代）。
+                self.db.columnar_sstables.remove(&stmt.table);
+                Ok(QueryResult::Definition {
+                    message: format!("Dropped column '{}' from table '{}'", name, stmt.table),
+                })
+            }
+            // 🔖 B2（0.18）: 纯 schema 层重命名（列按位置存储）。有索引的列
+            // v1 拒绝（索引命名 table_col 与元数据联动单独处理）。
+            AlterTableAction::RenameColumn { old_name, new_name } => {
+                let schema = self.db.get_table_schema(&stmt.table)?;
+                let col = schema
+                    .get_column(&old_name)
+                    .ok_or_else(|| MoteDBError::ColumnNotFound(old_name.clone()))?;
+                if col.dropped {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Column '{}' is dropped",
+                        old_name
+                    )));
+                }
+                if schema.get_column(&new_name).is_some() {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Column '{}' already exists in table '{}'",
+                        new_name, stmt.table
+                    )));
+                }
+                if [
+                    crate::database::index_metadata::IndexType::Column,
+                    crate::database::index_metadata::IndexType::Vector,
+                    crate::database::index_metadata::IndexType::Text,
+                ]
+                .into_iter()
+                .any(|it| {
+                    self.db
+                        .index_registry
+                        .find_by_column(&stmt.table, &old_name, it)
+                        .is_some()
+                }) {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "Column '{}' has an index — DROP the index first (v1 does \
+                         not cascade)",
+                        old_name
+                    )));
+                }
+                self.db
+                    .table_registry
+                    .rename_column(&stmt.table, &old_name, &new_name)?;
+                self.db.columnar_sstables.remove(&stmt.table);
+                Ok(QueryResult::Definition {
+                    message: format!(
+                        "Renamed column '{}' to '{}' in table '{}'",
+                        old_name, new_name, stmt.table
+                    ),
                 })
             }
         }
@@ -25304,6 +25412,7 @@ mod tests {
                 auto_increment: false,
                 auto_increment_start: None,
                 default_value: None,
+                dropped: false,
             },
             ColumnDef {
                 name: "name".into(),
@@ -25313,6 +25422,7 @@ mod tests {
                 auto_increment: false,
                 auto_increment_start: None,
                 default_value: None,
+                dropped: false,
             },
             ColumnDef {
                 name: "score".into(),
@@ -25322,6 +25432,7 @@ mod tests {
                 auto_increment: false,
                 auto_increment_start: None,
                 default_value: None,
+                dropped: false,
             },
             ColumnDef {
                 name: "active".into(),
@@ -25331,6 +25442,7 @@ mod tests {
                 auto_increment: false,
                 auto_increment_start: None,
                 default_value: None,
+                dropped: false,
             },
         ];
         TableSchema::new("t".into(), columns)
@@ -25697,6 +25809,7 @@ mod tests {
                     auto_increment: false,
                     auto_increment_start: None,
                     default_value: None,
+                    dropped: false,
                 })
                 .collect(),
         )

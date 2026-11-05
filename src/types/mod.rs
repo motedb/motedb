@@ -15,7 +15,7 @@ pub use table::{
     ColumnDef, ColumnType, EpisodeConfig, IndexDef, IndexType, TTLDuration, TableSchema, TableType,
 };
 // Legacy decode mirror for pre-v0.14 catalogs — internal to the open path.
-pub(crate) use table::TableSchemaLegacyV013;
+pub(crate) use table::{TableSchemaLegacyV013, TableSchemaV017};
 pub use tensor::Tensor;
 pub use text::{Text, TextDoc};
 pub use timestamp::Timestamp;

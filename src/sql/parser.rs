@@ -3723,6 +3723,45 @@ impl Parser {
                     nullable,
                 },
             })
+        } else if matches!(self.current().token_type, TokenType::Drop) {
+            // 🔖 B2: ALTER TABLE t DROP COLUMN name
+            self.advance();
+            if let TokenType::Identifier(name) = &self.current().token_type {
+                if name.eq_ignore_ascii_case("COLUMN") {
+                    self.advance();
+                }
+            }
+            let col_name = self.parse_identifier()?;
+            Ok(AlterTableStmt {
+                table,
+                action: AlterTableAction::DropColumn { name: col_name },
+            })
+        } else if let TokenType::Identifier(w) = &self.current().token_type {
+            if !w.eq_ignore_ascii_case("RENAME") {
+                return Err(
+                    self.error("Expected ADD, DROP, RENAME, or AUTO_INCREMENT after ALTER TABLE")
+                );
+            }
+            // 🔖 B2: ALTER TABLE t RENAME COLUMN a TO b
+            self.advance();
+            if let TokenType::Identifier(name) = &self.current().token_type {
+                if name.eq_ignore_ascii_case("COLUMN") {
+                    self.advance();
+                }
+            }
+            let old_name = self.parse_identifier()?;
+            // TO 关键字（未注册为 token，按标识符匹配）
+            match &self.current().token_type {
+                TokenType::Identifier(w) if w.eq_ignore_ascii_case("TO") => {
+                    self.advance();
+                }
+                _ => return Err(self.error("Expected TO in RENAME COLUMN")),
+            }
+            let new_name = self.parse_identifier()?;
+            Ok(AlterTableStmt {
+                table,
+                action: AlterTableAction::RenameColumn { old_name, new_name },
+            })
         } else {
             // AUTO_INCREMENT = value
             self.expect(TokenType::AutoIncrement)?;

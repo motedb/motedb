@@ -1253,6 +1253,7 @@ impl QueryExecutor {
                         auto_increment: false,
                         auto_increment_start: None,
                         default_value: None,
+                        dropped: false,
                     })
                     .collect();
                 for (pi, &p) in jproj.iter().enumerate() {
@@ -1265,6 +1266,7 @@ impl QueryExecutor {
                         auto_increment: false,
                         auto_increment_start: None,
                         default_value: None,
+                        dropped: false,
                     });
                 }
                 sc.rebuild_column_map();
