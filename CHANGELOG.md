@@ -2,6 +2,20 @@
 
 ## [0.18.0] — 开发中
 
+### 🔭 B4 EXPLAIN 决策点实录
+
+- **设计转向**: 从 v1 启发式计划模型改为**决策点实录**——执行器在真实
+  决策点写 thread-local plan trace（`src/sql/plan_trace.rs`），EXPLAIN
+  重放执行 + 采集输出（`source=live` 列），计划永远与实际一致、无漂移。
+  未插桩路径回退 v1 启发式描述（如实标注），不再维护第二套计划模型。
+- 插桩点（首轮 12 处）: 列段扫描路由 / i64 谓词快路径 / PK 点查 /
+  ORDER BY 排序点 / JOIN 三路由（M3 批哈希、multi-way、positional）/
+  向量 KNN 路由（has_index/live/min_rows + 新鲜度 built/unindexed/
+  ratio/fresh）/ M1-M4 批下推入口。
+- 采集关闭时近零开销（thread-local 读 + None 检查）。
+- 验收（tests/test_explain_live.rs）: 扫描/JOIN/KNN 实录; 未插桩路径
+  回退不报错; EXPLAIN 重放无写副作用（SELECT-only 由入口保证）。
+
 ### 🏗️ B2 Schema 演进 — DROP COLUMN（逻辑删除）+ RENAME COLUMN
 
 - **DROP COLUMN**: `ColumnDef.dropped` 逻辑删除位——**物理宽度不变**

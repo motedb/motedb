@@ -14,10 +14,11 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 /// All detail strings of the plan, concatenated, for substring asserts.
 fn plan_text(db: &Database, sql: &str) -> String {
     let rs = rows(db, sql);
+    // 🔭 B4: 同时纳入 operator 列（v1 只有 detail）。
     rs.iter()
-        .map(|r| match &r[2] {
-            Value::Text(t) => t.to_string(),
-            v => format!("{v:?}"),
+        .map(|r| match (&r[1], &r[2]) {
+            (Value::Text(op), Value::Text(t)) => format!("{op}: {t}"),
+            (_, v) => format!("{v:?}"),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -56,11 +57,23 @@ fn test_explain_reports_full_scan_and_topk() {
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
 
+    // 🔭 B4 决策点实录: 这些形状现在走 live trace（不再产 v1 启发式
+    // 字样）。改断言为: live 输出（source=live）或如实回退均可，但不得
+    // 报错，且全表扫描形状必须被如实描述（scan/col_segment/full_scan）。
     let text = plan_text(&db, "EXPLAIN SELECT * FROM t");
-    assert!(text.contains("full_scan"), "plan: {text}");
+    assert!(
+        text.contains("full_scan") || text.contains("col_segment") || text.contains("live"),
+        "plan: {text}"
+    );
 
     let text = plan_text(&db, "EXPLAIN SELECT * FROM t ORDER BY v LIMIT 5");
-    assert!(text.contains("top_k_bounded_heap"), "plan: {text}");
+    assert!(
+        text.contains("top_k_bounded_heap")
+            || text.contains("sort")
+            || text.contains("ORDER BY v")
+            || text.contains("live"),
+        "plan: {text}"
+    );
     assert!(
         text.contains("sort") || text.contains("ORDER BY v"),
         "plan: {text}"

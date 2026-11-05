@@ -848,6 +848,7 @@ pub fn try_vec_no_group_aggregate(
     schema: &TableSchema,
     stmt: &SelectStmt,
 ) -> Result<Option<VecScanAggOutcome>> {
+    crate::trace_plan!("vec", "entry: M1 no-group aggregate pushdown");
     if !vec_enabled() {
         return Ok(None);
     }
@@ -1470,6 +1471,7 @@ pub fn try_vec_group_by(
     schema: &TableSchema,
     stmt: &SelectStmt,
 ) -> Result<Option<VecGroupByOutcome>> {
+    crate::trace_plan!("vec", "entry: M2 GROUP BY batch pushdown");
     use std::collections::HashMap;
 
     if !vec_enabled() {
@@ -1995,6 +1997,7 @@ pub fn try_vec_equi_join_gb(
     probe_key_col: usize,
     stmt: &SelectStmt,
 ) -> Result<Option<VecJoinGbOutcome>> {
+    crate::trace_plan!("vec", "entry: M3 equi-join + GROUP BY");
     use std::collections::HashMap;
     if !vec_enabled() || crate::sql::executor::QueryExecutor::is_in_transaction_tls() {
         return Ok(None);
@@ -2725,6 +2728,7 @@ pub fn try_vec_projection(
     limit: Option<usize>,
     offset: usize,
 ) -> Result<Option<Vec<Vec<Value>>>> {
+    crate::trace_plan!("vec", "entry: M4 batch projection");
     if !vec_enabled() {
         return Ok(None);
     }

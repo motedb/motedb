@@ -12295,6 +12295,7 @@ impl QueryExecutor {
             // 🚀 VEC M3: 批 hash equi-JOIN + GROUP BY (半连接聚合形态 —
             // 探测行命中直接折叠, 不物化 joined 行)。None → 下方原路径。
             if let Some(outcome) = self.try_vec_equi_join_gb(stmt, left, right, on_condition)? {
+                crate::trace_plan!("join", "vec_equi_join_gb (M3 batch hash join + GROUP BY)");
                 return Ok(QueryResult::Select {
                     columns: outcome.columns,
                     rows: outcome.rows,
@@ -12305,6 +12306,7 @@ impl QueryExecutor {
             // the nested-loop general path took minutes for bounded
             // three-way joins.
             if let Some(result) = self.try_multi_way_inner_join(stmt)? {
+                crate::trace_plan!("join", "multi_way_inner_join (left-deep hash chain)");
                 return Ok(result);
             }
             if let (
@@ -12325,6 +12327,10 @@ impl QueryExecutor {
                         && stmt.having.is_none()
                         && !self.has_aggregates(&stmt.columns)
                     {
+                        crate::trace_plan!(
+                            "join_route",
+                            "equi join {lcol_full} = {rcol_full}, simple projection"
+                        );
                         if let Some(result) = self.try_positional_inner_join(
                             stmt,
                             ltable,
@@ -19394,6 +19400,28 @@ impl QueryExecutor {
             }
         };
 
+        // 🔖 B4（0.18）: 决策点实录——重放执行 + thread-local 采集，计划
+        // 永远与实际一致。空 trace（该查询走了无插桩的老路径）则回退
+        // 到 v1 启发式描述（保留单表快路径的无执行成本输出）。
+        {
+            let cloned = crate::sql::ast::SelectStmt::clone(sel);
+            let (trace, result) =
+                crate::sql::plan_trace::with_collection(|| self.execute_select_internal(&cloned));
+            // 物化/丢弃结果行——EXPLAIN 只取计划（SELECT 无写副作用）。
+            let _ = result?;
+            if !trace.is_empty() {
+                return Ok(QueryResult::Select {
+                    columns: vec![
+                        "step".to_string(),
+                        "operator".to_string(),
+                        "detail".to_string(),
+                        "source".to_string(),
+                    ],
+                    rows: crate::sql::plan_trace::render(trace),
+                });
+            }
+        }
+
         let Some(crate::sql::ast::TableRef::Table { name: table, .. }) = sel.from.as_ref() else {
             return Err(MoteDBError::InvalidArgument(
                 "EXPLAIN requires a simple FROM <table> in this version".into(),
@@ -19485,7 +19513,9 @@ impl QueryExecutor {
         }
         push(
             "note",
-            "heuristic plan (v1): reports the fast path the executor would pick; set-based paths (JOIN/subquery) are not yet modeled".to_string(),
+            "heuristic fallback (v1): this query took a path without live trace points; \
+             the description mirrors the executor's decision signals"
+                .to_string(),
             &mut rows,
         );
 
@@ -25069,6 +25099,12 @@ impl QueryExecutor {
         stmt: &SelectStmt,
         plan: &VectorOrderByPlan,
     ) -> Result<QueryResult> {
+        crate::trace_plan!(
+            "knn",
+            "vector ORDER BY plan: table={} k={}",
+            plan.table,
+            plan.k
+        );
         debug_log!(
             "[Executor] ✅ 使用向量索引优化 ORDER BY: {} <-> [...] LIMIT {}",
             plan.column,
@@ -25133,6 +25169,11 @@ impl QueryExecutor {
             });
         let use_index = {
             let has_index = self.db.has_vector_index(&index_name);
+            crate::trace_plan!(
+                "knn_route",
+                "has_index={has_index} live={} min_rows={index_min_rows}",
+                live_rows_probe.unwrap_or(0)
+            );
             has_index && live_rows_probe.is_some_and(|rows| rows >= index_min_rows) && {
                 // 🔒 B3 新鲜度护栏（0.18）: 增量未入图占比超阈值 → 该
                 // 查询降级暴力精确扫（正确性优先; 中小规模还更快——
@@ -25149,6 +25190,10 @@ impl QueryExecutor {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0.05);
                 let fresh = (unindexed as f64) <= ratio * rows.max(1) as f64;
+                crate::trace_plan!(
+                    "knn_freshness",
+                    "built={built} unindexed={unindexed} ratio={ratio} fresh={fresh}"
+                );
                 if !fresh {
                     crate::debug_log!(
                         "[B3] vector index '{index_name}' stale: live={rows} built={built} \

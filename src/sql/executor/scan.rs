@@ -50,6 +50,7 @@ impl QueryExecutor {
         if self.db.has_col_segment_store(table) {
             let col_types = schema.col_types().to_vec();
             if let Ok(store) = self.db.get_or_create_col_segment_store(table, &col_types) {
+                crate::trace_plan!("scan", "col_segment full scan (multi-segment merge)");
                 let _ = store.prepare_for_query();
                 // 🔑 Read-your-writes: the zero-copy SelectColumnar path below
                 // bypasses execute_full_scan_via_col_segment and would miss
@@ -770,6 +771,17 @@ impl QueryExecutor {
             }
         }
 
+        if stmt.order_by.is_some() {
+            crate::trace_plan!(
+                "sort",
+                "ORDER BY over col-seg scan output (vector distance keys: \
+                 bounded top-k heap when LIMIT present)"
+            );
+        }
+        crate::trace_plan!(
+            "scan_route",
+            "col_segment_via_col_segment (projected + filtered)"
+        );
         // IN (literal list) HashSet fast path: avoid O(rows × list_len) linear scan.
         // For `WHERE col IN (v1, v2, ...)`, build a HashSet once and do O(1) lookup per row.
         let in_hashset: Option<(usize /*col_pos*/, std::collections::HashSet<Value>)> =
@@ -1185,6 +1197,10 @@ impl QueryExecutor {
         // 页行做投影解码（旧路径解码全部命中行的全部投影列再全排序）。
         if where_clause.is_some() && stmt.order_by.is_some() && stmt.limit.is_some() {
             if let Some(rows) = crate::sql::vector_exec::try_vec_filter_topk(store, schema, stmt)? {
+                crate::trace_plan!(
+                    "knn",
+                    "brute top-k bounded heap (col-seg order-by distance)"
+                );
                 return Ok(StreamingQueryResult::SelectReady { columns, rows });
             }
         }
@@ -2188,6 +2204,7 @@ impl QueryExecutor {
         // 覆盖最高频场景：WHERE id > N, WHERE v = N, WHERE ts <= N。
         // i64 predicate 不构造 Value——每行省 Value 构造 + 析构。
         if let Some((fc, i64_op, i64_val)) = Self::try_extract_i64_predicate(wc, schema) {
+            crate::trace_plan!("scan", "i64 predicate fast path (no per-row Value)");
             if fc < col_types.len()
                 && matches!(
                     col_types[fc],

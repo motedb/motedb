@@ -151,7 +151,11 @@ fn next_op_after(last: &str, next_start: i64) -> Option<String> {
 
 fn read_journal(path: &Path) -> Vec<String> {
     let s = std::fs::read_to_string(path).unwrap_or_default();
-    s.lines()
+    // 🔒 kill -9 可在 writeln 的底层 write 之间撕裂最后一条（无换行的
+    // 残尾，甚至半截 token——实测 InvalidDigit）。撕裂尾行不可信：丢弃。
+    let complete_end = s.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    s[..complete_end]
+        .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| l.to_string())
         .collect()

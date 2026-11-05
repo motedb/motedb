@@ -26,6 +26,8 @@ pub use lexer::Lexer;
 pub use optimizer::{IndexStats, QueryOptimizer, QueryPlan, ScanMethod};
 pub use parser::Parser;
 pub use row_converter::{row_to_sql_row, rows_to_sql_rows, sql_row_to_row};
+/// 🔖 B4: EXPLAIN 决策点实录（thread-local plan trace）。
+pub mod plan_trace;
 /// SQL 比较语义层（L2）— NULL 三值 / Bool↔数值 / 方括号向量文本的唯一
 /// 实现。0.18 求值器统一（设计文档 §A1）。
 pub mod semantics;
