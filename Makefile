@@ -24,7 +24,7 @@
 #
 # See docs/benchmark_methodology.md for what is measured and how.
 
-.PHONY: compete compete-quick compete-full test test-fast wheel release-smoke release-smoke-local bench-industry
+.PHONY: compete compete-quick compete-full test test-fast wheel release-smoke release-smoke-local bench-industry vec-recall
 
 LANGS ?= python,node,rust
 
@@ -33,6 +33,12 @@ compete:
 
 compete-quick:
 	./scripts/compete.sh quick
+
+# 0.18 B3: 向量召回测量（增量 stranded 场景 vs 暴力精确扫）。
+#   测量模式: 只打印; 断言模式: MOTE_VEC_RECALL_ASSERT=1 且
+#   MOTE_VEC_RECALL_MIN=<阈值>（默认 0.98@10）。
+vec-recall:
+	cargo test --release --test bench_vec_recall -- --ignored --nocapture
 
 compete-full:
 	./scripts/compete.sh full

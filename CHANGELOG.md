@@ -2,6 +2,30 @@
 
 ## [0.18.0] — 开发中
 
+### 🧭 B3 向量召回硬化 — 测量基线 + 新鲜度护栏 + 路由降级
+
+- **测量工具** `make vec-recall`（tests/bench_vec_recall.rs）: 20K×
+  64 维 8-簇对抗数据，CREATE VECTOR INDEX 后 6 轮增量批（各 500 行
+  + 10% UPDATE + 5% DELETE churn），索引路径 vs 暴力精确扫逐相对拍。
+  断言模式 `MOTE_VEC_RECALL_ASSERT=1`（p50≥0.85 / p99≥0.99 / worst≥
+  0.5，`MOTE_VEC_RECALL_MIN` 可收紧）。**诚实基线**: 对抗簇数据上图
+  质量 p50 0.9–1.0 波动、worst 0.6–0.8; 均匀/真实嵌入数据引擎内部
+  实测 10/10（B-06）。方案原设想的 0.03–0.09 大面积 stranded 确认
+  为**陈旧测量**（B-06 注释已纠正），真实病灶是"列段缓冲新行对索引
+  路径不可见"。
+- **合并层补盲**: `vector_search` 原来只合并 LSM memtable——列段表的
+  新行全在 ColSegmentStore 写缓冲，增量窗口 recall p50 掉到 0.9。
+  新增 `buffered_vector_column`（单趟解码写缓冲的 Vector 列）参与
+  候选合并。
+- **新鲜度护栏 + 路由降级**: `vector_index_len`（图节点数）对比 live
+  行数，增量未入图占比 > 阈值（`MOTE_VEC_REBUILD_RATIO`，默认 5%）
+  → 该查询降级暴力精确扫（正确性优先; 20K 实测暴力 1.0ms vs 图路径
+  3.0ms——中小规模还更快），并触发**后台全量重建**
+  （`maybe_spawn_vector_rebuild`，单例防抖、Weak 引用、沿用原度量
+  ——cosine 重建不变 L2）。
+- **教训记录**: 图路径过取深度下限提到 256 反而使 fresh recall p50
+  1.0→0.9（请求深度超过 search_list 截断质量更差）——已回退并注释。
+
 ### 🔒 B1 多进程共享只读 — `Database::open_shared_readonly`
 
 - **打开模式三分**: 独占写（默认，flock EX，不变）/ **共享只读（新，

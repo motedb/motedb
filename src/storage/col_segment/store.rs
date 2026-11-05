@@ -4751,6 +4751,18 @@ impl ColSegmentStore {
         self.write_buf.lock().num_rows
     }
 
+    /// 🔒 B3（0.18）: 写缓冲中 **Vector 列**的全部未删值（composite_key,
+    /// ArcVec）——向量索引的新鲜度合并层用（图冻结于构建时刻，缓冲里的
+    /// 新行对索引路径不可见 → 新锚点查询漏候选）。
+    pub fn buffered_vector_column(&self, col_pos: usize) -> Vec<(u64, crate::types::ArcVec)> {
+        self.write_buf
+            .lock()
+            .vector_column_snapshot(col_pos)
+            .into_iter()
+            .filter_map(|(key, v)| v.map(|v| (key, v)))
+            .collect()
+    }
+
     /// Estimated heap bytes consumed by the write buffer. Used to trigger
     /// memory-aware flushes so RSS doesn't grow with buffered row count.
     pub fn buffered_bytes(&self) -> usize {

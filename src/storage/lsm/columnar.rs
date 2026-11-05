@@ -2921,6 +2921,78 @@ pub struct ColumnarSSTableBuilder {
 }
 
 impl ColumnarSSTableBuilder {
+    /// 🔒 B3（0.18）: 单趟扫描缓冲中某 **Vector 列**的全部值
+    /// （key, Option<ArcVec>）。变宽编码（[dim:u16][f32×dim]，NULL=2B）
+    /// 决定必须顺序解码——供向量索引新鲜度合并层使用（图冻结于构建
+    /// 时刻，缓冲新行对索引路径不可见）。非 Vector 列返回空（当前无
+    /// 消费方）。
+    pub fn vector_column_snapshot(&self, col: usize) -> Vec<(u64, Option<crate::types::ArcVec>)> {
+        let mut out = Vec::with_capacity(self.num_rows);
+        if col >= self.column_buffers.len()
+            || !matches!(self.column_tags[col], ColumnTypeTag::Vector)
+        {
+            return out;
+        }
+        let buf = &self.column_buffers[col];
+        // 🔑 newest-wins 去重: 同一 composite key 可能有多条（原插入 +
+        // UPDATE 新版 + DELETE 墓碑，append 语义）。倒序遍历，每 key 只
+        // 取最新一条——最新为墓碑/NULL 则整 key 排除。
+        let mut off = 0usize;
+        let mut dims: Vec<usize> = Vec::with_capacity(self.num_rows);
+        let mut starts: Vec<usize> = Vec::with_capacity(self.num_rows);
+        for _ in 0..self.num_rows {
+            let dim = if off + 2 <= buf.len() {
+                u16::from_le_bytes([buf[off], buf[off + 1]]) as usize
+            } else {
+                0
+            };
+            starts.push(off);
+            dims.push(dim);
+            off += 2 + dim * 4;
+        }
+        // 🔑 append 语义: 最新条目在数组尾部 → last-wins。
+        let mut newest: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::with_capacity(self.num_rows);
+        for i in 0..self.num_rows {
+            newest.insert(self.keys[i], i); // 后见覆盖 = 最新
+        }
+        // 输出按 key 首见顺序，但取的是各 key 的最新条目。
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..self.num_rows {
+            let key = self.keys[i];
+            if !seen.insert(key) {
+                continue;
+            }
+            let i = newest[&key]; // 该 key 的最新条目
+            if self.deleted.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let is_null = self
+                .null_flags
+                .get(col)
+                .and_then(|f| f.get(i).copied())
+                .unwrap_or(true);
+            let dim = dims[i];
+            let start = starts[i];
+            let end = start + 2 + dim * 4;
+            let val = if is_null || dim == 0 || end > buf.len() {
+                None
+            } else {
+                let floats: Vec<f32> = (0..dim)
+                    .map(|k| {
+                        let b = &buf[start + 2 + k * 4..start + 2 + k * 4 + 4];
+                        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    })
+                    .collect();
+                Some(crate::types::ArcVec::new(floats))
+            };
+            if let Some(v) = val {
+                out.push((key, Some(v)));
+            }
+        }
+        out
+    }
+
     pub fn new<P: AsRef<Path>>(path: P, column_types: Vec<ColumnType>) -> Self {
         let column_tags: Vec<ColumnTypeTag> = column_types
             .iter()

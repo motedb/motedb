@@ -217,6 +217,8 @@ pub struct MoteDB {
     /// Shared across all clones so `is_async_index_pipeline_active()` works
     /// correctly even for cloned MoteDB instances (auto-checkpoint thread).
     is_pipeline_active: Arc<AtomicBool>,
+    /// 🔒 B3: 向量索引后台重建进行中（同一时刻至多一个; 单例防抖）。
+    vector_rebuild_active: Arc<AtomicBool>,
 
     /// Async index build pipeline: sender (None if pipeline disabled)
     index_build_tx: Option<std::sync::mpsc::Sender<IndexBuildBatch>>,
@@ -655,6 +657,7 @@ impl MoteDB {
             vector_cache_budget_mb: config.vector_cache_budget_mb,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
+            vector_rebuild_active: Arc::new(AtomicBool::new(false)),
             pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             index_build_errors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             flush_errors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -938,6 +941,7 @@ impl MoteDB {
             vector_cache_budget_mb: self.vector_cache_budget_mb,
             is_flushing: self.is_flushing.clone(),
             is_pipeline_active: self.is_pipeline_active.clone(), // shared — clones see true when pipeline runs
+            vector_rebuild_active: self.vector_rebuild_active.clone(),
             pending_index_batches: self.pending_index_batches.clone(),
             checkpoint_mutex: self.checkpoint_mutex.clone(),
             is_closed: self.is_closed.clone(),
@@ -1635,6 +1639,7 @@ impl MoteDB {
             vector_cache_budget_mb: config.vector_cache_budget_mb,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
+            vector_rebuild_active: Arc::new(AtomicBool::new(false)),
             pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             index_build_errors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             flush_errors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3258,6 +3263,48 @@ impl MoteDB {
             // Dropping the Option's File releases the OS flock.
             guard.take();
         }
+    }
+
+    /// 🔒 B3 新鲜度护栏（0.18）: 检测到增量未入图占比超阈值的查询会降级
+    /// 暴力精确扫，并触发本后台全量重建（Weak 引用，db 关闭则放弃;
+    /// 单例防抖——重建进行中的新触发直接跳过）。重建复用 DDL 路径的
+    /// create_vector_index_with（同一次全量扫 + 建图 + 原子替换）。
+    pub(crate) fn maybe_spawn_vector_rebuild(
+        self: &Arc<Self>,
+        index_name: &str,
+        dimension: usize,
+        metric: Option<String>,
+    ) {
+        if self
+            .vector_rebuild_active
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return; // 已有重建在进行
+        }
+        let weak = Arc::downgrade(self);
+        let index_name = index_name.to_string();
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            if let Some(db) = weak.upgrade() {
+                if db
+                    .create_vector_index_with(&index_name, dimension, metric.as_deref(), &[])
+                    .is_ok()
+                {
+                    eprintln!(
+                        "[B3] vector index '{index_name}' rebuilt in {:.1}s (freshness guard)",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+                db.vector_rebuild_active
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        });
     }
 
     /// 🔒 B1 共享只读（0.18）: 以 flock **SH** 打开——多个只读者可并存;

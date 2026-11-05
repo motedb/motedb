@@ -25011,23 +25011,65 @@ impl QueryExecutor {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20_000);
+        let live_rows_probe: Option<usize> = self
+            .db
+            .get_or_create_col_segment_store(&plan.table, &[])
+            .ok()
+            .map(|store| {
+                store
+                    .segments_snapshot()
+                    .iter()
+                    .map(|s| s.sst.num_rows)
+                    .sum::<usize>()
+                    + store.buffered_row_count()
+            });
         let use_index = {
             let has_index = self.db.has_vector_index(&index_name);
-            has_index
-                && self
-                    .db
-                    .get_or_create_col_segment_store(&plan.table, &[])
+            has_index && live_rows_probe.is_some_and(|rows| rows >= index_min_rows) && {
+                // 🔒 B3 新鲜度护栏（0.18）: 增量未入图占比超阈值 → 该
+                // 查询降级暴力精确扫（正确性优先; 中小规模还更快——
+                // 20K 实测暴力 968µs vs 图路径 3171µs），并触发后台
+                // 全量重建。图候选缺失在 rerank 后不可恢复，memtable
+                // 合并只兜得住部分 stranded 形状（实测增量窗口 p50
+                // 掉到 0.9、min 0.7）。阈值 env MOTE_VEC_REBUILD_RATIO
+                // （默认 0.2）。
+                let rows = live_rows_probe.unwrap_or(0);
+                let built = self.db.vector_index_len(&index_name).unwrap_or(0);
+                let unindexed = rows.saturating_sub(built);
+                let ratio: f64 = std::env::var("MOTE_VEC_REBUILD_RATIO")
                     .ok()
-                    .map(|store| {
-                        let rows: usize = store
-                            .segments_snapshot()
-                            .iter()
-                            .map(|s| s.sst.num_rows)
-                            .sum::<usize>()
-                            + store.buffered_row_count();
-                        rows >= index_min_rows
-                    })
-                    .unwrap_or(false)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.05);
+                let fresh = (unindexed as f64) <= ratio * rows.max(1) as f64;
+                if !fresh {
+                    crate::debug_log!(
+                        "[B3] vector index '{index_name}' stale: live={rows} built={built} \
+                             → brute for this query + background rebuild"
+                    );
+                    // 维度/度量从注册表取（与 DDL 路径同源）。
+                    let dim = self
+                        .db
+                        .index_registry
+                        .resolve_index_name(&index_name)
+                        .and_then(|(t, c)| {
+                            let schema = self.db.get_table_schema(&t).ok()?;
+                            let pos = schema.get_column_position(&c)?;
+                            match schema.columns.get(pos)?.col_type {
+                                crate::types::ColumnType::Tensor(d) => Some(d),
+                                _ => None,
+                            }
+                        });
+                    // Some("cosine") → cosine; Some("") → L2（默认）。
+                    let metric = self
+                        .db
+                        .vector_index_metric(&index_name)
+                        .filter(|m| m == "cosine");
+                    if let Some(dim) = dim {
+                        self.db.maybe_spawn_vector_rebuild(&index_name, dim, metric);
+                    }
+                }
+                fresh
+            }
         };
         // 🔑 J3 filtered vector search: the WHERE predicate applies AFTER the
         // top-k selection, so a selective predicate leaves fewer than k
@@ -25059,6 +25101,9 @@ impl QueryExecutor {
         // 🔴 Overfetch on the graph path: candidates the graph missed are
         // unrecoverable after rerank — searching k×4 (min 64) and reranking
         // down costs a fraction of the graph walk and absorbs misses.
+        // ⚠️ B3 实测（2026-11-05, 8-簇对抗数据 20K）: 把下限提到 256 反而
+        // 使 fresh 图 recall p50 1.0 → 0.9（深度超过 search_list 的请求
+        // 截断路径质量更差）——不要盲目加深。
         let mut depth = if use_index {
             plan.k.saturating_mul(4).max(64)
         } else {

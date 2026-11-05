@@ -301,6 +301,28 @@ impl MoteDB {
         self.vector_indexes.contains_key(index_name)
     }
 
+    /// 🔒 B3 新鲜度护栏（0.18）: 图内节点数 = 索引覆盖的行数（构建时
+    /// 全量入图）。执行器用它对比 live 行数判定"增量未入图占比"。
+    pub fn vector_index_len(&self, index_name: &str) -> Option<usize> {
+        self.vector_indexes
+            .get(index_name)
+            .map(|r| r.value().read().len())
+    }
+
+    /// 🔒 B3: 索引的度量（后台重建沿用原度量，cosine 重建不得变 L2）。
+    pub fn vector_index_metric(&self, index_name: &str) -> Option<String> {
+        let guard = self.vector_indexes.get(index_name)?;
+        let is_cosine = matches!(
+            guard.value().read().metric(),
+            crate::distance::DistanceKind::Cosine
+        );
+        Some(if is_cosine {
+            "cosine".to_string()
+        } else {
+            String::new()
+        })
+    }
+
     /// Search for nearest neighbors (merges DiskANN index + memtable data)
     ///
     /// # LSM Architecture
@@ -441,7 +463,31 @@ impl MoteDB {
             debug_log!("[vector_search] 🔍 Memtable为空（数据已全部flush到SST）");
         }
 
-        // 3. Merge index_results and memtable_results
+        // 2b. 🔒 B3（0.18）: ColSegmentStore 写缓冲合并——LSM memtable 为
+        // 空的列段表，新行全在列段缓冲里（图冻结于构建时刻看不见 →
+        // 新锚点查询漏候选，实测增量窗口 recall p50 掉到 0.9）。
+        let buffer_results: Vec<(RowId, f32)> = self
+            .col_segment_stores
+            .get(table_name)
+            .map(|store| {
+                store
+                    .value()
+                    .buffered_vector_column(col_position)
+                    .into_iter()
+                    .filter(|(_, v)| v.len() == query.len())
+                    .map(|(key, v)| {
+                        // composite key → row_id（低 32 位）。
+                        let row_id = (key & 0xFFFFFFFF) as RowId;
+                        (row_id, metric.distance(v.as_slice(), query))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 3. Merge index_results and memtable_results (+ buffer_results)
+        if !buffer_results.is_empty() {
+            index_results.extend(buffer_results);
+        }
         if !memtable_results.is_empty() {
             debug_log!("[vector_search] ⚠️ 合并memtable结果...");
             let _before_len = index_results.len();
