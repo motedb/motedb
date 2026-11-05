@@ -1,0 +1,24 @@
+# 🔖 0.18 发版清单: GitHub Release 页自动化。
+#
+# 推送 v* 标签 → 建 Release 并以 CHANGELOG.md 对应版本段落填充正文
+# （scripts/extract_changelog.py 提取）。发版流程: bump Cargo.toml 版本
+# + CHANGELOG 落日期 → commit → tag v0.X.0 → push tag → 本工作流出页。
+#
+# 刻意不在这里做 npm/crates.io 发布——那是本地人工步骤（凭据与
+# registry 反垃圾策略判断需要在场），Release 页只做变更说明。
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract CHANGELOG section
+        run: python3 scripts/extract_changelog.py "${GITHUB_REF_NAME}" > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md

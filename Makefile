@@ -53,6 +53,10 @@ test:
 test-fast:
 	cargo test --profile release-test --no-fail-fast
 
+# 0.18 发版清单: 文档版本单源（与 CI lint job 同一脚本）。
+check-docs:
+	./scripts/check_doc_versions.sh
+
 wheel:
 	python3 -m pip install --quiet maturin
 	cd bindings/python && python3 -m maturin build --release

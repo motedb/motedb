@@ -297,13 +297,13 @@ cargo add motedb
 Or in `Cargo.toml`:
 ```toml
 [dependencies]
-motedb = "0.16"
+motedb = "0.17"
 ```
 
 For minimal edge builds (no tokenizer, no parallelism), disable default features:
 ```toml
 [dependencies]
-motedb = { version = "0.16", default-features = false, features = ["jemalloc"] }
+motedb = { version = "0.17", default-features = false, features = ["jemalloc"] }
 ```
 
 ## Configuration

@@ -28,7 +28,7 @@ Add the dependency in your project's `Cargo.toml`:
 
 ```toml
 [dependencies]
-motedb = "0.15"
+motedb = "0.17"
 ```
 
 ### Method 2: Build from Source

@@ -224,6 +224,24 @@
   sim + `I <next_start>`（child 循环总以 INSERT 开头），空 journal
   候选同理泛化。复跑 3× + 全套件 4/4 绿。
 
+### 🧰 0.18 发版清单（专业度捎带项）
+
+- **文档版本单源**: README（0.16）/ quick-start（0.16）/ installation
+  （0.15）/ install-troubleshooting（0.15）四处依赖拼写全部对齐
+  crates.io 最新 0.17; 新增 `scripts/check_doc_versions.sh`
+  （单源 = Cargo.toml version，历史文档豁免，`make check-docs`）接入
+  CI lint job——发版 bump 版本时文档漂移直接红。
+- **GitHub Release 自动化**: `.github/workflows/release.yml`——推 `v*`
+  标签即建 Release，正文由 `scripts/extract_changelog.py` 从
+  CHANGELOG.md 提取对应版本段落。刻意不自动做 npm/crates.io 发布
+  （registry 反垃圾与凭据判断留在人工发版步骤）。
+- `motedb-cli` 随包发布链路核实: 主包 `[[bin]]` 元数据完整、
+  `cargo package --list` 含 `src/bin/motedb-cli.rs`（0.17.0 已在
+  crates.io 证明管线）; 0.18.0 发版时随 `cargo publish` 常规更新。
+- win32 四件套（PR #4）: npm `motedb-win32-x64-msvc` 名额仍未放行
+  （registry 404，issue #5），按计划挂起、随版回归。
+
+
 ## [0.17.0] — 2026-11-03
 
 > 第三轮（自查）：上轮报告的 16 项确认发现全数处理——其中 **7 项是前两轮

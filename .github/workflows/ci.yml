@@ -34,6 +34,10 @@ jobs:
       # 分裂。上限在 scripts/check_sql_cmp.ceiling，清偿后调低。
       - name: check_sql_cmp (ratchet — bare Value comparisons in src/sql)
         run: ./scripts/check_sql_cmp.sh
+      # 0.18 发版清单: 文档版本单源——README/docs 安装段的 motedb 版本
+      # 必须跟随 Cargo.toml（此前 README 0.16 / installation 0.15 漂移）。
+      - name: check_doc_versions (docs version == Cargo.toml)
+        run: ./scripts/check_doc_versions.sh
       - name: cargo clippy (advisory — warnings do not fail the job)
         run: cargo clippy --all-targets --all-features --no-deps
         continue-on-error: true
