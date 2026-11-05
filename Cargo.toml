@@ -1,6 +1,6 @@
 [package]
 name = "motedb"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 rust-version = "1.87"
 description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
@@ -29,6 +29,11 @@ exclude = [
     "COMPETITIVE_ANALYSIS.md",
     "MULTIMODAL_COMPETITIVE_ANALYSIS.md",
     "RELEASE-v0.2.0.md",
+    # 🔒 本地会话/用户自有文稿绝不进包（cargo package 曾把未跟踪的
+    # .zcode/ 与 docs/rustcc-* 收进发布清单——发版前 cargo package
+    # --list 核验）。
+    ".zcode/",
+    "docs/rustcc-*",
 ]
 
 [lib]

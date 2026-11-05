@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.18.0] — 开发中
+## [0.18.0] — 2026-11-06
 
 ### ⏱ B5 时序连续聚合 — CREATE CONTINUOUS VIEW + FIRST/LAST
 

@@ -135,7 +135,7 @@ LTO. Reuse the build cache across projects with
 edge binaries:
 
 ```toml
-motedb = { version = "0.17", default-features = false, features = ["jemalloc"] }
+motedb = { version = "0.18", default-features = false, features = ["jemalloc"] }
 ```
 
 On Windows MSVC the `jemalloc` feature is accepted but resolves to nothing

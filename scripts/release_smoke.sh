@@ -112,12 +112,14 @@ smoke_python() {
   "$pybin/python" -m pip install --quiet --upgrade pip
 
   if [ $LOCAL = 1 ]; then
-    wheel="$(ls "$ROOT"/bindings/python/target/wheels/motedb_python-*.whl 2>/dev/null | head -1 || true)"
+    # 优先取**当前版本**的 wheel——`ls | head -1` 会拾取上一版发版残留
+    # 的旧 wheel（0.17 冒烟 0.16 包的静默错配，每次 bump 都会踩）。
+    wheel="$(ls "$ROOT"/bindings/python/target/wheels/motedb_python-"$VERSION"-*.whl 2>/dev/null | head -1 || true)"
     if [ -z "$wheel" ]; then
-      echo "   no wheel under bindings/python/target/wheels — building with maturin (slow)"
+      echo "   no motedb_python-$VERSION wheel — building with maturin (slow)"
       "$pybin/python" -m pip install --quiet maturin
       (cd "$ROOT/bindings/python" && "$pybin/python" -m maturin build --release --quiet)
-      wheel="$(ls "$ROOT"/bindings/python/target/wheels/motedb_python-*.whl | head -1)"
+      wheel="$(ls "$ROOT"/bindings/python/target/wheels/motedb_python-"$VERSION"-*.whl | head -1)"
     fi
     "$pybin/python" -m pip install --quiet "$wheel" numpy pyarrow
   else
