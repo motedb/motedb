@@ -1493,6 +1493,14 @@ impl Parser {
         })
     }
 
+    /// 当前 token 为标识符且等于关键字（大小写不敏感）。
+    fn peek_is_kw(&self, kw: &str) -> bool {
+        match self.peek_token_type() {
+            TokenType::Identifier(ref w) => w.eq_ignore_ascii_case(kw),
+            _ => false,
+        }
+    }
+
     /// Parse CREATE statement
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect(TokenType::Create)?;
@@ -1515,6 +1523,17 @@ impl Parser {
                     // 🔖 CREATE EPISODE TABLE … EPISODE BY (col, ts) GAP '5s'
                     self.advance(); // EPISODE
                     Ok(Statement::CreateTable(self.parse_create_table()?))
+                } else if id_upper == "CONTINUOUS" && self.peek_is_kw("VIEW") {
+                    // 🔖 B5: CREATE CONTINUOUS VIEW cv AS SELECT …
+                    self.advance(); // CONTINUOUS
+                    self.advance(); // VIEW
+                    let name = self.parse_identifier()?;
+                    self.expect(TokenType::As)?;
+                    let select = self.parse_select()?;
+                    Ok(Statement::CreateContinuousView {
+                        name,
+                        select: Box::new(select),
+                    })
                 } else {
                     Err(self.error("Expected TABLE or INDEX after CREATE"))
                 }

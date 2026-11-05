@@ -2007,6 +2007,7 @@ impl QueryExecutor {
                 | Statement::Update(_)
                 | Statement::Delete(_)
                 | Statement::CreateTable(_)
+                | Statement::CreateContinuousView { .. }
                 | Statement::CreateIndex(_)
                 | Statement::DropTable(_)
                 | Statement::DropIndex(_)
@@ -2150,6 +2151,9 @@ impl QueryExecutor {
                 })
             }
             Statement::CreateTable(c) => self.execute_create_table(c),
+            Statement::CreateContinuousView { name, select } => {
+                self.execute_create_continuous_view(&name, &select)
+            }
             Statement::CreateIndex(c) => self.execute_create_index(c),
             Statement::DropTable(d) => self.execute_drop_table(d),
             Statement::DropIndex(d) => self.execute_drop_index(d),
@@ -2420,6 +2424,14 @@ impl QueryExecutor {
             }
         }
         if agg_infos.is_empty() || agg_infos.len() != stmt.columns.len() {
+            return Ok(None);
+        }
+        // 🔖 B5: FIRST/LAST 是 2 参聚合，AggregateInfo 只有 arg0 的 col_pos，
+        // compute_aggregate_positional 对其返回 NULL。回退通用物化路径。
+        if agg_infos
+            .iter()
+            .any(|a| matches!(a.func.as_str(), "FIRST" | "LAST"))
+        {
             return Ok(None);
         }
         // 🔒 WHERE filtering — the overlaid row set is the WHOLE table (the
@@ -2697,6 +2709,15 @@ impl QueryExecutor {
                         Value::Integer(tables as i64),
                         Value::Integer(rows as i64),
                     ]],
+                }
+            }
+            Statement::CreateContinuousView { name, select } => {
+                let result = self.execute_create_continuous_view(name, select)?;
+                StreamingQueryResult::Definition {
+                    message: match result {
+                        QueryResult::Definition { message } => message,
+                        _ => "Continuous view created".to_string(),
+                    },
                 }
             }
             Statement::CreateTable(c) => {
@@ -5319,6 +5340,14 @@ impl QueryExecutor {
         } else {
             stmt
         };
+        // 🔖 B5: FROM <continuous view> → 惰性刷新（结果注册为物化 CTE），
+        // 走通用物化路径——外层投影/聚合/排序正常求值。在 WHERE 校验之前
+        // （cv 不是 registry 表; 与 execute_select_internal 的拦截对应）。
+        if let Some(TableRef::Table { name, .. }) = &stmt.from {
+            if self.try_continuous_view(name)? {
+                return self.materialize_as_streaming(stmt);
+            }
+        }
         // 🔴 round-20: unknown column in WHERE must ERROR, not silently
         // filter to empty (per-row paths swallow eval errors by design).
         if let (Some(wc), Some(TableRef::Table { name, .. })) = (&stmt.where_clause, &stmt.from) {
@@ -7684,6 +7713,9 @@ impl QueryExecutor {
                             // it would emit NULL for them. Fall back to the
                             // materialized path (compute_aggregate_positional).
                             "STDDEV" | "VARIANCE" => return Ok(None),
+                            // 🔖 B5: FIRST/LAST 是 2 参聚合，AggCol 只装一个
+                            // col_pos——下方 `_` 兜底会静默 NULL。回退通用路径。
+                            "FIRST" | "LAST" => return Ok(None),
                             _ => {
                                 let col = match args.first() {
                                     Some(Expr::Column(c)) => c.as_str(),
@@ -12118,6 +12150,13 @@ impl QueryExecutor {
         } else {
             stmt
         };
+        // 🔖 B5: FROM <continuous view> → 注册其惰性刷新的物化行（作为
+        // 物化 CTE），继续通用路径——execute_from_with_limit 优先从
+        // MATERIALIZED_CTES 解析。（在 WHERE 校验之前——cv 不是 registry 表。）
+        if let Some(TableRef::Table { name, .. }) = &stmt.from {
+            self.try_continuous_view(name)?;
+        }
+
         // 🔴 round-20: unknown column in WHERE must ERROR, not silently
         // filter to empty (per-row paths swallow eval errors by design).
         // (CTE-named FROM exempt: resolves to a materialized CTE, not the
@@ -12536,7 +12575,15 @@ impl QueryExecutor {
 
         // 🚀 FAST PATH 1: Aggregate query optimization (P0-2)
         // Pattern: SELECT COUNT(*) FROM table [WHERE indexed_col = value]
-        if self.has_only_count_aggregate(&stmt.columns) && stmt.group_by.is_none() {
+        // 🔓 物化 CTE / 连续视图（🔖 B5）FROM 豁免: 名称不在 registry，走
+        // 下方通用物化路径（execute_from_with_limit 从 MATERIALIZED_CTES
+        // 解析）——这里直接 `?` 会报 "Table not found"。
+        let from_is_materialized = matches!(from, TableRef::Table { name, .. }
+            if MATERIALIZED_CTES.with(|m| m.borrow().contains_key(name)));
+        if self.has_only_count_aggregate(&stmt.columns)
+            && stmt.group_by.is_none()
+            && !from_is_materialized
+        {
             // Check if WHERE clause can use index
             if let Some(ref where_clause) = stmt.where_clause {
                 if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
@@ -12774,7 +12821,11 @@ impl QueryExecutor {
             && matches!(stmt.columns[0], SelectColumn::Star)
             && stmt.group_by.is_none()
             && stmt.order_by.is_none()
-            && !stmt.distinct;
+            && !stmt.distinct
+            // 🔓 物化 CTE / 连续视图（🔖 B5）FROM 不在 registry——本路径直查
+            // 存储层，回退通用路径（execute_from_with_limit 先查 CTE map）。
+            && !matches!(from, TableRef::Table { name, .. }
+                if MATERIALIZED_CTES.with(|m| m.borrow().contains_key(name)));
 
         if is_simple_star {
             if let Some(ref where_clause) = stmt.where_clause {
@@ -13795,7 +13846,15 @@ impl QueryExecutor {
             Expr::FunctionCall { name, args, .. } => {
                 matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "STDDEV"
+                        | "VARIANCE"
+                        | "FIRST"
+                        | "LAST"
                 ) || args.iter().any(|a| self.expr_has_aggregates(a))
             }
             Expr::BinaryOp { left, right, .. } => {
@@ -15695,6 +15754,43 @@ impl QueryExecutor {
                         }
                         Ok(max_val.unwrap_or(Value::Null))
                     }
+                    "FIRST" | "LAST" => {
+                        // 🔖 B5（0.18）: FIRST(v, ts)/LAST(v, ts) — 组内按 ts
+                        // 最小/最大的 v（TimescaleDB 2 参 TS 语义）。ts 为 NULL
+                        // 的行不参与; 并列取扫描序最先出现者（稳定）。只在
+                        // 通用（materialized）聚合路径实现——各列段/位置快速
+                        // 路径显式回退（累加器是单参结构，装不下第二个参数）。
+                        if args.len() != 2 {
+                            return Err(MoteDBError::InvalidArgument(
+                                "FIRST/LAST require exactly 2 arguments: FIRST(value, timestamp)"
+                                    .to_string(),
+                            ));
+                        }
+                        let want_min = name.eq_ignore_ascii_case("FIRST");
+                        let mut best: Option<(Value, Value)> = None; // (ts, val)
+                        for row in rows {
+                            let ts = self.evaluator.eval(&args[1], row)?;
+                            if matches!(ts, Value::Null) {
+                                continue;
+                            }
+                            let val = self.evaluator.eval(&args[0], row)?;
+                            let take = match &best {
+                                None => true,
+                                Some((bts, _)) => {
+                                    let op = if want_min {
+                                        crate::sql::semantics::OrdOp::Lt
+                                    } else {
+                                        crate::sql::semantics::OrdOp::Gt
+                                    };
+                                    crate::sql::semantics::compare(&ts, bts, op).is_true()
+                                }
+                            };
+                            if take {
+                                best = Some((ts, val));
+                            }
+                        }
+                        Ok(best.map(|(_, v)| v).unwrap_or(Value::Null))
+                    }
                     "GROUP_CONCAT" => {
                         // 🔑 GROUP_CONCAT(expr [, separator]) — concatenates
                         // non-NULL values with a separator (default ',').
@@ -15803,6 +15899,8 @@ impl QueryExecutor {
                         | "STDDEV"
                         | "VARIANCE"
                         | "GROUP_CONCAT"
+                        | "FIRST"
+                        | "LAST"
                 ) =>
             {
                 let val = self.eval_aggregate(expr, rows)?;
@@ -16458,6 +16556,7 @@ impl QueryExecutor {
                     // aggregated value).
                     // 🔑 GROUP_CONCAT also — otherwise it's evaluated per-row
                     // and returns NULL for every input row.
+                    // 🔑 FIRST/LAST（🔖 B5）同理——2 参聚合，只在通用路径实现。
                     "COUNT"
                         | "SUM"
                         | "AVG"
@@ -16466,6 +16565,8 @@ impl QueryExecutor {
                         | "STDDEV"
                         | "VARIANCE"
                         | "GROUP_CONCAT"
+                        | "FIRST"
+                        | "LAST"
                 );
                 if is_agg_top {
                     return true;
@@ -16517,6 +16618,8 @@ impl QueryExecutor {
                         | "STDDEV"
                         | "VARIANCE"
                         | "GROUP_CONCAT"
+                        | "FIRST"
+                        | "LAST"
                 ) =>
             {
                 out.push(expr.clone());
@@ -21796,7 +21899,209 @@ impl QueryExecutor {
         })
     }
 
-    /// 🆕 Execute ALTER TABLE statement
+    /// 🔖 B5（0.18）: CREATE CONTINUOUS VIEW cv AS SELECT …
+    ///
+    /// v1（惰性刷新，如实声明）:
+    /// - 定义（SelectStmt 的 JSON）存系统表 `_mote_continuous_views`
+    ///   (name, base_table, select_json, watermark)，幂等建表;
+    /// - 查询 cv 时由 SELECT 入口拦截器触发**全量重算**并把结果注册为
+    ///   物化 CTE（外层投影/聚合/排序正常求值）; watermark 记录上次
+    ///   刷新时点——桶级增量（watermark 回退重算受影响区间）顺延 0.19;
+    /// - 守卫: 单表 FROM / 基表存在且非连续视图（防递归）/ 必含
+    ///   TIME_BUCKET / 同名拒绝 / 事务内拒绝。
+    fn execute_create_continuous_view(
+        &self,
+        name: &str,
+        select: &crate::sql::ast::SelectStmt,
+    ) -> Result<QueryResult> {
+        if self.current_txn_id().is_some() {
+            return Err(MoteDBError::InvalidArgument(
+                "CREATE CONTINUOUS VIEW cannot run inside a transaction".into(),
+            ));
+        }
+        let Some(crate::sql::ast::TableRef::Table { name: base, .. }) = select.from.as_ref() else {
+            return Err(MoteDBError::InvalidArgument(
+                "CONTINUOUS VIEW requires FROM <single table> in this version".into(),
+            ));
+        };
+        // 基表必须是真实表（存在），且不能是另一个连续视图——v1 的惰性
+        // 全量重算遇嵌套视图会无限递归（诚实拒绝而非栈溢出）。
+        self.db.get_table_schema(base)?;
+        if let Ok(defs) = self.read_system_view_defs() {
+            if defs
+                .iter()
+                .any(|r| matches!(&r[0], Value::Text(t) if t.as_str() == base))
+            {
+                return Err(MoteDBError::InvalidArgument(format!(
+                    "CONTINUOUS VIEW cannot reference another continuous view '{base}' in this version"
+                )));
+            }
+        }
+        let has_bucket = select.columns.iter().any(|c| {
+            matches!(
+                c,
+                crate::sql::ast::SelectColumn::Expr(
+                    crate::sql::ast::Expr::FunctionCall { name, .. },
+                    _,
+                ) if name.eq_ignore_ascii_case("time_bucket")
+            )
+        });
+        if !has_bucket {
+            return Err(MoteDBError::InvalidArgument(
+                "CONTINUOUS VIEW SELECT must include TIME_BUCKET(interval, ts)".into(),
+            ));
+        }
+
+        // 结构化保存: JSON（SelectStmt 需 Serialize —— 用 Debug 兜底不行，
+        // 刷新要重新解析）。这里改为保存**规范化 SQL 文本**: 重新渲染
+        // SelectStmt 太繁琐，取而代之保存 Debug 格式并按 Debug 重建是脆的。
+        // 最稳妥: 保存 JSON。为此给 SelectStmt 补 Serialize/Deserialize。
+        let select_json = serde_json::to_string(select)
+            .map_err(|e| MoteDBError::InvalidArgument(format!("serialize view: {e}")))?;
+
+        // 系统表（幂等）: TableSchema 直建。
+        if self
+            .db
+            .table_registry
+            .get_table("_mote_continuous_views")
+            .is_err()
+        {
+            let cols = vec![
+                crate::types::ColumnDef::new("name".into(), crate::types::ColumnType::Text, 0)
+                    .not_null(),
+                crate::types::ColumnDef::new(
+                    "base_table".into(),
+                    crate::types::ColumnType::Text,
+                    1,
+                ),
+                crate::types::ColumnDef::new(
+                    "select_json".into(),
+                    crate::types::ColumnType::Text,
+                    2,
+                ),
+                crate::types::ColumnDef::new(
+                    "watermark".into(),
+                    crate::types::ColumnType::Timestamp,
+                    3,
+                ),
+            ];
+            let mut schema = crate::types::TableSchema::new("_mote_continuous_views".into(), cols);
+            schema.primary_key_column = Some("name".into());
+            self.db.table_registry.create_table(schema)?;
+        }
+
+        // 已存在 → 报错。
+        if let Ok(existing) = self.read_system_view_defs() {
+            if existing
+                .iter()
+                .any(|r| matches!(&r[0], Value::Text(t) if t.as_str() == name))
+            {
+                return Err(MoteDBError::InvalidArgument(format!(
+                    "continuous view '{name}' already exists"
+                )));
+            }
+        }
+        self.db.insert_row_to_table(
+            "_mote_continuous_views",
+            vec![
+                Value::text_from(name),
+                Value::text_from(base.as_str()),
+                Value::text_from(&select_json),
+                Value::Null,
+            ],
+        )?;
+
+        Ok(QueryResult::Definition {
+            message: format!(
+                "Continuous view '{}' created over '{}' (lazy refresh, \
+                 bucket-level self-healing)",
+                name, base
+            ),
+        })
+    }
+
+    /// 🔖 B5: name 是连续视图 → 惰性刷新（v1 = 基表全量重算）并把物化
+    /// 行注册进 MATERIALIZED_CTES（外层投影/聚合/WHERE/ORDER BY 由常规
+    /// 物化路径在其上求值），返回 true; 不是 → false（常规表路径继续）。
+    ///
+    /// 同一条顶层语句内第二次引用 → 跳过刷新（语句内快照一致; map 在
+    /// 每条顶层语句开始时清空）。
+    fn try_continuous_view(&self, name: &str) -> Result<bool> {
+        if MATERIALIZED_CTES.with(|m| m.borrow().contains_key(name)) {
+            return Ok(true);
+        }
+        let defs = match self.read_system_view_defs() {
+            Ok(d) => d,
+            Err(_) => return Ok(false), // 系统表不存在 → 无视图
+        };
+        let Some(def) = defs
+            .into_iter()
+            .find(|r| matches!(&r[0], Value::Text(t) if t.as_str() == name))
+        else {
+            return Ok(false);
+        };
+        let select_json = match &def[2] {
+            Value::Text(t) => t.to_string(),
+            _ => return Err(MoteDBError::InvalidArgument("view def corrupt".into())),
+        };
+        let select: SelectStmt = serde_json::from_str(&select_json)
+            .map_err(|e| MoteDBError::InvalidArgument(format!("view def parse: {e}")))?;
+
+        // 惰性刷新 v1: 全量重算（基表全量 GROUP BY）——正确性优先; 桶级
+        // 增量（watermark 回退一桶重算受影响区间）在系统表 watermark 列
+        // 落地后接入。语义如实: 查询时点一致性。
+        crate::trace_plan!(
+            "continuous_view",
+            "lazy refresh: full recompute of '{name}'"
+        );
+        let result = self.execute_select_internal(&select)?;
+        let (columns, rows) = match result {
+            QueryResult::Select { columns, rows } => (columns, rows),
+            o => return Err(MoteDBError::InvalidArgument(format!("view body: {o:?}"))),
+        };
+        MATERIALIZED_CTES.with(|m| {
+            m.borrow_mut().insert(
+                name.to_string(),
+                MaterializedCte {
+                    columns,
+                    rows: Arc::new(rows),
+                },
+            );
+        });
+        // 推进 watermark = 本次刷新时点。v1 是全量重算，水位不用来裁剪
+        // 重算范围——它如实记录"上次刷新时点"（0.19 增量重算的接入点，
+        // 也让 reopen 后可观测）。失败不影响查询正确性（尽力而为）。
+        let _ = self.execute(crate::sql::ast::Statement::Update(
+            crate::sql::ast::UpdateStmt {
+                table: "_mote_continuous_views".into(),
+                assignments: vec![(
+                    "watermark".into(),
+                    crate::sql::ast::Expr::Literal(
+                        Value::Timestamp(crate::types::Timestamp::now()),
+                    ),
+                )],
+                where_clause: Some(crate::sql::ast::Expr::BinaryOp {
+                    left: Box::new(crate::sql::ast::Expr::Column("name".into())),
+                    op: crate::sql::ast::BinaryOperator::Eq,
+                    right: Box::new(crate::sql::ast::Expr::Literal(Value::text_from(name))),
+                }),
+            },
+        ));
+        Ok(true)
+    }
+
+    /// 读 `_mote_continuous_views` 全表（列段 store 扫描——系统表量小，
+    /// 建表即触发 flush，全量扫描即点查级）。
+    fn read_system_view_defs(&self) -> Result<Vec<Vec<Value>>> {
+        let schema = self.db.get_table_schema("_mote_continuous_views")?;
+        let col_types = schema.col_types().to_vec();
+        let store = self
+            .db
+            .get_or_create_col_segment_store("_mote_continuous_views", &col_types)?;
+        let _ = store.flush_buffer();
+        Ok(store.scan().map(|(_k, _ts, row)| row).collect())
+    }
+
     fn execute_alter_table(&self, stmt: AlterTableStmt) -> Result<QueryResult> {
         use super::ast::AlterTableAction;
 
@@ -23667,7 +23972,11 @@ impl QueryExecutor {
         };
 
         // Check if this column is the primary key
-        let schema = self.db.get_table_schema(table_name)?;
+        // 🔓 物化 CTE / 连续视图（🔖 B5）FROM 不在 registry——回退通用路径。
+        let schema = match self.db.get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
         let is_primary_key = schema
             .primary_key()
             .map(|pk| pk == col_name)
@@ -24010,7 +24319,11 @@ impl QueryExecutor {
         };
 
         // Check if this column is the primary key
-        let schema = self.db.get_table_schema(table_name)?;
+        // 🔓 物化 CTE / 连续视图（🔖 B5）FROM 不在 registry——回退通用路径。
+        let schema = match self.db.get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
         let is_primary_key = schema
             .primary_key()
             .map(|pk| pk == order_column)

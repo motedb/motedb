@@ -3,7 +3,7 @@ use crate::types::Value;
 
 /// Top-level SQL statement
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum Statement {
     Select {
         stmt: SelectStmt,
@@ -43,6 +43,14 @@ pub enum Statement {
     Update(UpdateStmt),
     Delete(DeleteStmt),
     CreateTable(CreateTableStmt),
+    /// 🔖 B5（0.18）: CREATE CONTINUOUS VIEW cv AS SELECT ...（时序连续
+    /// 聚合。v1 = 惰性刷新: 查询 cv 时全量重算视图体并注册为物化 CTE，
+    /// 外层投影/聚合/排序正常求值; 定义存系统表 `_mote_continuous_views`，
+    /// watermark 记录上次刷新时点。桶级增量顺延 0.19）。
+    CreateContinuousView {
+        name: String,
+        select: Box<SelectStmt>,
+    },
     CreateIndex(CreateIndexStmt),
     DropTable(DropTableStmt),
     DropIndex(DropIndexStmt),
@@ -109,7 +117,7 @@ pub enum Statement {
 /// b)` failed to parse). A body that references the CTE's own name is a
 /// recursive CTE: the statement must carry `with_recursive` (WITH RECURSIVE)
 /// and is evaluated by fixed-point iteration in the executor.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CteDef {
     pub name: String,
     /// Optional explicit column aliases: `WITH x(a, b) AS (...)`.
@@ -119,7 +127,7 @@ pub struct CteDef {
 }
 
 /// Set operations for combining query results.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub enum SetOp {
     Union,
     Intersect,
@@ -127,7 +135,7 @@ pub enum SetOp {
 }
 
 /// SELECT statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SelectStmt {
     pub distinct: bool, // SELECT DISTINCT
     pub columns: Vec<SelectColumn>,
@@ -147,7 +155,7 @@ pub struct SelectStmt {
 }
 
 /// Table reference in FROM clause (supports JOINs and subqueries)
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum TableRef {
     /// Single table: table_name [AS alias]
     Table { name: String, alias: Option<String> },
@@ -174,7 +182,7 @@ pub enum TableRef {
 }
 
 /// One argument of a FROM table function.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum TableFnArg {
     /// Parenthesized subquery (a ranked candidate list).
     Subquery(Box<Statement>),
@@ -185,7 +193,7 @@ pub enum TableFnArg {
 }
 
 /// JOIN types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
     Inner,
     Left,
@@ -199,7 +207,7 @@ pub enum JoinType {
     LeftAsOf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum SelectColumn {
     Star,                            // *
     Column(String),                  // column_name
@@ -207,7 +215,7 @@ pub enum SelectColumn {
     Expr(Expr, Option<String>),      // expression [AS alias]
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct OrderByExpr {
     pub expr: Expr,
     pub asc: bool, // true = ASC, false = DESC
@@ -217,7 +225,7 @@ pub struct OrderByExpr {
 }
 
 /// INSERT statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct InsertStmt {
     pub table: String,
     pub columns: Option<Vec<String>>, // None means all columns
@@ -230,7 +238,7 @@ pub struct InsertStmt {
 }
 
 /// ON CONFLICT clause for INSERT (upsert)
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct OnConflict {
     /// Explicit conflict target: `ON CONFLICT (col, ...)`. `None` for the
     /// targetless forms (`INSERT OR ...` / bare `ON CONFLICT DO ...`).
@@ -240,7 +248,7 @@ pub struct OnConflict {
     pub action: ConflictAction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum ConflictAction {
     /// `INSERT OR IGNORE` — skip rows whose primary key already exists
     Ignore,
@@ -255,7 +263,7 @@ pub enum ConflictAction {
 }
 
 /// UPDATE statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct UpdateStmt {
     pub table: String,
     pub assignments: Vec<(String, Expr)>, // column = expr
@@ -263,14 +271,14 @@ pub struct UpdateStmt {
 }
 
 /// DELETE statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct DeleteStmt {
     pub table: String,
     pub where_clause: Option<Expr>,
 }
 
 /// CREATE TABLE statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CreateTableStmt {
     pub table: String,
     pub columns: Vec<ColumnDef>,
@@ -289,14 +297,14 @@ pub struct CreateTableStmt {
 
 /// Episode segmentation config: rows sharing `key_col` form episodes split
 /// whenever consecutive `ts_col` values gap more than `gap_micros`.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct EpisodeCfg {
     pub key_col: String,
     pub ts_col: String,
     pub gap_micros: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
@@ -310,7 +318,7 @@ pub struct ColumnDef {
     pub default_value: Option<crate::types::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub enum DataType {
     Integer,
     /// 🚀 Phase 4: BIGINT for 64-bit integers (supports up to i64::MAX)
@@ -328,7 +336,7 @@ pub enum DataType {
 }
 
 /// CREATE INDEX statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CreateIndexStmt {
     pub index_name: String,
     /// `CREATE INDEX IF NOT EXISTS …` — a no-op (with a notice) when the
@@ -348,7 +356,7 @@ pub struct CreateIndexStmt {
     pub vector_opts: Vec<(String, f64)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum IndexType {
     BTree,
     Column, // 🆕 Column value index (same as BTree but explicit name)
@@ -359,27 +367,27 @@ pub enum IndexType {
 }
 
 /// DROP TABLE statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct DropTableStmt {
     pub table: String,
     pub if_exists: bool,
 }
 
 /// DROP INDEX statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct DropIndexStmt {
     pub index_name: String,
 }
 
 /// 🆕 ALTER TABLE statement
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct AlterTableStmt {
     pub table: String,
     pub action: AlterTableAction,
 }
 
 /// 🆕 ALTER TABLE actions
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum AlterTableAction {
     /// ALTER TABLE table_name AUTO_INCREMENT = value
     SetAutoIncrement(i64),
@@ -401,7 +409,7 @@ pub enum AlterTableAction {
 }
 
 /// Expression
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum Expr {
     /// Column reference
     Column(String),
@@ -603,7 +611,7 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub enum BinaryOperator {
     // Comparison
     Eq, // =
@@ -632,7 +640,7 @@ pub enum BinaryOperator {
     DotProduct,     // <#> (Inner product)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub enum UnaryOperator {
     Not,
     Minus,
@@ -665,7 +673,7 @@ impl BinaryOperator {
 }
 
 /// 🆕 Window function types
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum WindowFunc {
     /// ROW_NUMBER() - sequential number of row within partition
     RowNumber,
@@ -706,7 +714,7 @@ pub enum WindowFunc {
 }
 
 /// Aggregate kinds usable with `OVER ()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowAggFunc {
     Sum,
     Count,
@@ -725,21 +733,21 @@ pub enum WindowAggFunc {
 ///   units: the key's NATIVE engine unit — plain numbers for
 ///   INT/FLOAT keys, MICROseconds for TIMESTAMP keys, days for DATE
 ///   (INTERVAL syntax is not supported yet).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct WindowFrame {
     pub units: FrameUnits,
     pub start: FrameBound,
     pub end: FrameBound,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameUnits {
     Rows,
     Range,
 }
 
 /// One frame boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameBound {
     UnboundedPreceding,
     Preceding(i64),

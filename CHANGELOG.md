@@ -2,6 +2,37 @@
 
 ## [0.18.0] — 开发中
 
+### ⏱ B5 时序连续聚合 — CREATE CONTINUOUS VIEW + FIRST/LAST
+
+- **DDL**: `CREATE CONTINUOUS VIEW cv AS SELECT TIME_BUCKET('1m', ts) AS
+  b, device, AVG(v) AS v_avg FROM sensor GROUP BY b, device`——定义
+  （SelectStmt 的 JSON）入系统表 `_mote_continuous_views`（name /
+  base_table / select_json / watermark，幂等建表，CHECKPOINT 持久）。
+- **查询语义（惰性刷新 v1 = 查询时全量重算）**: 查 cv 时在两个 SELECT
+  入口（流式与物化）拦截 FROM 名——命中则重算视图体并把结果注册进
+  `MATERIALIZED_CTES`，外层投影/聚合/WHERE/ORDER BY/LIMIT 走既有
+  物化 CTE 路径正常求值（`SELECT COUNT(*) FROM cv`、`WHERE`、
+  `ORDER BY` 组合全部成立）; 同一语句内多次引用 = 语句内快照一致。
+  **如实声明**: 刷新滞后到查询时点、无写时维护、基表必须是单表且
+  不能嵌套另一个连续视图（明确报错，防递归）、事务内 CREATE 拒绝。
+  桶级增量（watermark 回退重算受影响区间）顺延 0.19——watermark 列
+  现记录"上次刷新时点"（持久化验收）。
+- **FIRST(v, ts) / LAST(v, ts)**（2 参 TS 语义，TimescaleDB 风格）:
+  组内按 ts 最小/最大的 v; ts 为 NULL 的行不参与; 并列取先见者。
+  仅在通用物化聚合路径实现（`eval_aggregate`），列段 GROUP BY 下推 /
+  流式聚合 / 事务覆盖聚合各快速路径显式回退（累加器单参结构装不下
+  第二参数）——绝不静默 NULL。
+- **顺带修复（连续视图把 CTE map 用满后暴露的预存在 CTE bug）**:
+  `WITH x AS (…) SELECT COUNT(*) FROM x` / 裸 `SELECT * FROM x` /
+  单列 `ORDER BY` 三个形态此前对 CTE 名直查 registry 硬报
+  "Table not found"——计数 O(1) 路径、simple-star 快路径、主键序
+  优化路径现已全部豁免物化 CTE 名（tests 锁定）。
+- 验收（tests/test_continuous_views.rs，7 用例）: 创建/外层语义/
+  FIRST·LAST（即时 GROUP BY + 视图内）/ **乱序随机写入差分 cv ≡
+  等价即时 GROUP BY**（AVG/MIN/MAX/SUM/COUNT/FIRST/LAST 七聚合逐行
+  对拍）/ CHECKPOINT+reopen 定义与 watermark 持久 / 五类守卫 /
+  EXPLAIN 输出 `continuous_view` 实录步骤（B4 联动）。
+
 ### 🔭 B4 EXPLAIN 决策点实录
 
 - **设计转向**: 从 v1 启发式计划模型改为**决策点实录**——执行器在真实
