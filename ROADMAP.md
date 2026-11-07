@@ -20,7 +20,33 @@ reach**, and **community usability**.
 
 ## 1. Capability completion
 
-### 🟢 v0.15.2 (current)
+### 🟢 v0.18.0 (current)
+
+- Evaluator unification (0.18 A-track): one L2 semantics layer (`semantics.rs`)
+  behind all 11 comparison entry points; three-valued logic; CI ratchet gate
+  (`check_sql_cmp`) + a 9-path randomized differential harness
+- Multi-process shared read-only: `Database::open_shared_readonly`
+  (flock SH, strict clean-open check, zero disk writes from readers)
+- Schema evolution: `ALTER TABLE DROP COLUMN` (logical delete) /
+  `RENAME COLUMN`, with cross-version catalog compatibility
+- Vector recall hardening: measured baseline harness (`make vec-recall`),
+  write-buffer merge in KNN, freshness gate + brute-force fallback +
+  background rebuild
+- `EXPLAIN` decision-point recording (live replay, `source=live`),
+  replacing the heuristic plan model
+- Time-series continuous aggregates: `CREATE CONTINUOUS VIEW` with lazy
+  refresh + `FIRST(v, ts)` / `LAST(v, ts)` aggregates
+- Release engineering: single-sourced doc versions (CI-enforced), GitHub
+  Release automation from CHANGELOG on `v*` tags
+
+### 🟢 v0.16.0 – v0.17.0 (shipped)
+
+- v0.17: stability rounds (kill-9 crash-injection envelopes, JOIN
+  differential fuzzing), Windows CI via cross-compile, BLOB hardening
+- v0.16: LATEST BY, UPSERT (`ON CONFLICT` / `OR REPLACE`), WAL group
+  commit, text-search expansion
+
+### 🟢 v0.15.x (foundation)
 
 - Unified storage and query for multimodal data (VECTOR / TIMESTAMP / TEXT / BLOB)
 - Five index families: column, vector (DiskANN), full-text (BM25), spatial
@@ -34,7 +60,7 @@ reach**, and **community usability**.
 - Crash-injection, differential fuzzing, corruption-recovery and perf-gate
   checks in CI
 
-### 🔵 Next up (v0.16 – v0.18)
+### 🔵 Next up (v0.19+)
 
 **SQL surface**
 

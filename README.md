@@ -331,14 +331,18 @@ See [`docs/`](docs/) for the full configuration reference and per-field docs.
 
 **Supported:** `CREATE TABLE` / `CREATE INDEX` (column, vector, text, spatial,
 timestamp) / `CREATE TEXT|VECTOR|SPATIAL|TIMESTAMP INDEX`, `DROP TABLE [IF
-EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
-`INSERT` (含 `INSERT ... SELECT`), `UPDATE`, `DELETE`, `SELECT` with:
+EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `DROP COLUMN` — logical
+delete, `RENAME COLUMN`, `AUTO_INCREMENT = N`), `CREATE CONTINUOUS VIEW`
+(时序连续聚合 — see below), `INSERT` (含 `INSERT ... SELECT`), `UPDATE`,
+`DELETE`, `SELECT` with:
 
 - `WHERE`, `JOIN` (INNER / LEFT / RIGHT / FULL), subqueries in `WHERE`,
   `FROM (SELECT ...)` 派生表
 - `GROUP BY` (columns, expressions like `id % 5`, and SELECT aliases), `HAVING` (incl. aggregate aliases), `ORDER BY` (multi-key, expressions, non-projected columns, `NULLS FIRST/LAST`), `LIMIT/OFFSET`
 - `DISTINCT` (rows) and `COUNT(DISTINCT col)` aggregates
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`, and
+  time-series `FIRST(v, ts)` / `LAST(v, ts)` (value at min/max timestamp,
+  2-argument TimescaleDB-style semantics)
 - `UNION` / `UNION ALL`
 - `CASE WHEN ... THEN ... ELSE ... END`
 - `WITH` / Common Table Expressions incl. **`WITH RECURSIVE`** (semi-naive
@@ -361,6 +365,20 @@ EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints, read-your-writes
   visibility inside a transaction
 
+**Continuous views (v0.18):** `CREATE CONTINUOUS VIEW cv AS SELECT
+TIME_BUCKET('1m', ts) AS b, device, AVG(v) AS v_avg FROM sensor GROUP BY b,
+device` — query `cv` like a table (outer `WHERE` / aggregates / `ORDER BY`
+compose normally); refresh is lazy at query time with full recompute (v1:
+query-point consistency; `watermark` records the last refresh). Bucket-level
+incremental refresh is deferred. See
+[SQL operations → continuous views](docs/03-sql-operations.md).
+
+**Multi-process access (v0.18):** one writer (flock EX, the default) **or**
+N concurrent read-only readers on the live directory —
+`Database::open_shared_readonly` takes a shared lock, performs a strict
+clean-open check (clean-close flag + empty WAL + manifest-parity) and writes
+zero bytes to disk. Readers never repair; repair is the writer's job.
+
 **BLOB type:** `payload BLOB` columns with SQLite-style `X'0aff00'` hex
 literals and Python `bytes` parameters (byte-exact round-trip, 16 MiB
 cap). Known v0.13 gaps: scalar functions over BLOB columns
@@ -369,7 +387,8 @@ through all executor paths — bare projection, equality (`WHERE payload =
 X'…'`), time-window scans and parameters are solid.
 
 **Not yet supported:** `DECIMAL`/`DATE` types, cross-statement server-side
-cursors, and explicit window frames (`ROWS`/`RANGE` specs).
+cursors, BLOB scalar functions and BLOB output under `ORDER BY` (see above),
+and `RENAME TABLE` (directory relocation — tracked separately).
 
 ## Documentation
 

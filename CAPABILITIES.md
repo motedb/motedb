@@ -5,7 +5,7 @@
 > this manifest rather than restating feature claims.
 > The point: every line below should map to an implementation and a test.
 
-**Version baseline:** v0.15.2 · **Last verified:** 2026-10-24
+**Version baseline:** v0.18.0 · **Last verified:** 2026-11-06
 
 Legend: `✅ supported` · `🟡 partial (see note)` · `❌ not supported` · `🟢 differentiator`
 
@@ -19,7 +19,7 @@ Legend: `✅ supported` · `🟡 partial (see note)` · `❌ not supported` · `
 | Capability | Status | Notes |
 |---|---|---|
 | `CREATE TABLE` / `CREATE INDEX` / `DROP TABLE [IF EXISTS]` / `DROP INDEX` | ✅ | Column, vector, text, spatial, timestamp index variants |
-| `ALTER TABLE` | ✅ | `ADD COLUMN`, `AUTO_INCREMENT = N` |
+| `ALTER TABLE` | ✅ | `ADD COLUMN`, `DROP COLUMN` (logical delete; PK / NOT NULL-no-default / indexed columns rejected), `RENAME COLUMN` (indexed columns rejected), `AUTO_INCREMENT = N` |
 | `INSERT` (incl. `INSERT ... SELECT`) | ✅ | |
 | `UPDATE` / `DELETE` | ✅ | |
 | `SELECT` with `WHERE` | ✅ | |
@@ -31,6 +31,7 @@ Legend: `✅ supported` · `🟡 partial (see note)` · `❌ not supported` · `
 | `LIMIT` / `OFFSET` | ✅ | |
 | `DISTINCT` (rows) / `COUNT(DISTINCT col)` | ✅ | |
 | Aggregates: `COUNT` `SUM` `AVG` `MIN` `MAX` `STDDEV` `VARIANCE` | ✅ | |
+| Time-series aggregates: `FIRST(v, ts)` / `LAST(v, ts)` | ✅ | 2-arg semantics: value at min/max timestamp in the group; NULL ts rows skipped; ties keep first-seen |
 | `UNION` / `UNION ALL` | ✅ | |
 | `CASE WHEN ... THEN ... ELSE ... END` | ✅ | |
 | `WITH` / CTEs, incl. `WITH RECURSIVE` | ✅ | Semi-naive fixed-point iteration, `UNION ALL` bodies, chained CTEs |
@@ -39,6 +40,8 @@ Legend: `✅ supported` · `🟡 partial (see note)` · `❌ not supported` · `
 | Scalar functions: `UPPER` `LOWER` `LENGTH` `TRIM` `SUBSTR` `REPLACE` `CONCAT` `INSTR` `COALESCE` `ROUND` `ABS` + arithmetic | ✅ | `CONCAT` skips NULL args (SQLite/Postgres semantics); `\|\|` propagates NULL; `ROUND` is binary-exact decimal rounding |
 | `EXPORT TABLE t TO 'x.parquet'` / `IMPORT PARQUET 'x' INTO t` | ✅ 🟢 | Columnar dump / batch load through the insert pipeline; pyarrow / pandas / DuckDB round-trip |
 | `EXPORT LEROBOT <table> TO 'dir/' [FPS n] [TASKS col]` | ✅ 🟢 | Writes a LeRobot v3 dataset on disk that the official `LeRobotDataset` (lerobot ≥ 0.6) loads directly |
+| `CREATE CONTINUOUS VIEW` (时序连续聚合) | ✅ 🟢 | Lazy refresh at query time (v1 = full recompute, query-point consistency); definitions persist in `_mote_continuous_views`; outer WHERE/aggregates/ORDER BY compose. Bucket-level incremental refresh deferred | 
+| `RENAME TABLE` | ❌ | Involves directory relocation — tracked separately | 
 | `DECIMAL` / `DATE` types | ❌ | Planned — see [ROADMAP](./ROADMAP.md) |
 | Cross-statement server-side cursors | ❌ | Planned — see [ROADMAP](./ROADMAP.md) |
 
@@ -111,6 +114,7 @@ Legend: `✅ supported` · `🟡 partial (see note)` · `❌ not supported` · `
 | Collection: high-performance directory | ✅ 🟢 | Atomic publish via temp + fsync + rename, plus WAL group commit |
 | Transport: single-file snapshot | ✅ 🟢 | `EXPORT DB TO '…'`; per-file CRC32, optional zstd, incremental re-export |
 | Deployment: read-only container | ✅ 🟢 | All write paths rejected, multiple concurrent readers |
+| Multi-process shared read-only (v0.18) | ✅ 🟢 | `Database::open_shared_readonly`: flock SH, N readers on the live directory beside one writer process; strict clean-open check; **zero bytes written** by readers. Rust API only in v0.18 (not yet in Python/Node bindings) |
 | MCAP import | ✅ 🟢 | |
 | Index self-healing | ✅ 🟢 | Rebuilds a corrupt index from source data |
 | Crash recovery | ✅ 🟢 | WAL replay + segment migration + orphan segment adoption |
@@ -127,7 +131,7 @@ Legend: `✅ supported` · `🟡 partial (see note)` · `❌ not supported` · `
 | Arrow | ✅ 🟢 | `query_arrow()` → canonical `pyarrow.Table`, vector columns as `FixedSizeList<float32>` |
 | pandas | ✅ | `query_pandas()` |
 | numpy bulk load | ✅ | `insert_arrays()` |
-| Node.js | 🟡 | npm package **is published** (`motedb@0.15.2`). Prebuilt binaries cover macOS (arm64/x64) and Linux (x64/arm64, glibc); **musl and Windows prebuilds are not published yet**, so `npm install motedb` on Windows currently yields no native binary |
+| Node.js | 🟡 | npm package **is published** (`motedb@0.18.0`). Prebuilt binaries cover macOS (arm64/x64) and Linux (x64/arm64, glibc); **musl and Windows prebuilds are not published yet**, so `npm install motedb` on Windows currently yields no native binary |
 | Go | 🟡 | Binding lives in `bindings/go` (with `go.mod`), but is **not published as a tagged Go module** yet — the module proxy only resolves a pseudo-version off the default branch |
 
 ---

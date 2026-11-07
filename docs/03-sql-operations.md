@@ -53,6 +53,65 @@ db.execute("CREATE TABLE locations (
 db.execute("DROP TABLE users")?;
 ```
 
+### CREATE CONTINUOUS VIEW（时序连续聚合）
+
+Continuous views pre-aggregate a time-series base table into buckets and
+behave like a table on read:
+
+```rust
+db.execute("CREATE TABLE sensor (ts TIMESTAMP, device TEXT, v FLOAT)")?;
+db.execute("INSERT INTO sensor VALUES ('2026-11-05T10:00:00', 'a', 1.0)")?;
+
+db.execute(
+    "CREATE CONTINUOUS VIEW cv AS \
+     SELECT TIME_BUCKET('1m', ts) AS b, device, AVG(v) AS v_avg, \
+            FIRST(v, ts) AS v_first, LAST(v, ts) AS v_last \
+     FROM sensor GROUP BY b, device",
+)?;
+
+// Query it like a table — outer WHERE / aggregates / ORDER BY / LIMIT
+// compose normally:
+db.query("SELECT * FROM cv ORDER BY b, device")?;
+db.query("SELECT COUNT(*) FROM cv WHERE device = 'a'")?;
+```
+
+- **Refresh is lazy** (v1): querying the view recomputes the body (full
+  GROUP BY over the base table) and registers the result for that statement
+  — multiple references within one statement see one consistent snapshot.
+  Late inserts become visible at the next query (query-point consistency,
+  no write-time maintenance).
+- `FIRST(v, ts)` / `LAST(v, ts)` are 2-argument time-series aggregates: the
+  value at the minimum / maximum `ts` in the group; rows with NULL `ts` are
+  skipped, ties keep the first-seen row.
+- Definitions persist in the system table `_mote_continuous_views`
+  (`name`, `base_table`, `select_json`, `watermark` = last refresh time);
+  `CHECKPOINT` + reopen keeps views queryable.
+- Guards: single-table `FROM` only; the base table must exist and must not
+  be another continuous view (recursion); `TIME_BUCKET` is required;
+  duplicate names and `CREATE` inside a transaction are rejected.
+- Not in v1: bucket-level incremental refresh (watermark-bounded recompute),
+  `JOIN` over a continuous view.
+
+### ALTER TABLE
+
+```sql
+ALTER TABLE t ADD COLUMN payload FLOAT DEFAULT 0.0;
+ALTER TABLE t RENAME COLUMN v TO voltage;
+ALTER TABLE t DROP COLUMN payload;
+```
+
+- `ADD COLUMN`: appends at the end of the visible column list (positions of
+  existing columns never move).
+- `RENAME COLUMN`: pure schema-level rename (columns are stored by
+  position). Columns with indexes are rejected for now (index naming is
+  `table_col`; cascade is future work).
+- `DROP COLUMN` (v0.18): **logical delete** — the column disappears from
+  all reads (`SELECT *`, name resolution, inserts, validation) and dropped
+  slots persist NULL placeholders; the physical width never shrinks because
+  segments store columns positionally. Guards: primary key, NOT NULL
+  without DEFAULT, and indexed columns are rejected. Physical reclamation
+  is deferred to a future vacuum variant.
+
 ### Supported Data Types
 
 | Type | Description | Example |
@@ -146,22 +205,24 @@ available via `DELETE FROM t WHERE ts < value` (same granularity).
 
 ### EXPLAIN
 
-`EXPLAIN <SELECT>` reports the plan the executor's fast paths would choose,
-without executing the query:
+`EXPLAIN <SELECT>` (v0.18) replays the query with a thread-local trace
+collector and prints **what the executor actually decided** at each real
+decision point — the plan can never drift from reality:
 
 ```rust
 let plan = db.query("EXPLAIN SELECT * FROM readings WHERE id = 42")?;
-// step | operator  | detail
-//    1 | scan      | table 'readings': strategy=pk_point_lookup(id), rows=1
-//    2 | note      | heuristic plan (v1): ...
+// step | operator  | detail                                    | source
+//    1 | scan      | col_segment: pk point lookup, rows=1      | live
 
 let plan = db.query("EXPLAIN SELECT * FROM readings ORDER BY val LIMIT 10")?;
-//    1 | scan      | table 'readings': strategy=top_k_bounded_heap(LIMIT 10), ...
+//    1 | scan      | sort: bounded heap k=10                   | live
 ```
 
-v1 is a heuristic report of the same signals the runtime fast paths key on
-(PK equality, column-index equality, ORDER BY + LIMIT top-K); JOIN/subquery
-plans are not yet modeled.
+`source=live` marks replayed decision points (scan strategy, PK point
+lookups, JOIN build side and predicate pushdown, aggregate pushdown hits,
+vector KNN index-vs-brute routing with freshness gates, continuous-view
+refresh). Paths without instrumentation fall back to the v1 heuristic
+description and are honestly labeled as such.
 
 ### UPDATE
 
