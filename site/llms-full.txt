@@ -5,7 +5,9 @@ intelligence (robotics). One embedded SQL library natively carries four
 modalities in a single transactional view:
 
 - VECTOR(n) columns — index-accelerated KNN via the `<->` operator
-- TIMESTAMP columns — TIME_BUCKET windows, TTL retention, LATEST BY
+- TIMESTAMP columns — TIME_BUCKET windows, TTL retention, LATEST BY,
+  continuous views (CREATE CONTINUOUS VIEW with lazy refresh) and
+  FIRST(v, ts)/LAST(v, ts) time-series aggregates
 - Full-text columns — BM25 ranking, snippet extraction, hybrid RRF fusion
 - BLOB columns — byte-exact equality, large payload safe
 
@@ -43,7 +45,10 @@ tbl = db.query_arrow("SELECT ts, sid, emb FROM poses")
 2. TRANSPORT — `EXPORT DB TO 'snap.mote' [COMPRESSED]` packs the whole
    database into one file: sequential entries, per-file CRC32, optional zstd.
 3. DEPLOY — `Database.open_readonly("snap.mote")`: read-only container,
-   every write path refused, multi-reader co-existence.
+   every write path refused, multi-reader co-existence. On the live
+   directory, `Database.open_shared_readonly` gives N concurrent readers
+   beside one writer process (shared flock, strict clean-open check,
+   zero disk writes from readers).
 
 ## Operations profile (v0.15.0, Apple-silicon measured)
 
@@ -60,7 +65,7 @@ tbl = db.query_arrow("SELECT ts, sid, emb FROM poses")
 - Differential fuzzing against reference semantics
 - Three independent pre-release audits (10 issues fixed)
 - CI perf-gate asserting query-shape latency ratios
-- Zero clippy warnings across lib/tests/examples
+- Zero clippy warnings across lib (advisory backlog in tests/benches)
 
 ## Links
 

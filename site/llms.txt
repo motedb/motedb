@@ -13,8 +13,12 @@ MoteDB stores robot data — poses, embeddings, sensor logs, binary frames — i
 
 ## Core capabilities
 
-- Vector KNN with the `<->` operator, index-accelerated (Vamana)
-- Time-series semantics: TIME_BUCKET, TTL retention, LATEST BY
+- Vector KNN with the `<->` operator, index-accelerated (DiskANN / Vamana graph)
+- Time-series semantics: TIME_BUCKET, TTL retention, LATEST BY, continuous views
+  (CREATE CONTINUOUS VIEW, lazy refresh) and FIRST(v, ts)/LAST(v, ts) aggregates
+- Schema evolution: ALTER TABLE ADD/DROP/RENAME COLUMN
+- Multi-process: one writer + N shared read-only readers on the live directory
+  (Database::open_shared_readonly)
 - Full-text search: BM25 ranking with snippet extraction
 - Hybrid retrieval: BM25 × vector KNN fused with Reciprocal Rank Fusion
 - BLOB columns with byte-exact equality
