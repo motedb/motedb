@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.18.1] — 2026-11-07
+
+### 📚 文档补齐（0.18 特性覆盖，代码零变更）
+
+- README: `ALTER TABLE` 补 `DROP COLUMN`/`RENAME COLUMN`; 新增连续视图
+  与多进程共享只读两段; 聚合列表补 `FIRST(v, ts)`/`LAST(v, ts)`;
+  修正 "Not yet supported" 残留的窗口帧矛盾（上文已支持）
+- docs/03-sql-operations.md: 新增 `CREATE CONTINUOUS VIEW`（示例/语义/
+  守卫/v1 边界）与 `ALTER TABLE`（三动作与逻辑删除语义）两节，归位
+  DDL 区; EXPLAIN 章节从 v1 启发式描述改为决策点实录描述
+- CAPABILITIES.md: 基线 v0.15.2 → v0.18.0; 连续视图/共享只读/
+  FIRST·LAST 各行; 修正过期 npm 0.15.2 引用
+- ROADMAP.md: v0.18.0 (current) 与 v0.16–0.17 shipped 归档
+- 发布动机: 让 crates.io/npm/PyPI 包内 README 与文档站点同步到
+  0.18 特性覆盖（0.18.0 的包内 README 还是旧文档）
+
 ## [0.18.0] — 2026-11-06
 
 ### ⏱ B5 时序连续聚合 — CREATE CONTINUOUS VIEW + FIRST/LAST

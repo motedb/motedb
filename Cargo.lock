@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "motedb"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "arrow-array",
