@@ -36,9 +36,10 @@ jobs:
       - name: hunt (serial workspace suite + stall watchdog)
         env:
           REPEATS: ${{ inputs.repeats || 3 }}
-          STALL_SECS: ${{ (inputs.stall_min || 5) * 60 }}
+          STALL_MIN: ${{ inputs.stall_min || 5 }}
         run: |
           set -o pipefail
+          STALL_SECS=$(( STALL_MIN * 60 ))
           rc=0
           i=0
           while [ "$i" -lt "$REPEATS" ]; do
