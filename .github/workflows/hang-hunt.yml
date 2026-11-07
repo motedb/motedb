@@ -1,0 +1,79 @@
+# 🔍 issue #3 挂死猎手: 在挂死真正发生的 ubuntu runner 上，以 CI 同款
+# 串行参数反复跑全量套件——带行表调试符号 + gdb，挂死即抓全线程栈并
+# 上传工件。默认 3 轮（每轮独立 watch，单轮 90 分钟硬上限）。
+#
+# 手动触发: Actions → hang-hunt → Run workflow（可调 repeats / stall_min）。
+# 结论判读: 全部轮次跑完未停增 → 该 commit 无挂死; 某轮 199 退出 →
+# 工件里 gdb 栈即死锁现场（对照 src 修复后重跑验证）。
+name: hang-hunt
+on:
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: "串行全量跑几轮"
+        default: "3"
+      stall_min:
+        description: "日志停增多少分钟判定挂死"
+        default: "5"
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      CI: "1"
+      # 行表符号: 体积远小于完整 debug（避免 v0.17 的磁盘爆），足够 gdb
+      # 给出带行号/函数名的栈。
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: install gdb
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends gdb procps
+      - name: hunt (serial workspace suite + stall watchdog)
+        env:
+          REPEATS: ${{ inputs.repeats || 3 }}
+          STALL_SECS: ${{ (inputs.stall_min || 5) * 60 }}
+        run: |
+          set -o pipefail
+          rc=0
+          i=0
+          while [ "$i" -lt "$REPEATS" ]; do
+            i=$((i + 1))
+            echo "===== hunt round $i/$REPEATS ====="
+            if ./scripts/ci_watchdog.sh "/tmp/hunt-$i.log" "$STALL_SECS" -- \
+              cargo test --workspace --all-features -- \
+                --test-threads=1 \
+                --skip bench_ --skip stress_ --skip perf_ \
+                --skip test_memory_linear --skip test_memory_leak \
+                --skip test_memory_does_not_grow_unbounded \
+                --skip test_disk_usage --skip test_no_bloat \
+                --skip test_perf_ --skip test_scan_latency_bounded \
+                --skip test_insert_latency_bounded \
+                --skip test_aggregate_latency_bounded \
+                --skip test_distinct_latency_bounded \
+                --skip test_where_latency_bounded \
+                --skip test_pk_select_latency_stable \
+                --skip test_latency_growth_sublinear \
+                --skip test_scalability_latency \
+                --skip test_scalability_memory \
+                --skip test_durability_large_dataset_checkpoint_recovery \
+                --skip test_performance_guarantees; then
+              echo "round $i: completed, no stall"
+            else
+              rc=$?
+              echo "round $i: watchdog exit $rc (199 = hang captured)"
+              break
+            fi
+          done
+          exit $rc
+      - name: upload hang evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hang-evidence
+          path: /tmp/hunt-*.log
+          retention-days: 30

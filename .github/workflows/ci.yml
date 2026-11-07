@@ -157,8 +157,12 @@ jobs:
         #  2. Performance/latency thresholds (µs/op, latency bounds) — assert
         #     hardware-speed assumptions shared runners can't meet. Tracked in
         #     BENCHMARK.md instead.
+        # 🔍 issue #3: 经 ci_watchdog 运行——挂死（日志停增 5 分钟）即抓
+        # 现场（挂死二进制名/日志尾/进程树/各线程等待点）并快速失败，
+        # 替代此前"90 分钟 job 超时、日志随 runner 丢失"的无输出形态。
         run: |
           set +e
+          ./scripts/ci_watchdog.sh /tmp/ci-test.log 300 -- \
           cargo test --workspace --all-features -- \
             --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ \
@@ -178,8 +182,7 @@ jobs:
             --skip test_scalability_latency \
             --skip test_scalability_memory \
             --skip test_durability_large_dataset_checkpoint_recovery \
-            --skip test_performance_guarantees \
-            > /tmp/ci-test.log 2>&1
+            --skip test_performance_guarantees
           rc=$?
           if [ $rc -ne 0 ]; then
             # 🔑 Anonymous-readable failure surface: the trailing `Running
@@ -201,6 +204,7 @@ jobs:
           CI: "1"
         run: |
           set +e
+          ./scripts/ci_watchdog.sh /tmp/ci-test.log 300 -- \
           cargo test --workspace --all-features -- \
             --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ \
@@ -220,8 +224,7 @@ jobs:
             --skip test_scalability_latency \
             --skip test_scalability_memory \
             --skip test_durability_large_dataset_checkpoint_recovery \
-            --skip test_performance_guarantees \
-            > /tmp/ci-test.log 2>&1
+            --skip test_performance_guarantees
           rc=$?
           if [ $rc -ne 0 ]; then
             # 🔑 Anonymous-readable failure surface: the trailing `Running
