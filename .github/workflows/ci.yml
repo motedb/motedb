@@ -38,6 +38,11 @@ jobs:
       # 必须跟随 Cargo.toml（此前 README 0.16 / installation 0.15 漂移）。
       - name: check_doc_versions (docs version == Cargo.toml)
         run: ./scripts/check_doc_versions.sh
+      # 🔖 用户文档语言门禁: 散文统一英文，防中英混杂回潮（v0.16 统一过
+      # 一次，0.17/0.18 期间漂回）。代码块内中文数据（jieba 示例）合法;
+      # CHANGELOG/设计稿/中文渠道物料按脚本头部豁免表放行。
+      - name: check_docs_language (user-facing docs prose in English)
+        run: ./scripts/check_docs_language.sh
       - name: cargo clippy (advisory — warnings do not fail the job)
         run: cargo clippy --all-targets --all-features --no-deps
         continue-on-error: true

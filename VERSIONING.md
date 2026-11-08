@@ -1,49 +1,61 @@
-# MoteDB 版本政策
+# MoteDB Versioning Policy
 
-本文件规定 MoteDB 的语义化版本(semver)政策与**存储格式兼容性政策** —— 对
-嵌入式数据库,后者直接决定用户能否升级,是 1.0 承诺的核心。
+This file defines MoteDB's semantic-versioning (semver) policy and the
+**storage-format compatibility policy** — for an embedded database the latter
+directly determines whether users can upgrade, and is the core of the 1.0
+promise.
 
-## 1. semver(代码 API)
+## 1. semver (code API)
 
-- **0.x(当前)**:minor(`0.15 → 0.16`)允许破坏性 API 变更;patch 只修
-  bug。Rust crate / Python wheel / npm 三端版本号保持一致。
-- **1.x**:minor 允许新增功能与不改变既有签名语义的重构;任何破坏性变更
-  (移除/重命名公开项、改变可观察行为语义)只在 **2.0**。
-- 公开面定义:
-  - Rust:`motedb` crate 的公开项(re-exports + `pub` 模块)。发布前用
-    `cargo public-api` 生成清单对比(`docs/api/`),非新增即需说明。
-  - Python:`motedb` 包的类与方法(`docs/14-api-reference.md` 冻结清单)。
-  - Node:`motedb` npm 包的导出对象与 TS 类型。
-- SQL 语法面按"新增不破坏"处理:新增语法/函数不升 minor 不算破坏;改变
-  既有语句的返回语义算破坏,只在 2.0。
+- **0.x (current)**: minor (`0.15 → 0.16`) may break APIs; patch releases
+  only fix bugs. The Rust crate / Python wheel / npm package share one
+  version number.
+- **1.x**: minor may add functionality and refactor without changing the
+  semantics of existing signatures; any breaking change (removing/renaming
+  public items, changing observable behavior) waits for **2.0**.
+- Public surface:
+  - Rust: public items of the `motedb` crate (re-exports + `pub` modules).
+    Before release, diff the `cargo public-api` inventory (`docs/api/`);
+    anything not an addition requires an explanation.
+  - Python: classes and methods of the `motedb` package (frozen list in
+    `docs/14-api-reference.md`).
+  - Node: exported objects and TS types of the `motedb` npm package.
+- SQL surface follows "additions don't break": new syntax/functions don't
+  bump minor and aren't breaking; changing the return semantics of existing
+  statements is breaking and waits for 2.0.
 
-## 2. 存储格式版本政策
+## 2. Storage-format versioning
 
-**承诺:1.x 内,任何 1.x 版本打开由任何更早 1.x/0.15+ 版本写入的数据库
-目录/快照,不做无损迁移即可读。**
+**Promise: within 1.x, any 1.x version opens a database directory/snapshot
+written by any earlier 1.x/0.15+ version, readable without lossy migration.**
 
-- 写入格式版本随版本演进时,**读侧必须保留对旧格式的解码**;
-  段(segment)不可变设计使多数优化以"新段生效"落地,旧段保持旧格式
-  可读 —— 这是不升 2.0 的前提。
-- 破坏性格式变更(需要重写/无法解码旧段)只能出现在 **2.0**,并附带
-  `motedb-migrate` 工具。
-- 格式版本标记:
-  - columnar MANIFEST:内嵌 `VERSION`(当前 2;读侧拒绝更高版本并明示
-    "database written by a newer MoteDB");
-  - `.mote` 快照容器:头部魔数 + 版本,同上策略;
-  - WAL 帧格式:字段仅追加,不重排。
-- 0.12 → 0.15 的历史布局在打开时自动迁移(前向迁移在 1.x 内继续保留;
-  迁移在打开时一次完成,不动原始文件直到 checkpoint)。
+- When the write format evolves, **the read side must keep decoding the old
+  format**; the immutable-segment design lets most optimizations land as
+  "new segments take effect" while old segments stay readable in their old
+  format — this is the precondition for not bumping to 2.0.
+- Breaking format changes (requiring rewrite / undecodable old segments)
+  can only appear in **2.0**, accompanied by a `motedb-migrate` tool.
+- Format version markers:
+  - columnar MANIFEST: embedded `VERSION` (currently 2; readers reject
+    higher versions with an explicit "database written by a newer MoteDB");
+  - `.mote` snapshot container: magic + version in the header, same policy;
+  - WAL frame format: fields are append-only, never reordered.
+- Historical layouts from 0.12 → 0.15 migrate automatically on open
+  (forward migration stays throughout 1.x; migration happens once at open
+  and never touches the original files until checkpoint).
 
-## 3. 发布流程
+## 3. Release process
 
-1. tag `vX.Y.Z` 触发:crates.io 发布 → PyPI(wheel ×8 平台,可信发布)→
-   npm(root + 平台包,幂等可重试)→ release-smoke(8 平台安装冒烟)。
-2. 任何端发布失败不阻塞其余端;失败自动开 issue,恢复 = 重跑同一
-   workflow(幂等)。
-3. RELEASE_NOTES.md 每版更新;格式变更必须在此声明并更新本文件第 2 节。
+1. Tagging `vX.Y.Z` triggers: crates.io publish → PyPI (wheel ×8 platforms,
+   trusted publishing) → npm (root + platform packages, idempotent and
+   retryable) → release-smoke (install smoke across 8 platforms).
+2. A failure on one end never blocks the others; failures open an issue
+   automatically, and recovery = re-run the same workflow (idempotent).
+3. RELEASE_NOTES.md is updated every release; any format change must be
+   declared there and reflected in section 2 of this file.
 
-## 4. 弃用政策
+## 4. Deprecation policy
 
-1.x 内弃用的 API:标注 `#[deprecated]`(Rust)/ 文档标注(Python/Node),
-至少保留 2 个 minor 版本后移除;移除即 2.0。
+APIs deprecated within 1.x: marked `#[deprecated]` (Rust) / documented
+(Python/Node), kept for at least 2 minor versions before removal; removal
+itself is 2.0.

@@ -75,7 +75,7 @@ cargo test --lib --all-features        # the fast gate — seconds
    must not write to stderr unconditionally.
 7. **Commit messages**: `type(scope): summary`, type ∈ `feat` `fix` `perf`
    `docs` `test` `refactor` `chore` `ci`. Example from the log:
-   `fix(ckpt): F2 脏标记在持久化失败时保留 — AUTO_INCREMENT 不再可能静默丢失`.
+   `fix(ckpt): keep the F2 dirty flag on persist failure — AUTO_INCREMENT can no longer be silently lost`.
 
 The pull request template has the checklist version of the above.
 

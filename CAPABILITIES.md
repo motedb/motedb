@@ -40,7 +40,7 @@ Legend: `✅ supported` · `🟡 partial (see note)` · `❌ not supported` · `
 | Scalar functions: `UPPER` `LOWER` `LENGTH` `TRIM` `SUBSTR` `REPLACE` `CONCAT` `INSTR` `COALESCE` `ROUND` `ABS` + arithmetic | ✅ | `CONCAT` skips NULL args (SQLite/Postgres semantics); `\|\|` propagates NULL; `ROUND` is binary-exact decimal rounding |
 | `EXPORT TABLE t TO 'x.parquet'` / `IMPORT PARQUET 'x' INTO t` | ✅ 🟢 | Columnar dump / batch load through the insert pipeline; pyarrow / pandas / DuckDB round-trip |
 | `EXPORT LEROBOT <table> TO 'dir/' [FPS n] [TASKS col]` | ✅ 🟢 | Writes a LeRobot v3 dataset on disk that the official `LeRobotDataset` (lerobot ≥ 0.6) loads directly |
-| `CREATE CONTINUOUS VIEW` (时序连续聚合) | ✅ 🟢 | Lazy refresh at query time (v1 = full recompute, query-point consistency); definitions persist in `_mote_continuous_views`; outer WHERE/aggregates/ORDER BY compose. Bucket-level incremental refresh deferred | 
+| `CREATE CONTINUOUS VIEW` (time-series continuous aggregation) | ✅ 🟢 | Lazy refresh at query time (v1 = full recompute, query-point consistency); definitions persist in `_mote_continuous_views`; outer WHERE/aggregates/ORDER BY compose. Bucket-level incremental refresh deferred | 
 | `RENAME TABLE` | ❌ | Involves directory relocation — tracked separately | 
 | `DECIMAL` / `DATE` types | ❌ | Planned — see [ROADMAP](./ROADMAP.md) |
 | Cross-statement server-side cursors | ❌ | Planned — see [ROADMAP](./ROADMAP.md) |

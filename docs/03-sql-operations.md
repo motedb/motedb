@@ -53,7 +53,7 @@ db.execute("CREATE TABLE locations (
 db.execute("DROP TABLE users")?;
 ```
 
-### CREATE CONTINUOUS VIEW（时序连续聚合）
+### CREATE CONTINUOUS VIEW (time-series continuous aggregation)
 
 Continuous views pre-aggregate a time-series base table into buckets and
 behave like a table on read:

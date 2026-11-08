@@ -24,9 +24,10 @@ Columnar storage engine with ACID transactions, vector search, full-text search,
 cargo add motedb
 ```
 
-**想要 10 分钟跑通全部核心能力**（Python，含连续视图/混合检索/Arrow/快照部署）：
-打开 [`examples/motedb-demo.ipynb`](examples/motedb-demo.ipynb) —— 可直接在
-Colab 运行，`pip install motedb-python` 是唯一前置。
+**Prefer a 10-minute tour of the core capabilities** (Python: continuous
+views, hybrid search, Arrow, snapshot deployment)? Open
+[`examples/motedb-demo.ipynb`](examples/motedb-demo.ipynb) — it runs
+directly on Colab; `pip install motedb-python` is the only prerequisite.
 
 A minimal, runnable example (`examples/hello_world.rs`):
 
@@ -72,7 +73,7 @@ import motedb, numpy as np
 db = motedb.Database("app.mote")
 db.execute("CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP, emb VECTOR(384), tag TEXT)")
 
-# 🚀 列式批量导入 (numpy 直通, GroupCommit 耐久档 197K rows/s):
+# Fast path: columnar bulk load (numpy passthrough, 197K rows/s durable):
 db.insert_arrays("ev", {
     "id":    np.arange(N),
     "ts":    ts_micros_array,          # i64 micros
@@ -80,11 +81,11 @@ db.insert_arrays("ev", {
     "tag":   [f"t{i%16}" for i in range(N)],
 })
 
-# 🚀 列式取回 (同质数值列 → numpy 零拷贝; TEXT/NULL → Python 列表):
+# Fast path: columnar fetch (numeric columns → zero-copy numpy; TEXT/NULL → Python lists):
 cols, arrays = db.fetch_arrays("SELECT id, ts, emb_norm... FROM ev WHERE ts > ?",
                                params=[t0])
 
-# INSERT ... SELECT (物化后走同一批量管线, 1.6M rows/s):
+# INSERT ... SELECT (materialized, then the same bulk pipeline — 1.6M rows/s):
 db.execute("INSERT INTO archive SELECT * FROM ev WHERE ts < ?", params=[cutoff])
 ```
 
@@ -92,32 +93,37 @@ db.execute("INSERT INTO archive SELECT * FROM ev WHERE ts < ?", params=[cutoff])
 
 Benchmark: 100K rows × 384-dim vectors (+TEXT/FLOAT/TIMESTAMP) on Apple
 Silicon M-series, official harness `bindings/python/bench/compete_bench.py`
-(SQLite 参照同形状; 详细方法学与历史曲线见 `bindings/python/bench/README.md`).
+(SQLite baseline uses the same shape; full methodology and history in
+`bindings/python/bench/README.md`).
 
-| Operation | MoteDB | SQLite | 倍数 |
-|-----------|--------|--------|------|
-| 批量导入 `insert_arrays` (GroupCommit 耐久档) | 197K rows/s | 2.4M rows/s* | *SQLite 无向量列 |
-| 批量导入 (NoSync/Periodic preset) | 286K rows/s | — | |
-| PK 点查 | 17µs | 7µs | |
-| 范围 COUNT+AVG (融合+并行) | 0.19ms | 0.39ms | 2.1x |
-| GROUP BY (morsel 并行) | 0.71ms | 58ms | 82x |
-| equi-JOIN + GROUP BY (批 hash join) | 0.44ms | 10.9ms | 25x |
+| Operation | MoteDB | SQLite | Ratio |
+|-----------|--------|--------|-------|
+| Bulk load `insert_arrays` (GroupCommit durable) | 197K rows/s | 2.4M rows/s* | *SQLite has no vector column |
+| Bulk load (NoSync/Periodic preset) | 286K rows/s | — | |
+| PK point lookup | 17µs | 7µs | |
+| Range COUNT+AVG (fused + parallel) | 0.19ms | 0.39ms | 2.1x |
+| GROUP BY (morsel-parallel) | 0.71ms | 58ms | 82x |
+| equi-JOIN + GROUP BY (batched hash join) | 0.44ms | 10.9ms | 25x |
 | top-k ORDER LIMIT | 0.45ms | 45.7ms | 100x |
-| 向量 top-10 (无索引精确扫描, SIMD+并行) | 18ms | 18.4ms** | **SQLite 无向量类型, 参照仅同数据量 |
+| Vector top-10 (exact scan, SIMD + parallel) | 18ms | 18.4ms** | **SQLite has no vector type; same data volume only |
 | FTS BM25 | 0.13ms | — | |
-| 笛卡尔积 COUNT(*) (6 亿对, 折叠) | 0.5ms | — | |
+| Cross-product COUNT(*) (600M pairs, folded) | 0.5ms | — | |
 
-**查询内存**: 全部查询形状 RSS 增量 ≈0 (steady-state 实测 <20MB, 默认
-档约束 ≤100MB); 资源画像全套快照见 `resource_bench_*.json`。
+**Query memory**: RSS delta across all query shapes ≈ 0 (measured
+steady-state < 20MB; default-profile budget ≤ 100MB). Full resource
+profiles in `resource_bench_*.json`.
 
-**多引擎对照** (220K×384, 同语料同 ground truth, `make bench-industry`
-一键复现): MoteDB DiskANN recall@10 **1.0000** / p50 **0.57ms** — 对照
-faiss-hnsw(ef256) 0.96/0.38ms、usearch 0.994/0.25ms、duckdb-hnsw
-0.999/0.96ms、lancedb-ivfpq(默认) 0.22-0.25/1.2-3.1ms。完整表与方法学
-(含对 MoteDB 不利的行): [docs/benchmark_report_2026-10-21.md](docs/benchmark_report_2026-10-21.md)。
+**Multi-engine comparison** (220K×384, same corpus and ground truth,
+one-command repro via `make bench-industry`): MoteDB DiskANN recall@10
+**1.0000** / p50 **0.57ms** — vs faiss-hnsw(ef256) 0.96/0.38ms, usearch
+0.994/0.25ms, duckdb-hnsw 0.999/0.96ms, lancedb-ivfpq(default)
+0.22-0.25/1.2-3.1ms. Full table and methodology — including the rows
+unfavorable to MoteDB — in
+[docs/benchmark_report_2026-10-21.md](docs/benchmark_report_2026-10-21.md).
 
-**执行内核**: 向量化 (VEC) + morsel 并行默认开启 (`MOTE_VEC=off` 一键
-回退旧行式路径); 无索引向量扫描为字节距离核零拷贝 (页缓存带宽地板)。
+**Execution kernel**: vectorized (VEC) + morsel parallelism on by default
+(`MOTE_VEC=off` restores the old row-wise path); index-free vector scans
+run a zero-copy byte-distance kernel (page-cache bandwidth floor).
 
 ## Architecture
 
@@ -173,7 +179,7 @@ See [`examples/logging.rs`](examples/logging.rs) for a runnable demo.
 
 ## Features
 
-- 🔍 **运维自检** — `db.doctor()` / `motedb-cli doctor <path>`：表布局、内存预算、索引覆盖率、磁盘占用逐项 PASS/WARN 报告。
+- 🔍 **Operational self-check** — `db.doctor()` / `motedb-cli doctor <path>`: per-item PASS/WARN report covering table layout, memory budgets, index coverage, and disk usage.
 
 ### Hybrid search (new in v0.13.1)
 
@@ -236,7 +242,7 @@ EXPORT materializes the pinned state into a fresh standalone database.
 
 ```bash
 motedb import mcap robot.mote recording.mcap        # CLI
-# 或 Python:
+# or Python:
 db.import_mcap("recording.mcap", decode={"/joint_states": my_decoder})
 ```
 
@@ -256,15 +262,19 @@ columns (e.g. decoded `emb VECTOR`) at import time. Re-imports are no-ops
 
 ### Embedded Optimized
 
-- **Low memory**: 222 B/row (vs SQLite's 335 B — 34% less); 查询期 RSS 增量 ≈0
-  (默认档向量缓存预算 64MB, `set_vector_cache_budget` 按表调整)
-- **Zero-copy reads**: mmap with on-demand page loading; 无索引向量扫描为
-  字节距离核零拷贝 (非对齐 SIMD 直读页缓存)
-- **Fast writes**: 列式批量导入 insert_arrays — GroupCommit 耐久档 197K
-  rows/s / NoSync 档 286K (100K×384 口径); fast path 段直写耐久
-  (temp+fsync+rename 原子发布 + manifest fsync), WAL 只服务慢路径
-- **Auto-checkpoint 双触发**: WAL 大小 + 段计数 (`max_segment_count`,
-  默认 32; edge preset 16) — WAL-less 批量导入的段阵有界
+- **Low memory**: 222 B/row (vs SQLite's 335 B — 34% less); query-time RSS
+  delta ≈ 0 (default vector-cache budget 64MB, per-table via
+  `set_vector_cache_budget`)
+- **Zero-copy reads**: mmap with on-demand page loading; index-free vector
+  scans use a zero-copy byte-distance kernel (unaligned SIMD straight off
+  the page cache)
+- **Fast writes**: columnar bulk load via `insert_arrays` — 197K rows/s in
+  the GroupCommit durable profile / 286K in NoSync (100K×384 basis). The
+  fast path writes segments directly with durability (temp+fsync+rename
+  atomic publish + manifest fsync); the WAL only serves the slow path
+- **Dual-trigger auto-checkpoint**: WAL size + segment count
+  (`max_segment_count`, default 32; edge preset 16) — keeps the segment
+  array bounded for WAL-less bulk loads
 - **Small disk**: zstd compression in compact mode (~40-50% smaller, 67 B/row on disk)
 - **No daemon**: Single library, embedded directly
 
@@ -341,11 +351,12 @@ See [`docs/`](docs/) for the full configuration reference and per-field docs.
 timestamp) / `CREATE TEXT|VECTOR|SPATIAL|TIMESTAMP INDEX`, `DROP TABLE [IF
 EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `DROP COLUMN` — logical
 delete, `RENAME COLUMN`, `AUTO_INCREMENT = N`), `CREATE CONTINUOUS VIEW`
-(时序连续聚合 — see below), `INSERT` (含 `INSERT ... SELECT`), `UPDATE`,
+(time-series continuous aggregation — see below), `INSERT` (including
+`INSERT ... SELECT`), `UPDATE`,
 `DELETE`, `SELECT` with:
 
 - `WHERE`, `JOIN` (INNER / LEFT / RIGHT / FULL), subqueries in `WHERE`,
-  `FROM (SELECT ...)` 派生表
+  `FROM (SELECT ...)` derived tables
 - `GROUP BY` (columns, expressions like `id % 5`, and SELECT aliases), `HAVING` (incl. aggregate aliases), `ORDER BY` (multi-key, expressions, non-projected columns, `NULLS FIRST/LAST`), `LIMIT/OFFSET`
 - `DISTINCT` (rows) and `COUNT(DISTINCT col)` aggregates
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`, and
