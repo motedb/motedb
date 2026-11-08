@@ -6,6 +6,10 @@ Columnar storage engine with ACID transactions, vector search, full-text search,
 [![Rust](https://img.shields.io/badge/rust-1.87+-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![crates.io](https://img.shields.io/crates/v/motedb.svg)](https://crates.io/crates/motedb)
+[![crates.io downloads](https://img.shields.io/crates/d/motedb.svg)](https://crates.io/crates/motedb)
+[![docs.rs](https://docs.rs/motedb/badge.svg)](https://docs.rs/motedb)
+[![PyPI](https://img.shields.io/pypi/v/motedb-python.svg)](https://pypi.org/project/motedb-python/)
+[![npm](https://img.shields.io/npm/v/motedb.svg)](https://www.npmjs.com/package/motedb)
 [![CI](https://github.com/motedb/motedb/actions/workflows/ci.yml/badge.svg)](https://github.com/motedb/motedb/actions/workflows/ci.yml)
 [![Perf Gate](https://github.com/motedb/motedb/actions/workflows/perf-gate.yml/badge.svg)](https://github.com/motedb/motedb/actions/workflows/perf-gate.yml)
 [![Website](https://img.shields.io/badge/website-motedb.github.io-ff8a2b.svg)](https://motedb.github.io/)
@@ -19,6 +23,10 @@ Columnar storage engine with ACID transactions, vector search, full-text search,
 ```bash
 cargo add motedb
 ```
+
+**想要 10 分钟跑通全部核心能力**（Python，含连续视图/混合检索/Arrow/快照部署）：
+打开 [`examples/motedb-demo.ipynb`](examples/motedb-demo.ipynb) —— 可直接在
+Colab 运行，`pip install motedb-python` 是唯一前置。
 
 A minimal, runnable example (`examples/hello_world.rs`):
 
