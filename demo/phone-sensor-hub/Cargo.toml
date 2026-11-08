@@ -1,0 +1,15 @@
+[package]
+name = "sensor_hub"
+version = "0.1.0"
+edition = "2021"
+description = "MoteDB demo: turn an Android phone (Termux) into an edge database node — sensor capture, minute fingerprints, continuous views, KNN, snapshot export."
+
+[dependencies]
+# no-default-features: no jemalloc/jieba/rayon/parquet — smallest surface for
+# cross-target builds (Termux aarch64-linux-android).
+motedb = { version = "0.18.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Standalone: not a member of the motedb workspace.
+[workspace]
