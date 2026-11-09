@@ -1,0 +1,10 @@
+[package]
+name = "robot_memory"
+version = "0.1.0"
+edition = "2021"
+description = "MoteDB demo: a robot that remembers where the red cup is — spatial + text + time memory with history (object permanence for embodied AI)."
+
+[dependencies]
+motedb = { version = "0.18.2", default-features = false }
+
+[workspace]
