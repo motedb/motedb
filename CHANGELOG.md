@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.18.3] — 开发中
+
+### 🔴 修复两只静默错误结果（demo 挖矿所得，#17 / #18）
+
+- **#17 `MATCH AGAINST + ORDER BY <列> DESC` 返回升序**: 文本检索快速路径
+  在**文档序**上预截断 LIMIT 候选、之后才按用户键重排——最新行从未进入
+  候选集（`MATCH(..) ORDER BY ts DESC LIMIT 1` 恒返回最旧命中）。
+  修复: 非 score 的 ORDER BY 存在时取全量命中，重排后统一应用
+  offset/limit（phrase/unranked/in-txn 三个截断点同修）。
+- **#18 等值 WHERE + ORDER BY（无 LIMIT）把 TIMESTAMP 列投影成 NULL**:
+  `scan_text_filtered_limit` 的固定列解码 match 缺 Timestamp/Date 臂，
+  落进 `_ => None`（LIMIT 路径走别的解码器所以"看起来正常"）。
+  修复: 补齐两臂，与另外三处规范解码对齐; 顺带统一 top-k 路径的
+  TIMESTAMP/DATE 投影变体（跨路径同构——同列不再一会儿 Integer 一会儿
+  Timestamp）。
+- 回归测试 `tests/test_regression_gh17_gh18.rs`（三用例: DESC 单调 /
+  非 NULL 投影 / 跨路径变体唯一）; 定向 FTS/排序套件 35 测全绿。
+
 ## [0.18.2] — 2026-11-07
 
 ### 📚 文档修正（代码零变更）

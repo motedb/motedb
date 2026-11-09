@@ -1383,6 +1383,28 @@ impl QueryExecutor {
                                                                 ))
                                                             })
                                                             .unwrap_or(Value::Null),
+                                                        // 🔴 变体一致性（#18 附带）:
+                                                        // TIMESTAMP/DATE 列解码为各自
+                                                        // Value 变体，不再落 Integer ——
+                                                        // 与 scan_projected_filtered/
+                                                        // scan_text_filtered_limit 的
+                                                        // 规范解码对齐（跨路径同构）。
+                                                        Some(crate::types::ColumnType::Timestamp) => f
+                                                            .get_i64(local_row)
+                                                            .map(|m| {
+                                                                Value::Timestamp(
+                                                                    crate::types::Timestamp::from_micros(m),
+                                                                )
+                                                            })
+                                                            .unwrap_or(Value::Null),
+                                                        Some(crate::types::ColumnType::Date) => f
+                                                            .get_i64(local_row)
+                                                            .map(|d| {
+                                                                Value::Date(crate::types::Date::from_days(
+                                                                    d as i32,
+                                                                ))
+                                                            })
+                                                            .unwrap_or(Value::Null),
                                                         _ => f
                                                             .get_i64(local_row)
                                                             .map(Value::Integer)

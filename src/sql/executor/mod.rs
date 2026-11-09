@@ -23089,6 +23089,22 @@ impl QueryExecutor {
             return Ok(None);
         }
 
+        // 🔴 issue #17: 非 score 的 ORDER BY 存在时，候选集绝不能在
+        // 文档序上预截断——`MATCH(..) ORDER BY ts DESC LIMIT k` 曾取前 k
+        // 个最旧命中再重排，最新行从未进入候选。needs_resort 为真时:
+        // 抓全量命中 → 重排 → 之后再 skip(offset)/take(limit)。
+        let needs_resort = stmt.order_by.as_ref().is_some_and(|ob| {
+            !(ob.len() == 1
+                && match &ob[0].expr {
+                    Expr::Column(c) => c.to_lowercase().contains("score"),
+                    Expr::FunctionCall { name, .. } => {
+                        name.eq_ignore_ascii_case("BM25_SCORE") || name.eq_ignore_ascii_case("bm25")
+                    }
+                    _ => false,
+                }
+                && !ob[0].asc)
+        });
+
         // Phrase search or ranked search depending on query type
         // 🚀 Carry (row_id, score) through — don't discard BM25 scores and
         // hardcode 1.0 (was executor.rs:17590). Keeps ORDER BY score correct.
@@ -23098,8 +23114,9 @@ impl QueryExecutor {
                 Err(_) => return Ok(None),
             };
             let ids: Vec<u64> = match stmt.limit {
-                Some(l) => ids.into_iter().take(l + offset).collect(),
-                None => ids,
+                // 🔴 #17: 非 score ORDER BY → 全量候选（重排后才分页）
+                Some(l) if !needs_resort => ids.into_iter().take(l + offset).collect(),
+                _ => ids,
             };
             ids.into_iter().map(|id| (id, 1.0)).collect()
         } else if let Some(l) = stmt.limit {
@@ -23117,10 +23134,12 @@ impl QueryExecutor {
                     Err(_) => return Ok(None),
                 }
             } else if !in_txn {
-                match self
-                    .db
-                    .text_search_limited(&index_name, &query, Some(l + offset))
-                {
+                let fetch = if needs_resort {
+                    None // 🔴 #17: 全量命中，重排后再分页
+                } else {
+                    Some(l + offset)
+                };
+                match self.db.text_search_limited(&index_name, &query, fetch) {
                     Ok(ids) => ids.into_iter().map(|id| (id, 0.0)).collect(),
                     Err(_) => return Ok(None),
                 }
@@ -23175,17 +23194,7 @@ impl QueryExecutor {
         // Default order is BM25 score descending (already sorted by text_search_ranked).
         // If ORDER BY specifies other columns, sort the projected results by
         // those columns after projection (handles the common ORDER BY id case).
-        let needs_resort = stmt.order_by.as_ref().is_some_and(|ob| {
-            !(ob.len() == 1
-                && match &ob[0].expr {
-                    Expr::Column(c) => c.to_lowercase().contains("score"),
-                    Expr::FunctionCall { name, .. } => {
-                        name.eq_ignore_ascii_case("BM25_SCORE") || name.eq_ignore_ascii_case("bm25")
-                    }
-                    _ => false,
-                }
-                && !ob[0].asc)
-        });
+        // (needs_resort computed before the candidate fetch — see issue #17 note.)
 
         // Build score lookup map (row_id → BM25 score) for MATCH-expr columns.
         let score_map: std::collections::HashMap<u64, f64> = scored_results
@@ -23230,11 +23239,16 @@ impl QueryExecutor {
         }
 
         let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(scored_results.len());
-        let emit: Vec<&(u64, f32)> = scored_results
-            .iter()
-            .skip(offset)
-            .take(stmt.limit.unwrap_or(usize::MAX))
-            .collect();
+        let emit: Vec<&(u64, f32)> = if needs_resort {
+            // 🔴 #17: 全量投影 → 重排 → 末尾统一分页
+            scored_results.iter().collect()
+        } else {
+            scored_results
+                .iter()
+                .skip(offset)
+                .take(stmt.limit.unwrap_or(usize::MAX))
+                .collect()
+        };
         for (row_id, _score) in emit {
             if let Some(row) = row_lookup.get(row_id) {
                 // Per-column projection: expression columns (MATCH /
@@ -23342,6 +23356,14 @@ impl QueryExecutor {
                         std::cmp::Ordering::Equal
                     });
                 }
+            }
+            // 🔴 #17: needs_resort 的分页在重排后统一应用
+            if needs_resort {
+                result_rows = result_rows
+                    .into_iter()
+                    .skip(offset)
+                    .take(stmt.limit.unwrap_or(usize::MAX))
+                    .collect();
             }
         }
 

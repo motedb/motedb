@@ -2246,6 +2246,17 @@ impl ColSegmentStore {
                                     ColumnType::Integer => f.get_i64(i).map(Value::Integer),
                                     ColumnType::Float => f.get_f64(i).map(Value::Float),
                                     ColumnType::Boolean => f.get_bool(i).map(Value::Bool),
+                                    // 🔴 issue #18: Timestamp/Date 落进 `_ => None`
+                                    // → 投影成 NULL（等值文本 WHERE + ORDER BY 无
+                                    // LIMIT 的路径正是这里; LIMIT 路径走了别的
+                                    // 解码器所以"看起来正常"）。与 1584/1644/2400
+                                    // 三处的规范解码对齐。
+                                    ColumnType::Timestamp => f.get_i64(i).map(|m| {
+                                        Value::Timestamp(crate::types::Timestamp::from_micros(m))
+                                    }),
+                                    ColumnType::Date => f.get_i64(i).map(|d| {
+                                        Value::Date(crate::types::Date::from_days(d as i32))
+                                    }),
                                     _ => None,
                                 }
                             } else if let Some(Some(ref t)) = ptext_cols.get(pi) {
