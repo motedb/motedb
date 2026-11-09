@@ -526,6 +526,9 @@ pub struct VecAggSpec {
     /// 聚合列是 TIMESTAMP（i64 micros 存储）— MIN/MAX 需还原
     /// Value::Timestamp 而非 Integer（test_timestamp_min_max）。
     pub ts: bool,
+    /// 🔴 同上，DATE（i64 days 存储）— MIN/MAX 必须还原 Value::Date，
+    /// 否则向量化路径把日期折成 Integer(days)（#18 变体一致性家族）。
+    pub date: bool,
 }
 
 #[derive(Default, Clone)]
@@ -796,7 +799,7 @@ impl VecAcc {
         }
     }
 
-    fn finalize(&self, func: VecAggFunc, ts: bool) -> Value {
+    fn finalize(&self, func: VecAggFunc, ts: bool, date: bool) -> Value {
         match func {
             VecAggFunc::CountStar => Value::Integer(self.count as i64),
             VecAggFunc::Count => Value::Integer(self.nn as i64),
@@ -821,12 +824,14 @@ impl VecAcc {
                 Value::Integer(m) if ts => {
                     Value::Timestamp(crate::types::Timestamp::from_micros(m))
                 }
+                Value::Integer(m) if date => Value::Date(crate::types::Date::from_days(m as i32)),
                 v => v,
             },
             VecAggFunc::Max => match self.max.clone().unwrap_or(Value::Null) {
                 Value::Integer(m) if ts => {
                     Value::Timestamp(crate::types::Timestamp::from_micros(m))
                 }
+                Value::Integer(m) if date => Value::Date(crate::types::Date::from_days(m as i32)),
                 v => v,
             },
         }
@@ -894,6 +899,8 @@ pub fn try_vec_no_group_aggregate(
                 ts: col.is_some_and(|c| {
                     matches!(schema.col_types().get(c), Some(ColumnType::Timestamp))
                 }),
+                date: col
+                    .is_some_and(|c| matches!(schema.col_types().get(c), Some(ColumnType::Date))),
             },
         ));
     }
@@ -1192,7 +1199,7 @@ pub fn try_vec_no_group_aggregate(
     let values: Vec<Value> = specs
         .iter()
         .zip(accs.iter())
-        .map(|((_, spec), acc)| acc.finalize(spec.func, spec.ts))
+        .map(|((_, spec), acc)| acc.finalize(spec.func, spec.ts, spec.date))
         .collect();
     Ok(Some(VecScanAggOutcome { columns, values }))
 }
@@ -1572,6 +1579,9 @@ pub fn try_vec_group_by(
                         ts: col.is_some_and(|c| {
                             matches!(schema.col_types().get(c), Some(ColumnType::Timestamp))
                         }),
+                        date: col.is_some_and(|c| {
+                            matches!(schema.col_types().get(c), Some(ColumnType::Date))
+                        }),
                     });
                 } else {
                     // 组键表达式 — canonical/别名须匹配某 GROUP BY 项
@@ -1868,7 +1878,9 @@ pub fn try_vec_group_by(
                 .iter()
                 .map(|c| match c {
                     Out::Key(i) => keys[*i].clone(),
-                    Out::Agg(i) => accs[*i].finalize(agg_specs[*i].func, agg_specs[*i].ts),
+                    Out::Agg(i) => {
+                        accs[*i].finalize(agg_specs[*i].func, agg_specs[*i].ts, agg_specs[*i].date)
+                    }
                 })
                 .collect::<Vec<_>>()
         })
@@ -2107,6 +2119,9 @@ pub fn try_vec_equi_join_gb(
                         col: col.filter(|_| !matches!(func, VecAggFunc::CountStar)),
                         ts: col.is_some_and(|c| {
                             matches!(pschema.col_types().get(c), Some(ColumnType::Timestamp))
+                        }),
+                        date: col.is_some_and(|c| {
+                            matches!(pschema.col_types().get(c), Some(ColumnType::Date))
                         }),
                     });
                 } else {
@@ -2559,7 +2574,9 @@ pub fn try_vec_equi_join_gb(
                     Out::Key(i) => keys[*i].clone(),
                     // build 侧组键: 单键 — 组键即 merged key 本身
                     Out::BKey => keys[0].clone(),
-                    Out::Agg(i) => accs[*i].finalize(agg_specs[*i].func, agg_specs[*i].ts),
+                    Out::Agg(i) => {
+                        accs[*i].finalize(agg_specs[*i].func, agg_specs[*i].ts, agg_specs[*i].date)
+                    }
                 })
                 .collect::<Vec<_>>()
         })
@@ -2817,7 +2834,12 @@ pub fn try_vec_projection(
     let need_dedup = store.may_have_duplicate_keys();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    'outer: for seg in segments.iter().rev() {
+    // 🔴 多段文档序（与 scan_i64_filtered_limit 同族修复）: 去重仍须
+    // 最新段先走，但输出必须文档序（旧段在前、段内行号升序）——否则同
+    // 查询在拆段后行序整体翻转，LIMIT 窗口跟着取错行。单段保持快路径。
+    let multi_seg = segments.len() > 1;
+    let mut tagged: Vec<(usize, u32, Vec<Value>)> = Vec::new();
+    'outer: for (seg_idx, seg) in segments.iter().enumerate().rev() {
         let n = seg.row_count;
         if n == 0 {
             continue;
@@ -2870,9 +2892,9 @@ pub fn try_vec_projection(
                 }
             }
         };
-        // 边界行拼装（budget 内）。
+        // 边界行拼装（budget 内；多段先全量收集后统一重排分页）。
         for r in filtered {
-            if rows_out.len() >= budget {
+            if !multi_seg && rows_out.len() >= budget {
                 break 'outer;
             }
             let i = r as usize;
@@ -2891,8 +2913,16 @@ pub fn try_vec_projection(
                     }
                 })
                 .collect();
-            rows_out.push(row);
+            if multi_seg {
+                tagged.push((seg_idx, r, row));
+            } else {
+                rows_out.push(row);
+            }
         }
+    }
+    if multi_seg {
+        tagged.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        rows_out.extend(tagged.into_iter().map(|(_, _, r)| r));
     }
     // LIMIT/OFFSET：拼装后的最后一跳（budget 已限总量）。
     if offset > 0 {
@@ -3091,12 +3121,18 @@ pub fn try_vec_filter_topk(
     let Some(order_bi) = needed.iter().position(|&x| x == order_col) else {
         return Ok(None);
     };
-    let mut proj_meta: Vec<(usize, bool)> = Vec::with_capacity(proj.len());
+    let mut proj_meta: Vec<(usize, bool, bool)> = Vec::with_capacity(proj.len());
     for &p in &proj {
         let Some(bi) = needed.iter().position(|&x| x == p) else {
             return Ok(None);
         };
-        proj_meta.push((bi, matches!(cts.get(p), Some(ColumnType::Timestamp))));
+        proj_meta.push((
+            bi,
+            matches!(cts.get(p), Some(ColumnType::Timestamp)),
+            // 🔴 DATE 与 TIMESTAMP 同为 I64 批 — 不标记则 top-k 行拼装把
+            // 日期当裸 Integer 投影（#18 变体一致性家族）。
+            matches!(cts.get(p), Some(ColumnType::Date)),
+        ));
     }
 
     let _ = store.flush_buffer();
@@ -3238,10 +3274,14 @@ pub fn try_vec_filter_topk(
         let i = r as usize;
         let row: Vec<Value> = proj_meta
             .iter()
-            .map(|&(bi, is_ts)| {
+            .map(|&(bi, is_ts, is_date)| {
                 let cv = &batch.cols[bi];
                 if is_ts {
                     crate::storage::colbatch::i64_vec_as_timestamp(cv, i)
+                } else if is_date {
+                    crate::storage::colbatch::i64_vec_get(cv, i)
+                        .map(|d| Value::Date(crate::types::Date::from_days(d as i32)))
+                        .unwrap_or(Value::Null)
                 } else {
                     cv.get(i)
                 }

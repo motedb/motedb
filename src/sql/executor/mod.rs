@@ -1925,6 +1925,16 @@ fn order_by_has_nondefault_nulls(order_by: Option<&[OrderByExpr]>) -> bool {
 /// considered smaller than every other value).
 /// Falls back to Value::partial_cmp for types not in the fast path
 /// (Bool, Timestamp, Blob), so they sort correctly too.
+/// Sort-key source for the text-search fast path's non-score ORDER BY:
+/// a projected output column (by position, covers aliases) or a schema
+/// column read from the source row (ORDER BY column not in the SELECT
+/// list — issue #17's silent-skip case).
+#[derive(Debug, Clone, Copy)]
+enum OrderKeySrc {
+    Output(usize),
+    Row(usize),
+}
+
 fn compare_with_nulls(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
@@ -7440,6 +7450,11 @@ impl QueryExecutor {
                         let ts = crate::types::Timestamp::from_micros(i64::from_le_bytes(arr));
                         Some(Value::Timestamp(ts))
                     }
+                    // 🔴 DATE 排序键此前落 `_ => None` → ORDER BY date_col
+                    // LIMIT k 的 top-k 快路径拿不到键，排序静默失效。
+                    crate::types::ColumnType::Date => Some(Value::Date(
+                        crate::types::Date::from_days(i64::from_le_bytes(arr) as i32),
+                    )),
                     _ => None,
                 }
             } else {
@@ -23238,7 +23253,36 @@ impl QueryExecutor {
             }
         }
 
-        let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(scored_results.len());
+        // 🔴 #17 (broadened): ORDER BY 列可以不在投影里（`SELECT id … ORDER BY
+        // ts DESC`）。排序键必须取自源行（schema 列位），投影里找不到时旧代码
+        // 直接跳过排序 → 静默文档序（升序）。这里预解析每个 ORDER BY 键:
+        // 先试输出列（含别名），再退回 schema 列位（从 row_lookup 的源行取值）。
+        let order_keys: Vec<(OrderKeySrc, bool)> = if needs_resort {
+            stmt.order_by
+                .as_ref()
+                .map(|ob| {
+                    ob.iter()
+                        .filter_map(|o| {
+                            if let Expr::Column(ref col_name) = o.expr {
+                                if let Some(pos) = columns.iter().position(|c| {
+                                    c == col_name || c.ends_with(&format!(".{}", col_name))
+                                }) {
+                                    return Some((OrderKeySrc::Output(pos), o.asc));
+                                }
+                                let bare = col_name.rsplit('.').next().unwrap_or(col_name);
+                                schema
+                                    .get_column_position(bare)
+                                    .map(|pos| (OrderKeySrc::Row(pos), o.asc))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let emit: Vec<&(u64, f32)> = if needs_resort {
             // 🔴 #17: 全量投影 → 重排 → 末尾统一分页
             scored_results.iter().collect()
@@ -23249,6 +23293,8 @@ impl QueryExecutor {
                 .take(stmt.limit.unwrap_or(usize::MAX))
                 .collect()
         };
+        // (sort keys from the source row, projected row)
+        let mut keyed_rows: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(emit.len());
         for (row_id, _score) in emit {
             if let Some(row) = row_lookup.get(row_id) {
                 // Per-column projection: expression columns (MATCH /
@@ -23316,55 +23362,47 @@ impl QueryExecutor {
                         _ => {}
                     }
                 }
-                result_rows.push(projected);
+                // Sort keys come from the SOURCE row (order column may be
+                // absent from the projection — see #17 note above).
+                let sort_keys: Vec<Value> = order_keys
+                    .iter()
+                    .map(|(src, _)| match src {
+                        OrderKeySrc::Output(pos) => {
+                            projected.get(*pos).cloned().unwrap_or(Value::Null)
+                        }
+                        OrderKeySrc::Row(pos) => row.get(*pos).cloned().unwrap_or(Value::Null),
+                    })
+                    .collect();
+                keyed_rows.push((sort_keys, projected));
             }
         }
 
         // Apply ORDER BY on non-score columns (e.g. ORDER BY id) by re-sorting
         // the projected results. The BM25-sorted order is preserved otherwise.
         if needs_resort {
-            if let Some(ref order_by) = stmt.order_by {
-                // Build column-position lookup for ORDER BY columns.
-                let col_pos: Vec<(usize, bool)> = order_by
-                    .iter()
-                    .filter_map(|ob| {
-                        if let Expr::Column(ref col_name) = ob.expr {
-                            columns
-                                .iter()
-                                .position(|c| {
-                                    c == col_name || c.ends_with(&format!(".{}", col_name))
-                                })
-                                .map(|pos| (pos, ob.asc))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !col_pos.is_empty() {
-                    result_rows.sort_by(|a, b| {
-                        for &(pos, asc) in &col_pos {
-                            let cmp = Self::compare_values(
-                                a.get(pos).unwrap_or(&Value::Null),
-                                b.get(pos).unwrap_or(&Value::Null),
-                            )
-                            .unwrap_or(std::cmp::Ordering::Equal);
-                            let result = if asc { cmp } else { cmp.reverse() };
-                            if result != std::cmp::Ordering::Equal {
-                                return result;
-                            }
-                        }
-                        std::cmp::Ordering::Equal
-                    });
+            keyed_rows.sort_by(|(ka, _), (kb, _)| {
+                for (i, (_, asc)) in order_keys.iter().enumerate() {
+                    let cmp = Self::compare_values(
+                        ka.get(i).unwrap_or(&Value::Null),
+                        kb.get(i).unwrap_or(&Value::Null),
+                    )
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                    let result = if *asc { cmp } else { cmp.reverse() };
+                    if result != std::cmp::Ordering::Equal {
+                        return result;
+                    }
                 }
-            }
+                std::cmp::Ordering::Equal
+            });
+        }
+        let mut result_rows: Vec<Vec<Value>> = keyed_rows.into_iter().map(|(_, row)| row).collect();
+        if needs_resort {
             // 🔴 #17: needs_resort 的分页在重排后统一应用
-            if needs_resort {
-                result_rows = result_rows
-                    .into_iter()
-                    .skip(offset)
-                    .take(stmt.limit.unwrap_or(usize::MAX))
-                    .collect();
-            }
+            result_rows = result_rows
+                .into_iter()
+                .skip(offset)
+                .take(stmt.limit.unwrap_or(usize::MAX))
+                .collect();
         }
 
         Ok(Some(QueryResult::Select {

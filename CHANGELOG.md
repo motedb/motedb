@@ -18,6 +18,44 @@
 - 回归测试 `tests/test_regression_gh17_gh18.rs`（三用例: DESC 单调 /
   非 NULL 投影 / 跨路径变体唯一）; 定向 FTS/排序套件 35 测全绿。
 
+### 🔴 路径矩阵扫描: 再修六类静默错误结果 + 一个 panic
+
+新增 `tests/test_path_matrix_correctness.rs` —— 不是 SQL-vs-SQL 等价
+（两个拼法可能一起错），而是 **~6,400 个查询形状**（18 WHERE × 13
+ORDER BY × 5 分页 × 5 投影 + 聚合 + FTS + 多段表）对**Rust 暴力
+oracle**（fixture 行上纯 Rust filter/sort/paginate/project）的全量
+校验。首跑抓出:
+
+- **BOOLEAN 投影 + ORDER BY + LIMIT 直接 panic**: top-k 列式解码把
+  布尔列当 8 字节定长走 `get_i64`（布尔列数据为空 → 越位 panic，
+  嵌入式库进程死亡）。四处 `_ =>` 通配补 Boolean 臂（get_bool）。
+- **#17 广面**: `MATCH + ORDER BY <列>` 当排序列**不在投影里**
+  （`SELECT id … ORDER BY ts DESC`）时排序被静默跳过——排序键只查
+  输出列。改为键取自源行（schema 列位），投影外列照排。
+- **`MIN(d)`/`MAX(d)` 返回 `Integer(days)`**: 向量化聚合只为
+  TIMESTAMP 配了变体还原标志。`VecAggSpec` 增加 `date` 标志。
+- **多段表行序翻转**: `scan_i64_filtered_limit` /
+  `scan_text_filtered_limit` / 向量化投影 / TEXT 等值多段拼装全部
+  按"最新段优先"（或 HashMap 无序）输出——同一条查询在后台 flush
+  拆段后行序整体翻转，LIMIT 窗口取错行。统一改为: 去重仍最新优先，
+  **输出按文档序**（旧段在前、段内行号升序）。
+- **FLOAT 位模式垃圾值**: 多段投影路径用 `i as f64` 把 f64 位模式
+  当整数再数值转换（1.5 → 4.6e18）。改按位重读（get_f64）。
+- **DATE 六处 `_ =>` 缺口**: decode_rows_at / top-k 排序键提取器 /
+  i64 过滤投影 / TEXT 等值投影 / 过滤列解码 / top-k 行拼装——
+  DATE 列在这些路径返回 NULL、Integer 或排序失效。全部补齐。
+- **`WHERE flag = TRUE` + 聚合在非向量化路径恒空**: `aggregate_filtered`
+  的目标提取只认 Integer/Float/Text 字面量，Bool 目标全落 None →
+  布尔过滤臂静默过滤掉所有行（MIN/COUNT 恒空）。补 `target_b`。
+- 附带: 四处 `offset + limit` 在无 LIMIT（usize::MAX）+ OFFSET 时
+  算术溢出 panic → saturating_add; TEXT 等值多段路径 store 端按
+  "最新优先"序预截断候选 → 多段时改取全量、文档序重排后分页。
+
+回归: `tests/test_regression_path_matrix_bugs.rs` 七用例; 相关套件
+（九路径差分 / 等价 / col_segment / FTS / 时序 / 向量读路径）全绿;
+路径矩阵四测在 MOTE_VEC=on/off 双模式全绿（向量化/回退两套路径
+同一 oracle 校验）。
+
 ## [0.18.2] — 2026-11-07
 
 ### 📚 文档修正（代码零变更）

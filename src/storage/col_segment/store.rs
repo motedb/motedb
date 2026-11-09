@@ -1529,6 +1529,12 @@ impl ColSegmentStore {
                                 Some(ColumnType::Timestamp) => f.get_i64(i).map(|m| {
                                     Value::Timestamp(crate::types::Timestamp::from_micros(m))
                                 }),
+                                // 🔴 DATE 过滤列此前落 `_ => None` → 谓词拿到
+                                // None，`WHERE d >= '…'` 在此路径上静默过滤掉
+                                // 所有行（#18 家族：路径相关的静默错误结果）。
+                                Some(ColumnType::Date) => f
+                                    .get_i64(i)
+                                    .map(|d| Value::Date(crate::types::Date::from_days(d as i32))),
                                 _ => None,
                             }
                         } else if let Some(ref t) = fcol_text {
@@ -2141,7 +2147,13 @@ impl ColSegmentStore {
             Some(std::collections::HashSet::with_capacity(total_rows))
         };
 
-        'outer: for seg in segs.iter().rev() {
+        // 🔴 多段文档序（issue: 多段 i64 过滤返回"最新段优先"）:
+        // 去重仍须从最新段/最新版本先走（首见即最新版本），但**输出**
+        // 必须是文档序（旧段在前、段内行号升序）——否则同一条查询在
+        // 单段表上是有序结果，一旦后台 flush 拆段后行序整体翻转，
+        // LIMIT 窗口取到的行集也跟着变。单段保持原快路径（天然有序）。
+        let mut unordered: Vec<(usize, usize, u64, Vec<Value>)> = Vec::new();
+        'outer: for (seg_idx, seg) in segs.iter().enumerate().rev() {
             let n = seg.sst.num_rows;
             let _ = seg.sst.load_full_keys();
 
@@ -2269,11 +2281,16 @@ impl ColSegmentStore {
                         };
                         row.push(v.unwrap_or(Value::Null));
                     }
-                    result.push((key, row));
-
-                    // 🔥 Early exit: stop scanning once we have `limit` matches.
-                    if result.len() >= limit {
-                        break 'outer;
+                    if single_seg {
+                        result.push((key, row));
+                        // 🔥 Early exit: stop once we have `limit` matches.
+                        if result.len() >= limit {
+                            break 'outer;
+                        }
+                    } else {
+                        // 🔴 多段: 先全量收集（去重已在上面完成），循环外
+                        // 按文档序重排后再 take(limit)。
+                        unordered.push((seg_idx, i, key, row));
                     }
                 }};
             }
@@ -2290,6 +2307,12 @@ impl ColSegmentStore {
                 for &i in &order {
                     process_row!(i);
                 }
+            }
+        }
+        if !single_seg {
+            unordered.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (_, _, key, row) in unordered.into_iter().take(limit) {
+                result.push((key, row));
             }
         }
         result
@@ -2319,7 +2342,13 @@ impl ColSegmentStore {
             Some(std::collections::HashSet::with_capacity(total_rows))
         };
 
-        'outer: for seg in segs.iter().rev() {
+        // 🔴 多段文档序（issue: 多段 i64 过滤返回"最新段优先"）:
+        // 去重仍须从最新段/最新版本先走（首见即最新版本），但**输出**
+        // 必须是文档序（旧段在前、段内行号升序）——否则同一条查询在
+        // 单段表上是有序结果，一旦后台 flush 拆段后行序整体翻转，
+        // LIMIT 窗口取到的行集也跟着变。单段保持原快路径（天然有序）。
+        let mut unordered: Vec<(usize, usize, u64, Vec<Value>)> = Vec::new();
+        'outer: for (seg_idx, seg) in segs.iter().enumerate().rev() {
             let n = seg.sst.num_rows;
             let _ = seg.sst.load_full_keys();
 
@@ -2463,10 +2492,21 @@ impl ColSegmentStore {
                         row.push(v.unwrap_or(Value::Null));
                     }
                 }
-                result.push((key, row));
-                if result.len() >= limit {
-                    break 'outer;
+                if single_seg {
+                    result.push((key, row));
+                    if result.len() >= limit {
+                        break 'outer;
+                    }
+                } else {
+                    // 文档序重排前先收集全量命中（含段号/行号），最后统一 take(limit)。
+                    unordered.push((seg_idx, i, key, row));
                 }
+            }
+        }
+        if !single_seg {
+            unordered.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (_, _, key, row) in unordered.into_iter().take(limit) {
+                result.push((key, row));
             }
         }
         result
@@ -3324,6 +3364,14 @@ impl ColSegmentStore {
         } else {
             None
         };
+        // 🔴 BOOLEAN 字面量目标（`WHERE flag = TRUE`）: Bool 不是 Integer，
+        // 此前 target_i/_f/_s 全 None → Bool 过滤臂拿到 None → 所有行被
+        // 静默过滤（MIN/COUNT 恒空）。单独提取布尔目标。
+        let target_b: Option<bool> = match target {
+            Value::Bool(b) => Some(*b),
+            Value::Integer(i) => Some(*i != 0),
+            _ => None,
+        };
         let no_filter = filter_col.is_none();
         let fc = filter_col.unwrap_or(0);
         let is_eq_filter = matches!(op, crate::sql::ast::BinaryOperator::Eq);
@@ -3404,7 +3452,7 @@ impl ColSegmentStore {
                         }
                         ColumnTypeTag::Float => cmp_opt_f64(f.get_f64(i), target_f, op),
                         ColumnTypeTag::Bool => {
-                            let tb = target_i.map(|i| i != 0);
+                            let tb = target_b.or(target_i.map(|i| i != 0));
                             cmp_opt(f.get_bool(i), tb, op)
                         }
                         _ => false,
@@ -4211,6 +4259,11 @@ impl ColSegmentStore {
                         Some(ColumnType::Timestamp) => f
                             .get_i64(row_idx)
                             .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))),
+                        // 🔴 DATE 同族缺口: 此前落 `_ => None` → ORDER BY …
+                        // LIMIT k 投影 DATE 列返回 NULL（#18 变体一致性家族）。
+                        Some(ColumnType::Date) => f
+                            .get_i64(row_idx)
+                            .map(|v| Value::Date(crate::types::Date::from_days(v as i32))),
                         _ => None,
                     }
                 } else if let Some(t) = pre_text.get(&(seg_idx, ci)) {

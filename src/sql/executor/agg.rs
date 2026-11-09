@@ -1603,12 +1603,30 @@ impl QueryExecutor {
                             })
                         })
                         .collect();
+                    // 🔴 Calendar MIN (Date/Timestamp): these carry no int/float
+                    // representation here — compare as Values so MIN(d)/MIN(ts)
+                    // return their own variant instead of NULL (vec-off path).
+                    let cals: Vec<&Value> = scanned
+                        .iter()
+                        .filter_map(|(_, row)| {
+                            col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                                matches!(v, Value::Date(_) | Value::Timestamp(_)).then_some(v)
+                            })
+                        })
+                        .collect();
                     if !ints.is_empty() {
                         result_row.push(Value::Integer(*ints.iter().min().unwrap()));
                     } else if !floats.is_empty() {
                         result_row.push(Value::Float(
                             floats.iter().cloned().fold(f64::INFINITY, f64::min),
                         ));
+                    } else if !cals.is_empty() {
+                        let m = cals
+                            .iter()
+                            .copied()
+                            .min_by(|a, b| order_by_cmp(a, b))
+                            .unwrap();
+                        result_row.push(m.clone());
                     } else if !texts.is_empty() {
                         // Alphabetical min (SQL standard for TEXT).
                         let min_text = texts.iter().min().cloned().unwrap();
@@ -1661,12 +1679,28 @@ impl QueryExecutor {
                             })
                         })
                         .collect();
+                    // 🔴 Calendar MAX (Date/Timestamp) — see MIN above.
+                    let cals: Vec<&Value> = scanned
+                        .iter()
+                        .filter_map(|(_, row)| {
+                            col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                                matches!(v, Value::Date(_) | Value::Timestamp(_)).then_some(v)
+                            })
+                        })
+                        .collect();
                     if !ints.is_empty() {
                         result_row.push(Value::Integer(*ints.iter().max().unwrap()));
                     } else if !floats.is_empty() {
                         result_row.push(Value::Float(
                             floats.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                         ));
+                    } else if !cals.is_empty() {
+                        let m = cals
+                            .iter()
+                            .copied()
+                            .max_by(|a, b| order_by_cmp(a, b))
+                            .unwrap();
+                        result_row.push(m.clone());
                     } else if !texts.is_empty() {
                         // Alphabetical max (SQL standard for TEXT).
                         let max_text = texts.iter().max().cloned().unwrap();

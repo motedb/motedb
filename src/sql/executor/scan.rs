@@ -914,9 +914,11 @@ impl QueryExecutor {
                     .collect();
                 if !byte_set.is_empty() {
                     let _ = store.prepare_for_query();
-                    if let Some(indices) =
-                        store.scan_row_indices_in_set(col_pos, &byte_set, offset + limit)
-                    {
+                    if let Some(indices) = store.scan_row_indices_in_set(
+                        col_pos,
+                        &byte_set,
+                        offset.saturating_add(limit),
+                    ) {
                         let segs = store.segments_snapshot();
                         let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
                         // Group indices by segment for sequential pre-decode.
@@ -1036,7 +1038,7 @@ impl QueryExecutor {
             && !has_vector_or_spatial
             && (stmt.limit.is_some() || stmt.offset.is_some())
         {
-            let take_n = offset + limit.min(100_000); // cap to avoid unbounded allocation
+            let take_n = offset.saturating_add(limit.min(100_000)); // cap to avoid unbounded allocation
             let scanned =
                 store.scan_projected_filtered_limit(None, &out_positions, &|_| true, take_n);
             let result_rows: Vec<Vec<Value>> = scanned
@@ -1405,6 +1407,13 @@ impl QueryExecutor {
                                                                 ))
                                                             })
                                                             .unwrap_or(Value::Null),
+                                                        // 🔴 BOOLEAN 列不是 8 字节定长布局
+                                                        // （FixedSegment 数据为空），get_i64
+                                                        // 会越界 panic —— 必须 get_bool。
+                                                        Some(crate::types::ColumnType::Boolean) => f
+                                                            .get_bool(local_row)
+                                                            .map(Value::Bool)
+                                                            .unwrap_or(Value::Null),
                                                         _ => f
                                                             .get_i64(local_row)
                                                             .map(Value::Integer)
@@ -1519,9 +1528,14 @@ impl QueryExecutor {
                             // test_update_indexed_column_moves_entry bug).
                             let _ = store.flush_buffer();
                             let target_bytes = tv.as_str().as_bytes();
-                            if let Some(indices) =
-                                store.scan_row_indices_eq(fc, target_bytes, offset + limit)
-                            {
+                            if let Some(indices) = store.scan_row_indices_eq(
+                                fc,
+                                target_bytes,
+                                // 🔴 多段分支必须取全量命中: store 端按"最新优先"
+                                // 序截断 offset+limit 会取走最新 N 条，文档序
+                                // 重排后分页窗口错位。单段不走此分支。
+                                usize::MAX,
+                            ) {
                                 let segs = store.segments_snapshot();
                                 // Build SelectColumnar with matched row indices.
                                 if segs.len() == 1 {
@@ -1569,14 +1583,24 @@ impl QueryExecutor {
                                 // decompression per call in compact mode):
                                 // O(N²) on 100K matches ≈ 568s in compact mode.
                                 let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
+                                // 🔴 文档序: scan_row_indices_eq 按"最新版本优先"
+                                // （段倒序 × 段内行号倒序）返回，HashMap 分组还会
+                                // 引入随机迭代序。先把命中按 (段号, 行号) 升序
+                                // 排序，再统一应用 offset/limit —— 否则行序在
+                                // 拆段/重开后翻转，分页窗口取错行。
+                                let mut ordered: Vec<(usize, usize)> = indices.clone();
+                                ordered.sort_unstable();
                                 let mut by_seg: std::collections::HashMap<usize, Vec<usize>> =
                                     std::collections::HashMap::new();
-                                for &(seg_idx, local_row) in indices.iter().skip(offset).take(limit)
+                                for &(seg_idx, local_row) in ordered.iter().skip(offset).take(limit)
                                 {
                                     by_seg.entry(seg_idx).or_default().push(local_row);
                                 }
-                                for (seg_idx, local_rows) in &by_seg {
-                                    let seg = match segs.get(*seg_idx) {
+                                let mut seg_order: Vec<usize> = by_seg.keys().copied().collect();
+                                seg_order.sort_unstable();
+                                for seg_idx in seg_order {
+                                    let local_rows = &by_seg[&seg_idx];
+                                    let seg = match segs.get(seg_idx) {
                                         Some(s) => s,
                                         None => continue,
                                     };
@@ -1594,6 +1618,30 @@ impl QueryExecutor {
                                                             .map(|i| f.get_f64(i).map(Value::Float))
                                                             .collect()
                                                     }
+                                                    // 🔴 变体一致性（同 #18）: 日历列返回各自
+                                                    // Value 变体；BOOLEAN 不是 8 字节定长布局，
+                                                    // get_i64 会越界 panic。
+                                                    Some(ColumnType::Timestamp) => (0..seg.sst.num_rows)
+                                                        .map(|i| {
+                                                            f.get_i64(i).map(|m| {
+                                                                Value::Timestamp(
+                                                                    crate::types::Timestamp::from_micros(m),
+                                                                )
+                                                            })
+                                                        })
+                                                        .collect(),
+                                                    Some(ColumnType::Date) => (0..seg.sst.num_rows)
+                                                        .map(|i| {
+                                                            f.get_i64(i).map(|d| {
+                                                                Value::Date(
+                                                                    crate::types::Date::from_days(d as i32),
+                                                                )
+                                                            })
+                                                        })
+                                                        .collect(),
+                                                    Some(ColumnType::Boolean) => (0..seg.sst.num_rows)
+                                                        .map(|i| f.get_bool(i).map(Value::Bool))
+                                                        .collect(),
                                                     _ => (0..seg.sst.num_rows)
                                                         .map(|i| f.get_i64(i).map(Value::Integer))
                                                         .collect(),
@@ -1678,7 +1726,7 @@ impl QueryExecutor {
                                 if let Some(indices) = store.scan_row_indices_prefix(
                                     fc,
                                     prefix.as_bytes(),
-                                    offset + limit,
+                                    offset.saturating_add(limit),
                                 ) {
                                     // Collect (seg, local_row) → flatten to row indices for single-segment.
                                     let segs = store.segments_snapshot();
@@ -2302,7 +2350,7 @@ impl QueryExecutor {
                         // column-aware pre-parse stays (one parse up front),
                         // and the closure itself now delegates to L2
                         // `semantics::equal`（PR-4）— 内置 Bool↔数值（此前
-                        // 字面量非 Bool 时 `fv == &val` 使 Bool 列 vs Float
+                        // 字面量非 Bool 时直接值等比较使 Bool 列 vs Float
                         // 字面量 0 命中）、`= NULL` 不再误匹配 NULL 行。
                         let val = Self::coerce_vector_literal_for_column(schema, pos, v.clone());
                         // If filtering on PK, at most 1 row matches → early-stop.
@@ -2481,9 +2529,11 @@ impl QueryExecutor {
                     let prefix = pat[..pat.len() - 1].to_string();
                     if let Some(fc) = schema.get_column_position(cn) {
                         if matches!(col_types.get(fc), Some(ColumnType::Text)) {
-                            if let Some(indices) =
-                                store.scan_row_indices_prefix(fc, prefix.as_bytes(), offset + limit)
-                            {
+                            if let Some(indices) = store.scan_row_indices_prefix(
+                                fc,
+                                prefix.as_bytes(),
+                                offset.saturating_add(limit),
+                            ) {
                                 // 🔑 PERF: build a SelectColumnar result (zero per-
                                 // row Value allocation) instead of materializing
                                 // Vec<Vec<Value>>. For LIKE 'cust_1%' matching
@@ -2547,6 +2597,28 @@ impl QueryExecutor {
                                                         .get_f64(row_idx)
                                                         .map(Value::Float)
                                                         .unwrap_or(Value::Null),
+                                                    // 🔴 变体一致性（同 #18）+ BOOLEAN 非 8 字节
+                                                    // 布局（get_i64 越界 panic）。
+                                                    Some(ColumnType::Timestamp) => f
+                                                        .get_i64(row_idx)
+                                                        .map(|m| {
+                                                            Value::Timestamp(
+                                                                crate::types::Timestamp::from_micros(m),
+                                                            )
+                                                        })
+                                                        .unwrap_or(Value::Null),
+                                                    Some(ColumnType::Date) => f
+                                                        .get_i64(row_idx)
+                                                        .map(|d| {
+                                                            Value::Date(crate::types::Date::from_days(
+                                                                d as i32,
+                                                            ))
+                                                        })
+                                                        .unwrap_or(Value::Null),
+                                                    Some(ColumnType::Boolean) => f
+                                                        .get_bool(row_idx)
+                                                        .map(Value::Bool)
+                                                        .unwrap_or(Value::Null),
                                                     _ => f
                                                         .get_i64(row_idx)
                                                         .map(Value::Integer)
@@ -2595,9 +2667,32 @@ impl QueryExecutor {
                                                 .map(|s| Value::Text(s.into()))
                                                 .unwrap_or(Value::Null),
                                             Col::Fixed(f) => match col_types.get(pc) {
+                                                // 🔴 修复: Float 列此前用 `i as f64` 把
+                                                // f64 位模式当整数再数值转换 —— 1.5 会变成
+                                                // 4.6e18。必须按位重读（同 topk 路径）。
                                                 Some(ColumnType::Float) => f
+                                                    .get_f64(*local_row)
+                                                    .map(Value::Float)
+                                                    .unwrap_or(Value::Null),
+                                                Some(ColumnType::Timestamp) => f
                                                     .get_i64(*local_row)
-                                                    .map(|i| Value::Float(i as f64))
+                                                    .map(|m| {
+                                                        Value::Timestamp(
+                                                            crate::types::Timestamp::from_micros(m),
+                                                        )
+                                                    })
+                                                    .unwrap_or(Value::Null),
+                                                Some(ColumnType::Date) => f
+                                                    .get_i64(*local_row)
+                                                    .map(|d| {
+                                                        Value::Date(crate::types::Date::from_days(
+                                                            d as i32,
+                                                        ))
+                                                    })
+                                                    .unwrap_or(Value::Null),
+                                                Some(ColumnType::Boolean) => f
+                                                    .get_bool(*local_row)
+                                                    .map(Value::Bool)
                                                     .unwrap_or(Value::Null),
                                                 _ => f
                                                     .get_i64(*local_row)
