@@ -69,7 +69,13 @@ Dogfooding found two real engine bugs, both filed with minimal repros:
 - [#18](https://github.com/motedb/motedb/issues/18) — equality `WHERE` +
   `ORDER BY` without `LIMIT` projects TIMESTAMP columns as NULL
 
-(The demo carries `LIMIT` workarounds, commented in code. An out-of-order
-timestamp scare during development turned out to be the demo's own clock
-drift — verified engine-innocent by Rust-side brute force before fixing
-the simulator.)
+Both were fixed — and the follow-up investigation didn't stop there: a
+new path-matrix sweep (~6,400 query shapes checked against a brute-force
+Rust oracle) caught **eight more silent-wrong-result bugs and one
+BOOLEAN-projection panic** in neighbouring fast paths, all fixed in
+[0.18.3](https://github.com/motedb/motedb/releases/tag/v0.18.3). The
+demo's `LIMIT` workarounds are gone; every query above now runs bare.
+
+(An out-of-order timestamp scare during development turned out to be the
+demo's own clock drift — verified engine-innocent by Rust-side brute
+force before fixing the simulator.)

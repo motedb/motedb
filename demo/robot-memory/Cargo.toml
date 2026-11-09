@@ -5,6 +5,6 @@ edition = "2021"
 description = "MoteDB demo: a robot that remembers where the red cup is — spatial + text + time memory with history (object permanence for embodied AI)."
 
 [dependencies]
-motedb = { version = "0.18.2", default-features = false }
+motedb = { version = "0.18.3", default-features = false }
 
 [workspace]

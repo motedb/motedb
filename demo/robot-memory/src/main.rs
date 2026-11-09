@@ -10,7 +10,8 @@
 //!   * WHERE (loc GEOMETRY + spatial)  — POINT3D(x, y, 0) on the floor plane
 //!   * and denormalized x/y/zone columns for plain GROUP BY analytics
 //!
-//! Verified SQL paths only (see issue #17 for the one that isn't):
+//! Verified SQL paths (two engine bugs found here were fixed in 0.18.3 —
+//! the LIMIT workarounds are gone):
 //!   * latest sighting:   `WHERE obj = '红杯子' LATEST BY obj`
 //!   * nearby things:     `WHERE ts > … ORDER BY loc <-> ST_POINT(x, y)`
 //!   * history timeline:  `ORDER BY ts ASC`
@@ -238,10 +239,7 @@ fn cmd_where(db: &Database, name: &str) {
     // History — the database remembers "always", not just "now".
     let hist = db
         .query(&format!(
-            // LIMIT workaround for issue #18: eq-WHERE + ORDER BY without
-            // LIMIT projects the TIMESTAMP column as NULL.
-            "SELECT ts, zone, x, y FROM sightings WHERE obj = '{name}' \
-             ORDER BY ts ASC LIMIT 100000"
+            "SELECT ts, zone, x, y FROM sightings WHERE obj = '{name}' ORDER BY ts ASC"
         ))
         .unwrap();
     if hist.len() > 1 {
@@ -324,9 +322,7 @@ fn cmd_near(db: &Database, x: f64, y: f64, k: usize) {
 fn cmd_timeline(db: &Database, name: &str) {
     let rows = db
         .query(&format!(
-            // Same issue-#18 workaround as above.
-            "SELECT ts, x, y, zone FROM sightings WHERE obj = '{name}' \
-             ORDER BY ts ASC LIMIT 100000"
+            "SELECT ts, x, y, zone FROM sightings WHERE obj = '{name}' ORDER BY ts ASC"
         ))
         .unwrap();
     if rows.is_empty() {
