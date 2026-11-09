@@ -1,6 +1,13 @@
 //! Pocket Sensor Hub — an MoteDB edge demo that runs on an Android phone.
 //!
-//! Scenario: the phone becomes an edge database node.
+//! v2: the phone becomes an edge node whose DATABASE is the brain — a
+//! 1-NN activity classifier whose model storage is MoteDB itself:
+//!   * `record <label>` — watch a gesture for ~10 s, store its window
+//!     fingerprint as VECTOR(8) rows in `gestures` (the "training set").
+//!   * `live`           — stream sensors, classify every half second via
+//!     KNN against `gestures`, print the live label + confidence bars.
+//!   * `serve`          — same, plus a zero-dependency web dashboard on
+//!     http://<phone-ip>:8080 (open it from any laptop on the same WiFi).
 //!   1) CAPTURE — Termux:API streams phone sensors as JSON lines on stdin:
 //!        {"timestamp": 1762512345678, "sensors": [
 //!           {"name": "ACCELEROMETER", "values": [x, y, z]}, ...]}
@@ -25,6 +32,9 @@
 //! Off-phone (macOS/Linux), feed a JSONL file the same way:
 //!   ./sensor_hub ingest < sim.jsonl && ./sensor_hub report
 
+mod dashboard;
+mod live;
+
 use std::io::BufRead;
 
 use motedb::Database;
@@ -35,14 +45,14 @@ const DB_DIR: &str = "sensorhub.mote";
 const SHAKE_G: f64 = 15.0;
 
 #[derive(serde::Deserialize)]
-struct SensorLine {
+pub struct SensorLine {
     timestamp: i64, // epoch ms (Termux)
     #[serde(default)]
     sensors: Vec<SensorEntry>,
 }
 
 #[derive(serde::Deserialize)]
-struct SensorEntry {
+pub struct SensorEntry {
     name: String,
     #[serde(default)]
     values: Vec<f64>,
@@ -50,7 +60,7 @@ struct SensorEntry {
 
 /// epoch-micros -> "YYYY-MM-DD HH:MM" (UTC), dependency-free (Hinnant's
 /// civil-from-days). Good enough for a demo CLI.
-fn fmt_minute(micros: i64) -> String {
+pub fn fmt_minute(micros: i64) -> String {
     let secs = micros.div_euclid(1_000_000);
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
@@ -71,7 +81,7 @@ fn fmt_minute(micros: i64) -> String {
     )
 }
 
-fn as_micros(v: &Value) -> i64 {
+pub fn as_micros(v: &Value) -> i64 {
     match v {
         Value::Integer(i) => *i,
         Value::Timestamp(t) => t.as_micros(),
@@ -79,7 +89,7 @@ fn as_micros(v: &Value) -> i64 {
     }
 }
 
-fn as_f64(v: &Value) -> f64 {
+pub fn as_f64(v: &Value) -> f64 {
     match v {
         Value::Integer(i) => *i as f64,
         Value::Float(f) => *f,
@@ -116,6 +126,15 @@ fn open_db() -> Database {
         )",
     )
     .expect("create events table");
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS gestures (
+            ts TIMESTAMP, label TEXT, fp VECTOR(8)
+        )",
+    )
+    .expect("create gestures table");
+    // Fingerprint index makes the live KNN window cheap; missing index is
+    // fine too (exact scan at this scale is sub-millisecond).
+    let _ = db.execute("CREATE VECTOR INDEX g_fp ON gestures(fp)");
     // (CREATE CONTINUOUS VIEW has no IF NOT EXISTS yet — tolerate the
     // "already exists" error across reruns.)
     let _ = db.execute(
@@ -129,9 +148,11 @@ fn open_db() -> Database {
     db
 }
 
-/// 8-dim fingerprint of one minute of samples: accelerometer magnitude
-/// quartiles + gyro energy quartiles + sample count.
-fn fingerprint(samples: &[(f64, f64, f64, f64, f64, f64)]) -> Vec<f32> {
+/// 8-dim fingerprint of a sample window: accelerometer magnitude
+/// quartiles + gyro energy quartiles + sampling rate (samples/sec —
+/// window-length invariant, so 3 s live windows and minute windows
+/// fingerprint comparably).
+pub fn fingerprint(samples: &[(f64, f64, f64, f64, f64, f64)], duration_s: f64) -> Vec<f32> {
     let mut mags: Vec<f64> = samples
         .iter()
         .map(|&(ax, ay, az, _, _, _)| (ax * ax + ay * ay + az * az).sqrt())
@@ -146,7 +167,7 @@ fn fingerprint(samples: &[(f64, f64, f64, f64, f64, f64)]) -> Vec<f32> {
     vec![
         q(&mags, 0), q(&mags, 1), q(&mags, 2), q(&mags, 3),
         q(&gyro, 1), q(&gyro, 2), q(&gyro, 3),
-        samples.len() as f32,
+        (samples.len() as f64 / duration_s.max(0.001)) as f32,
     ]
 }
 
@@ -205,7 +226,7 @@ fn cmd_ingest(db: &Database) {
         let minute = ts_micros.div_euclid(60_000_000);
         if minute != cur_minute {
             if bucket.len() >= 30 {
-                let fp = fingerprint(&bucket);
+                let fp = fingerprint(&bucket, bucket.len() as f64 / 5.0);
                 let fp_str = format!(
                     "[{}]",
                     fp.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",")
@@ -229,7 +250,7 @@ fn cmd_ingest(db: &Database) {
     }
     // Flush the trailing minute too.
     if bucket.len() >= 30 {
-        let fp = fingerprint(&bucket);
+        let fp = fingerprint(&bucket, bucket.len() as f64 / 5.0);
         let fp_str = format!(
             "[{}]",
             fp.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",")
@@ -342,10 +363,19 @@ fn cmd_export(db: &Database, path: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: sensor_hub <ingest|report|find-similar <epoch-ms>|export <path>>";
+    let usage = "usage: sensor_hub <ingest|record <label>|live|serve|report|find-similar <epoch-ms>|export <path>>";
     let db = open_db();
     match args.get(1).map(String::as_str) {
         Some("ingest") => cmd_ingest(&db),
+        Some("record") => {
+            let label = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("{usage}");
+                std::process::exit(2);
+            });
+            live::cmd_record(&db, &label);
+        }
+        Some("live") => live::run_live(&db, false),
+        Some("serve") => live::run_live(&db, true),
         Some("report") => cmd_report(&db),
         Some("find-similar") => {
             let ts: i64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or_else(|| {

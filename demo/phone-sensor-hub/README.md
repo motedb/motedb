@@ -1,9 +1,14 @@
 # Pocket Sensor Hub — your Android phone as an edge database node
 
-A ~350-line MoteDB demo that runs **on an Android phone** (via Termux) and
-exercises the full edge story: capture → per-minute aggregation → activity
-fingerprints → on-device similarity search → single-file snapshot for the
-laptop.
+A MoteDB demo that runs **on an Android phone** (via Termux) where **the
+database IS the classifier**: you record a few gestures (their window
+fingerprints land as `VECTOR(8)` rows), then MoteDB's SQL KNN recognizes
+your activity live — with a web dashboard served from the phone.
+
+![](docs_screenshot_idle.png)
+![](docs_screenshot_walk.png)
+
+*(idle → flat gravity line, walk ~2 Hz bounce — labeled live, 100% vote)*
 
 ```
 Termux:API sensor stream (JSON, 5–50 Hz)
@@ -29,14 +34,27 @@ Termux:API sensor stream (JSON, 5–50 Hz)
 pkg update && pkg install rust git binutils termux-api
 git clone https://github.com/motedb/motedb
 cd motedb/demo/phone-sensor-hub
-cargo run --release -- ingest < <(termux-sensor -s 200 -d 0)   # Ctrl-C to stop
+
+# 1. Teach it 3 gestures (~10 s each): put the phone on a desk, in your
+#    pocket while walking, then shake it — one record call per gesture:
+cargo run --release -- record idle  < <(termux-sensor -s 200 -d 0)   # Ctrl-C after ~10 s
+cargo run --release -- record walk  < <(termux-sensor -s 200 -d 0)
+cargo run --release -- record shake < <(termux-sensor -s 200 -d 0)
+
+# 2. Live classification in the terminal:
+cargo run --release -- live    < <(termux-sensor -s 200 -d 0)
+
+# 3. …or with the web dashboard (open from any laptop on the same WiFi):
+cargo run --release -- serve   < <(termux-sensor -s 200 -d 0)
+#    → http://<phone-ip>:8080   (port via SENSOR_HUB_PORT)
+
+# Batch import / analysis / snapshot still work as before:
+cargo run --release -- ingest  < <(termux-sensor -s 200 -d 0)
 cargo run --release -- report
 cargo run --release -- export /sdcard/sensor.mote
 ```
 
 `termux-sensor -s 200` streams accelerometer + gyroscope every 200 ms.
-Carry the phone around for a few minutes — walk, shake it, leave it on a
-desk — then `report` and `find-similar`.
 
 ## Off-phone (macOS/Linux) — simulated data
 
@@ -57,6 +75,8 @@ cargo run --release -- find-similar $(( $(head -1 sim.jsonl | python3 -c \
 | `minute_stats` | `CREATE CONTINUOUS VIEW` + `TIME_BUCKET('1m')` — define once, query like a table |
 | `minute_fp` | `VECTOR(8)` columns with string-literal inserts |
 | `find-similar` | `ORDER BY fp <-> '[…]'` KNN over fingerprints |
+| `record` → `live`/`serve` | **the database as a 1-NN classifier**: gesture fingerprints are the model, stored and queried as plain SQL VECTOR rows — no ML framework involved |
+| `serve` dashboard | zero-dependency HTTP server (std only) + embedded vanilla-JS canvas page |
 | `export` | single-file snapshot (CRC per file) — the transport step; open read-only anywhere with `Database::open_readonly` |
 | build | `default-features = false` — no jemalloc/jieba/rayon, the smallest cross-target surface (Termux `aarch64-linux-android`) |
 
