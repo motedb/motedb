@@ -35,6 +35,23 @@ Distance Semantics 节）: `loc <-> ST_POINT(x, y)` 计算完整 3D 距离、
 ST_POINT 抬升到 z=0（z ≠ 0 的行在排序中支付 z 偏移）——与 ST_WITHIN
 的 2D 语义及 PostGIS 的 2D `<->` 均不同，写明差异，测试钉死该行为。
 
+### JOIN × 子查询 × 窗口函数 oracle 扫描（零代码变更）
+
+新扫雷台 `tests/test_join_subquery_window_matrix.rs`:
+
+- INNER/LEFT JOIN（孤儿键/NULL 键的 NULL 填充、右列 WHERE 后过滤、
+  JOIN+GROUP BY 按层聚合）vs 嵌套循环暴力 oracle
+- IN / NOT IN 子查询（NULL 双侧排除语义）、相关标量子查询
+  （miss → NULL）、聚合标量子查询阈值
+- UPDATE SET 自引用表达式（amount = amount * 2）、双列联动赋值、
+  OR/NOT/BETWEEN+IN 复合 WHERE 的 UPDATE/DELETE × Rust 镜像状态
+- ROW_NUMBER（含 PARTITION BY——本轮唯一失败是我 oracle 公式写错，
+  引擎行为正确）、running SUM OVER
+- LATEST BY 在"新行挪位"与"UPDATE 挪位"两种移动后都返回最新位置，
+  且不吞历史（robot-memory demo 的命门路径）
+
+结果: **引擎零缺陷**——全部对照暴力 oracle 一次通过。
+
 ## [0.18.3] — 2026-11-09
 
 ### 🔴 修复两只静默错误结果（demo 挖矿所得，#17 / #18）
