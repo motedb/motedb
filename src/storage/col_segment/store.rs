@@ -4486,7 +4486,12 @@ impl ColSegmentStore {
                 heap.pop();
             }
         };
-        for (sidx, seg) in segs.iter().enumerate() {
+        // 🔴 新段优先（同族修复）: 去重"首见即赢"必须意味着**最新版本**赢。
+        // 此前正序遍历使最旧段先占坑——DELETE 墓碑（永远写在新段）被
+        // `!seen.insert` 挡在门外，`ORDER BY … LIMIT k` 让已删行复活
+        // （分页用户在第一页看到已删数据）。输出序不受影响（末尾按
+        // ord_key 全排序）。
+        for (sidx, seg) in segs.iter().enumerate().rev() {
             let n = seg.sst.num_rows;
             // 🔑 Only load full keys for dedup (multi-segment). Single-segment
             // top-K doesn't need keys — saves 16MB allocation.

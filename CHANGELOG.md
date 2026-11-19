@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.18.4] — 开发中
+
+### 🔴 重启一致性 × DML 矩阵: 三处数据正确性修复
+
+新增 `tests/test_reopen_dml_matrix.rs` —— 三条关闭路径（CHECKPOINT /
+脏 WAL / DML 后）× 9 个代表性查询的 close→reopen 逐行一致性校验，
+加 UPDATE 部分列保持性 / DELETE 后 LATEST BY / INSERT OR REPLACE 的
+Rust 镜像状态 oracle。首跑抓出:
+
+- **DELETE 后 `ORDER BY … LIMIT k` 已删行复活**: top-k 堆路径**正序**
+  遍历段，去重"首见即赢"变成最旧版本赢——墓碑永远写在新段，被
+  `seen` 挡在门外。分页用户会在第一页看到已删数据。改为新段优先
+  （全库其它扫描路径本就如此）。
+- **`INSERT OR REPLACE` / 列清单 INSERT 的 DATE 列静默存成
+  1970-01-01**: `values_to_row_by_columns` 与 schema-order 转换器均无
+  Date 强转臂，'YYYY-MM-DD' 文本原样落列式 writer 的 `_ => 0` 兜底。
+  三层修复: 两个转换器补 Date 臂（文本/Timestamp/Integer 天数）;
+  列式 writer 的 Date/Timestamp 兜底改为按列语义尽力解析（防御层，
+  注释里自己承认过的旧坑）。
+- 附带: UPDATE 合并路径落 Integer 天数进 DATE 列的场景由 writer 兜底
+  正确回存（矩阵全绿）。
+
 ## [0.18.3] — 2026-11-09
 
 ### 🔴 修复两只静默错误结果（demo 挖矿所得，#17 / #18）

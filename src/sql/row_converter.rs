@@ -145,6 +145,18 @@ pub fn values_to_row_by_columns(
             (ColumnType::Timestamp, Value::Text(s)) => crate::types::Timestamp::parse_iso(s)
                 .map(Value::Timestamp)
                 .unwrap_or_else(|| Value::Text(s.clone())),
+            // 🔴 DATE 同族: 列清单 INSERT / INSERT OR REPLACE 路径此前
+            // 无 Date 臂，'YYYY-MM-DD' 文本原样落库被列式 writer 兜成 0
+            // （1970-01-01 静默数据损坏）。
+            (ColumnType::Date, Value::Text(s)) => crate::types::Date::parse(s)
+                .map(Value::Date)
+                .unwrap_or_else(|| Value::Text(s.clone())),
+            (ColumnType::Date, Value::Timestamp(t)) => Value::Date(crate::types::Date::from_days(
+                t.as_micros().div_euclid(86_400_000_000) as i32,
+            )),
+            (ColumnType::Date, Value::Integer(days)) => {
+                Value::Date(crate::types::Date::from_days(*days as i32))
+            }
             (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
             // 🚨 Float to Integer: convert whole-number floats (prevents
             // f64 bit-pattern corruption). Fractional floats fall through
@@ -214,6 +226,24 @@ pub fn values_to_row_schema_order(values: &[Value], schema: &TableSchema) -> Res
                         )));
                     }
                 }
+            }
+            // 🔴 DATE 同族（见 values_to_row_by_columns 注释）: 文本 /
+            // Timestamp / Integer 天数 → Date。解析失败走报错（本函数的
+            // Timestamp 臂同风格），不让 Text 漏到列式 writer 兜底。
+            (ColumnType::Date, Value::Text(s)) => match crate::types::Date::parse(s) {
+                Some(d) => Value::Date(d),
+                None => {
+                    return Err(crate::error::MoteDBError::InvalidArgument(format!(
+                        "Cannot parse '{}' as DATE (expected YYYY-MM-DD)",
+                        s
+                    )));
+                }
+            },
+            (ColumnType::Date, Value::Timestamp(t)) => Value::Date(crate::types::Date::from_days(
+                t.as_micros().div_euclid(86_400_000_000) as i32,
+            )),
+            (ColumnType::Date, Value::Integer(days)) => {
+                Value::Date(crate::types::Date::from_days(*days as i32))
             }
             (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
             _ => val,

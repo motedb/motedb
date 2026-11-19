@@ -3205,17 +3205,31 @@ impl ColumnarSSTableBuilder {
                     buf.push(b);
                 }
                 ColumnTypeTag::Timestamp => {
+                    // 🔴 兜底强转（防御层）: 上游个别路径（如 INSERT OR
+                    // REPLACE 的 values_to_row_by_columns）漏掉 ISO 文本
+                    // 强转时，旧 `_ => 0` 把日期静默存成 1970-01-01。
+                    // 此处按列语义尽力解析; 解析不出才落 0。
                     let ts = match value {
                         Value::Timestamp(t) => t.as_micros(),
                         Value::Null => i64::MIN,
+                        Value::Text(s) => crate::types::Timestamp::parse_iso(s)
+                            .map(|t| t.as_micros())
+                            .unwrap_or(0),
                         _ => 0,
                     };
                     buf.extend_from_slice(&ts.to_le_bytes());
                 }
                 ColumnTypeTag::Date => {
+                    // 🔴 同上: Date 列兜底接受 'YYYY-MM-DD' 文本、
+                    // Timestamp（截到 UTC 日）、Integer（epoch 天数）。
                     let d = match value {
                         Value::Date(d) => d.days() as i64,
                         Value::Null => i64::MIN,
+                        Value::Text(s) => crate::types::Date::parse(s)
+                            .map(|d| d.days() as i64)
+                            .unwrap_or(0),
+                        Value::Timestamp(t) => t.as_micros().div_euclid(86_400_000_000),
+                        Value::Integer(days) => *days,
                         _ => 0,
                     };
                     buf.extend_from_slice(&d.to_le_bytes());
@@ -3448,17 +3462,31 @@ impl ColumnarSSTableBuilder {
                     buf.push(b);
                 }
                 ColumnTypeTag::Timestamp => {
+                    // 🔴 兜底强转（防御层）: 上游个别路径（如 INSERT OR
+                    // REPLACE 的 values_to_row_by_columns）漏掉 ISO 文本
+                    // 强转时，旧 `_ => 0` 把日期静默存成 1970-01-01。
+                    // 此处按列语义尽力解析; 解析不出才落 0。
                     let ts = match value {
                         Value::Timestamp(t) => t.as_micros(),
                         Value::Null => i64::MIN,
+                        Value::Text(s) => crate::types::Timestamp::parse_iso(s)
+                            .map(|t| t.as_micros())
+                            .unwrap_or(0),
                         _ => 0,
                     };
                     buf.extend_from_slice(&ts.to_le_bytes());
                 }
                 ColumnTypeTag::Date => {
+                    // 🔴 同上: Date 列兜底接受 'YYYY-MM-DD' 文本、
+                    // Timestamp（截到 UTC 日）、Integer（epoch 天数）。
                     let d = match value {
                         Value::Date(d) => d.days() as i64,
                         Value::Null => i64::MIN,
+                        Value::Text(s) => crate::types::Date::parse(s)
+                            .map(|d| d.days() as i64)
+                            .unwrap_or(0),
+                        Value::Timestamp(t) => t.as_micros().div_euclid(86_400_000_000),
+                        Value::Integer(days) => *days,
                         _ => 0,
                     };
                     buf.extend_from_slice(&d.to_le_bytes());
