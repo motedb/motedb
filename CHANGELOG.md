@@ -22,6 +22,19 @@ Rust 镜像状态 oracle。首跑抓出:
 - 附带: UPDATE 合并路径落 Integer 天数进 DATE 列的场景由 writer 兜底
   正确回存（矩阵全绿）。
 
+### 聚合 × 向量 KNN × 空间谓词 oracle 扫描（零代码变更）
+
+新扫雷台 `tests/test_agg_vector_spatial_matrix.rs` —— SUM/AVG × 6 种
+WHERE（含 NULL 语义/空集）、GROUP BY 单/双键 + HAVING + ORDER BY
+聚合别名、`ORDER BY emb <-> ?`（含过滤 KNN）× 4 查询点 × 4 个 k、
+ST_WITHIN / `ORDER BY loc <-> ST_POINT` / ST_DISTANCE_3D —— 全部
+对 Rust 暴力 oracle 校验。结果: **无新错误结果 bug**。
+
+附带钉住并文档化一个语义契约（docs/10-spatial-index.md 新增
+Distance Semantics 节）: `loc <-> ST_POINT(x, y)` 计算完整 3D 距离、
+ST_POINT 抬升到 z=0（z ≠ 0 的行在排序中支付 z 偏移）——与 ST_WITHIN
+的 2D 语义及 PostGIS 的 2D `<->` 均不同，写明差异，测试钉死该行为。
+
 ## [0.18.3] — 2026-11-09
 
 ### 🔴 修复两只静默错误结果（demo 挖矿所得，#17 / #18）

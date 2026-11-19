@@ -65,6 +65,17 @@ let bbox = BoundingBox::new(116.0, 39.0, 117.0, 40.0);
 let ids = db.spatial_search("locations_coords", &bbox)?;
 ```
 
+## Distance Semantics
+
+- `ST_WITHIN(pt, x0, y0, x1, y1)` is **2D** (x/y only). Use the `_3D`
+  suffixed variants (`ST_WITHIN_3D`, `ST_DISTANCE_3D`) when z participates.
+- `ORDER BY loc <-> ST_POINT(x, y)` computes the **full 3D distance**, and
+  `ST_POINT(x, y)` is lifted to z = 0 — a row with z ≠ 0 pays its z offset
+  in the ranking. If you store z and want floor-plane ranking, either keep
+  z = 0 in the column or filter by `ST_WITHIN` and re-rank client-side.
+  (This differs from PostGIS, whose `<->` is 2D with separate 3D
+  operators.)
+
 ## Performance
 
 | Dataset | P95 Query Latency | Memory | Build Time |
