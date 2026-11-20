@@ -336,9 +336,9 @@ dependencies = [
 
 [[package]]
 name = "motedb"
-version = "0.18.3"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e50816007f0dd2f7def7cc51d528f1fe1ac0bb70c39551550d744cb72f6d9eb6"
+checksum = "c4e1406d5dd0d4e0ddd93b144d16518a324b31df5a0dc78526fff9b1bf928e29"
 dependencies = [
  "arc-swap",
  "base64",

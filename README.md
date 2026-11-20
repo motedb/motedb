@@ -249,7 +249,7 @@ db.import_mcap("recording.mcap", decode={"/joint_states": my_decoder})
 One table per topic (`_uid` PK, `log_time`/`publish_time` TIMESTAMP + auto
 index, raw message `data BLOB`); a per-topic Python decode hook adds typed
 columns (e.g. decoded `emb VECTOR`) at import time. Re-imports are no-ops
-(`_uid` dedup) — crash-safe resumes.
+(`_uid` dedup) — crash-safe resumes. Full guide: `docs/21-mcap-import.md`.
 
 ### Multimodal
 

@@ -34,7 +34,13 @@ It is an embedded database purpose-built for edge devices such as home robots, A
 - **Install Troubleshooting**: [./18-install-troubleshooting.md](./18-install-troubleshooting.md) - Package names per registry, platform coverage, loader errors
 - **Training DataLoader**: [./19-training-dataloader.md](./19-training-dataloader.md) - PyTorch `MoteDataset`, LeRobot round-trip shape
 - **MCP Server**: [./20-mcp.md](./20-mcp.md) - Expose a database to AI agents (read-only, stdio)
+- **MCAP Import**: [./21-mcap-import.md](./21-mcap-import.md) - `ros2 bag` / Foxglove recordings → queryable tables (CLI, Python decode hooks, Rust)
 - **Benchmark Report**: [./benchmark_report_2026-10-21.md](./benchmark_report_2026-10-21.md) - Multi-engine vector comparison (`make bench-industry`)
+
+### Internal / Archives
+- [Benchmark methodology](./benchmark_methodology.md) - how every report is measured
+- [Design archive](./design/) - dated internal design docs (0.18 unification, columnar store, roadmap)
+- [Paper draft](./paper/) - academic write-up (LaTeX)
 
 ## 🚀 Core Features
 

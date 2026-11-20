@@ -47,3 +47,8 @@ trains on the same frame fields `LeRobotDataset` exposes.
   through episodes with `WHERE episode_index = ?` per `MoteDataset`.
 - Requires `numpy` (for vector columns) and `torch`. Neither is a hard
   dependency of the `motedb` package itself.
+
+---
+
+- Previous: [18 Install Troubleshooting](./18-install-troubleshooting.md)
+- Next: [20 MCP Server](./20-mcp.md)
