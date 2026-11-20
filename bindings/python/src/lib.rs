@@ -800,6 +800,26 @@ impl PyDatabase {
         })
     }
 
+    /// Run a SELECT and return the result column by column:
+    /// `(columns, {column_name: numpy array | Python list})`.
+    ///
+    /// Column mapping (numpy is imported lazily at call time):
+    /// - INTEGER / TIMESTAMP → numpy array, dtype '<i8' (TIMESTAMP as
+    ///   microseconds, same as execute())
+    /// - FLOAT → numpy array, dtype '<f8'
+    /// - BOOLEAN → numpy array, dtype 'bool'
+    /// - TEXT → list of str (repeated strings share one interned object)
+    /// - columns with any NULL, mixed types, VECTOR or SPATIAL values → list of
+    ///   Python objects, one per row (None for NULL)
+    ///
+    /// Zero-copy: homogeneous INTEGER / TIMESTAMP / FLOAT / BOOLEAN columns without
+    /// NULLs are built once as raw little-endian bytes and wrapped with
+    /// np.frombuffer, without one Python object per value. Without numpy those
+    /// columns come back as `bytes` objects instead (wrap them with
+    /// np.frombuffer yourself). Raises ValueError for anything but a SELECT.
+    /// For large result sets this is about an order of magnitude faster than
+    /// building per-row dicts with execute().
+    ///
     /// 🚀 列式取回: `(columns, {列名: numpy 数组 | Python 列表})`。
     ///
     /// 同质无 NULL 的列直接走 np.frombuffer 零拷贝 (运行时 lazy import
@@ -938,10 +958,29 @@ impl PyDatabase {
         Ok(tx)
     }
 
-    /// Execute one INSERT once per parameter set (executemany).
-    /// All rows go through a single multi-row INSERT — one WAL fsync for the
-    /// whole batch. `params` is a list of per-row parameter lists.
-    /// Returns the affected-row count.
+    /// Columnar bulk insert:
+    /// `db.insert_arrays("ev", {"id": np_ids, "emb": emb2d, ...})`.
+    ///
+    /// `columns` is a dict {column_name: numpy array or list} (a sequence of
+    /// (column_name, values) pairs is accepted too). Every column must have the
+    /// same number of rows. Names match the table schema case-insensitively and
+    /// are placed by schema position; schema columns that are left out are
+    /// inserted as NULL (an omitted auto-increment primary key gets its auto id).
+    ///
+    /// Accepted values:
+    /// - 1-D numpy arrays of i1/i2/i4/i8, u1/u2/u4/u8, f4 or f8 → one scalar per
+    ///   row; 1-D unicode arrays ('<U…') → TEXT
+    /// - 2-D numpy arrays of f4/f8 or integers → one VECTOR per row
+    /// - lists of str, int or float; mixed lists fall back to per-value
+    ///   conversion (None → NULL)
+    ///
+    /// numpy arrays are read with a single tobytes() copy and decoded by dtype and
+    /// shape, with no per-element Python objects. Big-endian dtypes raise
+    /// ValueError instead of being decoded silently as little-endian. SQL parsing,
+    /// parameter binding and per-row Python objects are skipped, so for a
+    /// 100K×384 import the Python-side cost drops from ~0.8s (.tolist() per row) to
+    /// ~0. All rows are written as one batch. Returns the number of inserted rows.
+    ///
     /// 🔥 列式批量插入: `db.insert_arrays("ev", {"id": np_ids, "emb": emb2d, ...})`
     /// 参数是 {列: numpy 数组或 list} 的列式 dict（也接受 (列, 值) 二元组序列）。
     /// numpy 数组经 buffer 协议零拷贝读取 (1D: i8/u8..64/f4/f8 标量, 2D: f4/f8/
@@ -1045,6 +1084,10 @@ impl PyDatabase {
         py.allow_threads(move || self.db.insert_rows(table, rows).map_err(py_err))
     }
 
+    /// Execute one INSERT once per parameter set (executemany).
+    /// All rows go through a single multi-row INSERT — one WAL fsync for the
+    /// whole batch. `params` is a list of per-row parameter lists.
+    /// Returns the affected-row count.
     #[pyo3(signature = (sql, params))]
     fn executemany(&self, py: Python<'_>, sql: &str, params: Bound<'_, PyAny>) -> PyResult<usize> {
         let list = params

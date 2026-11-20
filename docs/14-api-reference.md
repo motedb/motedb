@@ -338,6 +338,30 @@ let row_ids = db.batch_insert_with_vectors_map(
 )?;
 ```
 
+### Python: `insert_arrays` / `fetch_arrays`
+
+The Python binding's columnar fast paths (Node mirrors them as `insertArrays`;
+the docstrings in `bindings/python/src/lib.rs` carry the same text, see
+`help(motedb.Database.insert_arrays)`).
+
+**`insert_arrays(table, columns) -> int`** — `columns` is a dict
+`{column_name: numpy array or list}` (or a sequence of `(column_name, values)`
+pairs), all of the same length. Names match the schema case-insensitively;
+omitted columns are inserted as NULL, an omitted auto-increment primary key
+gets its auto id. 1-D numpy arrays of `i1`–`i8`, `u1`–`u8`, `f4`, `f8` give one
+scalar per row, 1-D unicode arrays give TEXT, 2-D float or integer arrays give
+one VECTOR per row; lists of `str`, `int` or `float` work too, mixed lists are
+converted per value (`None` → NULL). numpy arrays are read with one
+`tobytes()` copy, without per-element Python objects; big-endian dtypes raise
+`ValueError`. Returns the number of inserted rows.
+
+**`fetch_arrays(sql, params=None) -> (columns, dict)`** — runs a SELECT and
+returns `{column_name: values}`. Homogeneous columns without NULLs come back as
+numpy arrays: INTEGER / TIMESTAMP → `'<i8'` (TIMESTAMP in microseconds),
+FLOAT → `'<f8'`, BOOLEAN → `'bool'`; without numpy they are `bytes` objects
+for `np.frombuffer`. TEXT columns are lists of `str`; columns with NULLs, mixed
+types, VECTOR or SPATIAL values are lists of Python objects (`None` for NULL).
+
 ## Index Management
 
 ### create_column_index
