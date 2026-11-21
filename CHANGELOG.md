@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.18.5] — 开发中
+
+### 修复: KNN_SEARCH 维度不匹配静默返回空
+
+- 错维查询向量（如 2 维查 32 维索引）此前不报错、返回 0 行——
+  "静默空结果"家族。与 `ORDER BY emb <->` 的明确报错对齐
+  （InvalidArgument: Vector dimension mismatch），回归钉住
+- 顺带验证: 索引内 DELETE/UPDATE 幽灵行处理干净（删行不复现、
+  UPDATE 后新向量可见旧向量消失）、NULL 向量行不干扰查询
+- 25k 规模召回曲线（25k×64 合成，自查询）: 均匀 0.990 / 常规聚类
+  0.998 / 病态紧簇（±0.1、20× 分离）默认 0.62 →
+  `WITH (search_list=1000, max_degree=128)` 恢复 1.000（p50 0.76ms）。
+  曲线与调参指引写入 docs/08
+
+### 真实 embedding 召回基准 + KNN 一致性修复
+
+- **召回基准**（bge-small-zh-v1.5 ONNX × 740 个自述文档块 × 44 中英
+  查询，GT=暴力余弦）: `ORDER BY emb <->` R@10≈99.8%（overfetch+精确
+  rerank）; `KNN_SEARCH` 直查图 R@10≈98%、快 2.3×。两拼法均已实测
+  "建图后新插入行可见"（写缓冲合并生效）
+- **修复: `KNN_SEARCH(emb, '[…]', k)` 引号形式被 parser 拒绝**——
+  与 `ORDER BY emb <-> '[…]'` 只差一对引号却不可用。统一接受两种
+  拼法，结果一致（回归 test_knn_literal_forms）
+- **文档**: docs/08 新增 Query Routing and Recall Trade-offs 节——
+  20k 行路由门槛（MOTE_VEC_INDEX_MIN_ROWS）、新鲜度降级
+  （MOTE_VEC_REBUILD_RATIO，修正了注释与代码默认值 0.2/0.05 的
+  矛盾说明）、两拼法的召回/延迟取舍表
+- 新鲜度实验: 5% 阈值内/外两档均验证 ORDER BY 与 KNN_SEARCH 都能
+  找到未入图的新行（此前的"静默丢失"假设证伪）
+
 ## [0.18.4] — 2026-11-20
 
 ### 🔴 重启一致性 × DML 矩阵: 三处数据正确性修复

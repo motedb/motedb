@@ -2971,14 +2971,29 @@ impl Parser {
                             }
                         };
 
-                        // Extract query vector
-                        let query_vector =
-                            match &args[1] {
-                                Expr::Literal(Value::Vector(vec)) => vec.clone(),
-                                _ => return Err(self.error(
+                        // Extract query vector. Accept both the bare literal
+                        // (`[1.0, 2.0]`) and the quoted form (`'[1.0, 2.0]'`) —
+                        // the `<->` ordering path coerces quoted text the same
+                        // way, and the asymmetry rejected SQL that differed from
+                        // the ORDER BY spelling only in quotes.
+                        let query_vector = match &args[1] {
+                            Expr::Literal(Value::Vector(vec)) => vec.clone(),
+                            Expr::Literal(Value::Text(s)) => {
+                                match Value::parse_bracketed_vector(s.as_str()) {
+                                    Some(Value::Vector(vec)) => vec,
+                                    _ => {
+                                        return Err(self.error(
+                                            "KNN_SEARCH() second argument must be a vector literal [...]",
+                                        ))
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Err(self.error(
                                     "KNN_SEARCH() second argument must be a vector literal [...]",
-                                )),
-                            };
+                                ))
+                            }
+                        };
 
                         // Extract k
                         let k = match &args[2] {

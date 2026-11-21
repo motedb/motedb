@@ -23690,6 +23690,20 @@ impl QueryExecutor {
             return Ok(None);
         }
 
+        // 🔴 维度校验: 此前维错查询静默返回空（search() 对不匹配维度产出
+        // 零结果），而 `ORDER BY emb <->` 路径会明确报维错——同一错误两种
+        // 提示，且静默空结果是最恶劣的失败形态。统一报 InvalidArgument。
+        if let Some(dim) = self.db.vector_index_dim(&index_name) {
+            if query_vector.len() != dim {
+                return Err(MoteDBError::InvalidArgument(format!(
+                    "Vector dimension mismatch: query has {} dims, column '{}' declares {}",
+                    query_vector.len(),
+                    column,
+                    dim
+                )));
+            }
+        }
+
         debug_log!(
             "[Executor] ✅ vector KNN fast path: index={}, k={}, dims={}",
             index_name,
@@ -25554,7 +25568,8 @@ impl QueryExecutor {
                 // 全量重建。图候选缺失在 rerank 后不可恢复，memtable
                 // 合并只兜得住部分 stranded 形状（实测增量窗口 p50
                 // 掉到 0.9、min 0.7）。阈值 env MOTE_VEC_REBUILD_RATIO
-                // （默认 0.2）。
+                // （默认 0.05 —— 比设计稿 0.2 更保守: 中小规模暴力更快，
+                // 且增量窗口实测召回会衰减，宁早降级）。
                 let rows = live_rows_probe.unwrap_or(0);
                 let built = self.db.vector_index_len(&index_name).unwrap_or(0);
                 let unindexed = rows.saturating_sub(built);

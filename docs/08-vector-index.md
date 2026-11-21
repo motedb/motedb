@@ -89,6 +89,44 @@ let candidates = db.vector_search("docs_embedding", &query_vec, 10)?;
 
 > Parameters: R=32, L=50, PQ disabled, Apple M3 Pro (Release)
 
+## Query Routing and Recall Trade-offs
+
+Two SQL spellings reach the vector index, with different quality/speed
+trade-offs (measured on real bge-small-zh 512-dim document embeddings,
+740 vectors, 44 zh/en queries — ground truth = exact cosine scan):
+
+| Spelling | Path | Recall@10 | Latency (740 rows) |
+|---|---|---|---|
+| `ORDER BY emb <-> ?` | graph candidates (overfetch ~4x) + exact rerank | ~99.8% | ~0.6 ms |
+| `WHERE KNN_SEARCH(emb, ?, k)` | direct graph search | ~97-98% | ~0.25 ms |
+
+Routing rules for `ORDER BY emb <-> ?`:
+
+- **Below `MOTE_VEC_INDEX_MIN_ROWS` (default 20,000 live rows) the engine
+  always runs an exact brute-force scan** — at small scale exactness is
+  free and the graph adds latency without benefit.
+- With an index and enough rows, the graph serves the query unless more
+  than `MOTE_VEC_REBUILD_RATIO` (default 0.05) of live rows are newer
+  than the last graph build — then the query falls back to an exact scan
+  and a background rebuild is triggered.
+- Rows inserted after the graph build are still visible to both paths
+  (write-buffer merge) — recall degrades only inside the incremental
+  window above the freshness ratio, which triggers the fallback.
+
+The query vector accepts both `'[1.0, 2.0]'` (quoted) and `[1.0, 2.0]`
+(bare) literals in both spellings; a wrong-dimension query vector raises
+`Invalid argument: Vector dimension mismatch` in both spellings.
+
+**Recall vs data distribution** (25k x 64-dim synthetic, self-queries,
+default build R=64/L=300): uniform R@10 = 0.990, moderately clustered
+(cluster jitter ±0.4) R@10 = 0.998. Pathologically tight clusters (jitter
+±0.1 with 20x centroid separation — near-degenerate neighbor ties) degrade
+defaults to R@10 ≈ 0.62; rebuilding with
+`WITH (search_list = 1000, max_degree = 128)` restores R@10 = 1.000 at
+~0.8 ms p50. If your embeddings are extremely clustered (very low
+intra-class variance), raise `search_list` / `max_degree` before
+concluding the index lost data.
+
 ## Tuning Recommendations
 
 - **Prioritize recall**: increase `R` or `alpha`, or enable multi-batch reranking

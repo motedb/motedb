@@ -303,6 +303,13 @@ impl MoteDB {
 
     /// 🔒 B3 新鲜度护栏（0.18）: 图内节点数 = 索引覆盖的行数（构建时
     /// 全量入图）。执行器用它对比 live 行数判定"增量未入图占比"。
+    /// Declared dimension of a vector index (for query-time validation).
+    pub fn vector_index_dim(&self, index_name: &str) -> Option<usize> {
+        let index_ref = self.vector_indexes.get(index_name)?;
+        let dim = index_ref.value().read().dimension();
+        Some(dim)
+    }
+
     pub fn vector_index_len(&self, index_name: &str) -> Option<usize> {
         self.vector_indexes
             .get(index_name)
