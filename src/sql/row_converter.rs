@@ -46,6 +46,15 @@ pub fn sql_row_to_row(sql_row: &SqlRow, schema: &TableSchema) -> Result<Row> {
                 Value::Timestamp(Timestamp::from_micros(*i))
             }
             // Integer to Float conversion
+            // 🔴 VECTOR 同族（求值方向）: 表达式求值产出的 '[…]' 文本
+            // （UPDATE SET emb = '[…]' 等形状）在此转成真向量，与 INSERT
+            // 转换器的强转语义一致（维度不符保持 Text 交给 validate 报错）。
+            (ColumnType::Tensor(dim), Value::Text(t)) => {
+                match Value::parse_bracketed_vector(t.as_str()) {
+                    Some(Value::Vector(v)) if v.len() == *dim => Value::Vector(v),
+                    _ => Value::Text(t.clone()),
+                }
+            }
             (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
             // 🚨 Float to Integer: convert whole-number floats (prevents f64
             // bit-pattern corruption when stored). Fractional floats fall
@@ -157,6 +166,17 @@ pub fn values_to_row_by_columns(
             (ColumnType::Date, Value::Integer(days)) => {
                 Value::Date(crate::types::Date::from_days(*days as i32))
             }
+            // 🔴 VECTOR 同族: 引号字面量 '[…]' 此前只在 autocommit 路径
+            // 被 coerce_row_to_schema 补救——事务路径裸 validate 直接报
+            // "Type mismatch: expected Tensor"，同一条 INSERT 在事务内外
+            // 行为互补不一致。转换器源头统一强转（维度不符保持 Text
+            // 让 validate 给出明确错误）。
+            (ColumnType::Tensor(dim), Value::Text(t)) => {
+                match Value::parse_bracketed_vector(t.as_str()) {
+                    Some(Value::Vector(v)) if v.len() == *dim => Value::Vector(v),
+                    _ => Value::Text(t.clone()),
+                }
+            }
             (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
             // 🚨 Float to Integer: convert whole-number floats (prevents
             // f64 bit-pattern corruption). Fractional floats fall through
@@ -244,6 +264,17 @@ pub fn values_to_row_schema_order(values: &[Value], schema: &TableSchema) -> Res
             )),
             (ColumnType::Date, Value::Integer(days)) => {
                 Value::Date(crate::types::Date::from_days(*days as i32))
+            }
+            // 🔴 VECTOR 同族: 引号字面量 '[…]' 此前只在 autocommit 路径
+            // 被 coerce_row_to_schema 补救——事务路径裸 validate 直接报
+            // "Type mismatch: expected Tensor"，同一条 INSERT 在事务内外
+            // 行为互补不一致。转换器源头统一强转（维度不符保持 Text
+            // 让 validate 给出明确错误）。
+            (ColumnType::Tensor(dim), Value::Text(t)) => {
+                match Value::parse_bracketed_vector(t.as_str()) {
+                    Some(Value::Vector(v)) if v.len() == *dim => Value::Vector(v),
+                    _ => Value::Text(t.clone()),
+                }
             }
             (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
             _ => val,

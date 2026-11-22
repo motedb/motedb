@@ -2,6 +2,29 @@
 
 ## [0.18.5] — 开发中
 
+### 修复: 事务内向量字面量 INSERT 报"Type mismatch: expected Tensor"
+
+互补型不对称——同一条 `INSERT … VALUES (…, '[1.0, …]')`:
+- autocommit 路径先 coerce_row_to_schema（Text→Vector）再校验 → 引号形式 ✓、裸 `[…]` ✗
+- 事务路径（write_set）裸 validate → 引号形式 ✗（报错）、裸形式 ✓
+
+修复: row_converter 三个转换函数统一补 Tensor 强转臂（含维度校验，
+维度不符保持 Text 交给 validate 报明确错误）。2×2 矩阵（引号/裸 ×
+事务/自动提交）全部成功且存值正确、KNN 精确命中（回归钉住）。
+
+### FTS×DML / RRF / 连续视图 / 事务×索引 oracle 扫描（零缺陷）
+
+新扫雷台 test_fts_dml_rrf_matrix + test_cview_txn_index_matrix:
+
+- FTS 索引跟随 DML: 建索引后 INSERT 可搜、UPDATE 文本列搜新不搜旧、
+  DELETE 后不命中 ✓
+- 混合检索 RRF 与 Rust 手算融合一致（含子结果集完全重叠与错开两种
+  构造）✓
+- 连续视图（lazy 全量重算）在 INSERT 新桶 / DELETE 设备 / 外层聚合
+  三阶段与直接 GROUP BY 逐行一致 ✓
+- TIME_BUCKET 10m 边界: 分桶人口/均值/桶标签间距（600s）/锚点 ✓
+- 事务回滚不残留 FTS/向量索引幽灵项、COMMIT 后双索引可见 ✓
+
 ### 修复: KNN_SEARCH 维度不匹配静默返回空
 
 - 错维查询向量（如 2 维查 32 维索引）此前不报错、返回 0 行——
