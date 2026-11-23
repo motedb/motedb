@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.18.5] — 开发中
+## [0.18.5] — 2026-11-23
 
 ### 修复: 事务内向量字面量 INSERT 报"Type mismatch: expected Tensor"
 
