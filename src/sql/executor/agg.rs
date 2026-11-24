@@ -368,23 +368,40 @@ impl QueryExecutor {
         }
 
         // DISTINCT: scan the distinct column(s) and dedup.
-        if stmt.distinct {
+        // 🔴 Only for the bare shape: this pushdown returns the deduped rows
+        // as-is. WHERE must be applied before dedup (it used to be ignored:
+        // `SELECT DISTINCT c FROM t WHERE …` returned the unfiltered values),
+        // and ORDER BY / OFFSET / LIMIT apply after it.
+        if stmt.distinct
+            && stmt.where_clause.is_none()
+            && stmt.order_by.is_none()
+            && stmt.limit.is_none()
+            && stmt.offset.is_none()
+        {
             let out_pos: Vec<usize> =
                 Self::resolve_select_positions(&stmt.columns, &schema).unwrap_or_default();
             if !out_pos.is_empty() {
                 let dc = out_pos[0];
-                // 🚀 Fast path: for single-column DISTINCT on a TEXT column, use
-                // distinct_text_values (adaptive early-exit, ~0.5ms for a 2-value
-                // column) instead of materializing+deduping all 300K rows (~46ms).
-                if matches!(
-                    schema.col_types().get(dc),
-                    Some(crate::types::ColumnType::Text)
-                ) {
-                    let vals = store.distinct_text_values(dc, 10000);
-                    let rows: Vec<Vec<Value>> = vals
+                // 🚀 Fast path: single-column DISTINCT on a TEXT column (exact
+                // scan, one allocation per distinct value) instead of
+                // materializing+deduping all rows. Exactly ONE selected
+                // column — this branch emits one value per row.
+                // (`distinct_text_values` — adaptive early-exit + 10k cap —
+                // silently truncated clustered and high-cardinality columns.)
+                if out_pos.len() == 1
+                    && matches!(
+                        schema.col_types().get(dc),
+                        Some(crate::types::ColumnType::Text)
+                    )
+                {
+                    let (vals, has_null) = store.distinct_text_values_exact(dc);
+                    let mut rows: Vec<Vec<Value>> = vals
                         .into_iter()
                         .map(|v| vec![Value::Text(v.into())])
                         .collect();
+                    if has_null {
+                        rows.push(vec![Value::Null]);
+                    }
                     let columns = self
                         .build_select_columns(&stmt.columns, &schema)
                         .unwrap_or_default();
@@ -666,6 +683,25 @@ impl QueryExecutor {
                 let one = Self::parse_simple_comparison_where(wc, schema)?;
                 Some(vec![one])
             }
+        }
+    }
+
+    /// MIN/MAX fold TIMESTAMP / DATE columns as raw i64 (micros / days). Put
+    /// the column's own Value variant back: `MIN(ts)` is a Timestamp, not the
+    /// integer it was accumulated as (the single-comparison path did this for
+    /// TIMESTAMP only; the fused multi-predicate path — where a BETWEEN ends
+    /// up — returned a bare Integer).
+    pub(super) fn restore_calendar_variant(
+        schema: &TableSchema,
+        col: Option<usize>,
+        raw: i64,
+    ) -> Value {
+        match col.and_then(|c| schema.col_types().get(c)) {
+            Some(ColumnType::Timestamp) => {
+                Value::Timestamp(crate::types::Timestamp::from_micros(raw))
+            }
+            Some(ColumnType::Date) => Value::Date(crate::types::Date::from_days(raw as i32)),
+            _ => Value::Integer(raw),
         }
     }
 
@@ -1395,7 +1431,7 @@ impl QueryExecutor {
                             } else if r.has_float {
                                 row.push(Value::Float(r.min_float));
                             } else {
-                                row.push(Value::Integer(r.min_int));
+                                row.push(Self::restore_calendar_variant(schema, a.col, r.min_int));
                             }
                         }
                         "MAX" => {
@@ -1405,7 +1441,7 @@ impl QueryExecutor {
                             } else if r.has_float {
                                 row.push(Value::Float(r.max_float));
                             } else {
-                                row.push(Value::Integer(r.max_int));
+                                row.push(Self::restore_calendar_variant(schema, a.col, r.max_int));
                             }
                         }
                         _ => return Ok(None),

@@ -19,6 +19,11 @@ A: Ensure the `Vector` dimensions match those used at index creation time. Incre
 **Q: Full-text index is too large?**
 A: Enable `ngram`, compress long texts, or run `VACUUM TEXT INDEX` periodically.
 
+## Queries
+
+**Q: In what order do rows come back without ORDER BY?**
+A: In ascending order of the internal row key; for a table with an `INTEGER PRIMARY KEY` that is primary-key order. Since 0.18.6 this holds whether the table is stored in one segment or several, and it does not change across a restart, a checkpoint or an `UPDATE` — `LIMIT`/`OFFSET` therefore select the same rows every time. It covers plain single-table queries only: add `ORDER BY` whenever the order matters, in particular for `DISTINCT` and for joins.
+
 ## Data Types
 
 **Q: How do I insert a timestamp?**

@@ -192,27 +192,6 @@ fn time_bucket_boundaries_match_manual() {
                 FROM s GROUP BY b ORDER BY b",
         )
         .unwrap();
-    // 手算: 桶起点 = base + k*600s（对齐到 epoch? —— 以 base 为锚验证相对分桶）
-    let fmt = |rows: &Vec<Vec<Value>>| -> Vec<String> {
-        rows.iter()
-            .map(|r| {
-                let b = match &r[0] {
-                    Value::Timestamp(t) => t.as_micros().to_string(),
-                    other => format!("{other:?}"),
-                };
-                let n = match &r[1] {
-                    Value::Integer(i) => i.to_string(),
-                    o => format!("{o:?}"),
-                };
-                let a = match &r[2] {
-                    Value::Float(f) => format!("{f:.3}"),
-                    o => format!("{o:?}"),
-                };
-                format!("{b}/{n}/{a}")
-            })
-            .collect()
-    };
-    let got = fmt(&rows);
     // 期望: 手工分组 offs: [0,1,599]→3行(v 0,1,2 avg 1) ; [600,601,1199]→3行(3,4,5 avg 4) ; [1200,1201]→2行(6,7 avg 6.5)
     // 桶标签的时间值取决于锚点（epoch 对齐 vs 首行对齐）——断言分组结构 +
     // AVG 序列，标签单独按 epoch 对齐验证。
@@ -229,7 +208,7 @@ fn time_bucket_boundaries_match_manual() {
         .iter()
         .map(|r| match &r[2] {
             Value::Float(f) => *f,
-            o => 0.0,
+            _o => 0.0,
         })
         .collect();
     let want_avg = [1.0f64, 4.0, 6.5];
@@ -240,15 +219,15 @@ fn time_bucket_boundaries_match_manual() {
     // base = 2026-11-11T...，不保证整刻 —— 检查相邻桶间距恰为 600s。
     let b0 = match &rows[0][0] {
         Value::Timestamp(t) => t.as_micros(),
-        o => 0,
+        _o => 0,
     };
     let b1 = match &rows[1][0] {
         Value::Timestamp(t) => t.as_micros(),
-        o => 0,
+        _o => 0,
     };
     let b2 = match &rows[2][0] {
         Value::Timestamp(t) => t.as_micros(),
-        o => 0,
+        _o => 0,
     };
     assert_eq!(b1 - b0, min10, "adjacent bucket labels 600s apart");
     assert_eq!(b2 - b1, min10, "adjacent bucket labels 600s apart");

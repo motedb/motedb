@@ -1,5 +1,94 @@
 # Changelog
 
+## [0.18.6] — 开发中
+
+### 🔴 自查: DISTINCT 与文本 IN 列表的静默错误结果
+
+本轮从审计 0.18.3 自己的改动开始，挖出两类自始就存在的错值 bug。每一条
+都先在未修改的 0.18.5 上复现、后修复; 对应的 9 个回归测试在 0.18.5 上
+全部失败。
+
+**`SELECT DISTINCT …`**（物化路径与聚合下推路径各有一份同代码的快路径）
+
+- **带 WHERE 时 WHERE 被整个忽略**: `SELECT DISTINCT c FROM t WHERE …`
+  返回未过滤列的去重值 —— `SELECT DISTINCT id FROM t WHERE v > 10`
+  返回全表行数（已发布的 Python 包 0.18.4 上同样复现）
+- **多列时只按第一列去重，且每行只输出一列**:
+  `SELECT DISTINCT a, b` 声明两列，行里只有一个值
+- **文本列的启发式扫描会静默截断**:
+  - 连续 4096 行没出现新值就提前停止 → 值成簇存放的数据（按主机/地区
+    分堆的日志、时间序表）只返回第一簇的值
+  - 最多返回 10000 个值
+  - NULL 渲染成空字符串；表里一旦有墓碑，NULL 被整个丢掉
+
+  修复: 两处快路径补上 WHERE 守卫; 文本列分支另限定为单列，并改用精确
+  扫描 `distinct_text_values_exact`（全量、无上限、NULL 单独成值）。
+
+**`WHERE text_col IN ('a', 'b', …)`**（≥2 个元素的文本 IN 列表）
+
+- **多段表上返回被 UPDATE 行的旧版本，并复活已删除的行**: 扫描按段从旧
+  到新遍历，却用"首见即胜出"去重（`=` 路径一直是对的）
+- **ORDER BY 在截断之后才生效**: `… ORDER BY id DESC LIMIT 5` 返回最旧
+  的 5 行排成降序; 按其他列排序时结果根本未排序
+- **`LIMIT n OFFSET m` 的 OFFSET 被忽略**（返回的是第一页）
+- 段的拼接顺序取自 HashMap（不确定）; 投影 BOOLEAN 列时越界 panic
+
+  修复: store 侧改走与其它过滤扫描相同的位置选择器（见下节）; 该快
+  路径仅在无 ORDER BY / DISTINCT / GROUP BY 时启用; 分页在位置上进行;
+  按段号升序拼接; 补 BOOLEAN 解码臂。
+
+### 行序统一为 key 序，并修复 0.18.3 引入的 LIMIT 性能回归
+
+- **0.18.3 引入的回归**: 为修"多段表行序翻转"，四条扫描路径被改成
+  "全量物化再排序"，`LIMIT 10` 因此退化为全扫描 —— 30 万行多段表上
+  20ms（单段表 1.2ms，17×）。且 `scan_projected_filtered` 与文本 IN
+  路径当时未改: 向量化执行器开/关两种模式下，同一查询的分页不同。
+- **"段位置序"不是稳定约定**: 段的 key 区间交错时，`WHERE id > 3
+  LIMIT 2` 进程内返回 {5, 7}、重开后返回 {4, 5}; 被更新的行会跳到结果
+  末尾，直到下次合并才跳回原位。
+- **现在**: 无 ORDER BY 时按内部 key 升序返回（整数主键表即主键序），
+  与段布局、重启、CHECKPOINT、UPDATE 无关。
+- **实现**: 跨段按 key 的 k 路归并（同 key 取最新段、墓碑压制旧版本、
+  取满即停）; 各段 key 区间不重叠时（纯追加表的常态）直通顺序扫描，
+  无归并无中间缓冲。`ColSegmentStore::for_each_key_order_row` /
+  `select_doc_order_positions`。
+- **性能（30 万行，release，单机）**: 多段表 `WHERE … LIMIT 10`
+  20ms → 1.6ms（key 区间交错的布局上 < 0.01ms）; 无 LIMIT 的全扫描
+  19ms → 12ms，与单段表持平; 连续分区 / key 交错 / 交错 + 批量 UPDATE /
+  重开之后四种布局上，10 条查询的结果均与单段表逐行相同。
+
+### 聚合快路径的类型缺口
+
+以下三条**只在向量化执行器关闭时出现**（`MOTE_VEC=off`），且表为带
+跨段版本（有 UPDATE/DELETE）的多段表; 默认配置与单段表上未复现。
+均在 0.18.5 上实测复现。
+
+- `COUNT(*)` / `SUM` 对 DATE、TIMESTAMP 列使用文本字面量时返回 0
+  （`WHERE d >= '2026-04-11'`、`WHERE ts >= '2026-11-10 08:40:50'`），
+  而同一条件取行是对的
+- 多个聚合组合且谓词含 `BETWEEN` 时（折叠为多谓词后落入融合聚合），
+  `MIN(ts)` / `MAX(ts)` 返回 `Integer` 而非 `Timestamp`
+
+### 测试
+
+- `test_multiseg_versions_matrix`: 多段 × 跨段版本（UPDATE / DELETE /
+  删后重插）× 35 种谓词 × 4 种投影，对 Rust 镜像 oracle; 无 ORDER BY
+  的结果与 LIMIT/OFFSET 分页精确断言为 key 序; 新建 / 重开 /
+  CHECKPOINT 三种布局
+- `test_layout_order_consistency`: 单段、六段、key 交错六段，及各自重开
+  与 CHECKPOINT 之后，22 种查询形状逐行相同
+- `test_distinct_semantics`: DISTINCT 的 WHERE、多列、成簇数据、25000
+  个不同值、NULL
+- 上述测试在向量化执行器开 / 关两种模式下均通过（CI 默认只跑开启模式）
+
+### 文档
+
+- docs/08 "Query Routing and Recall Trade-offs" 按实测重写: 标明 740 行
+  语料的测量条件（默认门槛下走精确扫描; 测量时把路由门槛调低到 100）、
+  25k 合成数据的构造方式与"查询向量即已存向量"的前提; 删去未经核实的
+  说法
+- FAQ 新增: 无 ORDER BY 时的行序约定
+
 ## [0.18.5] — 2026-11-23
 
 ### 修复: 事务内向量字面量 INSERT 报"Type mismatch: expected Tensor"

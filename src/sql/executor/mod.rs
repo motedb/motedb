@@ -5788,6 +5788,11 @@ impl QueryExecutor {
                             && stmt.order_by.is_none()
                             && stmt.limit.is_none()
                             && stmt.offset.is_none()
+                            // 🔴 WHERE is applied before dedup — this path scans
+                            // the whole table. Without this guard
+                            // `SELECT DISTINCT c FROM t WHERE …` returned the
+                            // distinct values of the unfiltered column.
+                            && stmt.where_clause.is_none()
                         {
                             let schema = self.db.get_table_schema(table_name)?;
                             let out_pos: Vec<usize> =
@@ -5796,17 +5801,27 @@ impl QueryExecutor {
                             if !out_pos.is_empty() {
                                 let dc = out_pos[0];
                                 // 🚀 Fast path: single-column DISTINCT on a TEXT
-                                // column via distinct_text_values (adaptive early-
-                                // exit) instead of materializing+deduping all rows.
-                                if matches!(
-                                    schema.col_types().get(dc),
-                                    Some(crate::types::ColumnType::Text)
-                                ) {
-                                    let vals = store.distinct_text_values(dc, 10000);
-                                    let rows: Vec<Vec<Value>> = vals
+                                // column (exact scan, one allocation per distinct
+                                // value). Exactly ONE selected column: this branch
+                                // emits one value per row, so with `DISTINCT a, b`
+                                // it returned b's values never.
+                                // (`distinct_text_values` — adaptive early-exit +
+                                // 10k cap — silently truncated clustered and
+                                // high-cardinality columns.)
+                                if out_pos.len() == 1
+                                    && matches!(
+                                        schema.col_types().get(dc),
+                                        Some(crate::types::ColumnType::Text)
+                                    )
+                                {
+                                    let (vals, has_null) = store.distinct_text_values_exact(dc);
+                                    let mut rows: Vec<Vec<Value>> = vals
                                         .into_iter()
                                         .map(|v| vec![Value::Text(v.into())])
                                         .collect();
+                                    if has_null {
+                                        rows.push(vec![Value::Null]);
+                                    }
                                     let columns = self
                                         .build_select_columns(&stmt.columns, &schema)
                                         .unwrap_or_default();
@@ -25568,8 +25583,8 @@ impl QueryExecutor {
                 // 全量重建。图候选缺失在 rerank 后不可恢复，memtable
                 // 合并只兜得住部分 stranded 形状（实测增量窗口 p50
                 // 掉到 0.9、min 0.7）。阈值 env MOTE_VEC_REBUILD_RATIO
-                // （默认 0.05 —— 比设计稿 0.2 更保守: 中小规模暴力更快，
-                // 且增量窗口实测召回会衰减，宁早降级）。
+                // （代码默认 0.05，自引入起即如此; 原注释与设计稿写的 0.2
+                // 与代码不符，以代码为准）。
                 let rows = live_rows_probe.unwrap_or(0);
                 let built = self.db.vector_index_len(&index_name).unwrap_or(0);
                 let unindexed = rows.saturating_sub(built);

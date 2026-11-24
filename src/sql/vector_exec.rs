@@ -2733,10 +2733,14 @@ fn strip_alias(e: &Expr, alias: &str) -> Expr {
 /// LIMIT/OFFSET 在拼装前生效（budget = offset+limit，跨段提前终止）。
 /// 返回 None → 旧 scan_projected_filtered 路径原样回退。
 ///
-/// 🔑 行序精确复刻 `scan_projected_filtered`（分页依赖顺序一致）：
-/// 段 new→old（`.rev()`）；段内 need_dedup（多段 ∨ 可能重复键）时 index
-/// 降序 + newest-wins 去重（seen 先于墓碑检查 — 墓碑压制旧版本），
-/// 否则升序 0..n。单段无 dedup 时跳过 load_full_keys（旧路径每查询必做）。
+/// 🔑 行序与 `scan_projected_filtered` 一致（分页依赖顺序一致）: **key 序**
+/// （整数主键表即主键序）。单段表: 段内已按 key 排序，顺序走、取满 budget
+/// 即停。多段表: 行位置由 [`ColSegmentStore::select_doc_order_positions`]
+/// 先行选定（跨段按 key 归并、newest-wins、墓碑压制旧版本、取满即停），
+/// 这里只装被选中行的批次，再按输出槽位拼回。
+/// （0.18.3–0.18.5: 段 new→old 全量物化再按段位置排序 —— `LIMIT 10` 成了
+/// 全扫描（30 万行 17×），且段位置序在 key 区间交错/行被更新时与重开、
+/// 合并之后的顺序不同。）
 pub fn try_vec_projection(
     store: &ColSegmentStore,
     schema: &TableSchema,
@@ -2830,99 +2834,119 @@ pub fn try_vec_projection(
     if segments.iter().any(|s| s.has_any_deleted()) {
         return Ok(None);
     }
-    // 🔑 同 M1: 纯插入多段 (无 overlap) 不去重 — key 唯一。
-    let need_dedup = store.may_have_duplicate_keys();
-    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    // 🔴 多段文档序（与 scan_i64_filtered_limit 同族修复）: 去重仍须
-    // 最新段先走，但输出必须文档序（旧段在前、段内行号升序）——否则同
-    // 查询在拆段后行序整体翻转，LIMIT 窗口跟着取错行。单段保持快路径。
-    let multi_seg = segments.len() > 1;
-    let mut tagged: Vec<(usize, u32, Vec<Value>)> = Vec::new();
-    'outer: for (seg_idx, seg) in segments.iter().enumerate().rev() {
-        let n = seg.row_count;
-        if n == 0 {
-            continue;
-        }
-        let mut cols: Vec<std::sync::Arc<ColumnVector>> = Vec::with_capacity(needed.len());
-        for &c in &needed {
-            let Some(cv) = seg.read_column_batch(c, &cts[c]) else {
-                return Ok(None); // 读取失败（压缩等）→ 回退
-            };
-            cols.push(cv);
-        }
-        let batch = ColumnBatch::new_shared(cols);
-
-        // 可见性 selection（行序语义见函数注释）。
-        let vis: Vec<u32> = if !need_dedup {
-            (0..n)
-                .filter(|&i| !seg.is_row_deleted(i))
-                .map(|i| i as u32)
-                .collect()
-        } else {
-            let keys = seg.keys();
-            let mut v: Vec<u32> = Vec::with_capacity(n);
-            for i in (0..n).rev() {
-                if !seen.insert(keys[i]) {
-                    continue;
-                }
-                if seg.is_row_deleted(i) {
-                    continue;
-                }
-                v.push(i as u32);
-            }
-            v
-        };
-        // 谓词过滤（AND 链单遍短路；混合形状 selection∩vis）。
-        let filtered: Vec<u32> = match &pred {
-            None => vis,
-            Some(p) => {
-                let mut chain: Vec<&VecPredLeaf> = Vec::new();
-                if p.as_and_chain(&mut chain) {
-                    vis.into_iter()
-                        .filter(|&r| {
-                            chain
-                                .iter()
-                                .all(|l| leaf_tv_leaf(&batch.cols, l, r as usize) == TV::True)
-                        })
-                        .collect()
+    // 投影: I64 批的 Timestamp/Date 列包回各自的 Value 变体。
+    let build_row = |batch: &ColumnBatch, i: usize| -> Vec<Value> {
+        proj_meta
+            .iter()
+            .map(|&(bi, is_ts, is_date)| {
+                let cv = &batch.cols[bi];
+                if is_ts {
+                    crate::storage::colbatch::i64_vec_as_timestamp(cv, i)
+                } else if is_date {
+                    crate::storage::colbatch::i64_vec_get(cv, i)
+                        .map(|d| Value::Date(crate::types::Date::from_days(d as i32)))
+                        .unwrap_or(Value::Null)
                 } else {
-                    let set: std::collections::HashSet<u32> = p.eval_sel(&batch).iter().collect();
-                    vis.into_iter().filter(|r| set.contains(r)).collect()
+                    cv.get(i)
+                }
+            })
+            .collect()
+    };
+    // 谓词对单行求值（AND 链逐叶短路；混合形状用整段的 selection）。
+    let row_passes = |p: &VecPred,
+                      batch: &ColumnBatch,
+                      sel_set: &mut Option<std::collections::HashSet<u32>>,
+                      i: usize|
+     -> bool {
+        let mut chain: Vec<&VecPredLeaf> = Vec::new();
+        if p.as_and_chain(&mut chain) {
+            chain
+                .iter()
+                .all(|l| leaf_tv_leaf(&batch.cols, l, i) == TV::True)
+        } else {
+            let set = sel_set.get_or_insert_with(|| p.eval_sel(batch).iter().collect());
+            set.contains(&(i as u32))
+        }
+    };
+
+    if segments.len() > 1 && !store.key_ranges_disjoint(&segments) {
+        // 📐 key 区间交错的段（或行被更新过）: 跨段按 key 归并，行直接在
+        // 回调里构造 —— 没有位置表、没有槽位缓冲。批次按段惰性装载。
+        let mut batches: Vec<Option<ColumnBatch>> = vec![None; segments.len()];
+        let mut sel_sets: Vec<Option<std::collections::HashSet<u32>>> = vec![None; segments.len()];
+        let mut load_failed = false;
+        store.for_each_key_order_row(&segments, budget, &mut |s, i| {
+            if batches[s].is_none() {
+                let seg = &segments[s];
+                let mut cols: Vec<std::sync::Arc<ColumnVector>> = Vec::with_capacity(needed.len());
+                for &c in &needed {
+                    match seg.read_column_batch(c, &cts[c]) {
+                        Some(cv) => cols.push(cv),
+                        None => {
+                            load_failed = true;
+                            return false;
+                        }
+                    }
+                }
+                batches[s] = Some(ColumnBatch::new_shared(cols));
+            }
+            let batch = batches[s].as_ref().unwrap();
+            if let Some(p) = &pred {
+                if !row_passes(p, batch, &mut sel_sets[s], i) {
+                    return false;
                 }
             }
-        };
-        // 边界行拼装（budget 内；多段先全量收集后统一重排分页）。
-        for r in filtered {
-            if !multi_seg && rows_out.len() >= budget {
-                break 'outer;
+            rows_out.push(build_row(batch, i));
+            true
+        });
+        if load_failed {
+            return Ok(None); // 读取失败（压缩等）→ 回退
+        }
+    } else {
+        // 🚀 直通: 单段，或各段 key 区间不重叠（纯追加表的常态）——
+        // 段内已按 key 排序，段顺序拼接即 key 序; 取满 budget 即停。
+        'outer: for seg in segments.iter() {
+            let n = seg.row_count;
+            if n == 0 {
+                continue;
             }
-            let i = r as usize;
-            let row: Vec<Value> = proj_meta
-                .iter()
-                .map(|&(bi, is_ts, is_date)| {
-                    let cv = &batch.cols[bi];
-                    if is_ts {
-                        crate::storage::colbatch::i64_vec_as_timestamp(cv, i)
-                    } else if is_date {
-                        crate::storage::colbatch::i64_vec_get(cv, i)
-                            .map(|d| Value::Date(crate::types::Date::from_days(d as i32)))
-                            .unwrap_or(Value::Null)
+            let mut cols: Vec<std::sync::Arc<ColumnVector>> = Vec::with_capacity(needed.len());
+            for &c in &needed {
+                let Some(cv) = seg.read_column_batch(c, &cts[c]) else {
+                    return Ok(None); // 读取失败（压缩等）→ 回退
+                };
+                cols.push(cv);
+            }
+            let batch = ColumnBatch::new_shared(cols);
+
+            // 谓词过滤（AND 链单遍短路；混合形状 selection）。
+            let rows: Vec<u32> = match &pred {
+                None => (0..n as u32).collect(),
+                Some(p) => {
+                    let mut chain: Vec<&VecPredLeaf> = Vec::new();
+                    if p.as_and_chain(&mut chain) {
+                        (0..n as u32)
+                            .filter(|&r| {
+                                chain
+                                    .iter()
+                                    .all(|l| leaf_tv_leaf(&batch.cols, l, r as usize) == TV::True)
+                            })
+                            .collect()
                     } else {
-                        cv.get(i)
+                        let set: std::collections::HashSet<u32> =
+                            p.eval_sel(&batch).iter().collect();
+                        (0..n as u32).filter(|r| set.contains(r)).collect()
                     }
-                })
-                .collect();
-            if multi_seg {
-                tagged.push((seg_idx, r, row));
-            } else {
-                rows_out.push(row);
+                }
+            };
+            for r in rows {
+                if rows_out.len() >= budget {
+                    break 'outer;
+                }
+                rows_out.push(build_row(&batch, r as usize));
             }
         }
-    }
-    if multi_seg {
-        tagged.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-        rows_out.extend(tagged.into_iter().map(|(_, _, r)| r));
     }
     // LIMIT/OFFSET：拼装后的最后一跳（budget 已限总量）。
     if offset > 0 {

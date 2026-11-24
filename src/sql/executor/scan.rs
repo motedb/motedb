@@ -890,6 +890,17 @@ impl QueryExecutor {
         // HashSet<Value> per row (with ArcString alloc per row). This path
         // uses scan_row_indices_in_set (raw byte HashSet check, zero alloc).
         if let Some((col_pos, ref set)) = in_hashset {
+            // 🔴 This fast path pages the SCAN (`offset + limit` rows) and
+            // returns them as-is. With ORDER BY / DISTINCT / GROUP BY the
+            // caller would sort or dedup AFTER that truncation:
+            // `… WHERE cat IN ('a','b') ORDER BY id DESC LIMIT 5` returned the
+            // five OLDEST matches in descending order, OFFSET was applied
+            // before the sort, and secondary sort keys never got a chance.
+            // Those shapes take the general filtered scan below instead.
+            let returns_as_is = stmt.order_by.is_none()
+                && !stmt.distinct
+                && stmt.group_by.is_none()
+                && stmt.having.is_none();
             // 🚀 Raw-byte IN-set scan for TEXT columns. Uses scan_row_indices_in_set
             // which does zero-allocation HashSet<&[u8]> matching via
             // TextSegment::in_set_match_indices — a single-pass raw byte scan
@@ -900,7 +911,10 @@ impl QueryExecutor {
             // Now we pre-decode each output column once per segment, then index
             // into the pre-decoded data by local_row — converting 100K scattered
             // decodes into 4 sequential column reads + 100K cheap indexed lookups.
-            if matches!(col_types.get(col_pos), Some(ColumnType::Text)) && set.len() > 1 {
+            if returns_as_is
+                && matches!(col_types.get(col_pos), Some(ColumnType::Text))
+                && set.len() > 1
+            {
                 // Build a HashSet<&[u8]> from the Value set (once, not per-row).
                 let byte_set: crate::storage::lsm::columnar::ByteSet = set
                     .iter()
@@ -920,15 +934,28 @@ impl QueryExecutor {
                         offset.saturating_add(limit),
                     ) {
                         let segs = store.segments_snapshot();
-                        let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
+                        let mut rows_out: Vec<Option<Vec<Value>>> =
+                            vec![None; indices.len().min(offset.saturating_add(limit))];
                         // Group indices by segment for sequential pre-decode.
-                        let mut by_seg: std::collections::HashMap<usize, Vec<usize>> =
-                            std::collections::HashMap::new();
-                        for &(seg_idx, local_row) in indices.iter() {
-                            by_seg.entry(seg_idx).or_default().push(local_row);
+                        // 📐 分页在位置上进行（已是 key 序）: 旧的按段 `take(limit)`
+                        // 既从不 skip(offset)（`LIMIT n OFFSET m` 返回的是第一页），
+                        // 又把 LIMIT 在每个段各用一次。按段分组解码（段升序）:
+                        // 位置按段连续时（纯追加表的常态）结果直接追加; 各段
+                        // key 交错时按输出槽位写回。
+                        let page: Vec<(usize, usize)> =
+                            indices.iter().skip(offset).take(limit).copied().collect();
+                        let segment_major = page.windows(2).all(|w| w[0].0 <= w[1].0);
+                        let mut by_seg: Vec<Vec<(usize, usize)>> = vec![Vec::new(); segs.len()];
+                        for (slot, &(seg_idx, local_row)) in page.iter().enumerate() {
+                            by_seg[seg_idx].push((slot, local_row));
                         }
-                        for (seg_idx, row_indices) in &by_seg {
-                            let seg = match segs.get(*seg_idx) {
+                        let mut appended: Vec<Vec<Value>> = Vec::with_capacity(page.len());
+                        for seg_idx in 0..segs.len() {
+                            let row_indices = &by_seg[seg_idx];
+                            if row_indices.is_empty() {
+                                continue;
+                            }
+                            let seg = match segs.get(seg_idx) {
                                 Some(s) => s,
                                 None => continue,
                             };
@@ -968,6 +995,11 @@ impl QueryExecutor {
                                                     })
                                                 })
                                                 .collect(),
+                                            // 🔴 BOOLEAN 列是 1 字节布局 —— get_i64
+                                            // 会越界 panic（同 0.18.3 修过的四处）。
+                                            Some(ColumnType::Boolean) => (0..seg.sst.num_rows)
+                                                .map(|i| f.get_bool(i).map(Value::Bool))
+                                                .collect(),
                                             _ => (0..seg.sst.num_rows)
                                                 .map(|i| f.get_i64(i).map(Value::Integer))
                                                 .collect(),
@@ -985,19 +1017,27 @@ impl QueryExecutor {
                                 col_data.push(decoded);
                             }
                             // Materialize matched rows from pre-decoded data.
-                            for &local_row in row_indices.iter().take(limit) {
+                            for &(slot, local_row) in row_indices.iter() {
                                 let row: Vec<Value> = col_data
                                     .iter()
                                     .map(|col| {
                                         col.get(local_row).cloned().flatten().unwrap_or(Value::Null)
                                     })
                                     .collect();
-                                result.push(row);
+                                if segment_major {
+                                    appended.push(row);
+                                } else {
+                                    rows_out[slot] = Some(row);
+                                }
                             }
                         }
                         return Ok(StreamingQueryResult::SelectReady {
                             columns,
-                            rows: result,
+                            rows: if segment_major {
+                                appended
+                            } else {
+                                rows_out.into_iter().flatten().collect()
+                            },
                         });
                     }
                 }
@@ -1528,13 +1568,14 @@ impl QueryExecutor {
                             // test_update_indexed_column_moves_entry bug).
                             let _ = store.flush_buffer();
                             let target_bytes = tv.as_str().as_bytes();
-                            if let Some(indices) = store.scan_row_indices_eq(
+                            // 📐 key 序 + newest-wins + 取满即停（单段/多段同一
+                            // 约定，见 select_doc_order_positions）。0.18.3–0.18.5
+                            // 这里取全量命中再排序，让单段表的 LIMIT 也退化成
+                            // 全扫描。
+                            if let Some(indices) = store.scan_row_indices_eq_doc_order(
                                 fc,
                                 target_bytes,
-                                // 🔴 多段分支必须取全量命中: store 端按"最新优先"
-                                // 序截断 offset+limit 会取走最新 N 条，文档序
-                                // 重排后分页窗口错位。单段不走此分支。
-                                usize::MAX,
+                                offset.saturating_add(limit),
                             ) {
                                 let segs = store.segments_snapshot();
                                 // Build SelectColumnar with matched row indices.
@@ -1582,24 +1623,25 @@ impl QueryExecutor {
                                 // a full column read per row (and a full zstd
                                 // decompression per call in compact mode):
                                 // O(N²) on 100K matches ≈ 568s in compact mode.
-                                let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
-                                // 🔴 文档序: scan_row_indices_eq 按"最新版本优先"
-                                // （段倒序 × 段内行号倒序）返回，HashMap 分组还会
-                                // 引入随机迭代序。先把命中按 (段号, 行号) 升序
-                                // 排序，再统一应用 offset/limit —— 否则行序在
-                                // 拆段/重开后翻转，分页窗口取错行。
-                                let mut ordered: Vec<(usize, usize)> = indices.clone();
-                                ordered.sort_unstable();
-                                let mut by_seg: std::collections::HashMap<usize, Vec<usize>> =
-                                    std::collections::HashMap::new();
-                                for &(seg_idx, local_row) in ordered.iter().skip(offset).take(limit)
-                                {
-                                    by_seg.entry(seg_idx).or_default().push(local_row);
+                                let mut rows_out: Vec<Option<Vec<Value>>> =
+                                    vec![None; indices.len().min(offset.saturating_add(limit))];
+                                // 📐 位置是 key 序。按段分组解码（段内行号升序）:
+                                // 位置按段连续时（纯追加表的常态）结果直接追加;
+                                // 各段 key 交错时按输出槽位写回。
+                                let page: Vec<(usize, usize)> =
+                                    indices.iter().skip(offset).take(limit).copied().collect();
+                                let segment_major = page.windows(2).all(|w| w[0].0 <= w[1].0);
+                                let mut by_seg: Vec<Vec<(usize, usize)>> =
+                                    vec![Vec::new(); segs.len()];
+                                for (slot, &(seg_idx, local_row)) in page.iter().enumerate() {
+                                    by_seg[seg_idx].push((slot, local_row));
                                 }
-                                let mut seg_order: Vec<usize> = by_seg.keys().copied().collect();
-                                seg_order.sort_unstable();
-                                for seg_idx in seg_order {
-                                    let local_rows = &by_seg[&seg_idx];
+                                let mut appended: Vec<Vec<Value>> = Vec::with_capacity(page.len());
+                                for seg_idx in 0..segs.len() {
+                                    let local_rows = &by_seg[seg_idx];
+                                    if local_rows.is_empty() {
+                                        continue;
+                                    }
                                     let seg = match segs.get(seg_idx) {
                                         Some(s) => s,
                                         None => continue,
@@ -1660,7 +1702,7 @@ impl QueryExecutor {
                                         };
                                         col_data.push(decoded);
                                     }
-                                    for &local_row in local_rows {
+                                    for &(slot, local_row) in local_rows {
                                         let row: Vec<Value> = col_data
                                             .iter()
                                             .map(|col| {
@@ -1670,12 +1712,20 @@ impl QueryExecutor {
                                                     .unwrap_or(Value::Null)
                                             })
                                             .collect();
-                                        result.push(row);
+                                        if segment_major {
+                                            appended.push(row);
+                                        } else {
+                                            rows_out[slot] = Some(row);
+                                        }
                                     }
                                 }
                                 return Ok(StreamingQueryResult::SelectReady {
                                     columns,
-                                    rows: result,
+                                    rows: if segment_major {
+                                        appended
+                                    } else {
+                                        rows_out.into_iter().flatten().collect()
+                                    },
                                 });
                             }
                         }

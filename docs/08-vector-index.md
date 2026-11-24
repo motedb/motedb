@@ -91,41 +91,56 @@ let candidates = db.vector_search("docs_embedding", &query_vec, 10)?;
 
 ## Query Routing and Recall Trade-offs
 
-Two SQL spellings reach the vector index, with different quality/speed
-trade-offs (measured on real bge-small-zh 512-dim document embeddings,
-740 vectors, 44 zh/en queries — ground truth = exact cosine scan):
+Two SQL spellings reach the vector index:
 
-| Spelling | Path | Recall@10 | Latency (740 rows) |
-|---|---|---|---|
-| `ORDER BY emb <-> ?` | graph candidates (overfetch ~4x) + exact rerank | ~99.8% | ~0.6 ms |
-| `WHERE KNN_SEARCH(emb, ?, k)` | direct graph search | ~97-98% | ~0.25 ms |
+| Spelling | Path | Guard rails |
+|---|---|---|
+| `ORDER BY emb <-> ?` | graph candidates, then an exact re-rank of them | row floor and freshness fallback (below) |
+| `WHERE KNN_SEARCH(emb, ?, k)` | a single index lookup, no re-rank | none — it always reads the graph |
 
 Routing rules for `ORDER BY emb <-> ?`:
 
-- **Below `MOTE_VEC_INDEX_MIN_ROWS` (default 20,000 live rows) the engine
-  always runs an exact brute-force scan** — at small scale exactness is
-  free and the graph adds latency without benefit.
-- With an index and enough rows, the graph serves the query unless more
-  than `MOTE_VEC_REBUILD_RATIO` (default 0.05) of live rows are newer
-  than the last graph build — then the query falls back to an exact scan
-  and a background rebuild is triggered.
-- Rows inserted after the graph build are still visible to both paths
-  (write-buffer merge) — recall degrades only inside the incremental
-  window above the freshness ratio, which triggers the fallback.
+- **Below `MOTE_VEC_INDEX_MIN_ROWS` (default 20,000 live rows) it runs an
+  exact scan**, not the graph.
+- With an index and at least that many rows, the graph serves the query
+  until more than `MOTE_VEC_REBUILD_RATIO` (default 0.05) of the live rows
+  are newer than the last graph build. Past that, the query falls back to
+  an exact scan and a background rebuild starts.
+- Rows inserted after the build stay visible to both spellings (checked
+  with a probe insert). The source comments also record recall dropping
+  while such un-indexed rows accumulate (p50 0.9, min 0.7 inside that
+  window) — not re-measured here. `ORDER BY … <->` leaves the window by
+  falling back to the exact scan; `KNN_SEARCH` does not.
+- The query vector may be written quoted (`'[1.0, 2.0]'`) or bare
+  (`[1.0, 2.0]`) in either spelling. A wrong-dimension vector raises
+  `Invalid argument: Vector dimension mismatch`.
 
-The query vector accepts both `'[1.0, 2.0]'` (quoted) and `[1.0, 2.0]`
-(bare) literals in both spellings; a wrong-dimension query vector raises
-`Invalid argument: Vector dimension mismatch` in both spellings.
+### Measured recall@10
 
-**Recall vs data distribution** (25k x 64-dim synthetic, self-queries,
-default build R=64/L=300): uniform R@10 = 0.990, moderately clustered
-(cluster jitter ±0.4) R@10 = 0.998. Pathologically tight clusters (jitter
-±0.1 with 20x centroid separation — near-degenerate neighbor ties) degrade
-defaults to R@10 ≈ 0.62; rebuilding with
-`WITH (search_list = 1000, max_degree = 128)` restores R@10 = 1.000 at
-~0.8 ms p50. If your embeddings are extremely clustered (very low
-intra-class variance), raise `search_list` / `max_degree` before
-concluding the index lost data.
+| Corpus | `ORDER BY emb <-> ?` | `KNN_SEARCH` |
+|---|---|---|
+| 740 real text chunks, bge-small-zh-v1.5 (512-dim), 44 new zh/en queries | 99.8% | 98.1% |
+| 25k x 64-dim synthetic, i.i.d. uniform | 99.0% | 98.4% |
+| 25k x 64-dim, 50 clusters, coordinates within +/-0.4 of the centroid | 99.8% | 98.6% |
+| 25k x 64-dim, 50 clusters, coordinates within +/-0.1 of the centroid | 62.2% | 60.4% |
+| same corpus, index built `WITH (search_list = 1000, max_degree = 128)` | 100% | 95.2% |
+
+How to read this table:
+
+- The 740-row corpus is **below the default routing floor**. It was measured
+  with `MOTE_VEC_INDEX_MIN_ROWS=100` so that the graph is exercised; with
+  default settings it is served by the exact scan and recall is 100%.
+  Ground truth is an exact scan of the same L2-normalized vectors.
+- In the synthetic rows each query vector is one of the stored vectors.
+- Latency (p50, warm, in-process, one Apple-silicon laptop): 740 rows —
+  0.6 ms vs 0.25 ms; 25k rows — 0.6-0.8 ms vs 0.1-0.4 ms.
+- The +/-0.1 row is a stress construction, far denser than ordinary text
+  embeddings. Real embeddings have only been measured at the 740-row
+  scale, so the 25k rows say how the index behaves on those shapes, not
+  what your model's output will do.
+
+If recall on your own data is lower than you need, rebuild the index with
+a larger `search_list` / `max_degree` before concluding that it lost data.
 
 ## Tuning Recommendations
 

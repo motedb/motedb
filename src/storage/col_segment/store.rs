@@ -1337,6 +1337,7 @@ impl ColSegmentStore {
         predicate: &dyn Fn(Option<&Value>) -> bool,
         max_results: usize,
     ) -> Vec<(u64, Vec<Value>)> {
+        use crate::storage::lsm::columnar::{FixedSegment, TextSegment};
         // Snapshot col_types once for the whole scan — guards against a
         // concurrent ALTER swapping in a new layout mid-scan.
         let col_types = self.col_types.load();
@@ -1361,51 +1362,68 @@ impl ColSegmentStore {
         //
         // For single-segment tables with no UPDATE history, keys are already
         // unique, so we skip dedup entirely (need_dedup=false) — zero overhead.
-        let need_dedup = !single_seg || self.may_have_duplicate_keys();
-        let mut seen: std::collections::HashSet<u64> = if need_dedup {
-            std::collections::HashSet::with_capacity(total_rows)
+        let need_dedup = !single_seg;
+        let fcol_type: Option<&ColumnType> = filter_col.and_then(|fc| col_types.get(fc));
+        // 📐 Not direct (several segments whose key ranges overlap): select
+        // the row positions first — ascending key order, newest version of
+        // each key only, stopping after `max_results` hits — then decode
+        // only those. Until 0.18.6 this branch walked newest-first and kept
+        // the first hits, so `… LIMIT n` returned the NEWEST rows of a
+        // multi-segment table while a single-segment one returned the
+        // oldest.
+        let selected: Vec<(usize, usize)> = if need_dedup {
+            let mut cur: Option<(usize, Option<FixedSegment>, Option<TextSegment>)> = None;
+            self.select_doc_order_positions(&segs, max_results, &mut |s, i| {
+                let seg = &segs[s];
+                if cur.as_ref().is_none_or(|(cs, _, _)| *cs != s) {
+                    let (ff, ft) = Self::scan_filter_columns(seg, filter_col);
+                    cur = Some((s, ff, ft));
+                }
+                if seg.sst.row_map.is_deleted(i) {
+                    return false;
+                }
+                let Some(_) = filter_col else {
+                    return true;
+                };
+                let (_, ff, ft) = cur.as_ref().unwrap();
+                let fval = Self::scan_filter_value(
+                    seg,
+                    i,
+                    filter_col,
+                    fcol_type,
+                    ff.as_ref(),
+                    ft.as_ref(),
+                );
+                predicate(fval.as_ref())
+            })
         } else {
-            std::collections::HashSet::new()
+            Vec::new()
         };
-        for seg in segs.iter().rev() {
+        // Decoded rows are bucketed per segment and concatenated oldest-first.
+        // 📐 key 序下各段的位置是交错的: 结果按输出槽位装配 —— 选中的位置
+        // 先按段分组（段内仍按行号升序），各段只解码自己那几行，最后按
+        // 槽位拼回。
+        let mut slots: Vec<Option<(u64, Vec<Value>)>> = vec![None; selected.len()];
+        let mut by_seg: Vec<Vec<(usize, usize)>> = vec![Vec::new(); segs.len()];
+        for (slot, &(s, i)) in selected.iter().enumerate() {
+            by_seg[s].push((slot, i));
+        }
+        for (seg_idx, seg) in segs.iter().enumerate().rev() {
+            // No selected row in this (usually newer) segment: skip its setup.
+            let picks: Option<&Vec<(usize, usize)>> = if need_dedup {
+                let p = &by_seg[seg_idx];
+                if p.is_empty() {
+                    continue;
+                }
+                Some(p)
+            } else {
+                None
+            };
             let n = seg.sst.num_rows;
             let _ = seg.sst.load_full_keys();
-            // Descending index order within a segment: rows are appended old→new,
-            // so iterating n→0 visits the newest (largest index) version of a key
-            // first. Combined with `seen`, this keeps the newest version.
-            // 🚀 #7: no-dedup 路径无需分配 Vec<usize>（2M 行段 = 16MB）——直接迭代。
-            let order: Vec<usize> = if need_dedup {
-                (0..n).rev().collect()
-            } else {
-                // 非空 Vec 占位——实际循环用 0..n 迭代器，不消耗这个 Vec。
-                Vec::new()
-            };
 
             // Pre-decode filter column (once per segment).
-            let fcol_fixed = filter_col.and_then(|fc| {
-                if fc < seg.sst.column_tags.len() && seg.sst.column_tags[fc].is_fixed() {
-                    seg.sst.read_fixed_i64(fc).ok()
-                } else {
-                    None
-                }
-            });
-            let fcol_text = filter_col.and_then(|fc| {
-                // 🔴 TEXT tag only: Vector/Spatial columns are also
-                // non-fixed, and read_text_cached on them yields empty
-                // strings — a WHERE over a VECTOR column then filtered
-                // against Text("") for every row.
-                if fc < seg.sst.column_tags.len()
-                    && matches!(
-                        seg.sst.column_tags[fc],
-                        crate::storage::lsm::columnar::ColumnTypeTag::Text
-                    )
-                {
-                    seg.read_text_cached(fc)
-                } else {
-                    None
-                }
-            });
-            let fcol_type = filter_col.and_then(|fc| col_types.get(fc));
+            let (fcol_fixed, fcol_text) = Self::scan_filter_columns(seg, filter_col);
 
             // 🔑 PERF: do NOT pre-intern the entire text column (was 300K ArcString
             // allocations even when 99% of rows are filtered out by the predicate).
@@ -1496,22 +1514,17 @@ impl ColSegmentStore {
                 .iter()
                 .all(|&pc| pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed());
 
-            // 🚀 #7: 非 dedup 路径用 0..n 迭代器（零分配），dedup 用 order Vec。
-            // 用 Box<dyn Iterator> 统一两种迭代，避免循环体重复。
-            let row_iter: Box<dyn Iterator<Item = usize>> = if need_dedup {
-                Box::new(order.iter().copied())
-            } else {
-                Box::new(0..n)
+            // 🚀 #7: 非 dedup 路径用 0..n 迭代器（零分配）; dedup 路径只访问
+            // 被选中的行。用 Box<dyn Iterator> 统一两种迭代，避免循环体重复。
+            // (输出槽位, 行号): 多段只访问被选中的行。
+            let visits: Box<dyn Iterator<Item = (Option<usize>, usize)>> = match picks {
+                Some(p) => Box::new(p.iter().map(|&(slot, i)| (Some(slot), i))),
+                None => Box::new((0..n).map(|i| (None, i))),
             };
 
-            for i in row_iter {
+            for (slot, i) in visits {
                 let key = seg.sst.row_map.key(i);
-                // Newest-version-wins dedup: skip if a newer version of this key
-                // was already emitted. Mark seen BEFORE the deleted check so a
-                // tombstone in a newer version suppresses older live rows.
-                if need_dedup && !seen.insert(key) {
-                    continue;
-                }
+                // (newest-wins was settled by the position selector)
                 if seg.sst.row_map.is_deleted(i) {
                     continue;
                 }
@@ -1519,47 +1532,15 @@ impl ColSegmentStore {
                 // 🚀 #A: 无过滤时跳过 fval 构造 + predicate 调用。
                 // 当 filter_col=None（SELECT * 无 WHERE），每行不必构造 Value
                 // 和调 predicate（省 Value 构造 + 闭包间接调用）。
-                if filter_col.is_some() {
-                    let fval: Option<Value> = {
-                        let v = if let Some(ref f) = fcol_fixed {
-                            match fcol_type {
-                                Some(ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
-                                Some(ColumnType::Float) => f.get_f64(i).map(Value::Float),
-                                Some(ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
-                                Some(ColumnType::Timestamp) => f.get_i64(i).map(|m| {
-                                    Value::Timestamp(crate::types::Timestamp::from_micros(m))
-                                }),
-                                // 🔴 DATE 过滤列此前落 `_ => None` → 谓词拿到
-                                // None，`WHERE d >= '…'` 在此路径上静默过滤掉
-                                // 所有行（#18 家族：路径相关的静默错误结果）。
-                                Some(ColumnType::Date) => f
-                                    .get_i64(i)
-                                    .map(|d| Value::Date(crate::types::Date::from_days(d as i32))),
-                                _ => None,
-                            }
-                        } else if let Some(ref t) = fcol_text {
-                            // 🔖 BLOB filter column: verbatim bytes — get_str
-                            // lossy-NULLs non-UTF-8 payloads, silently failing
-                            // every WHERE over a blob column.
-                            if matches!(fcol_type, Some(ColumnType::Blob)) {
-                                t.get_bytes(i)
-                                    .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec())))
-                            } else {
-                                t.get_str(i).map(|s| Value::Text(s.into()))
-                            }
-                        } else if let (Some(fc), Some(ct)) = (filter_col, fcol_type) {
-                            // 🔴 Var-width filter columns (VECTOR / SPATIAL):
-                            // decode per row through the general reader — the
-                            // fixed/text readers above cover everything else.
-                            // Per-row cost is acceptable: vector-column WHERE
-                            // predicates are rare and the general reader is
-                            // the only correct decoder for the tag.
-                            Some(seg.read_column_at_idx(i, fc, ct))
-                        } else {
-                            None
-                        };
-                        v
-                    };
+                if !need_dedup && filter_col.is_some() {
+                    let fval = Self::scan_filter_value(
+                        seg,
+                        i,
+                        filter_col,
+                        fcol_type,
+                        fcol_fixed.as_ref(),
+                        fcol_text.as_ref(),
+                    );
                     if !predicate(fval.as_ref()) {
                         continue;
                     }
@@ -1726,14 +1707,98 @@ impl ColSegmentStore {
                         row.push(v.unwrap_or(Value::Null));
                     }
                 } // end else (non-lazy)
-                result.push((key, row));
-                // 🚀 LIMIT early-termination: stop scanning once we have enough rows.
-                if result.len() >= max_results {
-                    return result;
+                if need_dedup {
+                    slots[slot.expect("selected row has an output slot")] = Some((key, row));
+                } else {
+                    result.push((key, row));
+                    // 🚀 LIMIT early-termination: stop once we have enough rows.
+                    if result.len() >= max_results {
+                        return result;
+                    }
                 }
             }
         }
+        // 按槽位拼回 = key 序。
+        result.extend(slots.into_iter().flatten());
         result
+    }
+
+    /// Filter-column decoders for [`Self::scan_projected_filtered_limit`].
+    fn scan_filter_columns(
+        seg: &Segment,
+        filter_col: Option<usize>,
+    ) -> (
+        Option<crate::storage::lsm::columnar::FixedSegment>,
+        Option<crate::storage::lsm::columnar::TextSegment>,
+    ) {
+        let fcol_fixed = filter_col.and_then(|fc| {
+            if fc < seg.sst.column_tags.len() && seg.sst.column_tags[fc].is_fixed() {
+                seg.sst.read_fixed_i64(fc).ok()
+            } else {
+                None
+            }
+        });
+        let fcol_text = filter_col.and_then(|fc| {
+            // 🔴 TEXT tag only: Vector/Spatial columns are also non-fixed,
+            // and read_text_cached on them yields empty strings — a WHERE
+            // over a VECTOR column then filtered against Text("") for every
+            // row.
+            if fc < seg.sst.column_tags.len()
+                && matches!(
+                    seg.sst.column_tags[fc],
+                    crate::storage::lsm::columnar::ColumnTypeTag::Text
+                )
+            {
+                seg.read_text_cached(fc)
+            } else {
+                None
+            }
+        });
+        (fcol_fixed, fcol_text)
+    }
+
+    /// Filter-column value of row `i` for [`Self::scan_projected_filtered_limit`]
+    /// — shared by the row loop and its position selector so the two cannot
+    /// drift. BLOB payloads come back as verbatim bytes (get_str would
+    /// lossy-NULL non-UTF-8 data); var-width columns go through the general
+    /// reader, the only correct decoder for their tag.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_filter_value(
+        seg: &Segment,
+        i: usize,
+        filter_col: Option<usize>,
+        fcol_type: Option<&ColumnType>,
+        fcol_fixed: Option<&crate::storage::lsm::columnar::FixedSegment>,
+        fcol_text: Option<&crate::storage::lsm::columnar::TextSegment>,
+    ) -> Option<Value> {
+        if let Some(f) = fcol_fixed {
+            match fcol_type {
+                Some(ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
+                Some(ColumnType::Float) => f.get_f64(i).map(Value::Float),
+                Some(ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
+                Some(ColumnType::Timestamp) => f
+                    .get_i64(i)
+                    .map(|m| Value::Timestamp(crate::types::Timestamp::from_micros(m))),
+                // 🔴 DATE 过滤列此前落 `_ => None` → 谓词拿到 None，
+                // `WHERE d >= '…'` 在此路径上静默过滤掉所有行（#18 家族:
+                // 路径相关的静默错误结果）。
+                Some(ColumnType::Date) => f
+                    .get_i64(i)
+                    .map(|d| Value::Date(crate::types::Date::from_days(d as i32))),
+                _ => None,
+            }
+        } else if let Some(t) = fcol_text {
+            if matches!(fcol_type, Some(ColumnType::Blob)) {
+                t.get_bytes(i)
+                    .map(|b| Value::Blob(crate::types::ArcBytes::new(b.to_vec())))
+            } else {
+                t.get_str(i).map(|s| Value::Text(s.into()))
+            }
+        } else if let (Some(fc), Some(ct)) = (filter_col, fcol_type) {
+            Some(seg.read_column_at_idx(i, fc, ct))
+        } else {
+            None
+        }
     }
 
     /// High-performance scan with a Text (&str) predicate on the filter column.
@@ -2001,58 +2066,26 @@ impl ColSegmentStore {
         targets: &crate::storage::lsm::columnar::ByteSet,
         limit: usize,
     ) -> Option<Vec<(usize, usize)>> {
+        // 🔴 Was: segments oldest→newest with a first-sight-wins seen set —
+        // on a multi-segment table that kept the OLDEST version of a key, so
+        // `WHERE cat IN ('a', 'b')` returned pre-UPDATE values and
+        // resurrected deleted rows (the `=` path was correct). Now the same
+        // key-order + newest-wins selector every other filtered scan uses.
         let segs = self.segments_snapshot();
-        let single_seg = segs.len() <= 1;
-        let mut indices: Vec<(usize, usize)> = Vec::with_capacity(1024);
-        let mut seen: std::collections::HashSet<u64> = if single_seg {
-            std::collections::HashSet::new()
-        } else {
-            std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
-        };
-        for (sidx, seg) in segs.iter().enumerate() {
-            let _ = seg.sst.load_full_keys();
-            let ftext = match seg.read_text_cached(filter_col) {
-                Some(t) => t,
-                None => continue,
-            };
-            let has_deletions = seg.sst.row_map.has_any_deleted();
-            if !has_deletions {
-                let matched = ftext.in_set_match_indices(targets);
-                for &i in &matched {
-                    if !single_seg {
-                        let key = seg.sst.row_map.key(i);
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                    }
-                    indices.push((sidx, i));
-                    if indices.len() >= limit {
-                        return Some(indices);
-                    }
-                }
-            } else {
-                for i in 0..seg.sst.num_rows {
-                    if !single_seg {
-                        let key = seg.sst.row_map.key(i);
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                    }
-                    if seg.sst.row_map.is_deleted(i) {
-                        continue;
-                    }
-                    if let Some(s) = ftext.get_str(i) {
-                        if targets.contains(s.as_bytes()) {
-                            indices.push((sidx, i));
-                            if indices.len() >= limit {
-                                return Some(indices);
-                            }
-                        }
-                    }
-                }
+        let mut cur: Option<(usize, Option<crate::storage::lsm::columnar::TextSegment>)> = None;
+        Some(self.select_doc_order_positions(&segs, limit, &mut |s, i| {
+            let seg = &segs[s];
+            if cur.as_ref().is_none_or(|(cs, _)| *cs != s) {
+                cur = Some((s, seg.read_text_cached(filter_col)));
             }
-        }
-        Some(indices)
+            if seg.sst.row_map.is_deleted(i) {
+                return false;
+            }
+            cur.as_ref()
+                .and_then(|(_, t)| t.as_ref())
+                .and_then(|t| t.get_str(i))
+                .is_some_and(|v| targets.contains(v.as_bytes()))
+        }))
     }
 
     /// Legacy single-segment variant — kept for backward compat.
@@ -2125,6 +2158,217 @@ impl ColSegmentStore {
     /// 1. Early exit: stops as soon as `limit` matches are collected.
     /// 2. Skips per-segment key sort + HashSet for the single-segment common
     ///    case (no dedup needed → natural 0..n order, saves O(N log N)).
+    /// Comparison target brought into the filter column's own representation.
+    ///
+    /// 🔴 DATE columns store days and TIMESTAMP columns microseconds, and the
+    /// raw comparators in `count_filtered` / `aggregate_filtered` /
+    /// `aggregate_multi_filtered` only understand i64 / f64 / &str. A text
+    /// literal for those columns (`WHERE d >= '2026-04-11'`,
+    /// `WHERE ts >= '2026-11-10 08:40:50'`) therefore matched NOTHING there:
+    /// `SELECT COUNT(*) … WHERE d >= '2026-04-11'` returned 0 while the same
+    /// predicate as a row query returned the right rows (observed on a
+    /// multi-segment table holding updated rows with the vectorized executor
+    /// disabled — the configuration in which these scans are reached).
+    /// An unparseable literal becomes NULL, which never matches (SQL
+    /// three-valued logic).
+    fn normalize_filter_target(col_type: Option<&ColumnType>, target: &Value) -> Value {
+        match (col_type, target) {
+            (Some(ColumnType::Date), Value::Text(s)) => crate::types::Date::parse(s)
+                .map(Value::Date)
+                .unwrap_or(Value::Null),
+            (Some(ColumnType::Date), Value::Timestamp(t)) => Value::Date(
+                crate::types::Date::from_days(t.as_micros().div_euclid(86_400_000_000) as i32),
+            ),
+            (Some(ColumnType::Timestamp), Value::Text(s)) => crate::types::Timestamp::parse_iso(s)
+                .map(Value::Timestamp)
+                .unwrap_or(Value::Null),
+            (Some(ColumnType::Timestamp), Value::Date(d)) => Value::Timestamp(
+                crate::types::Timestamp::from_micros(d.days() as i64 * 86_400_000_000),
+            ),
+            _ => target.clone(),
+        }
+    }
+
+    /// An integer view of a comparison target: plain integers, plus the raw
+    /// storage form of DATE (days) and TIMESTAMP (microseconds) values.
+    fn target_as_i64(target: &Value) -> Option<i64> {
+        match target {
+            Value::Integer(v) => Some(*v),
+            Value::Date(d) => Some(d.days() as i64),
+            Value::Timestamp(t) => Some(t.as_micros()),
+            _ => None,
+        }
+    }
+
+    /// 📐 Key-ordered row selector for filtered scans with a row budget.
+    ///
+    /// Returns up to `limit` positions `(seg_idx, row_idx)` of rows for which
+    /// `keep(seg_idx, row_idx)` holds, newest version of each key only
+    /// (tombstones included — a deleted key suppresses its older versions),
+    /// **in ascending key order** and stopping after `limit` hits.
+    ///
+    /// Why key order: it is the one row order that does not move when the
+    /// storage layout does. Segments are written key-sorted, the merge
+    /// cursors and the point lookups are built on that, and a compacted or
+    /// reopened table hands rows back in it — for a table with an INTEGER
+    /// primary key it is simply primary-key order. Every other convention
+    /// this codebase has used for "no ORDER BY" was layout-dependent:
+    ///   * newest-segment-first kept the first hits it met, so `… LIMIT n`
+    ///     returned the NEWEST rows on a multi-segment table and the OLDEST
+    ///     on a single-segment one (before 0.18.3);
+    ///   * "materialize everything, then sort by (segment, row)" (0.18.3–
+    ///     0.18.5) turned `LIMIT 10` into a full scan, and still concatenated
+    ///     segments: with interleaved key ranges `id > 3 LIMIT 2` returned
+    ///     {5, 7} in-process and {4, 5} after a restart, and an updated row
+    ///     jumped to the end until the next compaction.
+    ///
+    /// How: a k-way merge over the segments' (sorted, duplicate-free) key
+    /// arrays — O(limit · log S) — with a plain sequential walk when the
+    /// segments' key ranges are disjoint and rising, which is the common
+    /// shape of append-only tables. No seen-set, no full scan, in any state.
+    /// 📐 Positions of up to `limit` live rows matching `keep`, in ascending
+    /// key order (newest version of each key only). Position-collecting form
+    /// of [`Self::for_each_key_order_row`] — for callers that decode rows
+    /// per segment. `keep` is only called for live rows.
+    pub(crate) fn select_doc_order_positions(
+        &self,
+        segs: &[Arc<Segment>],
+        limit: usize,
+        keep: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(limit.min(4096));
+        self.for_each_key_order_row(segs, limit, &mut |s, i| {
+            if keep(s, i) {
+                out.push((s, i));
+                return true;
+            }
+            false
+        });
+        out
+    }
+
+    /// True when the segments' key ranges are strictly rising and disjoint.
+    /// Then no key can live in two of them (a key shared by segments `a` and
+    /// `b` would make `max(a) >= min(b)`): the table needs no newest-wins
+    /// merge, and reading the segments oldest→newest IS key order — callers
+    /// take their plain sequential path with no intermediate buffer. This is
+    /// the normal shape of append-only tables; it stops holding once rows are
+    /// updated (the new versions' keys fall inside older ranges) or inserted
+    /// out of key order across flushes.
+    pub(crate) fn key_ranges_disjoint(&self, segs: &[Arc<Segment>]) -> bool {
+        let _ = self;
+        for seg in segs {
+            let _ = seg.sst.load_full_keys();
+        }
+        segs.windows(2).all(|w| {
+            let (a, b) = (&w[0].sst, &w[1].sst);
+            a.num_rows == 0 || b.num_rows == 0 || a.row_map.key(a.num_rows - 1) < b.row_map.key(0)
+        })
+    }
+
+    /// Streaming form of [`Self::select_doc_order_positions`]: calls
+    /// `visit(seg_idx, row_idx)` for every live row in ascending key order
+    /// (newest version of each key only) until it has accepted `limit` rows
+    /// (`visit` returns true) or the segments run out. Nothing is
+    /// materialized in between — callers build their output rows right inside
+    /// the callback.
+    pub(crate) fn for_each_key_order_row(
+        &self,
+        segs: &[Arc<Segment>],
+        limit: usize,
+        visit: &mut dyn FnMut(usize, usize) -> bool,
+    ) {
+        let _ = self;
+        if limit == 0 || segs.is_empty() {
+            return;
+        }
+        // row_map.key() needs the segment's key array (cached per segment).
+        for seg in segs {
+            let _ = seg.sst.load_full_keys();
+        }
+        // 🚀 Key ranges disjoint and rising: concatenating the segments
+        // oldest→newest IS key order.
+        let disjoint = segs.windows(2).all(|w| {
+            let (a, b) = (&w[0].sst, &w[1].sst);
+            a.num_rows == 0 || b.num_rows == 0 || a.row_map.key(a.num_rows - 1) < b.row_map.key(0)
+        });
+        let mut accepted = 0usize;
+        if disjoint {
+            for s in 0..segs.len() {
+                for i in 0..segs[s].sst.num_rows {
+                    if !segs[s].sst.row_map.is_deleted(i) && visit(s, i) {
+                        accepted += 1;
+                        if accepted >= limit {
+                            return;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // 🚀 k-way merge. Heap entries order by (key asc, segment NEWEST
+        // first, row DESC): the first entry popped for a key is its live
+        // version; every later one is a superseded older version.
+        use std::cmp::Reverse;
+        let newest_first = |s: usize, i: usize| (u32::MAX - s as u32, u32::MAX - i as u32);
+        let mut heap: std::collections::BinaryHeap<Reverse<(u64, u32, u32)>> =
+            std::collections::BinaryHeap::with_capacity(segs.len());
+        for (s, seg) in segs.iter().enumerate() {
+            if seg.sst.num_rows > 0 {
+                let (ns, nr) = newest_first(s, 0);
+                heap.push(Reverse((seg.sst.row_map.key(0), ns, nr)));
+            }
+        }
+        let mut current_key: Option<u64> = None;
+        while let Some(Reverse((key, ns, nr))) = heap.pop() {
+            let s = (u32::MAX - ns) as usize;
+            let i = (u32::MAX - nr) as usize;
+            let n = segs[s].sst.num_rows;
+            if i + 1 < n {
+                let (_, nr_next) = newest_first(s, i + 1);
+                heap.push(Reverse((segs[s].sst.row_map.key(i + 1), ns, nr_next)));
+            }
+            if current_key == Some(key) {
+                continue; // superseded older version of the key just handled
+            }
+            current_key = Some(key);
+            if !segs[s].sst.row_map.is_deleted(i) && visit(s, i) {
+                accepted += 1;
+                if accepted >= limit {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 📐 Positions of the rows whose TEXT column equals `target`, in
+    /// ascending key order (newest version of each key only), stopping
+    /// after `limit` hits.
+    /// (`scan_row_indices_eq` returns the NEWEST hits first — the right shape
+    /// for a top-k sort key, the wrong one for a plain `… LIMIT n` page.)
+    pub fn scan_row_indices_eq_doc_order(
+        &self,
+        filter_col: usize,
+        target: &[u8],
+        limit: usize,
+    ) -> Option<Vec<(usize, usize)>> {
+        let segs = self.segments_snapshot();
+        let mut cur: Option<(usize, Option<crate::storage::lsm::columnar::TextSegment>)> = None;
+        Some(self.select_doc_order_positions(&segs, limit, &mut |s, i| {
+            let seg = &segs[s];
+            if cur.as_ref().is_none_or(|(cs, _)| *cs != s) {
+                cur = Some((s, seg.read_text_cached(filter_col)));
+            }
+            if seg.sst.row_map.is_deleted(i) {
+                return false;
+            }
+            cur.as_ref()
+                .and_then(|(_, t)| t.as_ref())
+                .and_then(|t| if t.is_null(i) { None } else { t.get_str(i) })
+                .is_some_and(|v| v.as_bytes() == target)
+        }))
+    }
+
     pub fn scan_text_filtered_limit(
         &self,
         filter_col: usize,
@@ -2137,23 +2381,55 @@ impl ColSegmentStore {
         let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(cap.min(65536));
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
+        // 🚀 直通: 单段，或各段 key 区间不重叠 —— 无需归并、无中间缓冲。
+        let direct = single_seg || self.key_ranges_disjoint(&segs);
 
-        // Only multi-segment needs dedup (seen set) + key-sorted iteration.
-        // Single segment: iterate 0..n directly — no sort, no HashSet.
-        let mut seen: Option<std::collections::HashSet<u64>> = if single_seg {
-            None
+        // 🚀 直通（单段，或各段 key 区间不重叠）: 逐段顺序扫 0..n，取满即停
+        // —— 无归并、无去重集合。其余情形: 行位置先由选择器选定（key 序 +
+        // newest-wins + 取满即停，见 select_doc_order_positions），这里只
+        // 解码被选中的行。
+        let selected: Vec<(usize, usize)> = if direct {
+            Vec::new()
         } else {
-            let total_rows: usize = segs.iter().map(|s| s.sst.num_rows).sum();
-            Some(std::collections::HashSet::with_capacity(total_rows))
+            let mut cur: Option<(usize, Option<crate::storage::lsm::columnar::TextSegment>)> = None;
+            self.select_doc_order_positions(&segs, limit, &mut |s, i| {
+                let seg = &segs[s];
+                if cur.as_ref().is_none_or(|(cs, _)| *cs != s) {
+                    cur = Some((s, seg.sst.read_text(filter_col).ok()));
+                }
+                if seg.sst.row_map.is_deleted(i) {
+                    return false;
+                }
+                let fval = cur.as_ref().and_then(|(_, t)| t.as_ref()).and_then(|t| {
+                    if t.is_null(i) {
+                        None
+                    } else {
+                        t.get_str(i)
+                    }
+                });
+                str_predicate(fval)
+            })
         };
-
-        // 🔴 多段文档序（issue: 多段 i64 过滤返回"最新段优先"）:
-        // 去重仍须从最新段/最新版本先走（首见即最新版本），但**输出**
-        // 必须是文档序（旧段在前、段内行号升序）——否则同一条查询在
-        // 单段表上是有序结果，一旦后台 flush 拆段后行序整体翻转，
-        // LIMIT 窗口取到的行集也跟着变。单段保持原快路径（天然有序）。
-        let mut unordered: Vec<(usize, usize, u64, Vec<Value>)> = Vec::new();
-        'outer: for (seg_idx, seg) in segs.iter().enumerate().rev() {
+        // 📐 key 序下各段的位置是交错的: 结果按输出槽位装配 —— 选中的位置
+        // 先按段分组（段内仍按行号升序），各段只解码自己那几行，最后按
+        // 槽位拼回。
+        let mut slots: Vec<(u64, Vec<Value>)> = vec![(0, Vec::new()); selected.len()];
+        let mut by_seg: Vec<Vec<(usize, usize)>> = vec![Vec::new(); segs.len()];
+        for (slot, &(s, i)) in selected.iter().enumerate() {
+            by_seg[s].push((slot, i));
+        }
+        'outer: for (seg_idx, seg) in segs.iter().enumerate() {
+            // 本段没有被选中的行（通常是更新的段）: 整段跳过，连投影列
+            // 都不预读。
+            let picks: Option<&Vec<(usize, usize)>> = if direct {
+                None
+            } else {
+                let p = &by_seg[seg_idx];
+                if p.is_empty() {
+                    continue;
+                }
+                Some(p)
+            };
             let n = seg.sst.num_rows;
             let _ = seg.sst.load_full_keys();
 
@@ -2213,16 +2489,9 @@ impl ColSegmentStore {
 
             // Inner row-processing macro — shared between natural & sorted order.
             macro_rules! process_row {
-                ($i:expr) => {{
+                ($slot:expr, $i:expr) => {{
                     let i = $i;
                     let key = seg.sst.row_map.key(i);
-                    // Mark key as seen BEFORE checking deleted, so tombstones suppress
-                    // older versions of the same key in earlier segments.
-                    if let Some(ref mut s) = seen {
-                        if !s.insert(key) {
-                            continue;
-                        }
-                    }
                     if seg.sst.row_map.is_deleted(i) {
                         continue;
                     }
@@ -2232,7 +2501,7 @@ impl ColSegmentStore {
                         ftext
                             .as_ref()
                             .and_then(|t| if t.is_null(i) { None } else { t.get_str(i) });
-                    if !str_predicate(fval) {
+                    if direct && !str_predicate(fval) {
                         continue;
                     }
 
@@ -2281,40 +2550,33 @@ impl ColSegmentStore {
                         };
                         row.push(v.unwrap_or(Value::Null));
                     }
-                    if single_seg {
+                    if direct {
                         result.push((key, row));
                         // 🔥 Early exit: stop once we have `limit` matches.
                         if result.len() >= limit {
                             break 'outer;
                         }
                     } else {
-                        // 🔴 多段: 先全量收集（去重已在上面完成），循环外
-                        // 按文档序重排后再 take(limit)。
-                        unordered.push((seg_idx, i, key, row));
+                        slots[$slot] = (key, row);
                     }
                 }};
             }
 
-            if single_seg {
+            if direct {
                 // Natural order — no sort, no dedup. The hot path for SELECTs.
                 for i in 0..n {
-                    process_row!(i);
+                    process_row!(0usize, i);
                 }
             } else {
-                // Multi-segment: sort by key so newest version wins dedup.
-                let mut order: Vec<usize> = (0..n).collect();
-                order.sort_unstable_by_key(|&i| seg.sst.row_map.key(i));
-                for &i in &order {
-                    process_row!(i);
+                // Multi-segment: only the pre-selected rows (key order,
+                // already deduplicated and filtered), tagged with their slot.
+                for &(slot, i) in picks.unwrap() {
+                    process_row!(slot, i);
                 }
             }
         }
-        if !single_seg {
-            unordered.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            for (_, _, key, row) in unordered.into_iter().take(limit) {
-                result.push((key, row));
-            }
-        }
+        // 按槽位拼回 = key 序。
+        result.extend(slots);
         result
     }
 
@@ -2334,21 +2596,58 @@ impl ColSegmentStore {
         let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(cap.min(65536));
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
+        // 🚀 直通: 单段，或各段 key 区间不重叠 —— 无需归并、无中间缓冲。
+        let direct = single_seg || self.key_ranges_disjoint(&segs);
 
-        let mut seen: Option<std::collections::HashSet<u64>> = if single_seg {
-            None
+        // 🚀 直通（单段，或各段 key 区间不重叠）: 逐段顺序扫 0..n，取满即停
+        // —— 无归并、无去重集合。其余情形: 行位置先由选择器选定（key 序 +
+        // newest-wins + 取满即停，见 select_doc_order_positions），这里只
+        // 解码被选中的行。（0.18.3–0.18.5 的"全量物化再排序"让 30 万行上
+        // 的 LIMIT 10 慢了 17×。）
+        let filter_is_bool = matches!(col_types.get(filter_col), Some(ColumnType::Boolean));
+        let selected: Vec<(usize, usize)> = if direct {
+            Vec::new()
         } else {
-            let total_rows: usize = segs.iter().map(|s| s.sst.num_rows).sum();
-            Some(std::collections::HashSet::with_capacity(total_rows))
+            let mut cur: Option<(usize, Option<crate::storage::lsm::columnar::FixedSegment>)> =
+                None;
+            self.select_doc_order_positions(&segs, limit, &mut |s, i| {
+                let seg = &segs[s];
+                if cur.as_ref().is_none_or(|(cs, _)| *cs != s) {
+                    cur = Some((s, seg.sst.read_fixed_i64(filter_col).ok()));
+                }
+                if seg.sst.row_map.is_deleted(i) {
+                    return false;
+                }
+                let f = cur.as_ref().and_then(|(_, f)| f.as_ref());
+                let fval = if filter_is_bool {
+                    f.and_then(|f| f.get_bool(i)).map(|b| if b { 1 } else { 0 })
+                } else {
+                    f.and_then(|f| f.get_i64(i))
+                };
+                i64_predicate(fval)
+            })
         };
-
-        // 🔴 多段文档序（issue: 多段 i64 过滤返回"最新段优先"）:
-        // 去重仍须从最新段/最新版本先走（首见即最新版本），但**输出**
-        // 必须是文档序（旧段在前、段内行号升序）——否则同一条查询在
-        // 单段表上是有序结果，一旦后台 flush 拆段后行序整体翻转，
-        // LIMIT 窗口取到的行集也跟着变。单段保持原快路径（天然有序）。
-        let mut unordered: Vec<(usize, usize, u64, Vec<Value>)> = Vec::new();
-        'outer: for (seg_idx, seg) in segs.iter().enumerate().rev() {
+        // 解码结果按段分桶，末尾按段号升序拼接。
+        // 📐 key 序下各段的位置是交错的: 结果按输出槽位装配 —— 选中的位置
+        // 先按段分组（段内仍按行号升序），各段只解码自己那几行，最后按
+        // 槽位拼回。
+        let mut slots: Vec<(u64, Vec<Value>)> = vec![(0, Vec::new()); selected.len()];
+        let mut by_seg: Vec<Vec<(usize, usize)>> = vec![Vec::new(); segs.len()];
+        for (slot, &(s, i)) in selected.iter().enumerate() {
+            by_seg[s].push((slot, i));
+        }
+        'outer: for (seg_idx, seg) in segs.iter().enumerate() {
+            // 本段没有被选中的行（通常是更新的段）: 整段跳过，连投影列
+            // 都不预读。
+            let picks: Option<&Vec<(usize, usize)>> = if direct {
+                None
+            } else {
+                let p = &by_seg[seg_idx];
+                if p.is_empty() {
+                    continue;
+                }
+                Some(p)
+            };
             let n = seg.sst.num_rows;
             let _ = seg.sst.load_full_keys();
 
@@ -2394,20 +2693,14 @@ impl ColSegmentStore {
 
             let has_deletions = seg.sst.row_map.has_any_deleted();
 
-            // Inner loop: iterate rows in appropriate order.
-            let order_iter: Box<dyn Iterator<Item = usize>> = if let Some(ref _s) = seen {
-                Box::new((0..n).rev())
-            } else {
-                Box::new(0..n)
+            // Inner loop. (输出槽位, 行号): 多段只访问被选中的行。
+            let visits: Box<dyn Iterator<Item = (Option<usize>, usize)>> = match picks {
+                Some(p) => Box::new(p.iter().map(|&(slot, i)| (Some(slot), i))),
+                None => Box::new((0..n).map(|i| (None, i))),
             };
 
-            for i in order_iter {
+            for (slot, i) in visits {
                 let key = seg.sst.row_map.key(i);
-                if let Some(ref mut s) = seen {
-                    if !s.insert(key) {
-                        continue;
-                    }
-                }
                 if has_deletions && seg.sst.row_map.is_deleted(i) {
                     continue;
                 }
@@ -2420,7 +2713,7 @@ impl ColSegmentStore {
                 } else {
                     fcol_fixed.as_ref().and_then(|f| f.get_i64(i))
                 };
-                if !i64_predicate(fval) {
+                if direct && !i64_predicate(fval) {
                     continue;
                 }
 
@@ -2492,23 +2785,19 @@ impl ColSegmentStore {
                         row.push(v.unwrap_or(Value::Null));
                     }
                 }
-                if single_seg {
+                if direct {
                     result.push((key, row));
                     if result.len() >= limit {
                         break 'outer;
                     }
                 } else {
-                    // 文档序重排前先收集全量命中（含段号/行号），最后统一 take(limit)。
-                    unordered.push((seg_idx, i, key, row));
+                    // 被选中的行: 谓词与去重已在选择器里完成，直接写回槽位。
+                    slots[slot.expect("selected row has an output slot")] = (key, row);
                 }
             }
         }
-        if !single_seg {
-            unordered.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            for (_, _, key, row) in unordered.into_iter().take(limit) {
-                result.push((key, row));
-            }
-        }
+        // 按槽位拼回 = key 序。
+        result.extend(slots);
         result
     }
 
@@ -3160,12 +3449,11 @@ impl ColSegmentStore {
             std::collections::HashSet::new()
         };
 
+        let col_types = self.col_types.load();
+        let target_norm = Self::normalize_filter_target(col_types.get(filter_col), target);
+        let target = &target_norm;
         // Pre-extract target comparison value (avoids re-matching per row).
-        let target_i = if let Value::Integer(v) = target {
-            Some(*v)
-        } else {
-            None
-        };
+        let target_i = Self::target_as_i64(target);
         let mut target_f = if let Value::Float(v) = target {
             Some(*v)
         } else {
@@ -3251,7 +3539,7 @@ impl ColSegmentStore {
             let process_row = |i: usize, count: &mut usize| {
                 let matches = if let Some(ref f) = fcol_fixed {
                     match tag {
-                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp | ColumnTypeTag::Date => {
                             let v = f.get_i64(i);
                             // Prefer integer target; if the target is a Float
                             // (e.g. AVG() subquery resolved to Float), compare
@@ -3341,12 +3629,12 @@ impl ColSegmentStore {
         } else {
             std::collections::HashSet::new()
         };
-        // Pre-extract filter target for comparison.
-        let target_i = if let Value::Integer(v) = target {
-            Some(*v)
-        } else {
-            None
-        };
+        // Pre-extract filter target for comparison (in the filter column's
+        // own representation — see normalize_filter_target).
+        let target_norm =
+            Self::normalize_filter_target(col_types.get(filter_col.unwrap_or(0)), target);
+        let target = &target_norm;
+        let target_i = Self::target_as_i64(target);
         let target_f = if let Value::Float(v) = target {
             Some(*v)
         } else if let Value::Integer(v) = target {
@@ -3438,7 +3726,7 @@ impl ColSegmentStore {
                     true
                 } else if let Some(ref f) = fcol_fixed {
                     match seg.sst.column_tags[fc] {
-                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp | ColumnTypeTag::Date => {
                             // Prefer integer target; if the target is a Float
                             // (e.g. AVG() subquery resolved to Float), compare
                             // the column value promoted to f64 against target_f.
@@ -3686,28 +3974,33 @@ impl ColSegmentStore {
             target_f: Option<f64>,
             target_s: Option<String>,
         }
+        let col_types = self.col_types.load();
         let pred_targets: Vec<PredTarget> = comparisons
             .iter()
-            .map(|(_, _, t)| PredTarget {
-                // 🔑 Boolean literals coerce to 0/1 (SQL `flag = TRUE`): the
-                // Bool-column branch maps target_i back through `!= 0`. A Bool
-                // literal previously left target_i None and matched NOTHING
-                // (`flag = TRUE AND id < 10` counted 0 rows).
-                target_i: match t {
-                    Value::Integer(v) => Some(*v),
-                    Value::Bool(b) => Some(*b as i64),
-                    _ => None,
-                },
-                target_f: match t {
-                    Value::Float(v) => Some(*v),
-                    Value::Integer(v) => Some(*v as f64),
-                    _ => None,
-                },
-                target_s: if let Value::Text(s) = t {
-                    Some(s.as_str().to_string())
-                } else {
-                    None
-                },
+            .map(|(c, _, t)| {
+                let t = &Self::normalize_filter_target(col_types.get(*c), t);
+                PredTarget {
+                    // 🔑 Boolean literals coerce to 0/1 (SQL `flag = TRUE`): the
+                    // Bool-column branch maps target_i back through `!= 0`. A Bool
+                    // literal previously left target_i None and matched NOTHING
+                    // (`flag = TRUE AND id < 10` counted 0 rows).
+                    target_i: match t {
+                        Value::Integer(v) => Some(*v),
+                        Value::Bool(b) => Some(*b as i64),
+                        // DATE (days) / TIMESTAMP (microseconds) storage form.
+                        _ => Self::target_as_i64(t),
+                    },
+                    target_f: match t {
+                        Value::Float(v) => Some(*v),
+                        Value::Integer(v) => Some(*v as f64),
+                        _ => None,
+                    },
+                    target_s: if let Value::Text(s) = t {
+                        Some(s.as_str().to_string())
+                    } else {
+                        None
+                    },
+                }
             })
             .collect();
 
@@ -3796,7 +4089,9 @@ impl ColSegmentStore {
                     let pt = &pred_targets[pi];
                     let ok = if let Some(ref f) = fixed {
                         match seg.sst.column_tags[*col] {
-                            ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                            ColumnTypeTag::Integer
+                            | ColumnTypeTag::Timestamp
+                            | ColumnTypeTag::Date => {
                                 if pt.target_i.is_some() {
                                     cmp_opt(f.get_i64(i), pt.target_i, op)
                                 } else if pt.target_f.is_some() {
@@ -3855,7 +4150,9 @@ impl ColSegmentStore {
                                 }
                                 None => r.null_count += 1,
                             },
-                            ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                            ColumnTypeTag::Integer
+                            | ColumnTypeTag::Timestamp
+                            | ColumnTypeTag::Date => {
                                 match af.get_i64(i) {
                                     Some(v) => {
                                         r.count += 1;
@@ -4724,6 +5021,68 @@ impl ColSegmentStore {
         let mut out: Vec<(u64, usize, usize)> = heap.into_vec();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out.into_iter().map(|(_, s, r)| (s, r)).collect()
+    }
+
+    /// Exact distinct values of a TEXT column, with NULL reported separately.
+    ///
+    /// Every live row is visited (newest version of a key wins, tombstones
+    /// suppress older versions) — no early exit and no value cap. `SELECT
+    /// DISTINCT col` is a set, not a sample: the adaptive
+    /// [`Self::distinct_text_values`] stops after 4096 rows without a new
+    /// value, which on value-clustered data (rows grouped by host / region /
+    /// user — the common layout of logs and time-ordered tables) silently
+    /// drops every value stored after the first cluster, and it caps at
+    /// 10,000 values. It also renders NULL as `""` (or drops it once the
+    /// table has a tombstone); here NULL is a distinct value of its own.
+    pub fn distinct_text_values_exact(&self, col: usize) -> (Vec<String>, bool) {
+        let segs = self.segments_snapshot();
+        let live = self.segs();
+        let snapshot_is_live = live.len() == segs.len()
+            && live.iter().zip(segs.iter()).all(|(a, b)| Arc::ptr_eq(a, b));
+        let may_overlap = !snapshot_is_live || self.may_have_duplicate_keys();
+        let mut seen_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // Only first sightings allocate (one Arc per distinct value).
+        let mut values: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
+        let mut has_null = false;
+        // Newest-first: the first version of a key seen is its live one.
+        for s in (0..segs.len()).rev() {
+            let seg = &segs[s];
+            if may_overlap {
+                let _ = seg.sst.load_full_keys();
+            }
+            let Ok(text) = seg.sst.read_text(col) else {
+                continue;
+            };
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+            let has_nulls = text.has_any_null();
+            for i in 0..seg.sst.num_rows {
+                if may_overlap && !seen_keys.insert(seg.sst.row_map.key(i)) {
+                    continue;
+                }
+                if has_deletions && seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
+                // get_str_fast is not null-aware — only use it when the
+                // column segment has no NULL at all.
+                let v = if has_nulls {
+                    text.get_str(i)
+                } else {
+                    Some(text.get_str_fast(i))
+                };
+                match v {
+                    None => has_null = true,
+                    Some(v) => {
+                        if !values.contains(v) {
+                            values.insert(Arc::from(v));
+                        }
+                    }
+                }
+            }
+        }
+        (
+            values.into_iter().map(|v| v.to_string()).collect(),
+            has_null,
+        )
     }
 
     /// Distinct values from a text column with early exit. Returns unique
